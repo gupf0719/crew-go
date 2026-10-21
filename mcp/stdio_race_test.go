@@ -24,7 +24,7 @@ func TestMain(m *testing.M) {
 }
 
 // runMockMCPServer 读 stdin JSON-RPC：响应 initialize 与 tools/list（一个工具 t）；tools/call 按 mode 行为
-// （hang=永久阻塞让 rpc 挂 / exit=子进程崩溃 / 其他=正常响应）。
+// （hang=永久阻塞让 rpc 挂 / exit=子进程崩溃 / 其他=正常响应）；die 在报完 tools/list 后就退出。
 func runMockMCPServer(mode string) {
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 64*1024), 10*1024*1024)
@@ -48,6 +48,9 @@ func runMockMCPServer(mode string) {
 			w.Write(b)
 			w.WriteByte('\n')
 			w.Flush()
+			if mode == "die" {
+				os.Exit(0) // 报完清单就退出：之后写给它的请求撞上已关闭的管道
+			}
 		case "tools/call":
 			switch mode {
 			case "hang":

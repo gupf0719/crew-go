@@ -150,7 +150,7 @@ func (c *StdioClient) ListTools(ctx context.Context) ([]ToolSpec, error) {
 
 func (c *StdioClient) CallTool(ctx context.Context, name string, args map[string]any) (*CallResult, error) {
 	if err := c.Initialize(ctx); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrNotSent, err) // 握手没过，tools/call 还没发
 	}
 	if args == nil {
 		args = map[string]any{}
@@ -162,7 +162,11 @@ func (c *StdioClient) CallTool(ctx context.Context, name string, args map[string
 	if err != nil {
 		return nil, fmt.Errorf("mcp tools/call %s: %w", name, err)
 	}
-	return parseCallResult(raw)
+	res, err := parseCallResult(raw)
+	if err != nil {
+		return nil, &badResponseError{fmt.Errorf("mcp tools/call %s: %w", name, err)}
+	}
+	return res, nil
 }
 
 // Close 关闭子进程：先关 stdin 触发 server 自然退出，再等待 cmd.Wait；超时则 Kill。
@@ -315,7 +319,7 @@ func (c *StdioClient) rpc(ctx context.Context, method string, params map[string]
 	c.writeMu.Lock()
 	if c.stdin == nil {
 		c.writeMu.Unlock()
-		return nil, errors.New("mcp stdio: client closed")
+		return nil, fmt.Errorf("%w: mcp stdio: client closed", ErrNotSent)
 	}
 	c.pending[key] = ch
 	stdin := c.stdin // 持锁期间捕获引用，避免 Close 并发置 nil
@@ -329,7 +333,8 @@ func (c *StdioClient) rpc(ctx context.Context, method string, params map[string]
 		c.writeMu.Lock()
 		delete(c.pending, key)
 		c.writeMu.Unlock()
-		return nil, fmt.Errorf("write: %w", werr)
+		// 没写完整的一行 server 解析不了、不会执行
+		return nil, fmt.Errorf("%w: write: %w", ErrNotSent, werr)
 	}
 
 	select {

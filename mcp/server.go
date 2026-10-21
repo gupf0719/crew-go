@@ -38,8 +38,8 @@ func WithToolSnapshot(specs []ToolSpec) ServerOption {
 }
 
 // WithCallTimeout 给这个 server 的每次工具调用一个时限（d <= 0 = 不设，默认）。超过时限返回失败结果
-// （tool.ErrCodeTimeout，告诉模型 server 那边可能仍在执行），server 不因此算掉线。开了 WithSerialCalls 时
-// 排队等前一个调用的时间也算在内。
+// （tool.ErrCodeTimeout，告诉模型 server 那边可能仍在执行），server 不因此算掉线（WithSerialCalls 的除外）。
+// 开了 WithSerialCalls 时排队另有一份同样长的时限：排队与执行各自最多 d，排在后面的调用不会因为排队把执行的时间吃掉。
 //
 // ⚠️ StreamableHTTPClient 默认的 *http.Client 自带 20s 超时，比这里设得长的时限要配
 // WithHTTPClient 换掉它，否则 20s 时 HTTP 层先报错，按连接出错处理（server 标成掉线）。
@@ -51,9 +51,10 @@ func WithCallTimeout(d time.Duration) ServerOption {
 // WithCallTimeout 约束）。给操纵硬件的 server 用（摄像头、舵机……）——BasicAgent 一轮里的多个工具调用
 // 是并发执行的，没有按工具串行的声明。
 //
-// 超时的那个调用 server 那边可能还在执行：WithClientFactory 注册的 server 这时按连接不可信处理——标成掉线、
-// 关掉旧连接（stdio 的旧子进程随之退出）再重连，排队的调用不会发给还在执行的那个连接。HTTP server 端还在
-// 执行的调用管不到，要它自己串行；WithClient 的固定实例不重连，超时后排队的调用照常发出。
+// 请求发出之后没等到结果（超时、调用方取消）时，server 那边可能还在执行：WithClientFactory 注册的 server 这时按
+// 连接不可信处理——标成掉线、关掉旧连接（stdio 的旧子进程随之退出）再重连，排队的调用不会发给还在执行的那个连接。
+// 管不到的：HTTP server 端还在执行的调用（要它自己串行）、stdio 命令是包装器（npx 之类）时被留下的真正 server 进程、
+// WithClient 的固定实例（不重连，排队的调用照常发出）。
 //
 // （见 doc/v2/mcp.md §5）
 func WithSerialCalls() ServerOption {
@@ -122,6 +123,8 @@ type server struct {
 	registered     []string
 	registeredDefs map[string]ToolSpec
 	fromSnapshot   bool
+	// fixedClosed：Start 的回滚已经关了 fixed 实例，Close 不再关第二次；连上它时清掉。
+	fixedClosed bool
 }
 
 func newServer(h *Hub, name string, fixed Client, factory func(context.Context) (Client, error), opts []ServerOption) *server {
@@ -197,17 +200,19 @@ func (s *server) call(ctx context.Context, name, source string, args map[string]
 		return refused, nil
 	}
 
-	callCtx, cancel := ctx, context.CancelFunc(func() {})
-	if s.cfg.callTimeout > 0 {
-		callCtx, cancel = context.WithTimeout(ctx, s.cfg.callTimeout)
-	}
-	defer cancel()
-
 	if s.sem != nil {
+		// 排队有自己的一份时限（见 WithCallTimeout）：跟执行共用一份的话，排在后面的调用执行时只剩一点时间，
+		// 一超时就要断开重连（见 callFailed）。
+		waitCtx, cancelWait := ctx, context.CancelFunc(func() {})
+		if s.cfg.callTimeout > 0 {
+			waitCtx, cancelWait = context.WithTimeout(ctx, s.cfg.callTimeout)
+		}
 		select {
 		case s.sem <- struct{}{}:
+			cancelWait()
 			defer func() { <-s.sem }()
-		case <-callCtx.Done():
+		case <-waitCtx.Done():
+			cancelWait()
 			if ctx.Err() != nil {
 				return nil, fmt.Errorf("mcp call %s: %w", name, ctx.Err())
 			}
@@ -219,6 +224,12 @@ func (s *server) call(ctx context.Context, name, source string, args map[string]
 			return refused, nil
 		}
 	}
+
+	callCtx, cancel := ctx, context.CancelFunc(func() {})
+	if s.cfg.callTimeout > 0 {
+		callCtx, cancel = context.WithTimeout(ctx, s.cfg.callTimeout)
+	}
+	defer cancel()
 
 	res, err := c.CallTool(callCtx, source, args)
 	if err != nil {
@@ -270,14 +281,17 @@ func (s *server) admit(source string) (Client, uint64, *tool.Result) {
 //
 // 「没有发出」只认 Client 明确包上的 ErrNotSent，不从错误形状推断（推断错了，模型会把一个已执行的写操作当成没执行、再做一遍）。
 func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint64, err error) (*tool.Result, error) {
+	notSent := errors.Is(err, ErrNotSent)
+	// 串行的 server：请求发出之后没等到结果，那边可能还在执行，连接不可信——标掉线、关旧连接再重连（见 WithSerialCalls）。
+	untrusted := s.sem != nil && s.factory != nil && !notSent
 	if ctx.Err() != nil {
+		if untrusted {
+			s.markOffline(gen, err)
+		}
 		return nil, fmt.Errorf("mcp call %s: %w: %w", name, ctx.Err(), err)
 	}
-	notSent := errors.Is(err, ErrNotSent)
 	if callCtx.Err() != nil && !notSent {
-		if s.sem != nil && s.factory != nil {
-			// 串行的 server：超时的调用那边可能还在执行，连接不可信——标掉线、关旧连接再重连（见 WithSerialCalls）。
-			s.markOffline(gen, err)
+		if untrusted && s.markOffline(gen, err) {
 			return tool.Failure(tool.ErrCodeTimeout,
 				fmt.Sprintf("工具调用超时（超过 %s 未返回），已放弃等待；为保证同一时刻只有一个调用在执行，已断开 %s 重连（它那边的执行可能被打断）", s.cfg.callTimeout, s.name)), nil
 		}
@@ -316,19 +330,20 @@ func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint6
 		fmt.Sprintf("该能力暂时不可用（%s 连接出错），这次调用没拿到结果，不确定是否已执行", s.name)), nil
 }
 
-// markOffline 在第 gen 代连接上出了连接错误时把 server 标成掉线，并起后台重连。
+// markOffline 在第 gen 代连接上出了连接错误时把 server 标成掉线，并起后台重连；返回这次有没有标（已关闭、已离线、
+// 代数对不上、固定实例时不标）。
 //
 // 只认当前这一代：并发的几个调用同时撞上同一次掉线时只有第一个生效；重连上之后，迟到的旧连接错误不会
 // 把新连接标掉。fixed 型（WithClient）不标——它没法新建连接，标了也只能拿同一个实例再试，下一次调用
 // 照常发给它。
-func (s *server) markOffline(gen uint64, cause error) {
+func (s *server) markOffline(gen uint64, cause error) bool {
 	if s.factory == nil || s.hub == nil {
-		return
+		return false
 	}
 	s.mu.Lock()
 	if s.closed || !s.online || s.gen != gen {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	stale := s.client
 	s.client = nil
@@ -343,6 +358,7 @@ func (s *server) markOffline(gen uint64, cause error) {
 	slog.Warn("mcp: server 掉线，后台重连；期间它的工具返回「该能力暂时不可用」",
 		logKeyServer, s.name, logKeyErr, cause.Error())
 	go s.reconnectLoop(stale)
+	return true
 }
 
 // reconnectLoop 按退避反复连，连上或 Hub 关闭为止。stale 是掉线的那个连接（factory 型），在这里关：
@@ -393,6 +409,7 @@ func (s *server) goOnline(c Client, specs []ToolSpec) {
 	s.online = true
 	s.since = time.Now()
 	s.lastErr = nil
+	s.fixedClosed = false
 	s.setListedLocked(specs)
 	missing, added, changed := s.driftLocked()
 	s.hub.events.push(s.statusLocked())
@@ -461,6 +478,9 @@ func (s *server) shutdown() Client {
 	c := s.client
 	if s.fixed != nil {
 		c = s.fixed
+		if s.fixedClosed {
+			c = nil
+		}
 	}
 	s.closed = true
 	s.online = false

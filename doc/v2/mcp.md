@@ -73,11 +73,11 @@ agent := agent_v2.NewBasicAgent(agent_v2.WithToolkit(hub.Toolkit()), ...)
 
 | 情形 | 结果（`tool.Result.Error.Code`） | 模型看到的说明 | server 状态 |
 |---|---|---|---|
-| 调用方 ctx 已结束（排队中，或 `CallTool` 出错时） | 返回 error（链上带着 ctx 的错） | — | 不变 |
+| 调用方 ctx 已结束（排队中，或 `CallTool` 出错时） | 返回 error（链上带着 ctx 的错） | — | 不变；`WithSerialCalls` 的、请求已发出时掉线、断开重连（同下面的超时） |
 | Hub 已 `Close` | `server_unavailable` | 该能力暂时不可用（X 已关闭），这次调用没有发出 | — |
 | server 离线 | `server_unavailable` | 该能力暂时不可用（X offline），这次调用没有发出 | 不变 |
 | 重连后 server 上已没有这个工具 | `tool_not_found` | X 上已经没有工具 "t"……这次调用没有发出 | 不变 |
-| 串行排队超过 `WithCallTimeout` | `timeout` | 等 X 上一个调用结束超时……这次调用没有发出 | 不变 |
+| 串行排队超过 `WithCallTimeout`（排队与执行各有一份时限） | `timeout` | 等 X 上一个调用结束超时……这次调用没有发出 | 不变 |
 | 超过 `WithCallTimeout`、请求已发出 | `timeout` | 工具调用超时（超过 d 未返回），已放弃等待；X 那边可能仍在执行 | 不变；`WithSerialCalls` 的掉线、断开重连，说明改为「已断开 X 重连（它那边的执行可能被打断）」 |
 | 请求没发出（`Client` 包上 `ErrNotSent`：连不上、没写出去、连接早已关闭、握手没过；含被时限打断的） | `server_unavailable` | 该能力暂时不可用（X 连不上），这次调用没有发出 | 掉线 |
 | server 答了 JSON-RPC 错误（`*RPCError`，在 2xx 或非 2xx 响应体里） | `internal_error` | `mcp rpc error <code>: <message>` | 不变 |
@@ -109,9 +109,11 @@ agent := agent_v2.NewBasicAgent(agent_v2.WithToolkit(hub.Toolkit()), ...)
   卡在旧连接上的调用迟到的连接错误不会把新连接标掉（`TestHub_LateErrorFromOldConnection_DoesNotKnockNewOne`）。
 - 重连循环：先关掉线的旧连接（stdio 要等子进程退出，至多 3s，不放在调用路径上），然后按 `WithReconnectBackoff` 退避
   （默认 1s 起、每次翻倍、上限 60s）反复连，连上为止；每次尝试受 `WithConnectTimeout` 约束（不给时 30s）。
-- `WithSerialCalls`：排队的调用拿到信号量后按当时的状态再准入（不发给已判掉线的旧连接）；超时的调用 server 那边可能
-  还在执行，`WithClientFactory` 的串行 server 这时掉线、关旧连接（stdio 旧子进程随之退出）再重连，排队的调用不会跟它
-  重叠。HTTP server 端还在执行的调用管不到，要它自己串行；`WithClient` 的固定实例不重连。
+- `WithSerialCalls`：排队与执行各自最多 `WithCallTimeout`（共用一份的话排在后面的调用执行时只剩一点时间）；排队的调用
+  拿到信号量后按当时的状态再准入（不发给已判掉线的旧连接）；请求发出之后没等到结果（超时、调用方取消）时 server 那边
+  可能还在执行，`WithClientFactory` 的串行 server 这时掉线、关旧连接（stdio 旧子进程随之退出）再重连，排队的调用不会跟它
+  重叠。管不到的：HTTP server 端还在执行的调用（要它自己串行）、stdio 命令是包装器（npx 之类）时留下的真正 server 进程、
+  `WithClient` 的固定实例（不重连）。
 - 重连后 server 报的清单跟本会话注册的不一样时：去掉的工具调用返回 `tool_not_found`，新加的这次不注册，改了定义的
   仍按启动时的定义发给模型；日志里列出差异。下次启动按新清单注册。
 - 超时（非串行）不算掉线（server 可能只是忙）。
@@ -132,7 +134,8 @@ agent := agent_v2.NewBasicAgent(agent_v2.WithToolkit(hub.Toolkit()), ...)
 
 `WithStatusHook(fn)`：`Start` 成功后每个 server 回调一次初始状态，之后每次上线 / 掉线回调一次；**按状态变化的先后
 顺序**、在 Hub 自己的一个 goroutine 里逐个调用（入队在 server 的锁里做，回调不持任何锁）。回调里调 `Status`、调工具、
-调 `Close` 都可以；panic 只记日志。`Close` 之后不再开始新的回调，也不等正在执行的那个返回；`Close` 时还没送出的状态
+调 `Close` 都可以；panic 只记日志。`Close` 之后不再开始新的回调（至多还有一个恰好在那一刻开始的），也不等正在执行的那个
+返回；`Close` 时还没送出的状态
 变化不再回调——要持久化最后的清单，`Close` 之前读一次 `Status`。
 
 要让下次启动时连不上的 server 也有工具，就把在线状态的 `Tools` 持久化，下次作为 `WithToolSnapshot` 传回（deskbot 的
@@ -148,7 +151,7 @@ agent := agent_v2.NewBasicAgent(agent_v2.WithToolkit(hub.Toolkit()), ...)
 | 选项 | 作用 |
 |---|---|
 | `WithCallTimeout(d)`（server 级） | 每次调用的时限，见 §5 |
-| `WithSerialCalls()`（server 级） | 这个 server 的调用串行（硬件互斥），见 §6：BasicAgent 一轮里的多个工具调用是并发执行的 |
+| `WithSerialCalls()`（server 级） | 这个 server 的调用串行（硬件互斥），见 §6：BasicAgent 一轮里的多个工具调用是并发执行的。stdio server 的命令别用包装器（npx / uvx），断开重连时杀不到真正的 server 进程 |
 | `WithToolNamer(fn)` | 框架内的工具名，默认 `CanonicalName`（`mcp_<server>_<tool>`）；结果要符合 provider 的要求（Anthropic / OpenAI：`^[a-zA-Z0-9_-]{1,64}$`） |
 | `WithHTTPAllowTools` / `WithStdioAllowTools`（Client 级） | 按原始名过滤 server 报的清单；快照存的是过滤后的 |
 

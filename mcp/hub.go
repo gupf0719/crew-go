@@ -162,8 +162,8 @@ func WithToolNamer(fn func(server, tool string) string) HubOption {
 // 先后顺序逐个调用（在 Hub 自己的一个 goroutine 里，不并发）。用来记日志、上屏、把 ServerStatus.Tools 持久化成
 // 下次的快照。fn 里调 Status、调工具、调 Close 都可以；panic 只记日志。
 //
-// Close 之后不再开始新的回调，也不等正在执行的那个返回（等的话，回调里调 Close 就是自己等自己）；Close 时还没送出的
-// 状态变化不再回调——要持久化最后的清单，Close 之前读一次 Status。
+// Close 之后不再开始新的回调（至多还有一个恰好在 Close 那一刻开始的），也不等正在执行的那个返回（等的话，回调里调
+// Close 就是自己等自己）；Close 时还没送出的状态变化不再回调——要持久化最后的清单，Close 之前读一次 Status。
 func WithStatusHook(fn func(ServerStatus)) HubOption {
 	return func(h *Hub) { h.statusHook = fn }
 }
@@ -241,6 +241,9 @@ func (h *Hub) Start(ctx context.Context) error {
 		for i, s := range h.servers {
 			if s.fixed != nil {
 				closeQuietly(s.fixed)
+				s.mu.Lock()
+				s.fixedClosed = true // Close 时不再关第二次
+				s.mu.Unlock()
 			} else if results[i].client != nil {
 				closeQuietly(results[i].client)
 			}
@@ -303,6 +306,7 @@ func (h *Hub) Start(ctx context.Context) error {
 	}
 	h.tools = tools
 	now := time.Now()
+	var reconnect []*server // Start 时连不上的：置 started 之后再起重连循环
 	for i, s := range h.servers {
 		p := plans[i]
 		s.mu.Lock()
@@ -318,10 +322,11 @@ func (h *Hub) Start(ctx context.Context) error {
 			s.client = results[i].client
 			s.online = true
 			s.gen = 1
+			s.fixedClosed = false
 			s.setListedLocked(results[i].specs)
 		} else {
 			s.lastErr = err
-			h.bg.Add(1)
+			h.bg.Add(1) // 在 h.mu 里：Close 拿到 h.mu 之后才 Wait
 		}
 		h.events.push(s.statusLocked())
 		offline := !s.online
@@ -334,14 +339,19 @@ func (h *Hub) Start(ctx context.Context) error {
 				slog.WarnContext(ctx, "mcp: server 启动时连不上且没有快照，本会话不注册它的工具，后台重连",
 					logKeyServer, s.name, logKeyErr, results[i].err.Error())
 			}
-			go s.reconnectLoop(nil)
+			reconnect = append(reconnect, s)
 		}
+	}
+	// 先置 started 再起后台 goroutine：回调与重连循环里调 Status 要看到已启动（Status 不拿 h.mu）。顺序反了的话第一个
+	// 回调偶尔读到 nil（审计探针 3000 次撞到 1–4 次），把快照写空——窗口太窄，没有稳定的回归用例，别改回去。
+	h.started.Store(true)
+	for _, s := range reconnect {
+		go s.reconnectLoop(nil)
 	}
 	if h.events != nil {
 		// 不计入 bg：Close 不等它（回调里调 Close 时等它就是自己等自己），它在 done 关闭后不再开始新的回调。
 		go h.dispatchStatus()
 	}
-	h.started.Store(true)
 	return nil
 }
 

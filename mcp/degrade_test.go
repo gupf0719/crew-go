@@ -674,8 +674,8 @@ func TestHub_SerialCalls_NeverOverlap(t *testing.T) {
 	}
 }
 
-// 排队的时间算进 WithCallTimeout：前一个调用占着时，排不上的那个按超时失败，没有发出。
-func TestHub_SerialCalls_QueueWaitCountsTowardTimeout(t *testing.T) {
+// 排队有自己的时限（WithCallTimeout）：前一个调用一直占着时，排不上的那个按超时失败，没有发出。
+func TestHub_SerialCalls_QueueWaitHasTimeout(t *testing.T) {
 	hold := make(chan struct{})
 	entered := make(chan struct{}, 1)
 	fc := &memClient{name: "cam", tools: specs("shoot"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
@@ -1312,4 +1312,138 @@ func TestHub_StdioWriteToDeadChild_IsNotSent(t *testing.T) {
 	if res := call(t, h, "mcp_mock_t"); !res.Success {
 		t.Fatalf("重起子进程后该恢复：%+v", res)
 	}
+}
+
+// --- 第二轮审计补的用例 ---
+
+// 串行 + 调用方取消：请求已经发出、调用方喊停（stdio 不通知 server 取消），server 那边可能还在执行——跟超时一样按连接
+// 不可信处理，排队的调用不能发给同一个连接（第一轮修超时时漏了这条路）。
+func TestHub_SerialCallerCancel_NoOverlapOnServer(t *testing.T) {
+	var device, peak atomic.Int32
+	enter := func() {
+		n := device.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				return
+			}
+		}
+	}
+	var first *memClient
+	f := &seqFactory{build: func(n int) (mcp.Client, error) {
+		c := &memClient{name: "cam", tools: specs("shoot")}
+		if n == 1 {
+			killed := make(chan struct{})
+			var once sync.Once
+			c.onCall = func(ctx context.Context, _ string, _ map[string]any) (*mcp.CallResult, error) {
+				enter()
+				go func() { <-killed; device.Add(-1) }() // server 那边一直执行到连接被关
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			c.onClose = func() { once.Do(func() { close(killed) }) }
+			first = c
+			return c, nil
+		}
+		c.onCall = func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+			enter()
+			device.Add(-1)
+			return &mcp.CallResult{}, nil
+		}
+		return c, nil
+	}}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("cam", f.New, mcp.WithSerialCalls()))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	ctxA, cancelA := context.WithCancel(context.Background())
+	errA := make(chan error, 1)
+	go func() { _, err := h.Toolkit().Call(ctxA, "mcp_cam_shoot", nil); errA <- err }()
+	waitFor(t, "A 在 server 上执行", func() bool { return device.Load() == 1 })
+	doneB := make(chan struct{})
+	go func() { // B：另一个 ctx（带时限：发给旧连接的话它会一直卡到时限），排队
+		defer close(doneB)
+		ctxB, cancelB := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancelB()
+		_, _ = h.Toolkit().Call(ctxB, "mcp_cam_shoot", nil)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancelA()
+	if err := <-errA; !errors.Is(err, context.Canceled) {
+		t.Fatalf("A 被取消该返回 ctx 错，实际 %v", err)
+	}
+	<-doneB
+	if got := len(first.calls()); got != 1 {
+		t.Errorf("排队的 B 发给了还在执行 A 的旧连接（旧连接收到 %d 次）", got)
+	}
+	if got := peak.Load(); got != 1 {
+		t.Errorf("硬件上同时有 %d 个操作在执行", got)
+	}
+}
+
+// 排队与执行各自有一份时限：两个并行调用各执行 60ms、时限 100ms，排在后面的那个不该因为排队把执行时间吃掉而超时、
+// 把 server 断开重连。
+func TestHub_SerialQueueWait_DoesNotEatExecutionBudget(t *testing.T) {
+	c := &memClient{name: "cam", tools: specs("shoot"), onCall: func(ctx context.Context, _ string, _ map[string]any) (*mcp.CallResult, error) {
+		select {
+		case <-time.After(60 * time.Millisecond):
+			return &mcp.CallResult{}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}}
+	f := &seqFactory{build: func(int) (mcp.Client, error) { return c, nil }}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("cam", f.New, mcp.WithSerialCalls(), mcp.WithCallTimeout(100*time.Millisecond)))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	var wg sync.WaitGroup
+	results := make([]*tool.Result, 2)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); results[i] = call(t, h, "mcp_cam_shoot") }(i)
+	}
+	wg.Wait()
+	for i, res := range results {
+		if !res.Success {
+			t.Errorf("第 %d 个调用该成功（各自执行 60ms < 时限 100ms），实际 %+v", i+1, res)
+		}
+	}
+	if got := c.closed.Load(); got != 0 || f.count() != 1 {
+		t.Errorf("不该断开重连：连接被关 %d 次、工厂被调 %d 次", got, f.count())
+	}
+}
+
+// Close 打断 Start 时，WithClient 的实例只关一次（Start 的回滚已经关了，Close 不再关第二次）。
+func TestHub_CloseInterruptsStart_ClosesFixedOnce(t *testing.T) {
+	entered := make(chan struct{})
+	c := &blockingInitClient{memClient: memClient{name: "s", tools: specs("a")}, entered: entered}
+	h := mcp.NewHub(mcp.WithPartialStart(), mcp.WithConnectTimeout(0), mcp.WithClient(c))
+	startErr := make(chan error, 1)
+	go func() { startErr <- h.Start(context.Background()) }()
+	<-entered
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := <-startErr; err == nil {
+		t.Fatal("被打断的 Start 该返回错误")
+	}
+	if got := c.closed.Load(); got != 1 {
+		t.Errorf("固定实例该只关一次，实际 %d 次", got)
+	}
+}
+
+// blockingInitClient 的 Initialize 一直卡到 ctx 结束。
+type blockingInitClient struct {
+	memClient
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingInitClient) Initialize(ctx context.Context) error {
+	c.once.Do(func() { close(c.entered) })
+	<-ctx.Done()
+	return ctx.Err()
 }

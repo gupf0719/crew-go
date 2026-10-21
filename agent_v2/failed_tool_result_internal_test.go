@@ -14,7 +14,7 @@ func TestFailedToolResult_SinglePrefix(t *testing.T) {
 		{"invalid_arguments", "解析失败"},
 		{"tool_not_revealed", "未解锁"},
 	} {
-		m := failedToolResult("tc1", "f", c.code, c.msg)
+		m := failedToolResult("tc1", c.code, c.msg)
 		want := "[" + c.code + "] " + c.msg
 		if m.Content != want {
 			t.Errorf("content = %q, want %q", m.Content, want)

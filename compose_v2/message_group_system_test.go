@@ -37,7 +37,7 @@ func TestGroupMessagesByAPIRound_SystemIsAlwaysAlone(t *testing.T) {
 		},
 		"system 后跟 tool_result": {
 			schema.UserMessage("u1"), tc, schema.SystemMessage("MID"),
-			schema.ToolResultMessage("c1", "f", "结果"),
+			schema.ToolResultMessage("c1", "结果"),
 		},
 		"两条相邻 system": {
 			schema.UserMessage("u1"), schema.SystemMessage("A"),
@@ -75,7 +75,7 @@ func TestGroupMessagesByAPIRound_NonSystemGroupingUnchanged(t *testing.T) {
 	msgs := []*schema.Message{
 		schema.UserMessage("u1"),
 		tc1,
-		schema.ToolResultMessage("c1", "f", "r1"),
+		schema.ToolResultMessage("c1", "r1"),
 		schema.UserMessage("u2"),
 		schema.AssistantMessage("a2"),
 	}

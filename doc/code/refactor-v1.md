@@ -147,9 +147,9 @@
 
 ---
 
-## spec 对齐 —— agentdock-spec 新 commits 同步（2026-04-09）
+## spec 对齐 —— 公司 spec 新 commits 同步（2026-04-09）
 
-触发原因：agentdock-spec 合并了多个新提交，核心变化是 `common` 模块整合、`CommError` 由接口改为结构体、`MessageStreamReader` 移入 `model` 模块、`ToolOutput.Result` 结构化。
+触发原因：公司 spec 合并了多个新提交，核心变化是 `common` 模块整合、`CommError` 由接口改为结构体、`MessageStreamReader` 移入 `model` 模块、`ToolOutput.Result` 结构化。
 
 ### 19. `schema/tool.go` — `ToolInfo` 改为 alias
 

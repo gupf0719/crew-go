@@ -262,7 +262,7 @@ func (b *simpleSkillBox) ActivateSkill(_ context.Context, name string) (*skill.A
 	return &skill.ActiveSkill{Skill: skill.SkillDescriptor{Name: name}, Prompt: ""}, nil
 }
 func (b *simpleSkillBox) RunSkillAction(_ context.Context, _, _ string, _ map[string]any) (*skill.SkillExecutionResult, error) {
-	return nil, skill.ErrActionNotImplemented
+	return nil, skill.ErrSkillActionNotFound
 }
 
 func countValues(s *agent_v2.RunSession) int {

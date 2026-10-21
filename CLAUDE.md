@@ -745,11 +745,7 @@ func TestMyRedisHistory(t *testing.T) {
 ## 项目特定约定
 
 - **项目未上线，不考虑向后兼容、旧使用者、迁移路径**。设计/重构时直接按最优解走，破坏性改动随便提；不要为"防存量用户踩坑"加 warn / deprecated / fallback 路径——那些都是脑补的不存在场景。需要重命名/删 API 直接动手，所有调用点同步改完即可
-- 不修改 `agentdock-spec` 里的任何文件
-- `modules/` 目录存放从 `agentdock-spec/go-runtime` 拷贝过来的 spec 生成类型，不直接依赖外部模块
-  - 以 spec 设计为参考，但不完全照搬：若有更优的 Go 原生设计，直接在 `modules/` 里优化
-  - spec 更新时手动同步，有差异的地方以我们的设计为准并注释说明原因
-  - **同步 spec 时只看 `.tsp` 文件和 `go-runtime/` 目录，忽略 `java-runtime/` 和 `python-runtime/`**
+- `modules/` 存放 crew-go 自有的基础类型：起步于公司 spec 的 go-runtime 生成类型，**2026-10-21 起不再依赖、不再同步**——要改直接改，不必注释与 spec 的差异
 - `schema` 包的类型是 `modules/common` 的 type alias，不另起炉灶
 - 编排模式统一编译为 Graph，不自己维护循环
 - **Hook 消费语义**（按字段分档，**非"所有 hook 一律可改"**——权威表见 `hook/hooks.go` Hooks 接口 godoc）：hook 入参虽是指针，但"改了是否生效"取决于框架是否在该 hook 后消费该字段。两档：(1) **[消费]** 改写生效——`OnAgentStart`/`OnModelStart` 的 `input.Messages`、`OnModelEnd` 的 `output.Message`、`OnModelEndStream` 的返回 reader（不得为 nil：返回 nil 或报错都让这次模型调用失败）、`OnToolStart` 的 `input.Name`/`input.ArgumentsJSON`（只在这一批调用第一次交给工具执行时生效：续跑沿用那一次定下的内容、改写不生效——用户答过的、审批批过的、已执行过的都是那一份，见 `agent_v2.fixToolCallContent`；定下的内容随中断档落盘，凭证 / 短时令牌 / trace_id 这类每次都要新取的值放钩子返回的 ctx 或用工具中间件注入，别写进参数；改写让调用出错时修好钩子也救不回这一批，只能放弃任务重开）、`OnToolEnd` 的 `output.Result.*`（框架读改写值喂下游工具调用 / 写回 LLM 历史；`Success` 还决定这次调用做出的转交 / 路由算不算、框架控制工具短不短路——整体替换 Result 时 `Success` 零值为 false，按失败处理、模型看到失败格式）；(2) **[只读]** 改写不生效——`OnModelStart` 的 `Tools`（恒 nil 未填充）、`OnModelEnd` 的 `Usage`、`OnToolStart`/`OnToolEnd` 的 `CallId`（tool_call↔tool_result 配对锚点，改它破坏 OpenAI 422）、`OnAgentEnd`、`OnError`（观测/统计/锚点字段，by design 无下游；tool/model 层对齐 eino observation-only）。ctx 返回值链式交给下一个 hook；整条链返回之后，框架用开始一侧（`OnAgentStart` / `OnModelStart` / `OnModelEndStream` / `OnToolStart`）的返回值，**只用于它包住的那次调用**——这次 Run、这次模型调用、这次流式读取、第 i 个 tool_call 的执行（工具体、中间件、它调起的嵌套 agent），同一次的结束钩子收的也是它；结束一侧（`OnModelEnd` / `OnToolEnd` / `OnAgentEnd`）与 `OnError` 的返回值不往后流（曾经 OnToolStart 的返回值赋回整批共用的 ctx：b 的钩子收到 a 放的值、a 的工具体带着 b 的值在跑，实测；为此 `BasicAgentToolFn` 多了一个 `callCtxs []context.Context` 参数，每个调用一个 ctx）。采纳经 `compose_v2.CallHook`（放标记、调、采纳收在这一处）：框架的身份与位置一律取框架的；返回的 ctx 从入参派生时，业务值、调用方可配的（环境、软取消）与取消都听钩子的，外来的（存下来的、`Background`）只借业务值（框架分不出 span 与凭证，跨请求存 ctx 会带进别的请求的凭证；每个采纳点首次采纳外来 ctx 时告警一次、带采纳点位置）；可配项从它之后才读的地方生效，本层钩子之前已定下的不变。用户实现 hook 可纯观测也可改写，但改写仅在 [消费] 档字段生效。
@@ -774,7 +770,7 @@ func TestMyRedisHistory(t *testing.T) {
 
 ## 项目定位
 
-Go 原生 LLM Agent 编排框架。参考 LangGraph Pregel + eino adk + agentdock-spec 设计，不做跨语言 codegen，面向 Go 生态保持简洁。所有编排（BasicAgent ReAct + Sequential / Parallel / Loop / Plan / Reflect / Routing / Handoff / GraphAgent）编译为同一个 channel-based BSP 图执行引擎。
+Go 原生 LLM Agent 编排框架。参考 LangGraph Pregel + eino adk 设计（早期另参考公司 spec，现已不再依赖），不做跨语言 codegen，面向 Go 生态保持简洁。所有编排（BasicAgent ReAct + Sequential / Parallel / Loop / Plan / Reflect / Routing / Handoff / GraphAgent）编译为同一个 channel-based BSP 图执行引擎。
 
 测试用 LLM：**默认 qwen `NewTestClient`**（`model/qwen`）。**模型名用 `qwen.TestModelCandidates`**（带日期的固定快照在前、滚动别名兜底；`qwen3.6-flash` 免费额度已实测耗尽，新用例别照抄）——额度耗尽想自动切下一个就用 `fallback.New` 把候选串起来（`fallback` 认得 dashscope 403 `AllocationQuota.FreeTierOnly`，范式见 `example/compose/identity_guard_smoke`）。baseURL = `https://dashscope.aliyuncs.com/compatible-mode/v1`（阿里云 dashscope，兼容 OpenAI API）。API key 走项目根 `.env` 的 `QWEN_API_KEY`（`.gitignore` 已排除，`example/envloader` 自动加载）。**DeepSeek（`model/deepseek`，`deepseek-v4-flash`，`DEEPSEEK_API_KEY`）仍可用作备选**（`observability_demo` 等 `-provider deepseek|qwen` 两路保留）。qwen `NewClient`（显式传 key）+ `model/openai`（无 default URL）不用作测试。
 

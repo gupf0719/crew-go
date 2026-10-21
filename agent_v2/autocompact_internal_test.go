@@ -97,7 +97,7 @@ func TestAutoCompactShouldTrigger_SkipsOffloaded(t *testing.T) {
 	// 但都该被 shouldTrigger 过滤（整组保留不压缩，算进估算会反复空触发）
 	messages := []*schema.Message{schema.UserMessage("hi")}
 	for i := 0; i < 5; i++ {
-		off := schema.ToolResultMessage("tc", "", strings.Repeat("被卸载的大内容占位符填充", 20_000))
+		off := schema.ToolResultMessage("tc", strings.Repeat("被卸载的大内容占位符填充", 20_000))
 		off.Annotations = map[string]any{MicroCompactOffloadedAnnotation: true}
 		messages = append(messages, off)
 	}

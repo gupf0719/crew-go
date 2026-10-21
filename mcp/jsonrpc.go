@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// MCP 协议默认版本，对齐 agentdock-spec 的 "2025-03-26"。
+// MCP 协议默认版本 "2025-03-26"。
 const defaultProtocolVersion = "2025-03-26"
 
 // rpcRequest 是 JSON-RPC 2.0 请求信封。

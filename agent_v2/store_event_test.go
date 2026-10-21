@@ -254,7 +254,7 @@ func TestPhase2Sub1_AuditHIGH1_MicroCompactOffloadPutEmitsEvent(t *testing.T) {
 		callID := "off_tc_" + string(rune('0'+i))
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read"}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", "long original content offloaded"))
+		msgs = append(msgs, schema.ToolResultMessage(callID, "long original content offloaded"))
 	}
 	_ = agent_v2.MicroCompactRun(ctx, msgs, cfg)
 

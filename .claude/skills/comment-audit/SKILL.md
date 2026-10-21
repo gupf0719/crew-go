@@ -61,7 +61,7 @@ ERROR>0 返 `1`(供 Stop hook gate);仅 WARN 或干净返 `0`;扫描目录出错
 - **`lineSignals`**(v1/已删/废弃/deprecated/曾/不再/退化/原名/rename/改名/重命名/otlp/proto)→ **当行**豁免。这些可能与业务词共块,只豁免出现信号的当行,不放大整块。
 - **故意排除的词**(放大作用域会放过真 drift):
   - **"对照/vs"**——"vs 低阶 Router"是对照**本项目** API,符号**应存在**,误豁免会放过低阶 API 名漂移(drift 富矿)。
-  - **"删除/移除"**(业务高频:redis Cleanup 块"删除 sid")、**"spec"**(agentdock-spec 生成类型遍地引用)——共块会吞掉同块真缺失符号。
+  - **"删除/移除"**(业务高频:redis Cleanup 块"删除 sid")、**"spec"**(`modules/` 类型注释遍地提到 spec 来源)——共块会吞掉同块真缺失符号。
 
 其余机械降噪(均在 `checkSymbols`):缩进代码块行 / `//go:` 等指令 / 含空格(代码片段) / 含下划线(字符串值·JSON·env·metric·测试名) / 全大写(SQL/Redis 关键字 `LIKE`/`BGSAVE`) / 前导 `.`(方法引用) / 外部包 qualified(首段小写包名不在符号表) / 纯小写 base(ctx/err 通用词) / 占位符前缀(My/Foo/Bar/Baz/Example/Xxx) / 内置白名单(error/Context/Reader…)。**路径与数字不受任何语境豁免**——本仓文档移动 / 数字漂移仍是真 drift。
 

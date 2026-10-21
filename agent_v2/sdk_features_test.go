@@ -44,7 +44,7 @@ func TestHistoryFor_RewritesCrossAgentMessages(t *testing.T) {
 	})
 	sess.AddEvent(&agent_v2.AgentEvent{
 		AgentName: "agentB",
-		Output:    &agent_v2.AgentOutput{Message: schema.ToolResultMessage("tc_1", "search", "result data")},
+		Output:    &agent_v2.AgentOutput{Message: schema.ToolResultMessage("tc_1", "result data")},
 	})
 
 	out := sess.HistoryFor("agentA")

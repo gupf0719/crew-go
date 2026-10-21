@@ -150,7 +150,7 @@ func TestLastStructuredError(t *testing.T) {
 		}})
 	}
 	foFail := func(id, content string) *schema.Message {
-		m := schema.ToolResultMessage(id, "", content)
+		m := schema.ToolResultMessage(id, content)
 		m.Annotations = map[string]any{finalOutputAttemptAnnotation: true, finalOutputRetryAnnotation: true}
 		return m
 	}
@@ -179,7 +179,7 @@ func TestLastStructuredError(t *testing.T) {
 			foFail("fo", "[structured_output_invalid] 缺 age"),
 			bizTool,
 			// 业务工具输出恰好含框架内部 error code 字符串（倒扫在后）
-			schema.ToolResultMessage("biz", "", "搜索结果：文档提到 structured_output_invalid 这个错误码"),
+			schema.ToolResultMessage("biz", "搜索结果：文档提到 structured_output_invalid 这个错误码"),
 		}
 		if got := lastStructuredError(msgs); got != "[structured_output_invalid] 缺 age" {
 			t.Errorf("业务工具散文被误取（应锚定 final_output）: got %q", got)
@@ -193,7 +193,7 @@ func TestLastStructuredError(t *testing.T) {
 			foCall("a"),
 			foFail("a", "[structured_output_invalid] 缺 name"),
 			foCall("b"),
-			schema.ToolResultMessage("b", "", `{"note":"structured_output_invalid"}`),
+			schema.ToolResultMessage("b", `{"note":"structured_output_invalid"}`),
 		}
 		if got := lastStructuredError(msgs); got != "[structured_output_invalid] 缺 name" {
 			t.Errorf("成功的结果不该被当成失败: got %q", got)

@@ -181,7 +181,7 @@
 - **不做内建前端 UI**：可观测性优先对接外部（Jaeger / Prometheus / Grafana）
 - **不做 Agent 市场 / 模型路由网关**：聚焦编排框架本身
 - **RAG 只做接口 + 参考实现**：不绑定具体向量库，生态实现交由外部适配
-- **不绕过 CLAUDE.md 约束**：不改 `agentdock-spec`，不造 `util/common/misc` 万能包
+- **不绕过 CLAUDE.md 约束**：不造 `util/common/misc` 万能包
 
 ---
 

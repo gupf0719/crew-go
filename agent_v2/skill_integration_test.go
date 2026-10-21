@@ -41,7 +41,7 @@ func (b *fakeSkillBox) ActivateSkill(_ context.Context, name string) (*skill.Act
 	}, nil
 }
 func (b *fakeSkillBox) RunSkillAction(_ context.Context, _, _ string, _ map[string]any) (*skill.SkillExecutionResult, error) {
-	return nil, skill.ErrActionNotImplemented
+	return nil, skill.ErrSkillActionNotFound
 }
 
 var _ skill.SkillBox = (*fakeSkillBox)(nil)
@@ -343,7 +343,7 @@ func (b *blackboxAdaptiveBox) ActivateSkill(_ context.Context, name string) (*sk
 	return nil, errors.New("not found: " + name)
 }
 func (b *blackboxAdaptiveBox) RunSkillAction(_ context.Context, _, _ string, _ map[string]any) (*skill.SkillExecutionResult, error) {
-	return nil, skill.ErrActionNotImplemented
+	return nil, skill.ErrSkillActionNotFound
 }
 
 // TestSkill_BlackboxAdaptiveAndHook 黑盒覆盖 P1.B + R7 H2 公开 API：

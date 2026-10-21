@@ -26,7 +26,7 @@ func TestEmergencyDrop_NoOrphanToolResult(t *testing.T) {
 		tc,
 		schema.SystemMessage("MID"),
 		schema.AssistantMessage("中间产出"),
-		schema.ToolResultMessage("c1", "f", "结果"),
+		schema.ToolResultMessage("c1", "结果"),
 	}
 	out := emergencyDropOldestGroups(in, 50, 0, "[MARKER]")
 

@@ -98,7 +98,7 @@ func TestAutoCompact_OffloadedGroupKeepsPairing(t *testing.T) {
 	big := strings.Repeat("超长内容 ABCDEFGH ", 100) // ~1500 字符，确保超阈值触发压缩
 
 	// offload 后的占位 tool_result（MicroCompact 产物形态：RoleTool + 双 marker + 占位 content）
-	offloaded := schema.ToolResultMessage("tc_off_1", "", "[offloaded:tc_off_1] preview: 原全文已卸载到 store")
+	offloaded := schema.ToolResultMessage("tc_off_1", "[offloaded:tc_off_1] preview: 原全文已卸载到 store")
 	offloaded.Annotations = map[string]any{
 		agent_v2.MicroCompactOffloadedAnnotation:  true,
 		agent_v2.MicroCompactOffloadKeyAnnotation: "tc_off_1",

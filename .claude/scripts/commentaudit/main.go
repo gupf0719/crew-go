@@ -415,7 +415,7 @@ var externalFrameworks = []string{"eino", "langgraph", "langchain", "claude code
 // lineSignals 历史/改名/外部 proto:可能与业务词共块,只在出现信号的**当行**豁免,
 // 不放大整块.**故意不含泛化的"对照/vs"**——"vs 低阶 Router"是对照本项目 API,符号
 // 应存在,误豁免会放过真 drift(低阶 API 名漂移正是 drift 富矿);也不含业务高频词
-// "删除/移除"与项目高频词"spec"(agentdock-spec 生成类型遍地引用).
+// "删除/移除"与项目高频词"spec"(modules/ 类型注释遍地提到 spec 来源).
 var lineSignals = []string{
 	"v1", "已删", "废弃", "deprecated", "曾", "不再", "退化",
 	"原名", "rename", "改名", "重命名", "otlp", "proto",

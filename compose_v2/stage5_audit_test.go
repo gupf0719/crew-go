@@ -187,7 +187,7 @@ func TestC7_AdjustIndex_PullsBackToToolUse(t *testing.T) {
 		Type:     "function",
 		Function: schema.FunctionCall{Name: "x", Arguments: "{}"},
 	}})
-	tres := schema.ToolResultMessage("tc1", "x", "ok")
+	tres := schema.ToolResultMessage("tc1", "ok")
 	final := schema.AssistantMessage("done")
 	msgs := []*schema.Message{
 		schema.UserMessage("q"),

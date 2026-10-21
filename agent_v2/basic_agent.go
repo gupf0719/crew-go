@@ -1155,8 +1155,8 @@ const unfinishedToolResultText = "[未完成] 这次工具调用没有返回结�
 // ReturnDirectToolAnnotation 记录「这条 tool_result 是哪个 return-direct 工具产出的」（工具名），给业务
 // 看是谁收的尾。
 //
-// 存在的理由很实际：`schema.ToolResultMessage` **不保存工具名**（签名里那个参数写着
-// `_ /* name unused */`）。靠 tool_call ID 反查也能得到名字，但那需要扫消息列表，而消息列表**含 prior**
+// 存在的理由很实际：`schema.ToolResultMessage` **不保存工具名**（tool_result 块里只有
+// tool_call ID 与内容）。靠 tool_call ID 反查也能得到名字，但那需要扫消息列表，而消息列表**含 prior**
 // ——那正是我们已经踩过的那类坑（在含历史的列表里找本轮的东西）。名字在产出那一刻就是已知的，记下来
 // 比事后找回来可靠。
 //
@@ -1432,7 +1432,7 @@ func dropDanglingToolCalls(msgs []*schema.Message) []*schema.Message {
 				continue
 			}
 			// 这个 id 的结果用完了（或压根没有）→ 补占位，保证这一块自洽
-			block = append(block, schema.ToolResultMessage(tc.ID, tc.Function.Name, unfinishedToolResultText))
+			block = append(block, schema.ToolResultMessage(tc.ID, unfinishedToolResultText))
 		}
 
 		if anyReal {
@@ -3199,7 +3199,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 					// 同样标记让 gen_ai_tool_errors 计到。对比 approval 的 tool_denied
 					// **不标**——那是用户的主动决定、不是错误，计进错误率会污染告警。
 					msg := fmt.Sprintf("tool_call.Arguments JSON 解析失败: %v", jerr)
-					return outcome{toolMsg: failedToolResult(tc.ID, tc.Function.Name, "invalid_arguments", msg)}
+					return outcome{toolMsg: failedToolResult(tc.ID, "invalid_arguments", msg)}
 				}
 			}
 			// fail-closed：LLM 调了未揭示的 deferred 工具（不在它的 bind list 却硬调=幻觉）→
@@ -3213,7 +3213,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			if dispatchDeferred[tc.Function.Name] && !revealedAtEntry[tc.Function.Name] {
 				// finding 3: 同 invalid_arguments——LLM 硬调未解锁工具是失败的 tool call
 				msg := fmt.Sprintf("工具 %q 未解锁——请先调 tool_search(query) 检索解锁后再调用。", tc.Function.Name)
-				return outcome{toolMsg: failedToolResult(tc.ID, tc.Function.Name, "tool_not_revealed", msg)}
+				return outcome{toolMsg: failedToolResult(tc.ID, "tool_not_revealed", msg)}
 			}
 			// **工具审批 gate（harness P1）**：业务工具执行前查审批决策链（ApprovalMode!=Auto
 			// 或有 heuristic 时才有实际开销，默认 Auto 路径零开销）。Ask 未 resume → InterruptError
@@ -3337,7 +3337,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				// `Success=true`、`gen_ai.tool.error.total` 不计这一类、span 标成功——
 				// 最需要被观测到的工具失败反而是唯一不可见的（合成入口收敛见
 				// failedToolResult godoc）。
-				return outcome{toolMsg: failedToolResult(tc.ID, tc.Function.Name, "tool_timeout",
+				return outcome{toolMsg: failedToolResult(tc.ID, "tool_timeout",
 					fmt.Sprintf("工具调用超时（超过 %s 未返回），本次调用已放弃", cfg.ToolTimeout))}
 			}
 			if err != nil {
@@ -3405,7 +3405,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 						"skill", skillName, "max", maxChars, "original_chars", len(content))
 				}
 				ackContent := fmt.Sprintf("Skill %q activated; see next system reminder for content.", skillName)
-				toolMsg := schema.ToolResultMessage(tc.ID, tc.Function.Name, ackContent)
+				toolMsg := schema.ToolResultMessage(tc.ID, ackContent)
 				// R19 audit HIGH-1 fix: terse ack toolMsg 也打 SkillBodyAnnotation
 				toolMsg.Annotations = map[string]any{SkillBodyAnnotation: true}
 				bodyMsg := schema.UserMessage(fmt.Sprintf("[system_reminder] Skill %q content:\n%s", skillName, body))
@@ -3413,7 +3413,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				return outcome{toolMsg: toolMsg, bodyMsg: bodyMsg}
 			}
 
-			toolMsg := schema.ToolResultMessage(tc.ID, tc.Function.Name, content)
+			toolMsg := schema.ToolResultMessage(tc.ID, content)
 			if origBytes > 0 {
 				toolMsg.Annotations = map[string]any{TruncatedOriginalBytesAnnotation: origBytes}
 			}
@@ -3441,7 +3441,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 					}
 					toolMsg.Annotations[ReturnDirectAnnotation] = true
 					// 顺带记下是**哪个**工具一调即出——`schema.ToolResultMessage` 不存工具名
-					// （签名里那个参数是 `_ /* name unused */`）。只给业务看是谁收的尾，框架判身份不读它
+					// （见 ReturnDirectToolAnnotation godoc）。只给业务看是谁收的尾，框架判身份不读它
 					// （名字业务占得到）：结构化输出那件看收结果时盖的 finalOutputAttemptAnnotation。
 					toolMsg.Annotations[ReturnDirectToolAnnotation] = tc.Function.Name
 					// 身份在**这一层**判掉（手上有 toolkit 和真实实例），消费侧读事实

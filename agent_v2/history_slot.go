@@ -658,7 +658,7 @@ func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, age
 				continue
 			}
 			answered[tc.ID] = true // 同一个 id 只补一次
-			closers = append(closers, schema.ToolResultMessage(tc.ID, tc.Function.Name,
+			closers = append(closers, schema.ToolResultMessage(tc.ID,
 				"任务已被放弃（调用方 Abort），此工具调用没有结果"))
 		}
 	}

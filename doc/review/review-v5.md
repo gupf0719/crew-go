@@ -111,7 +111,7 @@ params := map[string]any{
 }
 ```
 
-MCP 协议 `tools/call.arguments` 要求 object（即使为空应为 `{}`）。部分 server（Python SDK 默认）对 `null` 抛 validation error。agentdock-spec 的实现用 `cloneMap(arguments)` 天然兜底为 `{}`。
+MCP 协议 `tools/call.arguments` 要求 object（即使为空应为 `{}`）。部分 server（Python SDK 默认）对 `null` 抛 validation error。公司 spec 的实现用 `cloneMap(arguments)` 天然兜底为 `{}`。
 
 **修复**：在 Client 层统一兜底：
 ```go

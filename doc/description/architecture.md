@@ -5,7 +5,7 @@
 
 ## 项目画像
 
-crew-go 是一个 **Go 原生 LLM Agent 编排框架**——用最少抽象把"单个 ReAct Agent"和"多 Agent 协作"统一在 channel-based BSP 图执行引擎里。参考 LangGraph Pregel + eino adk + agentdock-spec 设计，不做跨语言 codegen，面向 Go 生态保持简洁。
+crew-go 是一个 **Go 原生 LLM Agent 编排框架**——用最少抽象把"单个 ReAct Agent"和"多 Agent 协作"统一在 channel-based BSP 图执行引擎里。参考 LangGraph Pregel + eino adk 设计（早期另参考公司 spec，现已不再依赖），不做跨语言 codegen，面向 Go 生态保持简洁。
 
 **核心设计选择**：
 - 所有编排（BasicAgent ReAct + Sequential / Parallel / Loop / Plan / Reflect / Routing / Handoff / GraphAgent）**编译为同一个 channel-based Graph** 执行

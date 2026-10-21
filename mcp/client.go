@@ -79,7 +79,7 @@ func FirstText(blocks []Block) string {
 }
 
 // CanonicalName 生成工具在框架内的唯一名：mcp_<sanitize(clientName)>_<sanitize(sourceName)>。
-// 对齐 agentdock-spec 的命名规则，避免多 Server 工具重名冲突。
+// 加 client 前缀，避免多 Server 工具重名冲突。
 // 超过 64 字符时对末尾做 sha1 截断，保证 OpenAI/Qwen tool name 合法性。
 func CanonicalName(clientName, sourceName string) string {
 	name := "mcp_" + sanitize(clientName) + "_" + sanitize(sourceName)

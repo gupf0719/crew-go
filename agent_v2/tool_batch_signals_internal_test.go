@@ -114,9 +114,9 @@ func TestFinishToolBatchSignals_FirstWinsAndRewrites(t *testing.T) {
 		{ID: "c", Function: schema.FunctionCall{Name: HandoffTransferToolName}},
 	}
 	orig := []*schema.Message{
-		schema.ToolResultMessage("a", "", "已转交给 billing"),
-		schema.ToolResultMessage("b", "", "已转交给 tech"),
-		schema.ToolResultMessage("c", "", "已转交给 billing"),
+		schema.ToolResultMessage("a", "已转交给 billing"),
+		schema.ToolResultMessage("b", "已转交给 tech"),
+		schema.ToolResultMessage("c", "已转交给 billing"),
 	}
 	results := append([]*schema.Message(nil), orig...)
 	got, err := compose_v2.CaptureSignals(context.Background(), func(c context.Context) error {
@@ -157,7 +157,7 @@ func TestFinishToolBatchSignals_FirstWinsAndRewrites(t *testing.T) {
 
 	// 被盖掉的是框架那件控制工具：失败结果里不带它原本那句「已转交给 tech」——跟「没有生效」自相矛盾
 	ctl := append([]*schema.Message(nil), orig[:2]...)
-	ctl[1] = schema.ToolResultMessage("b", "", "已转交给 tech")
+	ctl[1] = schema.ToolResultMessage("b", "已转交给 tech")
 	ctl[1].Annotations = map[string]any{ReturnDirectAnnotation: true, ReturnDirectMintedAnnotation: true}
 	_, _ = compose_v2.CaptureSignals(context.Background(), func(c context.Context) error {
 		finishToolBatchSignals(c, calls[:2], ctl, []compose_v2.Signals{sigs("billing"), sigs("tech")}, []bool{false, false})

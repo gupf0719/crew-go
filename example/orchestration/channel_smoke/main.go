@@ -105,7 +105,7 @@ func scenarioBasicAgentHITL() error {
 				if err != nil {
 					return nil, err
 				}
-				out = append(out, schema.ToolResultMessage(tc.ID, "ask_user", ans.Content))
+				out = append(out, schema.ToolResultMessage(tc.ID, ans.Content))
 				continue
 			}
 		}

@@ -43,7 +43,7 @@ func (b *forkBox) ActivateSkill(_ context.Context, name string) (*skill.ActiveSk
 	return nil, errors.New("skill not found")
 }
 func (b *forkBox) RunSkillAction(_ context.Context, _, _ string, _ map[string]any) (*skill.SkillExecutionResult, error) {
-	return nil, skill.ErrActionNotImplemented
+	return nil, skill.ErrSkillActionNotFound
 }
 
 var _ skill.SkillBox = (*forkBox)(nil)

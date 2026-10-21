@@ -11,7 +11,6 @@ import (
 )
 
 // SkillBox 定义 skill 容器契约，负责发现、匹配和资源读取。
-// 对齐 spec skill.tsp SkillBox interface。
 //
 // **业务实现契约（R23 audit LOW-2/3）**：
 //
@@ -56,80 +55,14 @@ type SkillBox interface {
 	// `compose_v2.BasicAgentPreambleFn` godoc + `doc/v2/hitl-resume.md` §12。
 	ActivateSkill(ctx context.Context, name string) (*ActiveSkill, error)
 	// RunSkillAction 运行 skill 的命名 action（go runtime 进程内函数，经 WithSkillActionFunc 注册）。
-	// DefaultSkillBox 已实现；自定义 SkillBox 不支持可返 ErrActionNotImplemented。
+	// 找不到 action 返 ErrSkillActionNotFound——LLM 可能报出清单里没有的名字。
+	// 自定义 SkillBox 不提供 action 时 ListSkillActions 返空、本方法照样返 ErrSkillActionNotFound：
+	// 框架只在至少一个可被 LLM 调的 skill 列出了 action 时才挂 run_skill_action 工具，不会调到这里。
 	RunSkillAction(ctx context.Context, skillName, actionName string, arguments map[string]any) (*SkillExecutionResult, error)
 }
 
-// SkillBoxes 定义 skill box builder 入口。
-// 对齐 spec SkillBoxes interface。
-type SkillBoxes interface {
-	Builder() SkillBoxBuilder
-}
-
-// SkillBoxBuilder 定义 skill box 构造器契约。
-// 对齐 spec SkillBoxBuilder interface。
-type SkillBoxBuilder interface {
-	// Name 设置 skill box 名称。
-	Name(name string) SkillBoxBuilder
-	// RootDir 设置本地 skill 根目录。
-	RootDir(rootDir string) SkillBoxBuilder
-	// AllowSkills 设置允许加载的 skill 名称白名单，nil 或空表示允许所有。
-	AllowSkills(skillNames []string) SkillBoxBuilder
-	// Build 构建 skill box，扫描目录并加载 skill。
-	Build() (SkillBox, error)
-}
-
-// ErrActionNotImplemented 表示 SkillBox 实现不支持 action 执行。DefaultSkillBox 已
-// 实现执行（不再返此错），但自定义 SkillBox 若不支持 action 可返它作"能力缺失"哨兵。
-var ErrActionNotImplemented = errors.New("skill action execution not implemented")
-
 // ErrSkillActionNotFound 表示 RunSkillAction 找不到指定 skill/action（或 go action 未注册实现）。
 var ErrSkillActionNotFound = errors.New("skill: action not found")
-
-// defaultSkillBoxes 是 SkillBoxes 的唯一实现，提供 builder 入口。
-type defaultSkillBoxes struct{}
-
-// NewSkillBoxes 返回 SkillBoxes 入口，用于创建 SkillBoxBuilder。
-func NewSkillBoxes() SkillBoxes {
-	return &defaultSkillBoxes{}
-}
-
-func (s *defaultSkillBoxes) Builder() SkillBoxBuilder {
-	return &defaultSkillBoxBuilder{}
-}
-
-// defaultSkillBoxBuilder 实现 SkillBoxBuilder。
-type defaultSkillBoxBuilder struct {
-	name      string
-	rootDir   string
-	allowList []string
-}
-
-func (b *defaultSkillBoxBuilder) Name(name string) SkillBoxBuilder {
-	b.name = name
-	return b
-}
-
-func (b *defaultSkillBoxBuilder) RootDir(rootDir string) SkillBoxBuilder {
-	b.rootDir = rootDir
-	return b
-}
-
-func (b *defaultSkillBoxBuilder) AllowSkills(skillNames []string) SkillBoxBuilder {
-	b.allowList = skillNames
-	return b
-}
-
-func (b *defaultSkillBoxBuilder) Build() (SkillBox, error) {
-	opts := make([]SkillBoxOption, 0, 2)
-	if b.name != "" {
-		opts = append(opts, WithSkillBoxName(b.name))
-	}
-	if len(b.allowList) > 0 {
-		opts = append(opts, WithAllowList(b.allowList))
-	}
-	return NewDefaultSkillBox(b.rootDir, opts...)
-}
 
 // DefaultSkillBox 是基于文件系统的 SkillBox 实现。
 // 扫描 rootDir 的一级子目录，加载每个目录下的 SKILL.md。

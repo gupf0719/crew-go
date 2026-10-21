@@ -390,7 +390,7 @@ crew-go 没有「重建对话」这个动作。
 ## crew-go 当前优势
 
 1. **CJK 友好的 keyword matching**——eino / Claude Code 都没把 skill 选择前置，全推给 LLM；crew-go 的 `MatchSkills` 提供"调 LLM 之前先按关键词初筛"基础能力，未来 adaptive 模式直接用
-2. **spec / runtime 解耦**——`agentdock-spec/lib/crew-go/modules/skill/skill.tsp` 完整定义 9 model + 1 enum + 3 interface，多语言 runtime 实现可对齐；eino 的 skill 中间件没对应跨语言 spec
+2. **spec / runtime 解耦**（2026-10-21 起不再适用：crew-go 不再依赖公司 spec）——公司 spec 的 `lib/crew-go/modules/skill/skill.tsp` 完整定义 9 model + 1 enum + 3 interface，多语言 runtime 实现可对齐；eino 的 skill 中间件没对应跨语言 spec
 3. **资源类型化**——`SkillResource.ResourceType`（reference/script/template/asset）让业务在 UI 区分展示 skill 包含的不同类型文件（eino / Claude Code 把所有文件等同处理）
 4. **路径穿越防护**——`ReadSkillResource` 强制校验 `strings.HasPrefix(full, skillDir+filepath.Separator)`（`skill/skillbox.go:202`）避免 `../../../etc/passwd` 类攻击；拼 `Separator` 防 `/foo` 与 `/foobar` 假阳性匹配；eino 因为暴露 BaseDirectory 让通用工具读，由通用工具方负责（攻击面分散）
 5. **go-func action 执行已落地**——spec 的 `SkillActionDescriptor + RunSkillAction` 以 go-func 进程内实现（`WithSkillActionFunc` 注册 + `run_skill_action` 工具，详见 [`skill.md` §11](../../v2/skill.md)）；eino 完全没 action 概念（仅 fork-LLM）。声明式脚本 action 路径（含 `RunSkillScript`）已删（2026-06-30，spec 占位无 consumer），脚本执行收敛到 tool 层 open-bash（同 eino `Shell`/Claude Bash）
@@ -479,7 +479,7 @@ V2 实施时三类 reference 来源的角色定位 + 抄/不抄边界：
 | reference 来源 | 角色 | 怎么用 |
 |---|---|---|
 | **Claude Code 反混淆源码**（cc-local）| 设计哲学 + 工程窍门来源 | 学**设计取舍**（为什么这么做、解决什么问题）+ 抄**经验数值**（300ms debounce / 1% budget / POST_COMPACT_MAX_TOKENS_PER_SKILL=5_000 这类常量决策有 commit 教训）|
-| **agentdock-spec go-runtime** | 接口契约 + 算法雏形 | 学**思路**（两阶段 retrieval + LLM 选择）；保**接口兼容**（SkillBox 10 方法 + frontmatter 格式）；**不抄代码**（spec 的 skill 层脚本 exec 占位 crew-go 已不采纳，见 R1 不足 #6）|
+| **公司 spec go-runtime**（早期参考，2026-10-21 起不再依赖）| 接口契约 + 算法雏形 | 学**思路**（两阶段 retrieval + LLM 选择）；保**接口兼容**（SkillBox 10 方法 + frontmatter 格式）；**不抄代码**（spec 的 skill 层脚本 exec 占位 crew-go 已不采纳，见 R1 不足 #6）|
 | **eino skill middleware** | 同领域不同实现的对照 | 看 fork 模式怎么和子 agent 协议对齐；不抄代码 |
 
 **核心原则**：
@@ -566,7 +566,6 @@ skill 包**不依赖** compose_v2 / agent_v2 / hook，只依赖 schema 和标准
 | DefaultSkillBox 实现 | `skill/skillbox.go` | `NewDefaultSkillBox`, `*DefaultSkillBox` 方法 |
 | SKILL.md frontmatter parser | `skill/discover.go` | `parseFrontmatter` switch 段 |
 | 关键词匹配 | `skill/match.go` | `MatchSkills`, `keywordScore` |
-| spec 类型定义 | `agentdock-spec/lib/crew-go/modules/skill/skill.tsp` | (整文件) |
 | WithSkills option | `agent_v2/config.go` | `WithSkills` |
 | sysPrompt skill hint 注入 | `agent_v2/basic_agent.go` | `buildInitialMessages` (preamble) |
 | modelFn toolkit 注入 | `agent_v2/basic_agent.go` | `makeModelFn` (clone toolkit + skillTool) |

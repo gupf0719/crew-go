@@ -51,7 +51,7 @@ func TestAudit5_HIGH2_MicroCompact_OffloadToStore_StoresOriginalMessage(t *testi
 		content := fmt.Sprintf("LONG ORIGINAL CONTENT for call %d, this should be offloaded to store and retrievable", i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read", Arguments: `{"path":"/x"}`}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", content))
+		msgs = append(msgs, schema.ToolResultMessage(callID, content))
 		expectedOriginal[callID] = content
 	}
 
@@ -126,7 +126,7 @@ func TestAudit5_HIGH2_MicroCompact_OffloadDisabled_FallsBackToPlaceholder(t *tes
 		callID := fmt.Sprintf("tc_%d", i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read"}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", "content"))
+		msgs = append(msgs, schema.ToolResultMessage(callID, "content"))
 	}
 	out := agent_v2.MicroCompactRun(ctx, msgs, cfg)
 	// 验 store 内 0 item (offload 未启用)
@@ -167,7 +167,7 @@ func TestAudit5_HIGH2_MicroCompact_OffloadNoStore_FallsBackToPlaceholder(t *test
 		callID := fmt.Sprintf("tc_%d", i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read"}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", "content"))
+		msgs = append(msgs, schema.ToolResultMessage(callID, "content"))
 	}
 	// 不注入 store
 	out := agent_v2.MicroCompactRun(context.Background(), msgs, cfg)
@@ -209,7 +209,7 @@ func TestAudit5_HIGH2_MicroCompact_OffloadStoreFails_FallsBackToPlaceholder(t *t
 		callID := fmt.Sprintf("tc_%d", i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read"}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", "content"))
+		msgs = append(msgs, schema.ToolResultMessage(callID, "content"))
 	}
 	out := agent_v2.MicroCompactRun(ctx, msgs, cfg)
 	// 全部降级为纯 cleared
@@ -261,7 +261,7 @@ func TestAudit5_HIGH2_AuditHIGH1_AutoCompactSkipsOffloadedInReinject(t *testing.
 		args := fmt.Sprintf(`{"path":"/file_%d.txt"}`, i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read", Arguments: args}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", fmt.Sprintf("ORIGINAL CONTENT for file_%d.txt %s", i, bigPad)))
+		msgs = append(msgs, schema.ToolResultMessage(callID, fmt.Sprintf("ORIGINAL CONTENT for file_%d.txt %s", i, bigPad)))
 	}
 	// 加 user 后续轮触发 GroupMessagesByAPIRound 多组 (lastUserGroupIndex 要 >= 1)
 	msgs = append(msgs, schema.UserMessage("now summarize please "+bigPad))
@@ -338,7 +338,7 @@ func TestAudit5_HIGH2_AuditHIGH_C1_AutoCompactMarkerGuardIndependent(t *testing.
 		args := fmt.Sprintf(`{"path":"/file_%d.txt"}`, i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read", Arguments: args}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		toolMsg := schema.ToolResultMessage(callID, "Read", fmt.Sprintf("ORIG_MARKER_ONLY_%d %s", i, bigPad))
+		toolMsg := schema.ToolResultMessage(callID, fmt.Sprintf("ORIG_MARKER_ONLY_%d %s", i, bigPad))
 		if i < 3 {
 			// 早 3 个加 marker 但 Content 仍原始 (没经过 cloneToolResultWithOffloadRef)
 			if toolMsg.Annotations == nil {
@@ -404,7 +404,7 @@ func TestAudit5_HIGH2_AuditMED1_OffloadPreviewFromContentBlocks(t *testing.T) {
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
 		// schema.ToolResultMessage 已经 set 了 Content + ContentBlocks 双写,
 		// 但 spec 真实场景可能仅 ContentBlocks. 这里 mock 清掉 Content.
-		toolMsg := schema.ToolResultMessage(callID, "Read", fmt.Sprintf("ORIG_CONTENT_FOR_BLOCKS_%d body", i))
+		toolMsg := schema.ToolResultMessage(callID, fmt.Sprintf("ORIG_CONTENT_FOR_BLOCKS_%d body", i))
 		toolMsg.Content = "" // 模拟 ContentBlocks-only message
 		msgs = append(msgs, toolMsg)
 	}
@@ -449,7 +449,7 @@ func TestAudit5_HIGH2_AuditLOW3_OffloadPreviewUTF8Safe(t *testing.T) {
 		callID := fmt.Sprintf("tc_%d", i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read"}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", bigChinese))
+		msgs = append(msgs, schema.ToolResultMessage(callID, bigChinese))
 	}
 	out := agent_v2.MicroCompactRun(ctx, msgs, cfg)
 	// audit HIGH-C2 anchor: offload path 必跑
@@ -494,7 +494,7 @@ func TestAudit5_HIGH2_MicroCompact_OffloadIdempotent_OnResume(t *testing.T) {
 		callID := fmt.Sprintf("tc_%d", i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read"}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", fmt.Sprintf("orig content %d", i)))
+		msgs = append(msgs, schema.ToolResultMessage(callID, fmt.Sprintf("orig content %d", i)))
 	}
 	// 第一次跑——offload 早 3 个
 	out1 := agent_v2.MicroCompactRun(ctx, msgs, cfg)

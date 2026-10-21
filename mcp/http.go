@@ -13,7 +13,7 @@ import (
 )
 
 // StreamableHTTPClient 通过 streamable HTTP JSON-RPC 对接 MCP Server。
-// 每次调用都是独立 POST 请求，适合无状态服务端；对齐 agentdock-spec 的实现。
+// 每次调用都是独立 POST 请求，适合无状态服务端。
 type StreamableHTTPClient struct {
 	name            string
 	endpoint        string

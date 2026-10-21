@@ -71,7 +71,7 @@ whenToUse: 用户要求翻译 / 跨语言转换时
 | `ReadSkillPrompt(name)` | 读 SKILL.md body 原文 |
 | `ListSkillResources(name)` / `ReadSkillResource(name, path)` | skill 内资源文件清单 / 读取 |
 | `ListSkillActions(name)` | 列 skill 的 action 清单（**已实现**；`WithSkillActionFunc` 程序化注册的 go-func action）|
-| `RunSkillAction` | go-func action 执行（**已实现**：进程内 Go 函数，见 §11；自定义 SkillBox 不支持可返 `ErrActionNotImplemented`）|
+| `RunSkillAction` | go-func action 执行（**已实现**：进程内 Go 函数，见 §11；找不到 action 返 `ErrSkillActionNotFound`。自定义 SkillBox 不提供 action 时 `ListSkillActions` 返空、本方法同样返它——框架只在有可调 action 时才挂 `run_skill_action`，见 §11.3）|
 
 > `DefaultSkillBox` 构造时一次性全量加载（`NewDefaultSkillBox`），运行时只读 → 天然并发安全。业务自实现 backend 须自负并发安全。
 
@@ -114,7 +114,7 @@ frontmatter 用 **`gopkg.in/yaml.v3` 真解析器**（`ParseSkillMD` → `parseF
 > 该字段 godoc 里），机械对账见 `TestSkillDescriptor_EveryFieldDeclaresDisposition`。
 >
 > `MultiTurn` / `MaxTurns` / `InputSchema` / `OutputSchema` **2026-08-27 已删**：前两个来自
-> agentdock-spec，语义是「skill 在**主 AgentLoop** 中允许占用的最大轮次」，预设「skill 激活后
+> 公司 spec，语义是「skill 在**主 AgentLoop** 中允许占用的最大轮次」，预设「skill 激活后
 > 跨轮持续活着」这个我们**没有的状态**（同 `AllowedTools` 那条判据）；后两个解析器里根本没有
 > 对应分支、恒零值。四个都是零 consumer 的 spec 占位——**不解析的字段，不可能变成
 > 「解析了但没兑现」**。写了它们现在是未知键，静默忽略。

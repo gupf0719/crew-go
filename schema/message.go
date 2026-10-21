@@ -6,7 +6,8 @@ import (
 	"encoding/hex"
 )
 
-// 类型别名 — 重新导出 spec 生成的类型，保持跨语言一致性。
+// 类型别名——重新导出 modules/common 里定义的消息与 I/O 类型（那里是这些类型唯一的定义处；最初按
+// 公司 spec 生成，现已不依赖它）。
 type (
 	Message                = common.Message
 	MessageRole            = common.MessageRole
@@ -80,7 +81,9 @@ func AssistantMessage(content string) *Message {
 // ToolResultMessage 创建一个 role=tool 消息。
 // 工具调用 ID 和内容存储在 ToolresultContentBlock 中；
 // Content 也为直接读取平面字段的提供商设置。
-func ToolResultMessage(callID, _ /* name unused */, content string) *Message {
+// 不存工具名（ToolresultContentBlock 没有这个字段）：靠 callID 与对应的 tool_call 配对，
+// 要名字就按 callID 找那条 tool_call。
+func ToolResultMessage(callID, content string) *Message {
 	return &Message{
 		Role:    RoleTool,
 		Content: content,

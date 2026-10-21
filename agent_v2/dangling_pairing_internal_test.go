@@ -34,7 +34,7 @@ func TestDanglingToolCalls(t *testing.T) {
 		{
 			name: "全配对",
 			in: []*schema.Message{
-				tcMsg(tc("a", "f")), schema.ToolResultMessage("a", "f", "r"),
+				tcMsg(tc("a", "f")), schema.ToolResultMessage("a", "r"),
 			},
 			want: nil,
 		},
@@ -47,7 +47,7 @@ func TestDanglingToolCalls(t *testing.T) {
 			name: "部分配对：两个声明只有一个结果",
 			in: []*schema.Message{
 				tcMsg(tc("a", "f"), tc("b", "g")),
-				schema.ToolResultMessage("a", "f", "r"),
+				schema.ToolResultMessage("a", "r"),
 			},
 			want: []string{"b"},
 			why:  "只有 b 悬空，a 不能被误报",
@@ -57,7 +57,7 @@ func TestDanglingToolCalls(t *testing.T) {
 			in: []*schema.Message{
 				tcMsg(tc("a", "f")),
 				schema.UserMessage("插一句"),
-				schema.ToolResultMessage("a", "f", "r"),
+				schema.ToolResultMessage("a", "r"),
 			},
 			want: nil,
 			why: "**承重哨兵**：判据不要求紧跟。改成「必须紧跟」时这条会红——" +
@@ -66,7 +66,7 @@ func TestDanglingToolCalls(t *testing.T) {
 		{
 			name: "结果排在声明前面 = 错位，不算应答",
 			in: []*schema.Message{
-				schema.ToolResultMessage("a", "f", "r"),
+				schema.ToolResultMessage("a", "r"),
 				tcMsg(tc("a", "f")),
 			},
 			want: []string{"a"},
@@ -75,8 +75,8 @@ func TestDanglingToolCalls(t *testing.T) {
 		{
 			name: "id 跨轮复用：各认各的",
 			in: []*schema.Message{
-				tcMsg(tc("same", "f")), schema.ToolResultMessage("same", "f", "r1"),
-				tcMsg(tc("same", "f")), schema.ToolResultMessage("same", "f", "r2"),
+				tcMsg(tc("same", "f")), schema.ToolResultMessage("same", "r1"),
+				tcMsg(tc("same", "f")), schema.ToolResultMessage("same", "r2"),
 			},
 			want: nil,
 			why:  "队列语义：第二轮认领第二条结果。只记第一条的话第二轮会被误报悬空",
@@ -84,7 +84,7 @@ func TestDanglingToolCalls(t *testing.T) {
 		{
 			name: "id 跨轮复用但第二轮没结果",
 			in: []*schema.Message{
-				tcMsg(tc("same", "f")), schema.ToolResultMessage("same", "f", "r1"),
+				tcMsg(tc("same", "f")), schema.ToolResultMessage("same", "r1"),
 				tcMsg(tc("same", "f")),
 			},
 			want: []string{"same"},
@@ -94,9 +94,9 @@ func TestDanglingToolCalls(t *testing.T) {
 			name: "同 id 多结果：多出来的不算数，后续声明认领不到",
 			in: []*schema.Message{
 				tcMsg(tc("a", "f")),
-				schema.ToolResultMessage("a", "f", "r1"),
-				schema.ToolResultMessage("a", "f", "r2"), // ← 多出来的
-				tcMsg(tc("a", "f")),                      // ← 第二条声明
+				schema.ToolResultMessage("a", "r1"),
+				schema.ToolResultMessage("a", "r2"), // ← 多出来的
+				tcMsg(tc("a", "f")),                 // ← 第二条声明
 			},
 			want: []string{"a"},
 			why: "**承重**：r2 排在第二条声明**之前**、不是对它的应答。去掉 " +
@@ -140,10 +140,10 @@ func TestDanglingToolCalls_AgreesWithRebuild(t *testing.T) {
 	in := []*schema.Message{
 		schema.UserMessage("go"),
 		tcMsg(tc("a", "f"), tc("b", "g")),
-		schema.ToolResultMessage("a", "f", "ra"),
+		schema.ToolResultMessage("a", "ra"),
 		schema.UserMessage("再来"),
 		tcMsg(tc("c", "h"), tc("d", "i")),
-		schema.ToolResultMessage("c", "h", "rc"),
+		schema.ToolResultMessage("c", "rc"),
 	}
 	dangling := danglingToolCalls(in)
 	if len(dangling) != 2 || dangling[0].ID != "b" || dangling[1].ID != "d" {

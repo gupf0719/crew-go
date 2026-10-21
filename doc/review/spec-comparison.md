@@ -1,10 +1,10 @@
-# crew-go vs agentdock-spec / eino 设计对比
+# crew-go vs 公司 spec / eino 设计对比
 
 > ⚠️ **历史 Code Review 记录**：v1 时代审查结果。Stage 7 后 v1 (`agent/` + `compose/`) 已删，文中 file:line 引用是 v1 路径。审查发现的设计问题 / bug 类别在 v2 中已等价覆盖。
 
 
 > 更新时间：2026-04-13  
-> 对比来源：agentdock-spec `.tsp` 文件 + `go-runtime/` Go 类型；eino `components/tool/interface.go`
+> 对比来源：公司 spec `.tsp` 文件 + `go-runtime/` Go 类型；eino `components/tool/interface.go`
 
 ---
 

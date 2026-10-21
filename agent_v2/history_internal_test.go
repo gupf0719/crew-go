@@ -362,7 +362,7 @@ func TestRecordHistory_NilSafe(t *testing.T) {
 // 没留下」永远不够，得同时验「好的还在」。
 func TestDropDanglingToolCalls_MisorderedPair(t *testing.T) {
 	keep := schema.UserMessage("KEEP_ME_MARK") // 与配对无关，任何情况下都该原样留下
-	tr := schema.ToolResultMessage("call-1", "f", "结果")
+	tr := schema.ToolResultMessage("call-1", "结果")
 	as := schema.AssistantToolCallMessage([]schema.ToolCall{{
 		ID: "call-1", Type: "function",
 		Function: schema.FunctionCall{Name: "f", Arguments: "{}"},
@@ -404,7 +404,7 @@ func TestDropDanglingToolCalls_PartialPairing(t *testing.T) {
 		{ID: "X", Type: "function", Function: schema.FunctionCall{Name: "fx", Arguments: "{}"}},
 		{ID: "Y", Type: "function", Function: schema.FunctionCall{Name: "fy", Arguments: "{}"}},
 	})
-	okResult := schema.ToolResultMessage("X", "fx", "X 的结果")
+	okResult := schema.ToolResultMessage("X", "X 的结果")
 
 	got := dropDanglingToolCalls([]*schema.Message{as, okResult})
 

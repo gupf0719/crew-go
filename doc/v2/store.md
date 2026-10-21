@@ -1241,4 +1241,4 @@ R3 audit 发现的 RFC 表面未覆盖项——非阻塞但实施前应补：
   - circuit breaker：连续 N 次 store error 后短期跳过 store 读
   - retry with timeout：单次 error 内部 retry 1-2 次
 - **PoC 工程量估算**（**已落地，保留作历史记录**）：原估 ~26 .go 文件改 + 16 md 文档同步 + 11 测试改 + 2 文件 rename ≈ 3-5 PR / 5-8 人天为粗略量级；实际落地为 PR 1-3.3 共 9 commit（含 audit 收敛 / round-fix）跨 commits `408aba7..` 至最新 audit follow-up；后端实现（Redis/PG/Mem0）各自独立 module 各 3-5 人天为类似量级，待业务实施。
-- **spec / modules 同步**：`modules/common` 若有 Memory 引用（按 CLAUDE.md "不修改 agentdock-spec 但 modules/ 同步" 协议），落地前 grep 确认；spec 侧 `SpecMemoryInterface` 是从 spec 拷贝 / 改名后是否需要同步 spec 提交 issue 评估
+- **spec / modules 同步**：`modules/common` 若有 Memory 引用（按当时 CLAUDE.md「不修改公司 spec 但 modules/ 同步」的协议，2026-10-21 已废止），落地前 grep 确认；spec 侧 `SpecMemoryInterface` 是从 spec 拷贝 / 改名后是否需要同步 spec 提交 issue 评估

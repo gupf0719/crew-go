@@ -337,13 +337,13 @@ func markToolFailure(m *schema.Message, code, message string) *schema.Message {
 // `gen_ai_tool_call_duration` 的成功样本，即「用户拒绝了这次转账」与「转账成功了」
 // **在 span 与 metric 上无法区分**。正解是给它第三档（outcome=denied，span 留 Unset
 // 加一个 `crew.*` 属性），不是把它翻成失败。见 doc/code/todo.md。
-func failedToolResult(tcID, toolName, code, message string) *schema.Message {
+func failedToolResult(tcID, code, message string) *schema.Message {
 	// **message 传裸文本、不要自带 `[code]` 前缀**：前缀由这里统一拼进 content，
 	// 而 annotation 里存的是裸 message。两处合成曾自带前缀（`invalid_arguments` /
 	// `tool_not_revealed`），于是 annotation 里也带着——OnToolEnd 改写路径按
 	// `[code] message` 重拼 content 时就成了 `[x] [x] ...` 双前缀（实测）。
 	// 不变量：content == "[code] " + message，annotation.message == message。
-	return markToolFailure(schema.ToolResultMessage(tcID, toolName, toolErrorContent(code, message)), code, message)
+	return markToolFailure(schema.ToolResultMessage(tcID, toolErrorContent(code, message)), code, message)
 }
 
 // renderHookedToolResult 定下 OnToolEnd 之后模型看到的那条 tool_result 内容，以及它算不算失败——

@@ -8,7 +8,7 @@
 
 ## 1. 一句话定位
 
-Go 原生 LLM Agent 编排框架。参考 LangGraph Pregel + eino adk + agentdock-spec 设计，**不做跨语言
+Go 原生 LLM Agent 编排框架。参考 LangGraph Pregel + eino adk 设计（早期另参考公司 spec，现已不再依赖），**不做跨语言
 codegen**，面向 Go 生态保持简洁。所有编排（BasicAgent ReAct + 8 编排）**编译为同一个 channel-based
 BSP 图执行引擎**——不为每种编排手写循环。
 
@@ -17,7 +17,7 @@ BSP 图执行引擎**——不为每种编排手写循环。
 **实测依赖方向**（2026-06，grep 各包实际 import 的 `crew-go/` 子包）：
 
 ```
-modules                      ← agentdock-spec 拷贝来的 spec 生成类型（modules/ 目录）
+modules                      ← crew-go 自有基础类型（起步于公司 spec 生成类型，已独立演进）
   ↑
 schema                       ← modules 的 type alias（不另起炉灶）
   ↑
@@ -42,7 +42,7 @@ agent_v2                     ← 依赖以上全部（compose_v2 + hook + model 
 
 | 包 | 定位 | godoc / 用途 |
 |---|---|---|
-| `modules` | spec 生成类型 + 我们的 Go 原生优化（不直接依赖外部模块）| 从 agentdock-spec/go-runtime 拷贝 |
+| `modules` | crew-go 自有基础类型（起步于 spec 生成类型，已独立演进）| 不再与公司 spec 同步 |
 | `schema` | `modules` 的 type alias（`Message` / `StreamReader[T]` / `MessageRole`）| 无独立 Package godoc |
 | `model` | `ChatModel` 接口（`Generate` + `Stream` + `WithTools`）+ openai/qwen 实现 | 无独立 godoc |
 | `tool` | `Tool` / `Toolkit` / `FuncTool` / `StreamableTool` 工具接口与注册表 | 无独立 godoc |

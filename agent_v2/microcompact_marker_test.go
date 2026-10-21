@@ -33,7 +33,7 @@ func TestMicroCompact_R17_MED2_SkipsSkillBodyMarker(t *testing.T) {
 		}})
 		msgs = append(msgs, tc)
 		// tool_result 含 body marker
-		tr := schema.ToolResultMessage(tcID(i), "activate_skill", contentBodyN(i))
+		tr := schema.ToolResultMessage(tcID(i), contentBodyN(i))
 		tr.Annotations = map[string]any{agent_v2.SkillBodyAnnotation: true}
 		msgs = append(msgs, tr)
 	}

@@ -78,7 +78,7 @@ crew-go 有 **5 层 state 抽象**（`RunSession` 的 Events 与 values 生命�
 | `RunSession.Events` | 单 Run 内（caller 持引用可跨 Run 复用 sess 累积——**换 `NextTask` 不清空**）| 业务 / 框架混管 (AddEvent/RestoreEvents) | 审计事件流 (OutputEvent/ChunkEvent/ExitEvent) | **不走 cp**——业务自管 `RestoreEvents` 跨 Run（`Checkpoint` 结构无 events 字段）|
 | **`RunSession.values`** (`SetValue`/`GetValue`) | **单 sess 实例（half-shared child sess 跨 sub-agent 共享）** | **业务显式 SetValue/GetValue** | **sub-agent 间 sticky 状态** (e.g. 业务 `user_id` 注入承载点 / Plan 当前 step / Routing 路径标记) | **不走 cp**——生命周期跟 RunSession 实例; 业务复用 sess 跨 Run 累积（**`NextTask` 换 RunID 不动它**）, 新 sess = 新空 map (跟 eino runSession.Values 走 cp 序列化的设计不同, 见 §1.2) |
 | `compose_v2.Checkpointer` | 单 sessionID 的**一次 Run**（成功即清）| 框架自动 | channel state 快照 + frontier + pending interrupts + 子图嵌套 | 业务接 InMemory/Redis/PG |
-| **`agent_v2.HistoryStore`** | **一场会话（`HistoryKey{Owner, ConvID}`）跨任意多次 Run** | **框架自动写（opt-in `WithHistory`）/ 业务读** | **这场对话逐字说过的话**（用户输入 / LLM 产出 / 工具往返）| **业务接 InMemory/Redis/PG——append-only** |
+| **`agent_v2.HistoryStore`** | **一场会话（`HistoryKey{Owner, ConvID}`）跨任意多次 Run** | **框架自动写（opt-in `WithHistory`）/ 业务读** | **这场对话逐字说过的话**（用户输入 / LLM 产出 / 工具往返）| **内置 InMemory 与 SQL（`sql.NewHistoryStore`，SQLite 跑过 conformance）；Redis 等业务自研——append-only** |
 | **`store.Store`** | **跨 thread / 跨用户** | **业务显式 Get/Put/Search** | **用户偏好 / 长期事实 / 共享黑板 / 幂等记录** | **业务接 InMemory/Redis/PG/mem0** |
 
 ### 1.1 RunSession.values vs Store 关键差异（混用反模式）

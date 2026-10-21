@@ -36,6 +36,8 @@ import (
 	"crew-go/model/anthropic"
 	"crew-go/schema"
 	"crew-go/tool"
+
+	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
 // recorder 是记下每个请求体的 http.RoundTripper。
@@ -89,6 +91,9 @@ func newClient(t *testing.T, opts ...anthropic.ClientOption) (*anthropic.Client,
 		anthropic.WithMaxTokens(8000),
 		// 全部用例在 error 档下跑：回放的历史有任何改动都直接 400，而不是被静默丢掉
 		anthropic.WithPrefixMismatch(anthropic.PrefixMismatchError),
+		// 冒烟验的是行为，网络抖动交给 SDK 重试（实测从国内连 api.anthropic.com 偶发连接被断开、
+		// 报 EOF）。重试发的是同一个请求，不改变前缀。
+		anthropic.WithRequestOptions(option.WithMaxRetries(2)),
 	}
 	return anthropic.NewClient(key, os.Getenv("ANTHROPIC_SMOKE_MODEL"), append(base, opts...)...), rec
 }
@@ -153,7 +158,10 @@ func (h *modelEnds) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, out *sche
 // TestSmoke_G1_BasicAgentMultiTurn：BasicAgent + 会话历史跨两次 Run，工具里一次失败；error 模式下
 // 历史的任何改写都会让请求 400。
 func TestSmoke_G1_BasicAgentMultiTurn(t *testing.T) {
-	c, rec := newClient(t, anthropic.WithThinkingDisplay(anthropic.DisplaySummarized))
+	// effort 用 high：查天气这种简单任务在 low 下模型常常不思考，整个过程没有 thinking 块可回放，
+	// 用例就什么也没证明（实测 low 下 0 个、high 下 5 次响应里 2 次带 thinking）。
+	c, rec := newClient(t, anthropic.WithThinkingDisplay(anthropic.DisplaySummarized),
+		anthropic.WithEffort(anthropic.EffortHigh))
 
 	var mu sync.Mutex
 	shanghaiCalls := 0

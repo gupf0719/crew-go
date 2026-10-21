@@ -1,0 +1,808 @@
+package mcp_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"crew-go/mcp"
+	"crew-go/tool"
+)
+
+// --- 测试替身 ---
+
+// memClient 是测试用的内存 Client：工具清单固定；CallTool 交给 onCall（nil 时返回 "ok:<原始名>"），
+// 并记下收到的每次调用，供「这次调用有没有真发给 server」的断言用。
+type memClient struct {
+	name    string
+	tools   []mcp.ToolSpec
+	initErr error
+	onCall  func(ctx context.Context, name string, args map[string]any) (*mcp.CallResult, error)
+
+	mu       sync.Mutex
+	received []string
+	closed   atomic.Int32
+}
+
+func (c *memClient) Name() string                     { return c.name }
+func (c *memClient) Initialize(context.Context) error { return c.initErr }
+func (c *memClient) ListTools(context.Context) ([]mcp.ToolSpec, error) {
+	return c.tools, nil
+}
+func (c *memClient) CallTool(ctx context.Context, name string, args map[string]any) (*mcp.CallResult, error) {
+	c.mu.Lock()
+	c.received = append(c.received, name)
+	c.mu.Unlock()
+	if c.onCall != nil {
+		return c.onCall(ctx, name, args)
+	}
+	return &mcp.CallResult{Content: []mcp.Block{{Type: "text", Text: "ok:" + name}}}, nil
+}
+func (c *memClient) Close() error { c.closed.Add(1); return nil }
+
+func (c *memClient) calls() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.received...)
+}
+
+// seqFactory 是按次数造 Client 的工厂：第 n 次（从 1 起）建之前先等 gates[n]（有的话），再交出 build(n)。
+type seqFactory struct {
+	mu    sync.Mutex
+	n     int
+	build func(n int) (mcp.Client, error)
+	gates map[int]chan struct{}
+}
+
+func (f *seqFactory) New(ctx context.Context) (mcp.Client, error) {
+	f.mu.Lock()
+	f.n++
+	n := f.n
+	gate := f.gates[n]
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return f.build(n)
+}
+
+func (f *seqFactory) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.n
+}
+
+var errDown = errors.New("connection refused")
+
+func specs(names ...string) []mcp.ToolSpec {
+	out := make([]mcp.ToolSpec, 0, len(names))
+	for _, n := range names {
+		out = append(out, mcp.ToolSpec{
+			Name:        n,
+			Description: "tool " + n,
+			InputSchema: map[string]any{"type": "object", "properties": map[string]any{"q": map[string]any{"type": "string"}}},
+		})
+	}
+	return out
+}
+
+// toolsJSON 是发给模型的那份工具定义（名字、描述、schema、顺序）序列化后的样子——「工具集不变」比的就是它。
+func toolsJSON(t *testing.T, h *mcp.Hub) string {
+	t.Helper()
+	raw, err := json.Marshal(h.Toolkit().ToolInfos())
+	if err != nil {
+		t.Fatalf("marshal tool infos: %v", err)
+	}
+	return string(raw)
+}
+
+func names(h *mcp.Hub) []string {
+	out := []string{}
+	for _, ti := range h.Toolkit().ToolInfos() {
+		out = append(out, ti.Name)
+	}
+	return out
+}
+
+func statusOf(t *testing.T, h *mcp.Hub, server string) mcp.ServerStatus {
+	t.Helper()
+	for _, st := range h.Status() {
+		if st.Name == server {
+			return st
+		}
+	}
+	t.Fatalf("没有 server %q 的状态：%+v", server, h.Status())
+	return mcp.ServerStatus{}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("等不到：%s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func call(t *testing.T, h *mcp.Hub, name string) *tool.Result {
+	t.Helper()
+	res, err := h.Toolkit().Call(context.Background(), name, map[string]any{"q": "x"})
+	if err != nil {
+		t.Fatalf("%s：工具调用失败只该是失败结果、不该是 error（error 会让 BasicAgent 整轮 Run 失败）：%v", name, err)
+	}
+	if res == nil {
+		t.Fatalf("%s：结果为 nil", name)
+	}
+	return res
+}
+
+func wantFailure(t *testing.T, res *tool.Result, code, substr string) {
+	t.Helper()
+	if res.Success || res.Error == nil {
+		t.Fatalf("该失败，实际：%+v", res)
+	}
+	if res.Error.Code != code {
+		t.Errorf("失败代码 = %q，要 %q（消息：%s）", res.Error.Code, code, res.Error.Message)
+	}
+	if !strings.Contains(res.Error.Message, substr) {
+		t.Errorf("失败消息该含 %q，实际：%s", substr, res.Error.Message)
+	}
+}
+
+func fastBackoff() mcp.HubOption {
+	return mcp.WithReconnectBackoff(5*time.Millisecond, 20*time.Millisecond)
+}
+
+// --- 按 server 降级：Start ---
+
+// 连不上的 server 按快照注册工具：工具集跟它在线时一样，调用返回「该能力暂时不可用」、不发给 server，
+// Start 不失败。默认（不开 WithPartialStart）照旧全有或全无。
+func TestHub_PartialStart_RegistersSnapshotToolsForOfflineServer(t *testing.T) {
+	up := &memClient{name: "up", tools: specs("ping")}
+	newHub := func(extra ...mcp.HubOption) *mcp.Hub {
+		f := &seqFactory{build: func(int) (mcp.Client, error) { return nil, errDown }}
+		opts := append([]mcp.HubOption{
+			mcp.WithClient(up),
+			mcp.WithClientFactory("down", f.New, mcp.WithToolSnapshot(specs("lookup", "write"))),
+			fastBackoff(),
+		}, extra...)
+		return mcp.NewHub(opts...)
+	}
+
+	strict := newHub()
+	if err := strict.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("默认全有或全无：down 连不上 Start 该失败并带上原因，实际 %v", err)
+	}
+
+	h := newHub(mcp.WithPartialStart())
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("WithPartialStart 下个别 server 连不上不该让 Start 失败：%v", err)
+	}
+	defer h.Close()
+
+	if got, want := names(h), []string{"mcp_up_ping", "mcp_down_lookup", "mcp_down_write"}; !slices.Equal(got, want) {
+		t.Fatalf("工具集 = %v，要 %v（离线的 down 按快照注册，顺序按 server 注册顺序）", got, want)
+	}
+	wantFailure(t, call(t, h, "mcp_down_lookup"), mcp.ErrCodeServerUnavailable, "该能力暂时不可用（down offline）")
+	if res := call(t, h, "mcp_up_ping"); !res.Success || res.Output != "ok:ping" {
+		t.Errorf("在线的 up 照常可用，实际 %+v", res)
+	}
+
+	st := statusOf(t, h, "down")
+	if st.State != mcp.ServerOffline || st.Err == nil || !st.FromSnapshot {
+		t.Errorf("down 状态该是离线、带原因、来自快照，实际 %+v", st)
+	}
+	if !slices.Equal(st.Registered, []string{"lookup", "write"}) || st.Tools != nil {
+		t.Errorf("down 注册了快照里的两个工具、从没连上过（Tools 为 nil），实际 %+v", st)
+	}
+	if st := statusOf(t, h, "up"); st.State != mcp.ServerOnline || len(st.Tools) != 1 {
+		t.Errorf("up 该在线并报出清单，实际 %+v", st)
+	}
+}
+
+// 没有快照的离线 server 本会话不注册工具（不知道它有什么），Start 照样成功。
+func TestHub_PartialStart_NoSnapshotRegistersNothing(t *testing.T) {
+	f := &seqFactory{build: func(int) (mcp.Client, error) { return nil, errDown }}
+	h := mcp.NewHub(mcp.WithPartialStart(), fastBackoff(),
+		mcp.WithClient(&memClient{name: "up", tools: specs("ping")}),
+		mcp.WithClientFactory("down", f.New))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	if got := names(h); !slices.Equal(got, []string{"mcp_up_ping"}) {
+		t.Errorf("没快照的离线 server 不注册工具，实际 %v", got)
+	}
+	if st := statusOf(t, h, "down"); st.State != mcp.ServerOffline || st.FromSnapshot || st.Registered != nil {
+		t.Errorf("down 状态不对：%+v", st)
+	}
+}
+
+// 调用方 ctx 结束（取消 / 到期）时 Start 失败，哪怕开了 WithPartialStart——那是调用方放弃启动，不是 server 连不上。
+func TestHub_PartialStart_CallerCtxDoneFailsStart(t *testing.T) {
+	f := &seqFactory{
+		build: func(int) (mcp.Client, error) { return &memClient{name: "slow", tools: specs("a")}, nil },
+		gates: map[int]chan struct{}{1: make(chan struct{})}, // 永远不放行：只有 ctx 能解开
+	}
+	h := mcp.NewHub(mcp.WithPartialStart(), mcp.WithClientFactory("slow", f.New))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err := h.Start(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("调用方 ctx 到期，Start 该失败并带上 ctx 错，实际 %v", err)
+	}
+	if h.Status() != nil || len(names(h)) != 0 {
+		t.Errorf("Start 失败不该留下工具或状态")
+	}
+}
+
+// 连接尝试受 WithConnectTimeout 约束：一个卡住的 server 只让 Start 等那么久，然后按离线处理。
+func TestHub_PartialStart_ConnectTimeoutBoundsSlowServer(t *testing.T) {
+	f := &seqFactory{
+		build: func(int) (mcp.Client, error) { return &memClient{name: "slow"}, nil },
+		gates: map[int]chan struct{}{1: make(chan struct{})},
+	}
+	h := mcp.NewHub(mcp.WithPartialStart(), mcp.WithConnectTimeout(30*time.Millisecond), fastBackoff(),
+		mcp.WithClientFactory("slow", f.New, mcp.WithToolSnapshot(specs("a"))))
+	begin := time.Now()
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	if d := time.Since(begin); d > 2*time.Second {
+		t.Errorf("Start 等了 %s，没被 WithConnectTimeout 约束", d)
+	}
+	if st := statusOf(t, h, "slow"); st.State != mcp.ServerOffline || !errors.Is(st.Err, context.DeadlineExceeded) {
+		t.Errorf("卡住的 server 该按超时离线，实际 %+v", st)
+	}
+}
+
+// --- 重连：工具集不变 ---
+
+// Start 时离线的 server 后台重连上之后，按快照注册的工具可以正常调用；server 现在报的清单跟快照不同
+// （多了一个、改了一个的描述）也不改工具集——发给模型的工具定义逐字节不变。
+func TestHub_ReconnectAfterStartFailure_KeepsToolset(t *testing.T) {
+	live := specs("lookup", "write", "extra")
+	live[1].Description = "write v2" // 定义变了
+	var srv *memClient
+	f := &seqFactory{build: func(n int) (mcp.Client, error) {
+		if n <= 2 {
+			return nil, errDown
+		}
+		srv = &memClient{name: "down", tools: live}
+		return srv, nil
+	}}
+	h := mcp.NewHub(mcp.WithPartialStart(), fastBackoff(),
+		mcp.WithClientFactory("down", f.New, mcp.WithToolSnapshot(specs("lookup", "write"))))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	before := toolsJSON(t, h)
+
+	waitFor(t, "down 重连上", func() bool { return statusOf(t, h, "down").State == mcp.ServerOnline })
+	if res := call(t, h, "mcp_down_lookup"); !res.Success || res.Output != "ok:lookup" {
+		t.Fatalf("重连后快照注册的工具该能调通，实际 %+v", res)
+	}
+	if got := srv.calls(); !slices.Equal(got, []string{"lookup"}) {
+		t.Errorf("server 该收到一次 lookup（按原始名），实际 %v", got)
+	}
+	if after := toolsJSON(t, h); after != before {
+		t.Errorf("重连后工具集变了：\n前 %s\n后 %s", before, after)
+	}
+	st := statusOf(t, h, "down")
+	if len(st.Tools) != 3 || st.Tools[2].Name != "extra" || !slices.Equal(st.Registered, []string{"lookup", "write"}) {
+		t.Errorf("Status.Tools 该是 server 现在的清单（存成下次的快照），Registered 仍是本会话的，实际 %+v", st)
+	}
+	if f.count() != 3 {
+		t.Errorf("工厂该被调 3 次（两次失败 + 一次成功），实际 %d", f.count())
+	}
+}
+
+// 重连后 server 上已经没有的工具：调用返回「已经没有」，不发给 server。
+func TestHub_ToolRemovedAfterReconnect_ReturnsNotFound(t *testing.T) {
+	srv := &memClient{name: "down", tools: specs("a")}
+	f := &seqFactory{build: func(n int) (mcp.Client, error) {
+		if n == 1 {
+			return nil, errDown
+		}
+		return srv, nil
+	}}
+	h := mcp.NewHub(mcp.WithPartialStart(), fastBackoff(),
+		mcp.WithClientFactory("down", f.New, mcp.WithToolSnapshot(specs("a", "b"))))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	waitFor(t, "down 重连上", func() bool { return statusOf(t, h, "down").State == mcp.ServerOnline })
+	wantFailure(t, call(t, h, "mcp_down_b"), tool.ErrCodeNotFound, "已经没有工具")
+	if got := srv.calls(); len(got) != 0 {
+		t.Errorf("已经没有的工具不该发给 server，实际收到 %v", got)
+	}
+}
+
+// --- 中途掉线 ---
+
+// 一次调用撞上连接错误：返回「该能力暂时不可用」（不是 error），server 标成掉线；掉线期间的调用直接失败、
+// 不发给任何连接；后台新建实例重连上后恢复，旧实例被关掉。工具集全程不变。
+func TestHub_MidSessionDrop_FastFailsThenReconnects(t *testing.T) {
+	var broken atomic.Bool
+	first := &memClient{name: "dev", tools: specs("run"), onCall: func(_ context.Context, name string, _ map[string]any) (*mcp.CallResult, error) {
+		if broken.Load() {
+			return nil, errDown
+		}
+		return &mcp.CallResult{Content: []mcp.Block{{Type: "text", Text: "ok:" + name}}}, nil
+	}}
+	second := &memClient{name: "dev", tools: specs("run")}
+	release := make(chan struct{})
+	f := &seqFactory{
+		build: func(n int) (mcp.Client, error) {
+			if n == 1 {
+				return first, nil
+			}
+			return second, nil
+		},
+		gates: map[int]chan struct{}{2: release}, // 重连那一次先卡住，留出「掉线期间」的窗口
+	}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("dev", f.New))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	before := toolsJSON(t, h)
+
+	if res := call(t, h, "mcp_dev_run"); !res.Success {
+		t.Fatalf("第一次调用该成功：%+v", res)
+	}
+	broken.Store(true)
+	wantFailure(t, call(t, h, "mcp_dev_run"), mcp.ErrCodeServerUnavailable, "该能力暂时不可用（dev 连接出错）")
+	if st := statusOf(t, h, "dev"); st.State != mcp.ServerOffline || !errors.Is(st.Err, errDown) {
+		t.Fatalf("撞上连接错误后该标成掉线并记下原因，实际 %+v", st)
+	}
+
+	wantFailure(t, call(t, h, "mcp_dev_run"), mcp.ErrCodeServerUnavailable, "该能力暂时不可用（dev offline）")
+	if got := len(first.calls()); got != 2 {
+		t.Errorf("掉线期间的调用不该发给旧连接：旧连接收到 %d 次（要 2）", got)
+	}
+	waitFor(t, "旧连接被关掉", func() bool { return first.closed.Load() == 1 })
+
+	close(release)
+	waitFor(t, "dev 重连上", func() bool { return statusOf(t, h, "dev").State == mcp.ServerOnline })
+	if res := call(t, h, "mcp_dev_run"); !res.Success || res.Output != "ok:run" {
+		t.Fatalf("重连后该恢复：%+v", res)
+	}
+	if got := second.calls(); len(got) != 1 {
+		t.Errorf("重连后的调用该发给新连接，新连接收到 %v", got)
+	}
+	if after := toolsJSON(t, h); after != before {
+		t.Errorf("掉线、重连之后工具集变了")
+	}
+}
+
+// WithClient 给的固定实例：连接出错同样是失败结果而不是 error；它没法新建连接，所以不标掉线，下一次调用照常发给它。
+//
+// 这条替换了原来的 TestRemoteToolCallTransportErrorPropagates（「传输错误原样返回 error」）：BasicAgent 把工具
+// 返回的 error 当成整轮失败，一个 server 出错就拖垮整个 Run，所以契约改成了交给模型。
+func TestHub_FixedClient_TransportErrorIsFailure(t *testing.T) {
+	fc := &memClient{name: "srv", tools: specs("t"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+		return nil, errors.New("conn reset")
+	}}
+	h := mcp.NewHub(mcp.WithClient(fc))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	wantFailure(t, call(t, h, "mcp_srv_t"), mcp.ErrCodeServerUnavailable, "连接出错")
+	call(t, h, "mcp_srv_t")
+	if got := len(fc.calls()); got != 2 {
+		t.Errorf("固定实例不标掉线，两次调用都该发给它，实际 %d 次", got)
+	}
+	if st := statusOf(t, h, "srv"); st.State != mcp.ServerOnline {
+		t.Errorf("固定实例状态该仍是在线，实际 %+v", st)
+	}
+}
+
+// 吞点哨兵：调用方 ctx 结束（取消）时必须返回 error、不能转成失败结果——那是控制流，转成工具失败会让 agent
+// 当成普通失败继续跑。server 也不因此算掉线。
+func TestRemoteTool_CallerCanceled_PropagatesError(t *testing.T) {
+	started := make(chan struct{})
+	fc := &memClient{name: "srv", tools: specs("t"), onCall: func(ctx context.Context, _ string, _ map[string]any) (*mcp.CallResult, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	f := &seqFactory{build: func(int) (mcp.Client, error) { return fc, nil }}
+	h := mcp.NewHub(mcp.WithClientFactory("srv", f.New, mcp.WithCallTimeout(time.Minute)))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-started; cancel() }()
+	res, err := h.Toolkit().Call(ctx, "mcp_srv_t", nil)
+	if !errors.Is(err, context.Canceled) || res != nil {
+		t.Fatalf("调用方取消时该返回带 context.Canceled 的 error、结果为 nil，实际 res=%+v err=%v", res, err)
+	}
+	if st := statusOf(t, h, "srv"); st.State != mcp.ServerOnline {
+		t.Errorf("调用方取消不是 server 的问题，不该标掉线，实际 %+v", st)
+	}
+}
+
+// 超过 WithCallTimeout：超时失败（告诉模型 server 那边可能仍在执行），server 不算掉线、下一次照常发给它。
+func TestHub_CallTimeout_FailsWithoutMarkingOffline(t *testing.T) {
+	fc := &memClient{name: "srv", tools: specs("t"), onCall: func(ctx context.Context, _ string, _ map[string]any) (*mcp.CallResult, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	f := &seqFactory{build: func(int) (mcp.Client, error) { return fc, nil }}
+	h := mcp.NewHub(mcp.WithClientFactory("srv", f.New, mcp.WithCallTimeout(20*time.Millisecond)))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	wantFailure(t, call(t, h, "mcp_srv_t"), tool.ErrCodeTimeout, "可能仍在执行")
+	wantFailure(t, call(t, h, "mcp_srv_t"), tool.ErrCodeTimeout, "超过 20ms")
+	if got := len(fc.calls()); got != 2 {
+		t.Errorf("超时不算掉线，两次都该发给 server，实际 %d 次", got)
+	}
+	if f.count() != 1 {
+		t.Errorf("超时不该触发重连，工厂被调 %d 次", f.count())
+	}
+}
+
+// 建连接（dial）就失败、哪怕是被时限打断的，也算连不上：标掉线，之后的调用直接失败，不再每次干等满时限
+// （笔记本离家时 TCP 连接发不出去，正是这个形状）。
+func TestHub_DialFailureWithinTimeout_MarksOffline(t *testing.T) {
+	fc := &memClient{name: "srv", tools: specs("t"), onCall: func(ctx context.Context, _ string, _ map[string]any) (*mcp.CallResult, error) {
+		<-ctx.Done()
+		return nil, fmt.Errorf("post: %w", &net.OpError{Op: "dial", Net: "tcp", Err: ctx.Err()})
+	}}
+	f := &seqFactory{
+		build: func(n int) (mcp.Client, error) {
+			if n == 1 {
+				return fc, nil
+			}
+			return nil, errDown
+		},
+	}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("srv", f.New, mcp.WithCallTimeout(20*time.Millisecond)))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	wantFailure(t, call(t, h, "mcp_srv_t"), mcp.ErrCodeServerUnavailable, "连接出错")
+	if st := statusOf(t, h, "srv"); st.State != mcp.ServerOffline {
+		t.Errorf("dial 失败该标掉线，实际 %+v", st)
+	}
+}
+
+// server 答了 JSON-RPC 错误：它活着，只是这次调用报错——普通失败、带上 server 的错误信息，不标掉线。
+// 走真的 StreamableHTTPClient，顺带守「HTTP 客户端交出的 JSON-RPC 错误认得出来」。
+func TestHub_RPCError_KeepsServerOnline(t *testing.T) {
+	var callCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcReq
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "initialize":
+			writeResult(w, req.ID, map[string]any{})
+		case "tools/list":
+			writeResult(w, req.ID, map[string]any{"tools": []map[string]any{{"name": "t"}}})
+		case "tools/call":
+			callCount.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID,
+				"error": map[string]any{"code": -32602, "message": "invalid params: q is required"}})
+		}
+	}))
+	defer server.Close()
+	f := func(context.Context) (mcp.Client, error) { return mcp.NewStreamableHTTPClient("rpc", server.URL) }
+	h := mcp.NewHub(mcp.WithClientFactory("rpc", f))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	wantFailure(t, call(t, h, "mcp_rpc_t"), tool.ErrCodeInternal, "invalid params: q is required")
+	call(t, h, "mcp_rpc_t")
+	if got := callCount.Load(); got != 2 {
+		t.Errorf("JSON-RPC 错误不算掉线，两次都该发给 server，实际 %d 次", got)
+	}
+}
+
+// server 返回 (nil, nil)：失败结果，不 panic。
+func TestRemoteTool_NilResultIsFailure(t *testing.T) {
+	fc := &memClient{name: "srv", tools: specs("t"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+		return nil, nil
+	}}
+	h := mcp.NewHub(mcp.WithClient(fc))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	wantFailure(t, call(t, h, "mcp_srv_t"), tool.ErrCodeInternal, "空结果")
+}
+
+// --- 硬件互斥 ---
+
+// WithSerialCalls：同一 server 的并发调用串行执行；对照组（不开）确实会重叠——证明这个用例分得出两种行为。
+func TestHub_SerialCalls_NeverOverlap(t *testing.T) {
+	maxInFlight := func(serial bool) int32 {
+		var inFlight, peak atomic.Int32
+		fc := &memClient{name: "cam", tools: specs("shoot"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+			n := inFlight.Add(1)
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+			time.Sleep(30 * time.Millisecond)
+			inFlight.Add(-1)
+			return &mcp.CallResult{}, nil
+		}}
+		var opts []mcp.ServerOption
+		if serial {
+			opts = append(opts, mcp.WithSerialCalls())
+		}
+		h := mcp.NewHub(mcp.WithClient(fc, opts...))
+		if err := h.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer h.Close()
+		var wg sync.WaitGroup
+		gate := make(chan struct{})
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-gate
+				call(t, h, "mcp_cam_shoot")
+			}()
+		}
+		close(gate)
+		wg.Wait()
+		return peak.Load()
+	}
+	if got := maxInFlight(true); got != 1 {
+		t.Errorf("WithSerialCalls 下同时在执行的调用至多 1 个，实际峰值 %d", got)
+	}
+	if got := maxInFlight(false); got < 2 {
+		t.Errorf("对照组（不串行）该出现重叠，实际峰值 %d——用例分不出两种行为", got)
+	}
+}
+
+// 排队的时间算进 WithCallTimeout：前一个调用占着时，排不上的那个按超时失败，没有发出。
+func TestHub_SerialCalls_QueueWaitCountsTowardTimeout(t *testing.T) {
+	hold := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	fc := &memClient{name: "cam", tools: specs("shoot"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+		entered <- struct{}{}
+		<-hold
+		return &mcp.CallResult{}, nil
+	}}
+	h := mcp.NewHub(mcp.WithClient(fc, mcp.WithSerialCalls(), mcp.WithCallTimeout(30*time.Millisecond)))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = h.Toolkit().Call(context.Background(), "mcp_cam_shoot", nil) }()
+	<-entered
+	wantFailure(t, call(t, h, "mcp_cam_shoot"), tool.ErrCodeTimeout, "没排上")
+	close(hold)
+	<-done
+	if got := len(fc.calls()); got != 1 {
+		t.Errorf("排不上的调用不该发出，server 收到 %d 次", got)
+	}
+}
+
+// --- 命名与确定性错误 ---
+
+// WithToolNamer 决定框架内的工具名；撞名（会让一个工具静默顶掉另一个）与 server 名重复都让 Start 失败。
+func TestHub_ToolNamer_AndDuplicatesFailStart(t *testing.T) {
+	join := func(server, tool string) string { return server + "__" + tool }
+	h := mcp.NewHub(mcp.WithToolNamer(join),
+		mcp.WithClient(&memClient{name: "devbox", tools: specs("git_diff")}),
+		mcp.WithClient(&memClient{name: "cloud", tools: specs("list_tasks")}))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := names(h); !slices.Equal(got, []string{"devbox__git_diff", "cloud__list_tasks"}) {
+		t.Errorf("工具名该按 namer 生成，实际 %v", got)
+	}
+	if res := call(t, h, "devbox__git_diff"); !res.Success || res.Output != "ok:git_diff" {
+		t.Errorf("调用按原始名发给 server，实际 %+v", res)
+	}
+	_ = h.Close()
+
+	clash := mcp.NewHub(mcp.WithPartialStart(), mcp.WithToolNamer(func(string, string) string { return "same" }),
+		mcp.WithClient(&memClient{name: "a", tools: specs("x")}),
+		mcp.WithClient(&memClient{name: "b", tools: specs("y")}))
+	if err := clash.Start(context.Background()); err == nil || !strings.Contains(err.Error(), `"same"`) {
+		t.Errorf("两个工具撞名该让 Start 失败（哪怕开了 WithPartialStart），实际 %v", err)
+	}
+
+	dupServer := mcp.NewHub(mcp.WithClient(&memClient{name: "a", tools: specs("x")}),
+		mcp.WithClient(&memClient{name: "a", tools: specs("y")}))
+	if err := dupServer.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "duplicate server name") {
+		t.Errorf("server 名重复该让 Start 失败，实际 %v", err)
+	}
+
+	dupTool := mcp.NewHub(mcp.WithClient(&memClient{name: "a", tools: specs("x", "x")}))
+	if err := dupTool.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "duplicate tool name") {
+		t.Errorf("server 报了重名工具该让 Start 失败，实际 %v", err)
+	}
+}
+
+// 快照与状态都是深拷贝：调用方改自己手里的那份，不影响已注册工具发给模型的定义。
+func TestHub_SnapshotAndStatusAreCopies(t *testing.T) {
+	snap := specs("a")
+	f := &seqFactory{build: func(int) (mcp.Client, error) { return nil, errDown }}
+	h := mcp.NewHub(mcp.WithPartialStart(), fastBackoff(), mcp.WithClientFactory("s", f.New, mcp.WithToolSnapshot(snap)))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	before := toolsJSON(t, h)
+	snap[0].InputSchema["properties"].(map[string]any)["q"] = "mutated"
+	snap[0].Description = "mutated"
+	if after := toolsJSON(t, h); after != before {
+		t.Errorf("改调用方的快照改到了已注册工具：%s", after)
+	}
+}
+
+// --- 状态回调 ---
+
+// WithStatusHook 按状态变化的先后顺序回调：启动时离线 → 重连上 → 掉线 → 再重连上；上线的那几次带着清单。
+func TestHub_StatusHook_OrderedTransitions(t *testing.T) {
+	var broken atomic.Bool
+	mk := func() mcp.Client {
+		return &memClient{name: "s", tools: specs("a"), onCall: func(_ context.Context, name string, _ map[string]any) (*mcp.CallResult, error) {
+			if broken.Load() {
+				return nil, errDown
+			}
+			return &mcp.CallResult{}, nil
+		}}
+	}
+	f := &seqFactory{build: func(n int) (mcp.Client, error) {
+		if n == 1 {
+			return nil, errDown
+		}
+		return mk(), nil
+	}}
+	var mu sync.Mutex
+	var seen []mcp.ServerStatus
+	h := mcp.NewHub(mcp.WithPartialStart(), fastBackoff(),
+		mcp.WithClientFactory("s", f.New, mcp.WithToolSnapshot(specs("a"))),
+		mcp.WithStatusHook(func(st mcp.ServerStatus) {
+			mu.Lock()
+			seen = append(seen, st)
+			mu.Unlock()
+		}))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	count := func() int { mu.Lock(); defer mu.Unlock(); return len(seen) }
+	waitFor(t, "重连上（第 2 个事件）", func() bool { return count() >= 2 })
+	broken.Store(true)
+	call(t, h, "mcp_s_a")
+	broken.Store(false)
+	waitFor(t, "再次重连上（第 4 个事件）", func() bool { return count() >= 4 })
+
+	mu.Lock()
+	defer mu.Unlock()
+	var states []mcp.ServerState
+	for _, st := range seen {
+		states = append(states, st.State)
+	}
+	want := []mcp.ServerState{mcp.ServerOffline, mcp.ServerOnline, mcp.ServerOffline, mcp.ServerOnline}
+	if !slices.Equal(states, want) {
+		t.Fatalf("回调顺序 = %v，要 %v", states, want)
+	}
+	if seen[1].Tools == nil || seen[3].Tools == nil || seen[0].Tools != nil {
+		t.Errorf("上线事件该带清单、启动时离线的事件没有清单：%+v", seen)
+	}
+}
+
+// --- 关闭 ---
+
+// Close 打断正在进行的重连尝试、停掉重连循环；之后的调用返回「已关闭」，Start 报错。
+func TestHub_Close_StopsReconnecting(t *testing.T) {
+	block := make(chan struct{}) // 永不放行：第 2 次尝试会一直卡在工厂里，只有 ctx 能解开
+	f := &seqFactory{
+		build: func(int) (mcp.Client, error) { return nil, errDown },
+		gates: map[int]chan struct{}{2: block},
+	}
+	h := mcp.NewHub(mcp.WithPartialStart(), fastBackoff(), mcp.WithConnectTimeout(time.Hour),
+		mcp.WithClientFactory("s", f.New, mcp.WithToolSnapshot(specs("a"))))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFor(t, "第 2 次尝试开始", func() bool { return f.count() >= 2 })
+	closed := make(chan error, 1)
+	go func() { closed <- h.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close 没有打断卡住的重连尝试")
+	}
+	n := f.count()
+	time.Sleep(50 * time.Millisecond)
+	if f.count() != n {
+		t.Errorf("Close 之后还在重连：工厂调用 %d → %d", n, f.count())
+	}
+	wantFailure(t, call(t, h, "mcp_s_a"), mcp.ErrCodeServerUnavailable, "已关闭")
+	if err := h.Start(context.Background()); err == nil {
+		t.Error("Close 之后 Start 该报错")
+	}
+	if err := h.Close(); err != nil {
+		t.Errorf("重复 Close 该安全：%v", err)
+	}
+	if st := statusOf(t, h, "s"); st.State != mcp.ServerOffline || st.Err == nil {
+		t.Errorf("Close 之后状态该是离线并带原因：%+v", st)
+	}
+}
+
+// 并发调用撞上掉线与重连（-race 下跑）：每次调用都只是成功或失败结果，从不返回 error；工具集不变。
+func TestHub_ConcurrentCallsDuringFlapping(t *testing.T) {
+	var flaky atomic.Int32
+	f := &seqFactory{build: func(int) (mcp.Client, error) {
+		return &memClient{name: "s", tools: specs("a"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+			if flaky.Add(1)%3 == 0 {
+				return nil, errDown
+			}
+			return &mcp.CallResult{}, nil
+		}}, nil
+	}}
+	h := mcp.NewHub(mcp.WithReconnectBackoff(time.Millisecond, 2*time.Millisecond), mcp.WithClientFactory("s", f.New))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	before := toolsJSON(t, h)
+	// 跑到发生过几轮「掉线 → 重连」为止：离线期间的调用直接失败、极快，按次数跑的话一轮重连都等不到。
+	deadline := time.Now().Add(5 * time.Second)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f.count() < 5 && time.Now().Before(deadline) {
+				res, err := h.Toolkit().Call(context.Background(), "mcp_s_a", nil)
+				if err != nil || res == nil {
+					t.Errorf("掉线 / 重连期间的调用只该是结果，实际 res=%v err=%v", res, err)
+					return
+				}
+				_ = h.Status()
+				time.Sleep(50 * time.Microsecond)
+			}
+		}()
+	}
+	wg.Wait()
+	if f.count() < 5 {
+		t.Errorf("该发生过几轮重连，工厂只被调了 %d 次", f.count())
+	}
+	if after := toolsJSON(t, h); after != before {
+		t.Errorf("工具集变了")
+	}
+}

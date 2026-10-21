@@ -49,7 +49,11 @@ func runMockMCPServer(mode string) {
 			w.WriteByte('\n')
 			w.Flush()
 			if mode == "die" {
-				os.Exit(0) // 报完清单就退出：之后写给它的请求撞上已关闭的管道
+				// 报完清单就关掉管道再退出：之后写给它的请求撞上已关闭的管道。先关管道——-race 编译的进程退出时
+				// 还要停约 1s（竞态检测运行时的 atexit 延迟），只靠退出的话那段时间里写照样成功。
+				os.Stdin.Close()
+				os.Stdout.Close()
+				os.Exit(0)
 			}
 		case "tools/call":
 			switch mode {

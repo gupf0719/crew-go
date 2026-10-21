@@ -258,7 +258,8 @@ func TestHooks_OTelTokenAttrsAndSpanKind(t *testing.T) {
 	_, _ = ah.OnModelStart(ctx, info, &schema.ModelInput{Messages: []*schema.Message{schema.UserMessage("hi")}})
 	_, _ = ah.OnModelEnd(ctx, info, &schema.ModelOutput{
 		Message: schema.AssistantMessage("ok"),
-		Usage:   &common.MessageUsage{InputTokens: 10, OutputTokens: 20, TotalTokens: 35, ThinkTokens: 5, CachedInputTokens: 8},
+		Usage: &common.MessageUsage{InputTokens: 10, OutputTokens: 20, TotalTokens: 35, ThinkTokens: 5, CachedInputTokens: 8,
+			CacheCreationInputTokens: 2},
 	})
 	ah.OnAgentEnd(ctx, info, &hook.AgentOutput{Messages: []*schema.Message{schema.AssistantMessage("ok")}})
 	orch.OnGraphEnd(ctx, nil)
@@ -276,6 +277,9 @@ func TestHooks_OTelTokenAttrsAndSpanKind(t *testing.T) {
 	}
 	if v, ok := findIntAttr(chat, "gen_ai.usage.cache_read.input_tokens"); !ok || v != 8 {
 		t.Errorf("gen_ai.usage.cache_read.input_tokens = %d,%v; want 8", v, ok)
+	}
+	if v, ok := findIntAttr(chat, "gen_ai.usage.cache_creation.input_tokens"); !ok || v != 2 {
+		t.Errorf("gen_ai.usage.cache_creation.input_tokens = %d,%v; want 2", v, ok)
 	}
 	// 旧名不该再 emit (改名而非新增)
 	if _, ok := findIntAttr(chat, "gen_ai.usage.reasoning_tokens"); ok {

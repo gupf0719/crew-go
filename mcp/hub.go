@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crew-go/internal/panicerr"
@@ -68,13 +69,15 @@ type Hub struct {
 	statusHook     func(ServerStatus)
 	events         *statusQueue // 配了 statusHook 才有
 
-	mu      sync.Mutex // 管 started / closed / tools；Start 全程持有（并发 Start 串行）
-	started bool
-	closed  bool
+	mu      sync.Mutex  // 管 tools；Start 全程持有（并发 Start 串行）
+	started atomic.Bool // Start 成功后置位（在 mu 里）；Status 读它不拿锁，Start 进行中也不挡
 	tools   []*RemoteTool
 
-	done chan struct{}  // Close 时关闭：后台重连与状态回调据此退出
-	bg   sync.WaitGroup // 后台 goroutine：各 server 的重连循环、状态回调
+	done      chan struct{}  // Close 一开始就关闭：Start 与后台重连的连接尝试据此打断，重连循环、状态回调据此退出
+	bg        sync.WaitGroup // 各 server 的重连循环（Close 等它们退出）
+	closeOnce sync.Once
+	closeDone chan struct{} // 第一个 Close 做完时关闭；并发的 Close 等它
+	closeErr  error
 }
 
 // HubOption 配置 Hub。
@@ -154,7 +157,10 @@ func WithToolNamer(fn func(server, tool string) string) HubOption {
 
 // WithStatusHook 设状态回调：Start 成功后每个 server 回调一次初始状态，之后每次上线 / 掉线回调一次，按状态变化的
 // 先后顺序逐个调用（在 Hub 自己的一个 goroutine 里，不并发）。用来记日志、上屏、把 ServerStatus.Tools 持久化成
-// 下次的快照。fn 要尽快返回（Close 会等它）；在它里面调 Status 没问题；panic 只记日志。Close 之后不再回调。
+// 下次的快照。fn 里调 Status、调工具、调 Close 都可以；panic 只记日志。
+//
+// Close 之后不再开始新的回调，也不等正在执行的那个返回（等的话，回调里调 Close 就是自己等自己）；Close 时还没送出的
+// 状态变化不再回调——要持久化最后的清单，Close 之前读一次 Status。
 func WithStatusHook(fn func(ServerStatus)) HubOption {
 	return func(h *Hub) { h.statusHook = fn }
 }
@@ -168,6 +174,7 @@ func NewHub(opts ...HubOption) *Hub {
 		backoffInitial: defaultBackoffInitial,
 		backoffMax:     defaultBackoffMax,
 		done:           make(chan struct{}),
+		closeDone:      make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -182,7 +189,8 @@ func NewHub(opts ...HubOption) *Hub {
 //
 // 默认任一 server 失败则整体失败，已连上的 Client 会被 Close 回滚；开了 WithPartialStart 时只有调用方 ctx 结束与
 // 确定性错误（server 名重复、工具重名、快照不合法）才失败，连不上的 server 按快照注册并后台重连（见 Hub godoc）。
-// 失败时可以重试；成功后重复调用是幂等的（工具集已定，不再连）。Close 之后调用返回错误。
+// 失败时可以重试；成功后重复调用是幂等的（工具集已定，不再连）。Close 会打断进行中的 Start（它返回错误），Close 之后
+// 调用返回错误。
 func (h *Hub) Start(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -192,10 +200,10 @@ func (h *Hub) Start(ctx context.Context) error {
 	// 不用"乐观置位于首个临界区"——那样第二个 Start 见 true 提前 return 时第一个尚在 register，
 	// caller 拿到未 register 完的空 Toolkit。连接 goroutine 只写局部 results 不碰 h.mu、
 	// register 在锁内故安全持 mu；失败不置 started(保持 false)允许重试。
-	if h.closed {
+	if h.isClosed() {
 		return errHubClosed
 	}
-	if h.started {
+	if h.started.Load() {
 		return nil
 	}
 	if err := h.checkServerNames(); err != nil {
@@ -215,7 +223,7 @@ func (h *Hub) Start(ctx context.Context) error {
 			defer wg.Done()
 			actx, cancel := h.attemptCtx(ctx)
 			defer cancel()
-			c, specs, err := s.connect(actx) // 业务 Client panic 在 connect 里转成 err
+			c, specs, err := s.connect(actx) // 业务 Client panic 在 connect 里转成 err；Close 打断时 actx 被取消
 			results[i] = result{client: c, specs: specs, err: err}
 		}(i, s)
 	}
@@ -233,6 +241,10 @@ func (h *Hub) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		rollback()
 		return fmt.Errorf("mcp: start: %w", err)
+	}
+	if h.isClosed() {
+		rollback()
+		return errHubClosed
 	}
 	var startErrs []error
 	for _, r := range results {
@@ -301,7 +313,6 @@ func (h *Hub) Start(ctx context.Context) error {
 			s.setListedLocked(results[i].specs)
 		} else {
 			s.lastErr = err
-			s.reconnecting = true
 			h.bg.Add(1)
 		}
 		h.events.push(s.statusLocked())
@@ -319,11 +330,21 @@ func (h *Hub) Start(ctx context.Context) error {
 		}
 	}
 	if h.events != nil {
-		h.bg.Add(1)
+		// 不计入 bg：Close 不等它（回调里调 Close 时等它就是自己等自己），它在 done 关闭后不再开始新的回调。
 		go h.dispatchStatus()
 	}
-	h.started = true
+	h.started.Store(true)
 	return nil
+}
+
+// isClosed 报 Close 是否已经开始。
+func (h *Hub) isClosed() bool {
+	select {
+	case <-h.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // checkServerNames 查 server 名重复：工具名前缀、快照、状态都按名字对应，重名的两个分不开。
@@ -338,12 +359,24 @@ func (h *Hub) checkServerNames() error {
 	return nil
 }
 
-// attemptCtx 给一次连接尝试派生 ctx（WithConnectTimeout）。
+// attemptCtx 给一次连接尝试派生 ctx：受 WithConnectTimeout 约束，Close 时被取消（ctx 不存进 Hub，起一个小
+// goroutine 把 done 转成取消；cancel 之后它就退出）。
 func (h *Hub) attemptCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	var ctx context.Context
+	var cancel context.CancelFunc
 	if h.connectTimeout > 0 {
-		return context.WithTimeout(parent, h.connectTimeout)
+		ctx, cancel = context.WithTimeout(parent, h.connectTimeout)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
 	}
-	return context.WithCancel(parent)
+	go func() {
+		select {
+		case <-h.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 // Toolkit 返回聚合后的工具注册表；在 Start 前调用得到空 Toolkit。
@@ -363,10 +396,7 @@ func (h *Hub) Tools() []*RemoteTool {
 // Status 返回各 server 的状态（按注册顺序）；Start 成功之前返回 nil。Close 之后各 server 都是离线、Err 为
 // Hub 已关闭。
 func (h *Hub) Status() []ServerStatus {
-	h.mu.Lock()
-	started := h.started
-	h.mu.Unlock()
-	if !started {
+	if !h.started.Load() {
 		return nil
 	}
 	out := make([]ServerStatus, 0, len(h.servers))
@@ -378,18 +408,22 @@ func (h *Hub) Status() []ServerStatus {
 	return out
 }
 
-// Close 停掉后台重连与状态回调，并发关闭所有 Client，用 errors.Join 聚合所有错误。多次调用安全；Close 之后
-// 工具调用返回「该能力暂时不可用」。
+// Close 打断进行中的 Start 与重连尝试，停掉后台重连与状态回调，并发关闭所有 Client，用 errors.Join 聚合所有错误。
+// 多次调用安全：并发的 Close 等第一个做完，返回同一个结果。Close 之后工具调用返回「该能力暂时不可用」。
 func (h *Hub) Close() error {
-	h.mu.Lock()
-	if h.closed {
-		h.mu.Unlock()
-		return nil
+	first := false
+	h.closeOnce.Do(func() {
+		first = true
+		close(h.done) // 先关：Start 的连接尝试被打断，Start 才会放开 mu
+	})
+	if !first {
+		<-h.closeDone
+		return h.closeErr
 	}
-	h.closed = true
-	h.mu.Unlock()
-	close(h.done)
+	defer close(h.closeDone)
 
+	h.mu.Lock() // 等进行中的 Start 收尾（它看到 done 已关闭会回滚）
+	h.mu.Unlock()
 	clients := make([]Client, 0, len(h.servers))
 	for _, s := range h.servers {
 		if c := s.shutdown(); c != nil {
@@ -418,12 +452,12 @@ func (h *Hub) Close() error {
 		}(i, c)
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+	h.closeErr = errors.Join(errs...)
+	return h.closeErr
 }
 
-// dispatchStatus 按入队顺序逐个回调 statusHook，Close 时退出。
+// dispatchStatus 按入队顺序逐个回调 statusHook；Close 之后不再开始新的回调、退出。
 func (h *Hub) dispatchStatus() {
-	defer h.bg.Done()
 	for {
 		select {
 		case <-h.done:
@@ -431,6 +465,9 @@ func (h *Hub) dispatchStatus() {
 		case <-h.events.wake:
 		}
 		for _, st := range h.events.take() {
+			if h.isClosed() {
+				return
+			}
 			h.callStatusHook(st)
 		}
 	}

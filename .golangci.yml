@@ -1,0 +1,45 @@
+version: "2"
+
+# golangci-lint v2 配置.
+#
+# 门禁聚焦"正确性类" lint —— standard set: errcheck / govet / ineffassign /
+# staticcheck (SA bug 类) / unused. 风格简化建议 (staticcheck QF*) 关闭; 测试与
+# example/ demo 代码放宽 (忽略 error / 临时 unused 在那里是常态, 不是缺陷).
+linters:
+  default: standard
+  settings:
+    errcheck:
+      # defer xxx.Close() 不检查 error 是 Go 惯例 (response body / io.Closer 关闭).
+      exclude-functions:
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+  exclusions:
+    rules:
+      # QF* 是 quickfix 风格简化建议 (tagged switch / Fprintf 等), 非正确性问题.
+      # 用 exclusions 排除而非改 staticcheck.checks —— 后者会覆盖默认、误启用 ST*
+      # 命名风格类 (modules/ 是 spec 拷贝, Id/Url 命名跟随 spec, 不强制改).
+      - linters: [staticcheck]
+        text: "QF1003"
+      - linters: [staticcheck]
+        text: "QF1012"
+      # 测试文件: 忽略 error / 临时 unused / dead assign / 故意 nil context 测 typed-nil /
+      # embedded selector 等是测试惯用写法, 不强制 (生产代码保持全严格).
+      - path: _test\.go
+        linters:
+          - errcheck
+          - unused
+          - ineffassign
+          - staticcheck
+      # example/ demo 代码: 演示为主, 放宽噪音类.
+      - path: ^example/
+        linters:
+          - errcheck
+          - unused
+          - staticcheck
+          - govet
+
+# 报全部 issue, 不截断同类 (默认 max-same-issues:3 / max-issues-per-linter:50 会
+# 隐藏剩余同类, CI 需看全).
+issues:
+  max-same-issues: 0
+  max-issues-per-linter: 0

@@ -1,0 +1,75 @@
+# crew-go GitLab CI (OKR 9.4)
+#
+# 六道关: build (主 module + 3 独立 module) / test / race / vet / lint / coverage。
+# 覆盖率门禁: 核心包 >= 75% (scripts/check-coverage.sh); MR / 徽章看核心包合并 total。
+
+stages:
+  - build
+  - test
+  - lint
+  - coverage
+
+# go.mod toolchain go1.26.4 —— 用精确 image 免运行时下载 toolchain。
+default:
+  image: golang:1.26.4
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .gocache/
+  before_script:
+    - export GOPATH="$CI_PROJECT_DIR/.gocache/gopath"
+    - export GOCACHE="$CI_PROJECT_DIR/.gocache/build"
+    - export PATH="$GOPATH/bin:$PATH"
+
+# ---------- build ----------
+# 主 module + 3 个独立 go module (redis / sql / a2a/zk, 各自 go.mod + replace 主 module)。
+build:
+  stage: build
+  script:
+    - go build ./...
+    - (cd redis && go build ./...)
+    - (cd sql && go build ./...)
+    - (cd a2a/zk && go build ./...)
+
+# ---------- test (主 module 单测, 不连外网) ----------
+# ⚠️ go.work 下根目录 `go test ./...` **不含** redis / sql / a2a/zk 三个子模块的包,
+# 所以它们的测试现在 CI 里一条都不跑(只在 build job 里编译)。redis 用 miniredis、
+# sql 用 SQLite, 都自包含不连外网, 可以直接加 (cd redis && go test ./...) 等;
+# 只有 a2a/zk 的 conformance 要真 ZK(integration tag)。见 doc/code/todo.md 同名条目。
+test:
+  stage: test
+  script:
+    - go test ./...
+
+# ---------- race (主 module 竞态检测) ----------
+race:
+  stage: test
+  script:
+    - go test -race ./...
+
+# ---------- vet ----------
+vet:
+  stage: test
+  script:
+    - go vet ./...
+
+# ---------- lint (golangci-lint, 规则见 .golangci.yml) ----------
+lint:
+  stage: lint
+  script:
+    - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+    - golangci-lint run
+
+# ---------- coverage (核心包 >= 75% 门禁 + 徽章) ----------
+# GitLab 经 coverage 正则抓核心包合并 total, 显示在 MR 概览 / pipeline 徽章。
+coverage:
+  stage: coverage
+  script:
+    - bash scripts/check-coverage.sh
+  coverage: '/total:\s+\(statements\)\s+(\d+\.\d+)%/'
+  # 覆盖率快照 (ISSUE-52 #4): 每条 pipeline 留 30 天 profile, 本地
+  # `go tool cover -html=coverage.out` 看行级; 历次涨落在 pipeline 列表按 job 对比.
+  artifacts:
+    paths:
+      - coverage.out
+    expire_in: 30 days

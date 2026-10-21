@@ -1,0 +1,189 @@
+{"id":"ecom-01","sc":"ecom","gold":"order_logistics","tags":["direct"],"zh":"我的订单什么时候发货？","en":"When will my order ship?"}
+{"id":"ecom-02","sc":"ecom","gold":"order_logistics","tags":["paraphrase"],"zh":"买的东西现在到哪儿了，能帮我看看吗","en":"Where's the stuff I bought right now? Can you take a look?"}
+{"id":"ecom-03","sc":"ecom","gold":"order_logistics","tags":["colloquial"],"zh":"快递咋还不动啊，都三天了，急死了","en":"Why hasn't my package moved? It's been three days, I'm freaking out."}
+{"id":"ecom-04","sc":"ecom","gold":"order_logistics","tags":["implicit"],"zh":"明天我就不在家了，东西能不能改寄到公司","en":"I won't be home tomorrow. Can the package be redirected to my office?"}
+{"id":"ecom-05","sc":"ecom","gold":"order_logistics","tags":["negation","trap"],"zh":"不用退款，我就想知道包裹现在到哪了","en":"I don't need a refund, I just want to know where my parcel is right now."}
+{"id":"ecom-06","sc":"ecom","gold":"order_logistics","tags":["multi"],"zh":"帮我催一下发货，顺便问下你们家有没有运费险","en":"Please hurry my shipment along. Also, do you offer shipping insurance?"}
+{"id":"ecom-07","sc":"ecom","gold":"order_logistics","tags":["distractor"],"zh":"上周给我妈买了个按摩仪当生日礼物，她念叨好几天了，生日就在周六，我就想确认下周五之前能不能送到","en":"Last week I bought my mom a massager for her birthday. She's been talking about it for days and her birthday is Saturday. I just want to confirm it'll be delivered before Friday."}
+{"id":"ecom-08","sc":"ecom","gold":"order_logistics","tags":["typo"],"zh":"我的快第怎么还在路上","en":"why is my packge still in transit"}
+{"id":"ecom-09","sc":"ecom","gold":"order_logistics","tags":["trad"],"zh":"請問我的訂單出貨了嗎？","en":"Has my order been shipped yet?"}
+{"id":"ecom-10","sc":"ecom","gold":"refund_return","tags":["direct"],"zh":"我要申请退款","en":"I want to request a refund."}
+{"id":"ecom-11","sc":"ecom","gold":"refund_return","tags":["paraphrase"],"zh":"这件衣服不想要了，钱能退回来吗","en":"I don't want this shirt anymore. Can I get my money back?"}
+{"id":"ecom-12","sc":"ecom","gold":"refund_return","tags":["colloquial"],"zh":"买的耳机左边没声儿，这不坑人嘛，给我换个新的","en":"The earbuds I bought have no sound on the left. What a rip-off. Swap them for a new pair."}
+{"id":"ecom-13","sc":"ecom","gold":"refund_return","tags":["implicit"],"zh":"收到的鞋子小了一码，穿不进去","en":"The shoes I received are a size too small, I can't get them on."}
+{"id":"ecom-14","sc":"ecom","gold":"refund_return","tags":["negation","trap"],"zh":"我不是要投诉，就是想问下退款多久能到账","en":"I'm not filing a complaint, I just want to know how long the refund takes to come through."}
+{"id":"ecom-15","sc":"ecom","gold":"refund_return","tags":["multi"],"zh":"收到的杯子碎了一个，要退；另外同款还有货吗，想再买两个","en":"One of the cups arrived broken and I want to return it. Also, is the same one still in stock? I'd like two more."}
+{"id":"ecom-16","sc":"ecom","gold":"refund_return","tags":["distractor"],"zh":"我在你们店买了好几年了，一直挺满意的，这次的电饭煲用了两天就不加热了，按说明书操作也不行，想走一下售后","en":"I've shopped at your store for years and have always been happy, but this rice cooker stopped heating after two days, even when I follow the manual. I'd like to go through after-sales."}
+{"id":"ecom-17","sc":"ecom","gold":"refund_return","tags":["typo"],"zh":"tui款申请提交了怎么没反应","en":"i submitted a refnd request, why no response"}
+{"id":"ecom-18","sc":"ecom","gold":"refund_return","tags":["mixed"],"zh":"这个 order 我想 return，怎么操作","en":"I want to return this order. How do I do that?"}
+{"id":"ecom-19","sc":"ecom","gold":"payment_invoice","tags":["direct"],"zh":"怎么开发票？","en":"How do I get an invoice?"}
+{"id":"ecom-20","sc":"ecom","gold":"payment_invoice","tags":["paraphrase"],"zh":"公司报销要写抬头，能帮我补开一张吗","en":"My company needs a receipt with its name on it for reimbursement. Can you issue one?"}
+{"id":"ecom-21","sc":"ecom","gold":"payment_invoice","tags":["colloquial"],"zh":"付钱一直转圈圈，咋回事","en":"The payment keeps spinning forever, what's going on?"}
+{"id":"ecom-22","sc":"ecom","gold":"payment_invoice","tags":["implicit"],"zh":"银行卡被扣了两次钱，订单却只有一个","en":"My bank card was charged twice, but there's only one order."}
+{"id":"ecom-23","sc":"ecom","gold":"payment_invoice","tags":["negation","trap"],"zh":"不是要退货哈，就是优惠券用不了，结算时没抵扣","en":"I'm not returning anything. It's just that my coupon won't apply at checkout."}
+{"id":"ecom-24","sc":"ecom","gold":"payment_invoice","tags":["multi"],"zh":"发票抬头开错了要重开，另外我那个快递能不能加急","en":"The invoice has the wrong company name and needs reissuing. Also, can my delivery be expedited?"}
+{"id":"ecom-25","sc":"ecom","gold":"payment_invoice","tags":["distractor"],"zh":"我们部门这个月团建订了一批零食，领导让我统一负责，东西都收到了挺好的，就是财务说要增值税专用发票才能报销","en":"Our department ordered a batch of snacks for a team event this month and my manager put me in charge. Everything arrived and it's great, but finance says they need a VAT special invoice to reimburse it."}
+{"id":"ecom-26","sc":"ecom","gold":"payment_invoice","tags":["typo"],"zh":"fa票在哪里下载","en":"where do i download the invoce"}
+{"id":"ecom-27","sc":"ecom","gold":"payment_invoice","tags":["trad"],"zh":"付款失敗了，但錢好像被扣了","en":"The payment failed, but it looks like the money was taken."}
+{"id":"ecom-28","sc":"ecom","gold":"product_consult","tags":["direct"],"zh":"这款手机支持无线充电吗？","en":"Does this phone support wireless charging?"}
+{"id":"ecom-29","sc":"ecom","gold":"product_consult","tags":["paraphrase"],"zh":"身高175体重140斤，穿多大的合适","en":"I'm 175 cm and 70 kg. What size would fit me?"}
+{"id":"ecom-30","sc":"ecom","gold":"product_consult","tags":["colloquial"],"zh":"这锅不粘的不？煎蛋会不会糊","en":"Is this pan non-stick or not? Will eggs burn on it?"}
+{"id":"ecom-31","sc":"ecom","gold":"product_consult","tags":["implicit"],"zh":"家里有个两岁的娃，这桌子边角会不会很尖","en":"I have a two-year-old at home. Are the corners on this table sharp?"}
+{"id":"ecom-32","sc":"ecom","gold":"product_consult","tags":["negation","trap"],"zh":"先别给我讲退货流程，我还没买呢，就想问这个充电宝能不能带上飞机","en":"Don't walk me through returns. I haven't bought it yet. I just want to know if this power bank can go on a plane."}
+{"id":"ecom-33","sc":"ecom","gold":"product_consult","tags":["multi"],"zh":"这款空气炸锅有几升的？再问下现在下单什么时候能发货","en":"What sizes does this air fryer come in? Also, if I order now, when would it ship?"}
+{"id":"ecom-34","sc":"ecom","gold":"product_consult","tags":["distractor"],"zh":"最近刚搬新家，客厅挺大的，朝南采光也好，就是冬天有点冷，想问问这台取暖器适合多大面积用","en":"We just moved into a new place. The living room is big and faces south with good light, but it gets a bit cold in winter. What room size is this heater suitable for?"}
+{"id":"ecom-35","sc":"ecom","gold":"product_consult","tags":["mixed"],"zh":"这个 laptop 的 RAM 能自己升级吗","en":"Can I upgrade the RAM in this laptop myself?"}
+{"id":"ecom-36","sc":"ecom","gold":"product_consult","tags":["short"],"zh":"有货吗","en":"In stock?"}
+{"id":"ecom-37","sc":"ecom","gold":"account_security","tags":["direct"],"zh":"登录密码忘了怎么办","en":"I forgot my login password, what should I do?"}
+{"id":"ecom-38","sc":"ecom","gold":"account_security","tags":["paraphrase"],"zh":"手机号换了，账号上绑的还是旧号，怎么改","en":"I changed my phone number but my account is still tied to the old one. How do I update it?"}
+{"id":"ecom-39","sc":"ecom","gold":"account_security","tags":["colloquial"],"zh":"号被人盗了！！里面还有我好多积分","en":"My account got hacked!! I had tons of points in there."}
+{"id":"ecom-40","sc":"ecom","gold":"account_security","tags":["implicit"],"zh":"收到短信说我在外地登录了，可我人一直在北京","en":"I got a text saying I logged in from another city, but I've been in Beijing the whole time."}
+{"id":"ecom-41","sc":"ecom","gold":"account_security","tags":["negation","trap"],"zh":"别给我转人工，我自己能搞定，就告诉我实名认证在哪儿做","en":"Don't transfer me to a human, I can handle it. Just tell me where to do identity verification."}
+{"id":"ecom-42","sc":"ecom","gold":"account_security","tags":["multi"],"zh":"注册的时候验证码一直收不到，另外新用户有没有什么优惠","en":"I never get the verification code when signing up. Also, are there any deals for new users?"}
+{"id":"ecom-43","sc":"ecom","gold":"account_security","tags":["distractor"],"zh":"我平时都用我老婆的手机下单，她那个号用了好几年了，最近我想自己也注册一个，结果提示这个身份证已经被绑定了","en":"I usually order on my wife's phone. She's had that account for years. Recently I tried to register my own, but it says this ID card is already bound."}
+{"id":"ecom-44","sc":"ecom","gold":"account_security","tags":["typo"],"zh":"mm忘了，登不上去","en":"forgot my pw, can't log in"}
+{"id":"ecom-45","sc":"ecom","gold":"account_security","tags":["trad"],"zh":"帳號被鎖住了，怎麼解鎖？","en":"My account is locked. How do I unlock it?"}
+{"id":"ecom-46","sc":"ecom","gold":"complaint_human","tags":["direct"],"zh":"我要投诉","en":"I want to file a complaint."}
+{"id":"ecom-47","sc":"ecom","gold":"complaint_human","tags":["paraphrase"],"zh":"别让机器人跟我说了，找个真人来","en":"Stop making me talk to a bot, get me a real person."}
+{"id":"ecom-48","sc":"ecom","gold":"complaint_human","tags":["colloquial"],"zh":"你们这客服啥态度啊，叫你们领导出来","en":"What's with your support's attitude? Get your manager out here."}
+{"id":"ecom-49","sc":"ecom","gold":"complaint_human","tags":["implicit"],"zh":"同样的问题我已经问了三遍了，每次都是这几句模板话，能不能换个人来处理","en":"I've asked the same question three times and keep getting the same canned lines. Can someone else handle this?"}
+{"id":"ecom-50","sc":"ecom","gold":"complaint_human","tags":["negation","trap"],"zh":"我不是查物流，我是要投诉这个快递员态度恶劣","en":"I'm not asking about tracking. I want to complain that the courier was extremely rude."}
+{"id":"ecom-51","sc":"ecom","gold":"complaint_human","tags":["multi"],"zh":"我要投诉你们商家发错货，顺便问下能不能先给我补发","en":"I want to file a complaint that the seller sent the wrong item. Also, can you send the right one first?"}
+{"id":"ecom-52","sc":"ecom","gold":"complaint_human","tags":["distractor"],"zh":"我从早上九点等到现在，中间打了四次电话，每次都说会有人回电，孩子还在旁边哭，真的受够了，我要投诉你们的服务","en":"I've been waiting since nine this morning and called four times. Every time they said someone would call back. My kid is crying next to me and I'm fed up. I want to file a complaint about your service."}
+{"id":"ecom-53","sc":"ecom","gold":"complaint_human","tags":["mixed"],"zh":"给我转 human agent","en":"Transfer me to a human agent."}
+{"id":"ecom-54","sc":"ecom","gold":"complaint_human","tags":["short"],"zh":"人工","en":"Human."}
+{"id":"ecom-55","sc":"ecom","gold":"other","tags":["short"],"zh":"你好","en":"Hi"}
+{"id":"ecom-56","sc":"ecom","gold":"other","tags":["direct"],"zh":"讲个笑话吧","en":"Tell me a joke."}
+{"id":"ecom-57","sc":"ecom","gold":"other","tags":["direct"],"zh":"你喜欢吃火锅吗","en":"Do you like hot pot?"}
+{"id":"ecom-58","sc":"ecom","gold":"other","tags":["direct"],"zh":"今天北京天气怎么样","en":"What's the weather like in Beijing today?"}
+{"id":"ecom-59","sc":"ecom","gold":"other","tags":["negation"],"zh":"不买东西，就是无聊想找人聊聊天","en":"I'm not buying anything, I'm just bored and want someone to chat with."}
+{"id":"ecom-60","sc":"ecom","gold":"other","tags":["trap","distractor"],"zh":"我在写一篇关于电商物流发展的论文，你觉得未来无人机送货会普及吗","en":"I'm writing a paper on how e-commerce logistics is developing. Do you think drone delivery will become common?"}
+{"id":"ecom-61","sc":"ecom","gold":"other","tags":["direct"],"zh":"帮我写一首关于秋天的诗","en":"Write me a poem about autumn."}
+{"id":"ecom-62","sc":"ecom","gold":"other","tags":["colloquial"],"zh":"哈哈哈你好可爱","en":"Hahaha you're so cute."}
+{"id":"ecom-63","sc":"ecom","gold":"other","tags":["mixed"],"zh":"你是 ChatGPT 吗","en":"Are you ChatGPT?"}
+{"id":"ops-01","sc":"ops","gold":"metrics_query","tags":["direct"],"zh":"查一下 order-service 最近一小时的 QPS","en":"Check order-service's QPS over the last hour."}
+{"id":"ops-02","sc":"ops","gold":"metrics_query","tags":["paraphrase"],"zh":"支付服务这两天响应是不是变慢了，看看耗时曲线","en":"Has the payment service gotten slower over the past two days? Show me the latency curve."}
+{"id":"ops-03","sc":"ops","gold":"metrics_query","tags":["colloquial"],"zh":"网关那台机器 CPU 是不是又飙了","en":"Is the CPU on that gateway box spiking again?"}
+{"id":"ops-04","sc":"ops","gold":"metrics_query","tags":["implicit"],"zh":"双十一压测的时候，下单接口最高扛到了多少","en":"During the Double 11 load test, what was the most the order API could handle?"}
+{"id":"ops-05","sc":"ops","gold":"metrics_query","tags":["negation","trap"],"zh":"不用建告警规则，我就想看看过去一周内存使用率的趋势","en":"No need to create an alert rule, I just want to see the memory usage trend over the past week."}
+{"id":"ops-06","sc":"ops","gold":"metrics_query","tags":["multi"],"zh":"帮我写个 PromQL 算一下 5xx 错误率，顺便看看有没有相关告警","en":"Write a PromQL query for the 5xx error rate, and also check whether there are related alerts."}
+{"id":"ops-07","sc":"ops","gold":"metrics_query","tags":["distractor"],"zh":"我们组下周要做季度汇报，老板想看稳定性数据，我在整理材料，现在需要 user-center 服务上个季度 P99 延迟的月度均值","en":"Our team has a quarterly review next week and the boss wants stability data. I'm putting materials together and need the monthly average P99 latency of user-center for last quarter."}
+{"id":"ops-08","sc":"ops","gold":"metrics_query","tags":["mixed"],"zh":"帮我 query 一下 redis 集群的 hit rate","en":"Query the Redis cluster's hit rate for me."}
+{"id":"ops-09","sc":"ops","gold":"metrics_query","tags":["implicit"],"zh":"rate(http_requests_total[5m]) 这个表达式是什么意思","en":"What does the expression rate(http_requests_total[5m]) mean?"}
+{"id":"ops-10","sc":"ops","gold":"alert_manage","tags":["direct"],"zh":"现在有哪些告警在响？","en":"Which alerts are firing right now?"}
+{"id":"ops-11","sc":"ops","gold":"alert_manage","tags":["paraphrase"],"zh":"今晚十点到十二点要做数据库维护，这段时间别一直通知我","en":"We have database maintenance tonight from 10 to 12. Don't keep notifying me during that window."}
+{"id":"ops-12","sc":"ops","gold":"alert_manage","tags":["colloquial"],"zh":"告警群里又被刷屏了，都是些啥","en":"The alerts channel is getting flooded again. What's all that?"}
+{"id":"ops-13","sc":"ops","gold":"alert_manage","tags":["implicit","trap"],"zh":"磁盘使用率超过 85% 的时候我希望能收到通知","en":"I'd like to be notified whenever disk usage goes above 85%."}
+{"id":"ops-14","sc":"ops","gold":"alert_manage","tags":["negation","trap"],"zh":"不是查日志，我想看看昨天凌晨触发过哪些告警","en":"Not the logs. I want to see which alerts fired early yesterday morning."}
+{"id":"ops-15","sc":"ops","gold":"alert_manage","tags":["multi"],"zh":"把 order-service 的 CPU 告警阈值调到 90%，另外帮我看下它现在 CPU 多少","en":"Raise order-service's CPU alert threshold to 90%, and also check what its CPU is at right now."}
+{"id":"ops-16","sc":"ops","gold":"alert_manage","tags":["distractor"],"zh":"我刚接手这个服务，前任同事走得急也没交接清楚，凌晨总有电话把我吵醒，我想把这些告警的通知方式从电话改成钉钉消息","en":"I just took over this service and my predecessor left in a hurry without a proper handover. Phone calls keep waking me up at night, and I want to switch these alerts from phone calls to DingTalk messages."}
+{"id":"ops-17","sc":"ops","gold":"alert_manage","tags":["mixed"],"zh":"帮我 silence 掉 test 环境的所有 alert","en":"Silence all alerts in the test environment."}
+{"id":"ops-18","sc":"ops","gold":"alert_manage","tags":["trad"],"zh":"幫我訂閱支付服務的告警通知","en":"Subscribe me to alert notifications for the payment service."}
+{"id":"ops-19","sc":"ops","gold":"log_search","tags":["direct"],"zh":"帮我查一下 trace id 为 a1b2c3d4 的日志","en":"Look up the logs for trace ID a1b2c3d4."}
+{"id":"ops-20","sc":"ops","gold":"log_search","tags":["paraphrase"],"zh":"用户说下午三点二十左右下单报错了，帮我看看后台当时记录了什么","en":"A user says ordering failed around 3:20 pm. Check what the backend recorded at that time."}
+{"id":"ops-21","sc":"ops","gold":"log_search","tags":["colloquial","mixed"],"zh":"grep 一下 NullPointerException 最近出现了多少次","en":"grep how many times NullPointerException has shown up recently"}
+{"id":"ops-22","sc":"ops","gold":"log_search","tags":["implicit"],"zh":"那个接口偶尔返回 500，我想看看具体的报错堆栈","en":"That API returns 500 now and then. I want to see the actual error stack trace."}
+{"id":"ops-23","sc":"ops","gold":"log_search","tags":["negation","trap"],"zh":"不用看监控图，直接把 nginx access 日志里状态码 499 的请求捞出来","en":"Skip the dashboards. Just pull the requests with status 499 out of the nginx access logs."}
+{"id":"ops-24","sc":"ops","gold":"log_search","tags":["multi"],"zh":"帮我搜下今天的 OOM 日志，搜完顺便告诉我今天谁值班","en":"Search today's logs for OOM, and after that tell me who's on call today."}
+{"id":"ops-25","sc":"ops","gold":"log_search","tags":["distractor"],"zh":"客户投诉说昨天下午的对账文件少了几条记录，财务催得很急，我怀疑是定时任务没跑完，想先看看 reconcile-job 昨天下午的运行日志里有没有异常","en":"A client complained that yesterday afternoon's reconciliation file was missing a few records and finance is pushing hard. I suspect the scheduled job didn't finish, so I want to check reconcile-job's run logs from yesterday afternoon for anything abnormal."}
+{"id":"ops-26","sc":"ops","gold":"log_search","tags":["typo"],"zh":"查下日至里有没有 timeout 关键字","en":"check the logz for the keyword timeout"}
+{"id":"ops-27","sc":"ops","gold":"log_search","tags":["short"],"zh":"捞日志","en":"Pull logs."}
+{"id":"ops-28","sc":"ops","gold":"k8s_ops","tags":["direct"],"zh":"重启一下 order-service 的 pod","en":"Restart the order-service pods."}
+{"id":"ops-29","sc":"ops","gold":"k8s_ops","tags":["paraphrase"],"zh":"晚高峰快到了，把推荐服务多开几个实例","en":"Evening peak is coming. Spin up a few more instances of the recommendation service."}
+{"id":"ops-30","sc":"ops","gold":"k8s_ops","tags":["colloquial"],"zh":"刚发的版本有问题，赶紧给我回滚","en":"The version we just shipped is broken, roll it back now."}
+{"id":"ops-31","sc":"ops","gold":"k8s_ops","tags":["implicit"],"zh":"user-center 有个副本一直起不来，状态是 CrashLoopBackOff","en":"One user-center replica won't start, it's stuck in CrashLoopBackOff."}
+{"id":"ops-32","sc":"ops","gold":"k8s_ops","tags":["negation","trap"],"zh":"别拉故障群，没那么严重，就是 search-api 有个 pod 卡住了，帮我删掉让它重建","en":"Don't open a war room, it's not that serious. One search-api pod is stuck. Delete it so it gets recreated."}
+{"id":"ops-33","sc":"ops","gold":"k8s_ops","tags":["multi"],"zh":"把 payment 服务从 3 个副本扩到 6 个，完了看下扩容后的 CPU 曲线","en":"Scale the payment service from 3 replicas to 6, then look at the CPU curve after scaling."}
+{"id":"ops-34","sc":"ops","gold":"k8s_ops","tags":["distractor"],"zh":"这周产品要上个新活动，预计流量是平时的三倍，运营那边已经在准备了，我得提前把 promo-service 的 HPA 最大副本数调到 20","en":"Product is launching a new campaign this week with about three times normal traffic, and the ops team is already preparing. I need to raise promo-service's HPA max replicas to 20 ahead of time."}
+{"id":"ops-35","sc":"ops","gold":"k8s_ops","tags":["mixed"],"zh":"帮我 kubectl get pods 看下 prod 这个 namespace 里哪些不是 Running","en":"Run kubectl get pods and show which ones in the prod namespace aren't Running."}
+{"id":"ops-36","sc":"ops","gold":"k8s_ops","tags":["trad"],"zh":"幫我把 gateway 回滾到上一個版本","en":"Roll the gateway back to the previous version."}
+{"id":"ops-37","sc":"ops","gold":"incident","tags":["direct"],"zh":"线上出故障了，帮我拉个应急群","en":"We have a production outage. Open a war room for me."}
+{"id":"ops-38","sc":"ops","gold":"incident","tags":["paraphrase"],"zh":"支付大面积失败，影响了全部用户，这个要按几级事故处理","en":"Payments are failing for all users. What severity level should this be?"}
+{"id":"ops-39","sc":"ops","gold":"incident","tags":["colloquial"],"zh":"今晚谁值班啊，出事了找不到人","en":"Who's on call tonight? Something broke and I can't find anyone."}
+{"id":"ops-40","sc":"ops","gold":"incident","tags":["implicit"],"zh":"上周那次数据库主从切换导致的停机，领导让我写个总结，说清楚原因和改进措施","en":"For last week's downtime caused by the database failover, my manager wants a write-up covering the cause and the improvements."}
+{"id":"ops-41","sc":"ops","gold":"incident","tags":["negation","trap"],"zh":"不用帮我查指标了，故障已经恢复，现在要写复盘报告","en":"No need to check metrics. The incident is resolved and now I need to write the postmortem."}
+{"id":"ops-42","sc":"ops","gold":"incident","tags":["multi"],"zh":"赶紧把故障升级到 P1 并通知相关负责人，另外帮我看看是哪个 pod 出的问题","en":"Escalate this incident to P1 and notify the owners right away. Also check which pod caused it."}
+{"id":"ops-43","sc":"ops","gold":"incident","tags":["distractor"],"zh":"今天本来在休假，刚落地就收到一堆电话，说首页打不开已经半小时了，我现在手边只有手机，需要马上让整个团队进入应急状态","en":"I was on vacation today and just landed to a pile of calls saying the homepage has been down for half an hour. I only have my phone and need to get the whole team into incident mode right now."}
+{"id":"ops-44","sc":"ops","gold":"incident","tags":["mixed"],"zh":"帮我开个 incident，severity 定 P2","en":"Open an incident with severity P2."}
+{"id":"ops-45","sc":"ops","gold":"incident","tags":["short"],"zh":"找值班","en":"Find on-call."}
+{"id":"ops-46","sc":"ops","gold":"knowledge_qa","tags":["direct","trap"],"zh":"新服务怎么接入监控平台？有文档吗","en":"How do I onboard a new service to the monitoring platform? Is there a doc?"}
+{"id":"ops-47","sc":"ops","gold":"knowledge_qa","tags":["paraphrase","trap"],"zh":"我们的日志采集 agent 要怎么配置才能把多行日志合并成一条","en":"How should our log collection agent be configured to merge multi-line logs into one entry?"}
+{"id":"ops-48","sc":"ops","gold":"knowledge_qa","tags":["colloquial","trap"],"zh":"告警规则命名有啥规范没","en":"Is there any naming convention for alert rules?"}
+{"id":"ops-49","sc":"ops","gold":"knowledge_qa","tags":["implicit","trap"],"zh":"新来的同学第一次值班，需要提前了解哪些东西","en":"A new teammate is doing their first on-call shift. What should they know beforehand?"}
+{"id":"ops-50","sc":"ops","gold":"knowledge_qa","tags":["negation","trap"],"zh":"不是让你帮我扩容，我是想了解 HPA 一般怎么配比较合理","en":"I'm not asking you to scale anything. I want to learn how HPA is usually configured sensibly."}
+{"id":"ops-51","sc":"ops","gold":"knowledge_qa","tags":["multi"],"zh":"Prometheus recording rule 的规范在哪看？顺便帮我查下当前 QPS","en":"Where can I find the standards for Prometheus recording rules? Also check the current QPS."}
+{"id":"ops-52","sc":"ops","gold":"knowledge_qa","tags":["distractor"],"zh":"我们团队刚从自建机房迁到云上，很多老的运维脚本都用不了了，大家都在摸索，我想知道公司内部有没有关于 K8s 资源 request 和 limit 怎么设置的规范文档","en":"Our team just migrated from our own data center to the cloud and a lot of old ops scripts no longer work. Everyone's figuring things out. Is there an internal standard doc on how to set Kubernetes resource requests and limits?"}
+{"id":"ops-53","sc":"ops","gold":"knowledge_qa","tags":["mixed"],"zh":"OpenTelemetry SDK 接入有 best practice 文档吗","en":"Is there a best-practice doc for integrating the OpenTelemetry SDK?"}
+{"id":"ops-54","sc":"ops","gold":"knowledge_qa","tags":["trad"],"zh":"監控平台的權限要怎麼申請？","en":"How do I apply for access to the monitoring platform?"}
+{"id":"ops-55","sc":"ops","gold":"other","tags":["direct"],"zh":"中午吃什么好","en":"What should I have for lunch?"}
+{"id":"ops-56","sc":"ops","gold":"other","tags":["direct"],"zh":"帮我写一封请假邮件","en":"Write me an email requesting time off."}
+{"id":"ops-57","sc":"ops","gold":"other","tags":["short"],"zh":"你好呀","en":"Hello there!"}
+{"id":"ops-58","sc":"ops","gold":"other","tags":["direct"],"zh":"推荐几本好看的科幻小说","en":"Recommend a few good sci-fi novels."}
+{"id":"ops-59","sc":"ops","gold":"other","tags":["negation"],"zh":"不是工作上的事，就是想问问周末去哪玩比较好","en":"It's not about work. Just wondering where's good to go this weekend."}
+{"id":"ops-60","sc":"ops","gold":"other","tags":["trap"],"zh":"我们运维组周五聚餐，大家想吃火锅，帮我推荐几家公司附近评价好的店","en":"Our ops team is having dinner on Friday and everyone wants hot pot. Recommend a few well-reviewed places near the office."}
+{"id":"ops-61","sc":"ops","gold":"other","tags":["colloquial"],"zh":"好累啊，今天加班到十点","en":"So tired, I worked overtime until ten today."}
+{"id":"ops-62","sc":"ops","gold":"other","tags":["direct"],"zh":"帮我把“会议改到明天了”翻译成日语","en":"Translate 'the meeting has moved to tomorrow' into Japanese."}
+{"id":"ops-63","sc":"ops","gold":"other","tags":["short"],"zh":"谢谢","en":"Thanks."}
+{"id":"gen-01","sc":"gen","gold":"weather","tags":["direct"],"zh":"明天上海天气怎么样","en":"What's the weather like in Shanghai tomorrow?"}
+{"id":"gen-02","sc":"gen","gold":"weather","tags":["paraphrase"],"zh":"周末去杭州爬山，会不会淋雨","en":"Going hiking in Hangzhou this weekend. Will I get rained on?"}
+{"id":"gen-03","sc":"gen","gold":"weather","tags":["colloquial"],"zh":"外面冷不冷啊，要不要穿秋裤","en":"Is it cold out there? Do I need long johns?"}
+{"id":"gen-04","sc":"gen","gold":"weather","tags":["implicit"],"zh":"今天适合晾被子吗","en":"Is today a good day to air out the quilt?"}
+{"id":"gen-05","sc":"gen","gold":"weather","tags":["negation","trap"],"zh":"不用帮我订票，我就想知道下周三成都下不下雨","en":"No need to book tickets, I just want to know if it'll rain in Chengdu next Wednesday."}
+{"id":"gen-06","sc":"gen","gold":"weather","tags":["multi"],"zh":"明天北京空气质量怎么样？顺便提醒我早上七点起床","en":"How's the air quality in Beijing tomorrow? Also remind me to get up at 7 am."}
+{"id":"gen-07","sc":"gen","gold":"weather","tags":["distractor"],"zh":"我女儿下周二学校组织去郊外春游，她特别期待，零食都准备好了，我想看看那天会不会降温，要不要给她多带件外套","en":"My daughter's school has a spring outing to the countryside next Tuesday. She's super excited and has her snacks packed already. I want to know if it'll get colder that day and whether she needs an extra jacket."}
+{"id":"gen-08","sc":"gen","gold":"weather","tags":["typo"],"zh":"今天有没有雾mai，出门要戴口罩吗","en":"is ther smog today, do i need a mask outside"}
+{"id":"gen-09","sc":"gen","gold":"weather","tags":["trad"],"zh":"明天台北會下雨嗎","en":"Will it rain in Taipei tomorrow?"}
+{"id":"gen-10","sc":"gen","gold":"travel","tags":["direct"],"zh":"帮我订一张明天北京到上海的高铁票","en":"Book me a high-speed train ticket from Beijing to Shanghai for tomorrow."}
+{"id":"gen-11","sc":"gen","gold":"travel","tags":["paraphrase"],"zh":"下个月去三亚，帮我找个离海边近的地方住","en":"I'm going to Sanya next month. Find me somewhere to stay near the beach."}
+{"id":"gen-12","sc":"gen","gold":"travel","tags":["colloquial"],"zh":"打个车去虹桥机场","en":"Get me a cab to Hongqiao Airport."}
+{"id":"gen-13","sc":"gen","gold":"travel","tags":["implicit"],"zh":"从公司到国贸怎么走最快","en":"What's the fastest way to get from the office to Guomao?"}
+{"id":"gen-14","sc":"gen","gold":"travel","tags":["negation","trap"],"zh":"不用看天气，直接帮我查周五去广州的机票","en":"Skip the weather, just look up flights to Guangzhou on Friday."}
+{"id":"gen-15","sc":"gen","gold":"travel","tags":["multi"],"zh":"订一间后天晚上的如家，另外那边会不会很热","en":"Book a Home Inn room for the night after tomorrow. Also, will it be hot there?"}
+{"id":"gen-16","sc":"gen","gold":"travel","tags":["distractor"],"zh":"春节想带爸妈出去玩一趟，他们年纪大了不想太折腾，也不喜欢坐飞机，我想先看看腊月二十八从武汉到昆明的卧铺还有没有票","en":"I want to take my parents on a trip over Spring Festival. They're older, don't want anything too tiring, and don't like flying. First I want to check whether there are still sleeper berths from Wuhan to Kunming on the 28th of the twelfth lunar month."}
+{"id":"gen-17","sc":"gen","gold":"travel","tags":["mixed"],"zh":"帮我 book 一个周六的 Airbnb","en":"Book me an Airbnb for Saturday."}
+{"id":"gen-18","sc":"gen","gold":"travel","tags":["typo"],"zh":"查下明天去西按的火车","en":"check trains to xian tomorow"}
+{"id":"gen-19","sc":"gen","gold":"translate","tags":["direct"],"zh":"把“谢谢你的帮助”翻译成英文","en":"Translate 'thank you for your help' into Chinese."}
+{"id":"gen-20","sc":"gen","gold":"translate","tags":["paraphrase"],"zh":"“早上好”用日语怎么说","en":"How do you say 'good morning' in Japanese?"}
+{"id":"gen-21","sc":"gen","gold":"translate","tags":["colloquial"],"zh":"这句韩语啥意思：감사합니다","en":"what's this korean say: 감사합니다"}
+{"id":"gen-22","sc":"gen","gold":"translate","tags":["implicit"],"zh":"要给外国客户回邮件，帮我把这段话弄成地道的英文：货物已发出，预计三天后到达","en":"I need to reply to a foreign client. Turn this into natural French: the goods have shipped and should arrive in three days."}
+{"id":"gen-23","sc":"gen","gold":"translate","tags":["negation","trap"],"zh":"不用算，我只是想知道“汇率”这个词英文怎么说","en":"No need to calculate anything, I just want to know how to say 'exchange rate' in Spanish."}
+{"id":"gen-24","sc":"gen","gold":"translate","tags":["multi"],"zh":"把这句翻成法语：明天见；再帮我设个明早八点的闹钟","en":"Translate this into French: see you tomorrow. And set an alarm for 8 am tomorrow."}
+{"id":"gen-25","sc":"gen","gold":"translate","tags":["distractor"],"zh":"我在读一本德文小说，是朋友从柏林寄给我的，很多地方看不懂，这句“Die Zeit heilt alle Wunden”是什么意思","en":"I'm reading a German novel a friend mailed me from Berlin and there's a lot I don't get. What does 'Die Zeit heilt alle Wunden' mean?"}
+{"id":"gen-26","sc":"gen","gold":"translate","tags":["mixed"],"zh":"help 我 translate 一下：请准时参加会议","en":"Translate into German: please attend the meeting on time."}
+{"id":"gen-27","sc":"gen","gold":"translate","tags":["short"],"zh":"翻译：苹果","en":"Translate: apple"}
+{"id":"gen-28","sc":"gen","gold":"calc","tags":["direct"],"zh":"356 乘以 24 等于多少","en":"What's 356 times 24?"}
+{"id":"gen-29","sc":"gen","gold":"calc","tags":["paraphrase"],"zh":"100 美元能换多少人民币","en":"How many yuan do 100 US dollars get you?"}
+{"id":"gen-30","sc":"gen","gold":"calc","tags":["colloquial"],"zh":"三斤半是多少克来着","en":"How many grams is three and a half jin again?"}
+{"id":"gen-31","sc":"gen","gold":"calc","tags":["implicit"],"zh":"一顿饭 486 块，我们 6 个人 AA，每人出多少","en":"Dinner came to 486 yuan and six of us are splitting it evenly. How much does each person pay?"}
+{"id":"gen-32","sc":"gen","gold":"calc","tags":["negation","trap"],"zh":"不是要翻译，我是问 1 英里等于多少公里","en":"I'm not asking for a translation. How many kilometers are in a mile?"}
+{"id":"gen-33","sc":"gen","gold":"calc","tags":["multi"],"zh":"帮我算下 230 美元的账单付 15% 小费是多少，然后提醒我明天还信用卡","en":"Work out a 15% tip on a $230 bill, then remind me to pay my credit card tomorrow."}
+{"id":"gen-34","sc":"gen","gold":"calc","tags":["distractor"],"zh":"在装修新房，客厅长 6.5 米宽 4.2 米，老婆想铺木地板，师傅说损耗要多算 5%，你帮我算算一共要买多少平方","en":"We're renovating our new place. The living room is 6.5 m by 4.2 m, my wife wants wood flooring, and the installer says to add 5% for waste. How many square meters do we need to buy in total?"}
+{"id":"gen-35","sc":"gen","gold":"calc","tags":["mixed"],"zh":"帮我算一下 sqrt(144) + 2^10","en":"compute sqrt(144) + 2^10"}
+{"id":"gen-36","sc":"gen","gold":"calc","tags":["trad"],"zh":"華氏 98.6 度是攝氏幾度","en":"What is 98.6 degrees Fahrenheit in Celsius?"}
+{"id":"gen-37","sc":"gen","gold":"media","tags":["direct"],"zh":"放一首周杰伦的《晴天》","en":"Play 'Sunny Day' by Jay Chou."}
+{"id":"gen-38","sc":"gen","gold":"media","tags":["paraphrase"],"zh":"来点适合睡前听的轻音乐","en":"Put on some soft music for bedtime."}
+{"id":"gen-39","sc":"gen","gold":"media","tags":["colloquial"],"zh":"整点摇滚听听","en":"Hit me with some rock."}
+{"id":"gen-40","sc":"gen","gold":"media","tags":["implicit"],"zh":"《三体》的有声书我上次听到第十二章了，接着往下放","en":"I got to chapter 12 of the 'Three-Body Problem' audiobook last time. Keep going from there."}
+{"id":"gen-41","sc":"gen","gold":"media","tags":["negation","trap"],"zh":"不用设闹钟，现在就给我放段白噪音助眠","en":"No need to set an alarm. Just play some white noise now to help me sleep."}
+{"id":"gen-42","sc":"gen","gold":"media","tags":["multi"],"zh":"播放最新一集《庆余年》，顺便告诉我明天会不会下雨","en":"Play the latest episode of 'Joy of Life', and also tell me if it'll rain tomorrow."}
+{"id":"gen-43","sc":"gen","gold":"media","tags":["distractor"],"zh":"今天开了一整天会，脑子嗡嗡的，回家路上又堵了一个小时，现在终于躺沙发上了，随便放部轻松点的喜剧电影吧","en":"Meetings all day, my head is buzzing, and I sat in traffic for an hour on the way home. Finally on the couch. Just put on some light comedy movie."}
+{"id":"gen-44","sc":"gen","gold":"media","tags":["mixed"],"zh":"shuffle 一下我的歌单","en":"Shuffle my playlist."}
+{"id":"gen-45","sc":"gen","gold":"media","tags":["typo"],"zh":"放一首林俊结的歌","en":"play a song by taylor swfit"}
+{"id":"gen-46","sc":"gen","gold":"schedule","tags":["direct"],"zh":"提醒我下午三点开会","en":"Remind me about the meeting at 3 pm."}
+{"id":"gen-47","sc":"gen","gold":"schedule","tags":["paraphrase"],"zh":"明早六点半叫我起床","en":"Wake me up at 6:30 tomorrow morning."}
+{"id":"gen-48","sc":"gen","gold":"schedule","tags":["colloquial"],"zh":"定个十分钟，泡面好了叫我","en":"Set ten minutes, give me a shout when the noodles are ready."}
+{"id":"gen-49","sc":"gen","gold":"schedule","tags":["implicit"],"zh":"下周五是我妈生日，别让我忘了","en":"Next Friday is my mom's birthday, don't let me forget."}
+{"id":"gen-50","sc":"gen","gold":"schedule","tags":["negation","trap"],"zh":"不用查天气，帮我记一下周日早上出门带伞","en":"No need to check the weather. Just remind me to take an umbrella when I head out Sunday morning."}
+{"id":"gen-51","sc":"gen","gold":"schedule","tags":["multi"],"zh":"每周一早上九点提醒我交周报，另外查下这周末北京天气","en":"Remind me every Monday at 9 am to submit my weekly report, and check this weekend's weather in Beijing."}
+{"id":"gen-52","sc":"gen","gold":"schedule","tags":["distractor"],"zh":"最近事情特别多，孩子要开家长会，老人要去医院复查，公司项目还要交付，我老忘事，帮我把周四下午两点陪老人去医院这件事记进日程","en":"Things have been crazy lately: the kid's parent-teacher meeting, my parents' hospital follow-up, and a project deadline at work. I keep forgetting stuff. Put 'take my parents to the hospital Thursday at 2 pm' on my calendar."}
+{"id":"gen-53","sc":"gen","gold":"schedule","tags":["mixed"],"zh":"帮我 set 一个明天 8 点的 alarm","en":"Set an alarm for 8 tomorrow."}
+{"id":"gen-54","sc":"gen","gold":"schedule","tags":["trad"],"zh":"提醒我晚上九點吃藥","en":"Remind me to take my medicine at 9 pm."}
+{"id":"gen-55","sc":"gen","gold":"chat","tags":["direct"],"zh":"我今天心情不太好","en":"I'm not in a great mood today."}
+{"id":"gen-56","sc":"gen","gold":"chat","tags":["direct"],"zh":"你觉得人为什么要读书","en":"Why do you think people should read?"}
+{"id":"gen-57","sc":"gen","gold":"chat","tags":["direct"],"zh":"讲个笑话听听","en":"Tell me a joke."}
+{"id":"gen-58","sc":"gen","gold":"chat","tags":["colloquial"],"zh":"哈哈哈你太逗了","en":"Hahaha you're hilarious."}
+{"id":"gen-59","sc":"gen","gold":"chat","tags":["negation","trap"],"zh":"不用放歌，陪我说说话就行","en":"No need to play music, just talk with me for a while."}
+{"id":"gen-60","sc":"gen","gold":"chat","tags":["trap"],"zh":"我明天要坐飞机去深圳面试，有点紧张，你能给我打打气吗","en":"I'm flying to Shenzhen tomorrow for a job interview and I'm a bit nervous. Can you cheer me on?"}
+{"id":"gen-61","sc":"gen","gold":"chat","tags":["direct"],"zh":"你最喜欢什么颜色","en":"What's your favorite color?"}
+{"id":"gen-62","sc":"gen","gold":"chat","tags":["short"],"zh":"在吗","en":"You there?"}
+{"id":"gen-63","sc":"gen","gold":"chat","tags":["mixed"],"zh":"今天 mood 有点 down","en":"Feeling kind of down today."}

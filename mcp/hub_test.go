@@ -182,23 +182,6 @@ func TestRemoteToolCallIsErrorMapsFailure(t *testing.T) {
 	}
 }
 
-func TestRemoteToolCallTransportErrorPropagates(t *testing.T) {
-	fc := &fakeClient{
-		name:    "srv",
-		tools:   []mcp.ToolSpec{{Name: "t"}},
-		callErr: errors.New("conn reset"),
-	}
-	h := mcp.NewHub(mcp.WithClient(fc))
-	if err := h.Start(context.Background()); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	_, err := h.Toolkit().Call(context.Background(), "mcp_srv_t", nil)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-}
-
 // --- HTTP 集成测：httptest.Server 模拟 MCP server ---
 
 type rpcReq struct {

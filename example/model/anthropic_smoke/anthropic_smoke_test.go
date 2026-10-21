@@ -12,8 +12,8 @@
 //
 //	go test -tags=integration ./example/model/anthropic_smoke -v
 //
-// 需要 ANTHROPIC_API_KEY（项目根 .env 或环境变量），没有时 Skip；ANTHROPIC_SMOKE_MODEL 可换模型
-// （默认 claude-opus-5-5）。全部用例 prefix_mismatch_behavior="error"、effort=low，合计十几次请求。
+// 需要 ANTHROPIC_API_KEY（项目根 .env 或环境变量），没有时 Skip。模型默认 claude-haiku-5-5（省钱：
+// 测试用 Haiku、最多 Sonnet），ANTHROPIC_SMOKE_MODEL 可换。全部用例 prefix_mismatch_behavior="error"、effort=low，合计十几次请求。
 package anthropic_smoke_test
 
 import (
@@ -91,11 +91,15 @@ func newClient(t *testing.T, opts ...anthropic.ClientOption) (*anthropic.Client,
 		anthropic.WithMaxTokens(8000),
 		// 全部用例在 error 档下跑：回放的历史有任何改动都直接 400，而不是被静默丢掉
 		anthropic.WithPrefixMismatch(anthropic.PrefixMismatchError),
-		// 冒烟验的是行为，网络抖动交给 SDK 重试（实测从国内连 api.anthropic.com 偶发连接被断开、
+		// 冒烟验的是行为，网络抖动交给 SDK 重试（实测本机带宽被别的设备占满时，连接偶发被断开、
 		// 报 EOF）。重试发的是同一个请求，不改变前缀。
 		anthropic.WithRequestOptions(option.WithMaxRetries(2)),
 	}
-	return anthropic.NewClient(key, os.Getenv("ANTHROPIC_SMOKE_MODEL"), append(base, opts...)...), rec
+	model := os.Getenv("ANTHROPIC_SMOKE_MODEL")
+	if model == "" {
+		model = "claude-haiku-5-5"
+	}
+	return anthropic.NewClient(key, model, append(base, opts...)...), rec
 }
 
 // replayedThinking 数请求里回放的 thinking / redacted_thinking 块。

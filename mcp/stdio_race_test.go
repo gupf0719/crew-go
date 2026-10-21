@@ -23,7 +23,7 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// runMockMCPServer 读 stdin JSON-RPC：响应 initialize；tools/call 按 mode 行为
+// runMockMCPServer 读 stdin JSON-RPC：响应 initialize 与 tools/list（一个工具 t）；tools/call 按 mode 行为
 // （hang=永久阻塞让 rpc 挂 / exit=子进程崩溃 / 其他=正常响应）。
 func runMockMCPServer(mode string) {
 	sc := bufio.NewScanner(os.Stdin)
@@ -43,6 +43,11 @@ func runMockMCPServer(mode string) {
 			w.Flush()
 		case "notifications/initialized":
 			// notify 无响应
+		case "tools/list":
+			b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": req["id"], "result": map[string]any{"tools": []any{map[string]any{"name": "t"}}}})
+			w.Write(b)
+			w.WriteByte('\n')
+			w.Flush()
 		case "tools/call":
 			switch mode {
 			case "hang":

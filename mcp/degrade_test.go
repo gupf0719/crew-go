@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"slices"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"crew-go/mcp"
 	"crew-go/tool"
@@ -1162,17 +1165,26 @@ func TestStreamableHTTP_ErrorResponsesClassified(t *testing.T) {
 		wantCode   string
 		wantMsg    string
 		wantOnline bool
+		notMsg     string // 说明里不该出现的断言
 	}{
 		{"非 2xx 里的 JSON-RPC 错误", 400, `{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params: q is required"}}`,
-			tool.ErrCodeInternal, "invalid params: q is required", true},
-		{"400 纯文本", 400, "bad request", tool.ErrCodeInternal, "拒绝了这次调用（HTTP 400），没有执行", true},
-		{"429", 429, "slow down", tool.ErrCodeInternal, "HTTP 429", true},
+			tool.ErrCodeInternal, "invalid params: q is required", true, ""},
+		{"400 纯文本", 400, "bad request", tool.ErrCodeInternal, "拒绝了这次调用（HTTP 400），没有执行", true, ""},
+		{"429", 429, "slow down", tool.ErrCodeInternal, "HTTP 429", true, ""},
+		{"408（代理空闲超时也回它，请求可能已转给 server）", 408, "timeout", tool.ErrCodeTimeout, "不确定是否已执行", true, "没有执行"},
+		{"409 不断言没执行", 409, "conflict", tool.ErrCodeInternal, "HTTP 409", true, "没有执行"},
+		{"401 带 JSON-RPC 错误体仍按状态码分档", 401, `{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"invalid credentials: Bearer s3cret-token"}}`,
+			mcp.ErrCodeServerUnavailable, "HTTP 401", false, "s3cret-token"},
+		{"非 2xx 的 JSON-RPC 错误交给模型前抹掉 token", 400, `{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad token Bearer s3cret-token"}}`,
+			tool.ErrCodeInternal, "bad token <redacted>", true, "s3cret-token"},
 		{"200 但 image 的 base64 坏了", 200, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"image","data":"!!!","mimeType":"image/png"}]}}`,
-			tool.ErrCodeInternal, "解析不了", true},
-		{"200 但不是 JSON", 200, "event: message\ndata: {}\n\n", tool.ErrCodeInternal, "解析不了", true},
-		{"401", 401, "unauthorized: Bearer s3cret-token", mcp.ErrCodeServerUnavailable, "拒绝了请求：HTTP 401），这次调用没有执行", false},
-		{"404", 404, "", mcp.ErrCodeServerUnavailable, "HTTP 404", false},
-		{"500", 500, "boom", mcp.ErrCodeServerUnavailable, "不确定是否已执行", false},
+			tool.ErrCodeInternal, "解析不了", true, ""},
+		{"200 但不是 JSON", 200, "event: message\ndata: {}\n\n", tool.ErrCodeInternal, "解析不了", true, ""},
+		{"200 的 JSON-RPC 错误交给模型前抹掉 token", 200, `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"denied for s3cret-token"}}`,
+			tool.ErrCodeInternal, "denied for <redacted>", true, "s3cret-token"},
+		{"401", 401, "unauthorized: Bearer s3cret-token", mcp.ErrCodeServerUnavailable, "拒绝了请求：HTTP 401），这次调用没有执行", false, ""},
+		{"404", 404, "", mcp.ErrCodeServerUnavailable, "HTTP 404", false, ""},
+		{"500", 500, "boom", mcp.ErrCodeServerUnavailable, "不确定是否已执行", false, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1198,7 +1210,11 @@ func TestStreamableHTTP_ErrorResponsesClassified(t *testing.T) {
 				t.Fatalf("Start: %v", err)
 			}
 			defer h.Close()
-			wantFailure(t, call(t, h, "mcp_x_t"), c.wantCode, c.wantMsg)
+			res := call(t, h, "mcp_x_t")
+			wantFailure(t, res, c.wantCode, c.wantMsg)
+			if c.notMsg != "" && strings.Contains(res.Error.Message, c.notMsg) {
+				t.Errorf("说明里不该有 %q：%s", c.notMsg, res.Error.Message)
+			}
 			st := statusOf(t, h, "x")
 			if got := st.State == mcp.ServerOnline; got != c.wantOnline {
 				t.Errorf("server 在线 = %v，要 %v（%+v）", got, c.wantOnline, st)
@@ -1446,4 +1462,131 @@ func (c *blockingInitClient) Initialize(ctx context.Context) error {
 	c.once.Do(func() { close(c.entered) })
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+// HTTP/2：请求体（这里 400KB 的参数）还在往外写时调用时限到了——h2 的 RoundTrip 在 ctx 结束时立刻返回、不等写请求的
+// goroutine，WroteRequest 可能在 Do 返回之后才到，而请求其实已经完整发出、server 执行了。这时绝不能告诉模型「没有发出」
+// （模型会再做一遍写操作）。用真的内核阻塞：TCP 中继在请求头写出之后停读 600ms，两端的 socket 缓冲都设成 4KB。
+func TestStreamableHTTP_H2_SlowBodyWrite_NeverClaimsNotSent(t *testing.T) {
+	var executed atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			return // 请求体没读全：没执行
+		}
+		switch req.Method {
+		case "initialize":
+			writeResult(w, req.ID, map[string]any{})
+		case "tools/list":
+			writeResult(w, req.ID, map[string]any{"tools": []map[string]any{{"name": "write"}}})
+		case "tools/call":
+			executed.Add(1)
+			writeResult(w, req.ID, map[string]any{"content": []any{}})
+		}
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+	var stall atomic.Bool
+	ln, err := (&net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+		var serr error
+		_ = c.Control(func(fd uintptr) { serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096) })
+		return serr
+	}}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	target := strings.TrimPrefix(srv.URL, "https://")
+	go func() { // 中继：收到 stall 信号就停读一会儿，让客户端的写在内核里堵住
+		for {
+			cc, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			sc, err := net.Dial("tcp", target)
+			if err != nil {
+				_ = cc.Close()
+				continue
+			}
+			go func() { _, _ = io.Copy(cc, sc); _ = cc.Close() }()
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					if stall.Swap(false) {
+						time.Sleep(600 * time.Millisecond)
+					}
+					n, err := cc.Read(buf)
+					if n > 0 {
+						_, _ = sc.Write(buf[:n])
+					}
+					if err != nil {
+						_ = sc.Close()
+						return
+					}
+				}
+			}()
+		}
+	}()
+	tr := srv.Client().Transport.(*http.Transport).Clone()
+	d := &net.Dialer{}
+	tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		c, err := d.DialContext(ctx, network, ln.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		_ = c.(*net.TCPConn).SetWriteBuffer(4096)
+		return c, nil
+	}
+	f := func(context.Context) (mcp.Client, error) {
+		return mcp.NewStreamableHTTPClient("srv", srv.URL, mcp.WithHTTPClient(&http.Client{Transport: tr}))
+	}
+	h := mcp.NewHub(mcp.WithReconnectBackoff(time.Hour, time.Hour), mcp.WithClientFactory("srv", f, mcp.WithCallTimeout(100*time.Millisecond)))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{WroteHeaders: func() { stall.Store(true) }})
+	res, err := h.Toolkit().Call(ctx, "mcp_srv_write", map[string]any{"content": strings.Repeat("v", 400<<10)})
+	if err != nil || res == nil || res.Error == nil {
+		t.Fatalf("该是失败结果（超时），实际 res=%+v err=%v", res, err)
+	}
+	time.Sleep(1500 * time.Millisecond) // 等中继放行、server 处理完
+	if strings.Contains(res.Error.Message, "没有发出") && executed.Load() > 0 {
+		t.Fatalf("告诉模型「%s」，server 实际执行了 %d 次", res.Error.Message, executed.Load())
+	}
+	t.Logf("模型看到：[%s] %s；server 执行 %d 次", res.Error.Code, res.Error.Message, executed.Load())
+}
+
+// redact 的边界：截短不切断多字节字符（Status.Err 是合法 UTF-8）；endpoint 路径里的长段（有的服务把 token 放进 URL）也抹掉。
+func TestStreamableHTTP_RedactEdges(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcReq
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "initialize":
+			writeResult(w, req.ID, map[string]any{})
+		case "tools/list":
+			writeResult(w, req.ID, map[string]any{"tools": []map[string]any{{"name": "t"}}})
+		default:
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(strings.Repeat("a", 511) + "中文错误 Cannot POST " + r.URL.Path))
+		}
+	}))
+	defer server.Close()
+	secretURL := server.URL + "/mcp/sk-PATH-SECRET-1234567"
+	f := func(context.Context) (mcp.Client, error) { return mcp.NewStreamableHTTPClient("x", secretURL) }
+	h := mcp.NewHub(mcp.WithReconnectBackoff(time.Hour, time.Hour), mcp.WithClientFactory("x", f))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	call(t, h, "mcp_x_t")
+	st := statusOf(t, h, "x")
+	if st.Err == nil || !utf8.ValidString(st.Err.Error()) {
+		t.Errorf("Status.Err 该是合法 UTF-8：%q", st.Err)
+	}
+	if strings.Contains(st.Err.Error(), "sk-PATH-SECRET-1234567") && strings.Contains(st.Err.Error(), "Cannot POST") {
+		t.Errorf("响应体里回显的 URL 路径秘密没抹：%v", st.Err)
+	}
 }

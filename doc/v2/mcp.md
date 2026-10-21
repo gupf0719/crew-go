@@ -81,8 +81,10 @@ agent := agent_v2.NewBasicAgent(agent_v2.WithToolkit(hub.Toolkit()), ...)
 | 超过 `WithCallTimeout`、请求已发出 | `timeout` | 工具调用超时（超过 d 未返回），已放弃等待；X 那边可能仍在执行 | 不变；`WithSerialCalls` 的掉线、断开重连，说明改为「已断开 X 重连（它那边的执行可能被打断）」 |
 | 请求没发出（`Client` 包上 `ErrNotSent`：连不上、没写出去、连接早已关闭、握手没过；含被时限打断的） | `server_unavailable` | 该能力暂时不可用（X 连不上），这次调用没有发出 | 掉线 |
 | server 答了 JSON-RPC 错误（`*RPCError`，在 2xx 或非 2xx 响应体里） | `internal_error` | `mcp rpc error <code>: <message>` | 不变 |
-| HTTP 400 / 408 / 409 / 413 / 422 / 429（不是 JSON-RPC 错误体） | `internal_error` | X 拒绝了这次调用（HTTP n），没有执行 | 不变 |
-| HTTP 401 / 403 / 404 | `server_unavailable` | 该能力暂时不可用（X 拒绝了请求：HTTP n），这次调用没有执行 | 掉线（重连会新建会话） |
+| HTTP 400 / 413 / 422 / 429（不是 JSON-RPC 错误体） | `internal_error` | X 拒绝了这次调用（HTTP n），没有执行 | 不变 |
+| HTTP 409 | `internal_error` | X 拒绝了这次调用（HTTP 409）（不断言没执行） | 不变 |
+| HTTP 408（代理的空闲超时也回它，请求可能已转给 server） | `timeout` | X 那边超时（HTTP 408），不确定是否已执行 | 不变 |
+| HTTP 401 / 403 / 404（哪怕响应体是 JSON-RPC 错误） | `server_unavailable` | 该能力暂时不可用（X 拒绝了请求：HTTP n），这次调用没有执行 | 掉线（重连会新建会话） |
 | server 答了但结果解析不了（不是 JSON、坏的 base64、超过 10MB） | `internal_error` | X 返回的结果解析不了（原因），这次调用可能已执行 | 不变 |
 | 其余连接错误（写出之后断开、HTTP 5xx、stdio 子进程中途退出……） | `server_unavailable` | 该能力暂时不可用（X 连接出错），这次调用没拿到结果，不确定是否已执行 | 掉线 |
 | server 返回 `isError` | `internal_error` | 第一个非空文本块（没有则 "mcp tool call failed"） | 不变 |
@@ -90,12 +92,14 @@ agent := agent_v2.NewBasicAgent(agent_v2.WithToolkit(hub.Toolkit()), ...)
 | 成功 | — | 有 `structuredContent` 时 `Output` 是解出来的值（BasicAgent 用 `%v` 交给模型，Go 的 map 打印格式——见 §9），否则文本块拼接；有非文本块时打包成 `{"text", "blocks"}` | — |
 
 「没有发出」只认 `ErrNotSent`，不从错误形状推断：推断错了，模型会把一个已执行的写操作当成没执行、再做一遍。
-`StreamableHTTPClient` 用 `httptrace` 记下请求有没有完整写出（请求 ctx 结束时 `net/http` 交出的是 ctx 的错，错误链上
-没有 dial 错误，按形状判会把「连不上」判成「超时、可能仍在执行」）；`StdioClient` 在写管道失败、连接已关、握手没过时包上它。
+`StreamableHTTPClient` 用 `httptrace` 判：trace 生效了（`GetConn` 到过）而请求头、请求体都没写出才算没发出（请求 ctx
+结束时 `net/http` 交出的是 ctx 的错，错误链上没有 dial 错误；HTTP/2 在 ctx 结束时 `Do` 立刻返回、`WroteRequest` 可能晚到，
+只看它会把一个已完整发出、已执行的请求说成没发出——`TestStreamableHTTP_H2_SlowBodyWrite_NeverClaimsNotSent`）；拿不准的
+一律按「不确定」。`StdioClient` 在写管道失败、连接已关、握手没过时包上它。
 
-原始错误（地址、端口）不进模型看到的文本；把 server 标掉线的那次记一条 warn 日志并写进 `ServerStatus.Err`（非串行的
-超时、`WithClient` 的连接错误不标掉线，也就不记）。HTTP 错误里带的响应体截到 512 字节，并抹掉自己发出的请求头的值（有的 server 在错误里回显
-`Authorization`）。
+交给模型的 JSON-RPC 错误信息与 HTTP 错误里带的响应体都会先抹掉自己发出的秘密（请求头的值、endpoint 里的 userinfo、
+query 值与长路径段），响应体再截到 512 字节（不切断多字节字符）。原始错误（地址、端口）不进模型看到的文本；把 server 标掉线的那次记一条 warn 日志并写进 `ServerStatus.Err`（非串行的
+超时、`WithClient` 的连接错误不标掉线，也就不记）。有的 server 在错误里回显 `Authorization`，有的服务把 token 放在 URL 里、404 时回显路径。
 
 自定义 `Client` 的契约（`Client.CallTool` godoc）：server 答的 JSON-RPC 错误交出 `*RPCError`，确定没发出时包上
 `ErrNotSent`，不要返回控制流信号（中断等）。`CallTool` panic 按 agent_v2 对工具 panic 的统一处理（整轮失败），Hub 不兜。

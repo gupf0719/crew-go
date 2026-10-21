@@ -275,7 +275,7 @@ func (s *server) admit(source string) (Client, uint64, *tool.Result) {
 // callFailed 把一次失败的 CallTool 分档（见 doc/v2/mcp.md §5）：
 //   - 调用方喊停 → error（链上带着调用方 ctx 的错）；
 //   - 自己的时限到了、请求已发出 → 超时失败（串行的 server 还要按连接不可信处理）；
-//   - server 答了 JSON-RPC 错误 / 答了但结果解析不了 / 拒绝了这一个请求（HTTP 400、408、409、413、422、429）→
+//   - server 答了 JSON-RPC 错误 / 答了但结果解析不了 / 拒绝了这一个请求（HTTP 400、409、413、422、429；408 按超时说）→
 //     普通失败，它活着、不标掉线；
 //   - 其余算连接出错（含没写出就失败、HTTP 401 / 403 / 404 / 5xx）→ 标掉线、后台重连，返回「该能力暂时不可用」。
 //
@@ -310,9 +310,15 @@ func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint6
 	var st *httpStatusError
 	if errors.As(err, &st) {
 		switch st.code {
-		case 400, 408, 409, 413, 422, 429: // 只是这一个请求被拒，server 活着
+		case 400, 413, 422, 429: // 执行之前就拒了这一个请求，server 活着
 			return tool.Failure(tool.ErrCodeInternal,
 				fmt.Sprintf("%s 拒绝了这次调用（HTTP %d），没有执行", s.name, st.code)), nil
+		case 409: // 冲突多在执行前判出，但不断言
+			return tool.Failure(tool.ErrCodeInternal,
+				fmt.Sprintf("%s 拒绝了这次调用（HTTP 409）", s.name)), nil
+		case 408: // 代理的空闲超时也回 408，而请求可能早已转给 server：按超时说，不断言没执行
+			return tool.Failure(tool.ErrCodeTimeout,
+				fmt.Sprintf("%s 那边超时（HTTP 408），不确定是否已执行", s.name)), nil
 		case 401, 403, 404: // 鉴权 / 地址 / 会话不对：每次都会这样，标掉线；重连会新建会话
 			s.markOffline(gen, err)
 			return tool.Failure(ErrCodeServerUnavailable,

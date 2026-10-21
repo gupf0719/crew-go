@@ -76,6 +76,7 @@ events, err = ag.Resume(ctx, sess.RunID,
 ### 3.3 语义与约束
 
 - **默认关 thinking**，`WithRunModelOptions` 按次开。理由：用户要的是按次开关而非默认开；关更快/省，且兼容框架强制 tool_choice 的路径（`LLMPlanner`——dashscope qwen3 thinking 与 forced tool_choice 互斥会 400）。
+- **思考模式下 `tool_choice: none` 不在禁列**：BasicAgent 的软降落轮保留工具、发 none（见 §5.4），开着 thinking 也会发。DeepSeek 与百炼 Qwen 的官方文档在思考模式下只禁 `required` 与指定函数（百炼的报错是 `The tool_choice parameter does not support being set to required or object in thinking mode`），none 两家都写明可用。**未用真 key 验证**（2026-10-22 只查了文档）。
 - **覆盖语义**：per-request 覆盖构造期默认，同 key per-request 赢、不同 key 保留（`model/openai` buildRequest 合并 `c.extraBody` ⊕ `o.ExtraBody`）。
 - **仅 BasicAgent 生效**：composite 编排（Sequential/Parallel/Loop/…）收到 per-call 覆盖 fail-fast 返 `agent_v2.ErrCompositeOverride`（含 model-options）——业务应在构造期设或在具体 BasicAgent 上用。
 - **不泄漏进嵌套子 agent**：`withRunOverrides` 总是 push（即使空），父 BasicAgent 的 per-Run 参数不会经 AgentAsTool 泄漏给子 BasicAgent（子只用自己的 Run/ResumeOption）。
@@ -135,7 +136,7 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 下列功能会改写更早的消息、`system` 或工具集，之后的 thinking 块对不上前缀。默认 `drop_block` 下请求照常，但 API 丢的是第一个对不上的块**以及它之后的每一个 thinking 块**（直到下一个 compaction 块），并且之后每次请求都再丢一遍——改动之后这场会话基本没有回放的推理可用，模型可能多想补回来；`PrefixMismatchError` 下之后每次请求都 400。同时 prompt cache 从改动处失效：
 
 - MicroCompact / AutoCompact / ReactiveCompact（改写或删掉旧消息）、`MaxHistoryPairs`（**默认 20，滚动截断**：跨 Run 的历史超过 40 条消息后，每次 Run 开始都从开头截掉超出部分，窗口随之前移；开了会话历史时工具往返也算条数）。
-- 工具集变化：`WithToolSearch` 揭示工具、`WithToolFilter`、`model.WithAllowedTools`、**软降落轮摘掉工具**（轮次预算最后一轮；Anthropic 的建议是保留工具、用 `tool_choice: none` 关掉）。
+- 工具集变化：`WithToolSearch` 揭示工具、`WithToolFilter`、`model.WithAllowedTools`、**配了 `WithOutputSchema` 时的软降落轮**（轮次预算最后一轮只留 `final_output`；保住前缀得用 tool_choice 指定只能调它，而 Opus 5.5 对指定工具返回 400）。没配结构化输出时软降落轮不改工具集：工具照旧，只发 `tool_choice: none`（Anthropic 建议的做法——tool_choice 不在前缀里，prompt cache 也只有 messages 段因它失效），那一轮模型硬调的工具不执行（记成失败的工具结果）。真 API 实测（2026-10-22，`claude-haiku-5-5`、effort high、`prefix_mismatch_behavior: "error"`）：同一段带 thinking 的历史，最后一轮工具照旧 + none 成功；摘掉工具、或只改一个工具的描述，都返回 400（`Invalid signature in thinking block … The tools list differs from the one this block was created with`）。BasicAgent 端到端（`WithMaxRounds(2)`）三次请求的 tools 逐字节相同，第三次发 none 并回放了 thinking，没有 400，也没有 input_transformations。
 - 每次 Run 变化的开头 system 消息：`WithStoreMemory` 每次 Run 检索一次，结果作为开头的 system 消息进顶层 `system`。
 - Handoff 的 Raw 历史（`HistoryForRaw`）把别的 agent 的 assistant 消息连同回放快照原样交给接手的 agent：那些 thinking 是在另一套 `system` / tools 下产生的，必然对不上。
 

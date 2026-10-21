@@ -51,6 +51,12 @@ func WithCallTimeout(d time.Duration) ServerOption {
 // WithSerialCalls 让这个 server 的工具调用串行：同一时刻至多一个在执行，其余排队（排队受调用方 ctx 与
 // WithCallTimeout 约束）。给操纵硬件的 server 用（摄像头、舵机……）——BasicAgent 一轮里的多个工具调用
 // 是并发执行的，没有按工具串行的声明。
+//
+// 超时的那个调用 server 那边可能还在执行：WithClientFactory 注册的 server 这时按连接不可信处理——标成掉线、
+// 关掉旧连接（stdio 的旧子进程随之退出）再重连，排队的调用不会发给还在执行的那个连接。HTTP server 端还在
+// 执行的调用管不到，要它自己串行；WithClient 的固定实例不重连，超时后排队的调用照常发出。
+//
+// （见 doc/v2/mcp.md §5）
 func WithSerialCalls() ServerOption {
 	return func(c *serverConfig) { c.serial = true }
 }
@@ -117,7 +123,6 @@ type server struct {
 	registered     []string
 	registeredDefs map[string]ToolSpec
 	fromSnapshot   bool
-	reconnecting   bool
 }
 
 func newServer(h *Hub, name string, fixed Client, factory func(context.Context) (Client, error), opts []ServerOption) *server {
@@ -188,25 +193,10 @@ func (s *server) discard(c Client) {
 // 原样往上交；其余失败（离线、超时、server 报错、连接出错）一律是 tool.Failure，交给模型看。
 // BasicAgent 把工具返回的 error 当成整轮失败，一个 server 掉线不该拖垮整个 Run。
 func (s *server) call(ctx context.Context, name, source string, args map[string]any) (*tool.Result, error) {
-	s.mu.Lock()
-	switch {
-	case s.closed:
-		s.mu.Unlock()
-		return tool.Failure(ErrCodeServerUnavailable,
-			fmt.Sprintf("该能力暂时不可用（%s 已关闭），这次调用没有发出", s.name)), nil
-	case !s.online:
-		s.mu.Unlock()
-		return tool.Failure(ErrCodeServerUnavailable,
-			fmt.Sprintf("该能力暂时不可用（%s offline），这次调用没有发出", s.name)), nil
-	case s.listedNames != nil:
-		if _, ok := s.listedNames[source]; !ok {
-			s.mu.Unlock()
-			return tool.Failure(tool.ErrCodeNotFound,
-				fmt.Sprintf("%s 上已经没有工具 %q（本会话的工具清单在启动时定下，server 之后去掉了它），这次调用没有发出", s.name, source)), nil
-		}
+	c, gen, refused := s.admit(source)
+	if refused != nil {
+		return refused, nil
 	}
-	c, gen := s.client, s.gen
-	s.mu.Unlock()
 
 	callCtx, cancel := ctx, context.CancelFunc(func() {})
 	if s.cfg.callTimeout > 0 {
@@ -224,6 +214,10 @@ func (s *server) call(ctx context.Context, name, source string, args map[string]
 			}
 			return tool.Failure(tool.ErrCodeTimeout,
 				fmt.Sprintf("等 %s 上一个调用结束超时（%s 内没排上），这次调用没有发出", s.name, s.cfg.callTimeout)), nil
+		}
+		// 排队期间可能掉线、重连过：按现在的状态再准入一次，别把调用发给已经判掉线（可能还在执行上一个调用）的旧连接。
+		if c, gen, refused = s.admit(source); refused != nil {
+			return refused, nil
 		}
 	}
 
@@ -247,6 +241,27 @@ func (s *server) call(ctx context.Context, name, source string, args map[string]
 	return tool.Success(flattenContent(res.Content)), nil
 }
 
+// admit 按当前状态决定这次调用能不能发出：能发时交出当前连接与它的代数，不能时交出给模型的失败结果。
+func (s *server) admit(source string) (Client, uint64, *tool.Result) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case s.closed:
+		return nil, 0, tool.Failure(ErrCodeServerUnavailable,
+			fmt.Sprintf("该能力暂时不可用（%s 已关闭），这次调用没有发出", s.name))
+	case !s.online:
+		return nil, 0, tool.Failure(ErrCodeServerUnavailable,
+			fmt.Sprintf("该能力暂时不可用（%s offline），这次调用没有发出", s.name))
+	}
+	if s.listedNames != nil {
+		if _, ok := s.listedNames[source]; !ok {
+			return nil, 0, tool.Failure(tool.ErrCodeNotFound,
+				fmt.Sprintf("%s 上已经没有工具 %q（本会话的工具清单在启动时定下，server 之后去掉了它），这次调用没有发出", s.name, source))
+		}
+	}
+	return s.client, s.gen, nil
+}
+
 // callFailed 把一次失败的 CallTool 分档：调用方喊停 → error；自己的时限到了 → 超时失败；server 答了
 // JSON-RPC 错误 → 普通失败（它活着）；其余算连接出错 → 标掉线、后台重连，返回「该能力暂时不可用」。
 func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint64, err error) (*tool.Result, error) {
@@ -258,6 +273,12 @@ func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint6
 	var opErr *net.OpError
 	dialFailed := errors.As(err, &opErr) && opErr.Op == "dial"
 	if callCtx.Err() != nil && !dialFailed {
+		if s.sem != nil && s.factory != nil {
+			// 串行的 server：超时的调用那边可能还在执行，连接不可信——标掉线、关旧连接再重连（见 WithSerialCalls）。
+			s.markOffline(gen, err)
+			return tool.Failure(tool.ErrCodeTimeout,
+				fmt.Sprintf("工具调用超时（超过 %s 未返回），已放弃等待；为保证同一时刻只有一个调用在执行，已断开 %s 重连（它那边的执行可能被打断）", s.cfg.callTimeout, s.name)), nil
+		}
 		return tool.Failure(tool.ErrCodeTimeout,
 			fmt.Sprintf("工具调用超时（超过 %s 未返回），已放弃等待；%s 那边可能仍在执行", s.cfg.callTimeout, s.name)), nil
 	}
@@ -296,20 +317,13 @@ func (s *server) markOffline(gen uint64, cause error) {
 	s.since = time.Now()
 	s.lastErr = cause
 	s.hub.events.push(s.statusLocked())
-	start := !s.reconnecting
-	if start {
-		s.reconnecting = true
-		// 在 s.mu 里 Add：Close 先在 s.mu 里置 closed 再 Wait，这里要么看到 closed 不起，要么 Add 先于 Wait。
-		s.hub.bg.Add(1)
-	}
+	// 在 s.mu 里 Add：Close 先在 s.mu 里置 closed 再 Wait，这里要么看到 closed 不起，要么 Add 先于 Wait。
+	// 在线时不会有重连循环在跑（循环只在离线时存在、上线即退出），所以每次掉线起一个。
+	s.hub.bg.Add(1)
 	s.mu.Unlock()
 	slog.Warn("mcp: server 掉线，后台重连；期间它的工具返回「该能力暂时不可用」",
 		logKeyServer, s.name, logKeyErr, cause.Error())
-	if start {
-		go s.reconnectLoop(stale)
-		return
-	}
-	closeQuietly(stale)
+	go s.reconnectLoop(stale)
 }
 
 // reconnectLoop 按退避反复连，连上或 Hub 关闭为止。stale 是掉线的那个连接（factory 型），在这里关：
@@ -329,15 +343,11 @@ func (s *server) reconnectLoop(stale Client) {
 			return
 		case <-timer.C:
 		}
-		ctx, cancel := h.attemptCtx(context.Background())
-		// Close 时打断正在进行的这次尝试（ctx 不存进 Hub，用 done 通道转一下）。
-		go func() {
-			select {
-			case <-h.done:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
+		// 计时器与 done 同时就绪时 select 随机选：再查一次，Close 已开始就不再发起新的尝试。
+		if h.isClosed() {
+			return
+		}
+		ctx, cancel := h.attemptCtx(context.Background()) // Close 时被取消
 		c, specs, err := s.connect(ctx)
 		cancel()
 		if err == nil {
@@ -364,7 +374,6 @@ func (s *server) goOnline(c Client, specs []ToolSpec) {
 	s.online = true
 	s.since = time.Now()
 	s.lastErr = nil
-	s.reconnecting = false
 	s.setListedLocked(specs)
 	missing, added, changed := s.driftLocked()
 	s.hub.events.push(s.statusLocked())

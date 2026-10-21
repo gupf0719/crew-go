@@ -465,6 +465,11 @@ var (
 	basicToolsUsedCh = compose_v2.OnceFlag("__basic_agent_tools_used__")
 	// basicSearchGraceCh：这个任务里已经豁免过一批检索（tools 节点写，随存档走）。之后任何一批都算「调过工具」。
 	basicSearchGraceCh = compose_v2.OnceFlag("__basic_agent_search_grace__")
+	// basicFinalRoundCh：最近一次模型调用是不是软降落轮（轮次预算的最后一轮，见 [withFinalRound]）。model 节点每轮写
+	// （真假都写），tools 节点读出来交给工具函数：那一轮模型硬调的工具不执行。「是不是最后一轮」只在 model 节点判一次——
+	// tools 节点按 round 自己再算一遍的话同一个判断就有两份，而且两边读到的 round 差一（model 节点写完才 +1）。随存档走：
+	// 中断续跑直接进 tools 节点时，读到的仍是产出这批调用的那一轮的值。
+	basicFinalRoundCh = compose_v2.LastValue[bool]("__basic_agent_final_round__")
 	// basicRepeatChainCh：工具重复调用检测的计数链（见 repeatToolState），tools 节点成功后写。单写入者（只有 tools 节点写）。
 	basicRepeatChainCh = compose_v2.LastValue[*repeatToolState]("__basic_agent_repeat_chain__")
 
@@ -634,6 +639,23 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	modelNode := func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 		msgs, _ := compose_v2.Get(chs, basicMessagesCh)
 		round, _ := compose_v2.Get(chs, basicRoundCh)
+		// **每个任务至多一个软降落轮**（同一个预算下；续跑时调大了预算，新预算的最后一轮另算）：上一次模型调用就是
+		// 软降落轮（basicFinalRoundCh），而 round 已越过预算 ⟹ 软降落轮用过了，不再调模型、直接报轮次耗尽。只有续跑
+		// （含自动续上的存档）走得到这里：顶层 Run 上访问计数跟 round 同步，引擎的 maxVisit 先拦下；续跑时引擎的访问
+		// 计数从 0 数，round 却随存档接着数。不挡的话，不认 tool_choice=none 的 provider 在软降落轮之后每一轮都硬调工具、
+		// 被执行闸拦下（见 makeToolsFn）、又回到这里，直到本次续跑的访问上限用完：白调 maxRounds+1 次、没有收尾答复
+		// （审计实测）。
+		//
+		// 只看「round 越过预算」不够：续跑时把预算调得比已用的轮数还小（WithResumeMaxRounds），round 是直接跳过预算的，
+		// 软降落一次都还没给过——这时这一次就是软降落轮，照常调模型（审计实测：只看 round 的话一次都不调就报错）。
+		//
+		// 存档照常留下，跟引擎的 maxVisit 同款：调大这个 agent 的预算再续跑还能接着跑（顶层用 WithResumeMaxRounds；编排
+		// 里的成员续跑不收按次覆盖，要用更大的 WithMaxRounds 重建成员）。放在 OnModelStart 之前：这一轮不调模型，模型
+		// 钩子也不触发。
+		if lastFinal, _ := compose_v2.Get(chs, basicFinalRoundCh); maxRounds > 0 && round > maxRounds && lastFinal {
+			return nil, fmt.Errorf("basic agent %q: 轮次预算 %d 轮已用完、软降落轮也已用过，不再调用模型（要接着跑，调大这个 agent 的轮次预算再续跑）: %w",
+				name, maxRounds, &compose_v2.MaxIterationsError{Iterations: round})
+		}
 		// 工具渐进披露的已解锁集：channel 是权威副本（随 cp 走），经 ctx 递给 modelFn
 		// ——它的签名是 (ctx, msgs)、拿不到 channel，见 withRevealedFromChannel。
 		// 没有也推（nil）：盖掉从调用方继承来的那份——父 agent 模型回调里调起的子 agent 不该拿到父的揭示集。
@@ -681,14 +703,17 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 它会一路走到 provider 的消息转换里——实测真 openai client 在那里 panic。
 		modelIn.Preamble = dropNilMessages(modelIn.Preamble)
 
-		// **软降落**：这是轮次预算的最后一轮 ⟹ 标记 ctx，让 modelFn 摘掉工具。
+		// **软降落**：这是轮次预算的最后一轮 ⟹ 标记 ctx，让 modelFn 关掉这一轮的工具调用（见 [withFinalRound]）；
+		// 同一个值写进 basicFinalRoundCh，tools 节点据它不执行这一轮模型硬调的工具。
 		//
-		// round 从 0 开始数（Sum channel），maxVisit = maxRounds+1，所以模型节点最多被访问
-		// maxRounds+1 次、round 取值 0..maxRounds。`round >= maxRounds` 即最后那一次。
+		// round 从 0 开始数（Sum channel），每完成一次模型调用 +1；maxVisit = maxRounds+1，所以一个任务里调模型时
+		// round 取值 0..maxRounds（顶层 Run 由引擎的 maxVisit 保证，续跑由节点开头那道闸保证）。
+		// `round >= maxRounds` 即最后那一次。
 		// 那一格本来就是为「无 tool 的 final 调用」预留的，只是原先靠模型自己选择不调工具。
 		//
 		// 这两个标记每轮都推（为假也推）：这一轮的模型回调里调起的子 agent 要拿到假，不是父的真。
-		callCtx = withFinalRound(callCtx, maxRounds > 0 && round >= maxRounds)
+		finalRound := maxRounds > 0 && round >= maxRounds
+		callCtx = withFinalRound(callCtx, finalRound)
 		// 这个任务里模型「调过工具」没有（见 basicToolsUsedCh；随存档走，中断续跑重跑这一轮时读到
 		// 的还是同一个值）。
 		toolsUsedSoFar, _ := compose_v2.Get(chs, basicToolsUsedCh)
@@ -772,6 +797,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		writes := []compose_v2.ChannelWrite{
 			compose_v2.Write(basicMessagesCh, []*schema.Message{out}),
 			compose_v2.Write(basicRoundCh, 1), // 累加 round
+			compose_v2.Write(basicFinalRoundCh, finalRound),
 		}
 
 		// **本轮产出交给 basicFinalCh**，而不是让下游事后回消息列表里倒扫找——那个列表
@@ -804,6 +830,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 续跑，那件工具的函数体一次都不再执行，final 却看着一切正常。
 		revealed, _ := compose_v2.Get(chs, basicRevealedCh)
 		ctx = withRevealedFromChannel(ctx, revealed) // 没有也推，理由同 model 节点
+		// 产出这批调用的那次模型调用是不是软降落轮（见 basicFinalRoundCh）：是的话工具函数不执行这一批（框架那件
+		// final_output 除外，见 makeToolsFn）。为假也推，理由同 model 节点——父 agent 软降落轮的模型回调里调起的子 agent，
+		// 自己的工具要照常执行。
+		finalRound, _ := compose_v2.Get(chs, basicFinalRoundCh)
+		ctx = withFinalRound(ctx, finalRound)
 		// 这一批里检索解锁的名字记在这次执行上（工具体拿不到 channel 写入口），节点成功后写进 basicRevealedCh；
 		// 节点失败或中断时随这次执行一起丢掉，续跑重跑这一批时检索重新记（tool_search 不进工具账）。每次执行一份新的，
 		// 也盖掉从调用方继承来的那份——父 agent 工具里调起的子 agent 不该记进父的这一批。
@@ -1191,6 +1222,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	bld = compose_v2.WithChannel(bld, basicReturnDirectCh)
 	bld = compose_v2.WithChannel(bld, basicToolsUsedCh)
 	bld = compose_v2.WithChannel(bld, basicSearchGraceCh)
+	bld = compose_v2.WithChannel(bld, basicFinalRoundCh)
 	bld = compose_v2.WithChannel(bld, basicRepeatChainCh)
 	bld = compose_v2.WithChannel(bld, basicFinalCh)
 

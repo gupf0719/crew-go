@@ -198,7 +198,8 @@ func WithRunModel(m model.ChatModel) RunOption {
 // 一轮。「调过工具」按模型发起过调用算、不看结果（失败、被拒的也算）；只有第一批全是框架的 tool_search、且解锁出新
 // 工具的不算：它只是把别的工具解锁出来，开了渐进披露时第一轮往往只能调它，强制要留给解锁出来的那件。只豁免这一批：
 // 检索什么都没解锁的、之后再检索的照算——不然检索不到、或工具库比轮次预算大时，模型一路检索烧到最后一轮。
-// 这一轮没有工具可绑时（软降落轮、白名单滤光）也摘掉它。
+// 这一轮没有工具可绑时（白名单滤光、本来就没配）也摘掉它。轮次预算的最后一轮（软降落）不管传了什么都换成 none，
+// 那一轮没绑上工具时同样摘掉；配了结构化输出时不换（那一轮只绑着 final_output）。
 func WithRunModelOptions(opts ...model.Option) RunOption {
 	return func(c *runConfig) {
 		c.modelOpts = opts
@@ -222,11 +223,11 @@ func WithRunSystemPrompt(s string) RunOption {
 // 编译期注入 graph 的 WithMaxVisit（maxVisit 不进 graph ID hash，故 per-call 改它
 // 不触发 Resume 的 GraphID 冲突）。语义：仅本次 Run 生效、不自动跨 Resume。
 //
-// **每段 Run/Resume 各自约束**（audit Finding 2）：框架 visit 计数每次 compose_v2.Run
-// 从 0 重置（不从 cp.NodeVisits 续），且 Resume 默认回退构造期 maxRounds——故 per-call
-// maxRounds 约束的是"本段未中断的连续轮数"。要让 cap 跨 HITL 续上，Run 传
-// WithRunMaxRounds(n) 的同时 Resume 也传 WithResumeMaxRounds(n)（对齐 eino resume 重传
-// WithRuntimeMaxSteps）。需要全局硬上限则在构造期 WithMaxRounds 设兜底值。
+// **预算按整个任务累计**：模型调用的轮数随存档跨 Run / Resume 接着数，轮数到达预算的那一次就是软降落轮，
+// 软降落轮之后不再调模型（见 BasicAgent 的软降落）。框架 visit 计数每次 compose_v2.Run 从 0 重置（不从
+// cp.NodeVisits 续），只是每段的兜底上限。Resume 默认回退构造期 maxRounds——Run 传了 WithRunMaxRounds(n)
+// 的，Resume 也传 WithResumeMaxRounds(n)（对齐 eino resume 重传 WithRuntimeMaxSteps），否则续跑按构造期
+// 的预算算。需要全局硬上限则在构造期 WithMaxRounds 设兜底值。
 func WithRunMaxRounds(n int) RunOption {
 	return func(c *runConfig) {
 		if n > 0 {
@@ -477,9 +478,9 @@ func WithResumeModel(m model.ChatModel) ResumeOption {
 
 // WithResumeMaxRounds 仅对本次 Resume 覆盖构造期的 maxRounds。n<=0 忽略。
 //
-// 配合 WithRunMaxRounds 让 cap 跨 HITL 续上（audit Finding 2）：业务 Run 传
-// WithRunMaxRounds(n)、Resume 也传 WithResumeMaxRounds(n) 即可在中断恢复后续用同一
-// 上限（框架 visit 计数每次 compose_v2.Run 从 0 重置，故每段 Run/Resume 各自约束 n 轮）。
+// 配合 WithRunMaxRounds 让 cap 跨 HITL 续上：业务 Run 传 WithRunMaxRounds(n)、Resume 也传
+// WithResumeMaxRounds(n)，中断恢复后按同一个预算算。预算按整个任务累计（见 WithRunMaxRounds）：n 比已经
+// 用掉的轮数还小时，续跑的第一次模型调用就是软降落轮；调大则接着跑到新预算的最后一轮。
 func WithResumeMaxRounds(n int) ResumeOption {
 	return func(c *resumeConfig) {
 		if n > 0 {

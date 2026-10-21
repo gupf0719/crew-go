@@ -60,6 +60,33 @@ func TestToolChoice_DroppedWhenNoTools(t *testing.T) {
 	}
 }
 
+// TestToolChoice_NoneSentWithTools：none 跟 required 走同一条规则——请求里有工具时原样发 "none"，没有工具时不发。
+// BasicAgent 的软降落轮靠它：工具照旧绑着，只用 none 关掉工具调用。
+func TestToolChoice_NoneSentWithTools(t *testing.T) {
+	var got []any
+	srv := toolChoiceServer(t, &got)
+	defer srv.Close()
+	ctx := context.Background()
+	in := []*schema.Message{schema.UserMessage("hi")}
+	none := model.WithToolChoice(schema.ToolChoiceNone)
+
+	c := openai.NewClient("k", "m", openai.WithBaseURL(srv.URL))
+	if _, err := c.Generate(ctx, in, none); err != nil {
+		t.Fatalf("没绑工具: %v", err)
+	}
+	bound, err := c.WithTools([]*schema.ToolInfo{{Name: "alpha", Desc: "a", Params: map[string]any{"type": "object"}}})
+	if err != nil {
+		t.Fatalf("WithTools: %v", err)
+	}
+	if _, err := bound.Generate(ctx, in, none); err != nil {
+		t.Fatalf("有工具: %v", err)
+	}
+
+	if len(got) != 2 || got[0] != nil || got[1] != "none" {
+		t.Fatalf("没有工具时不该发 tool_choice、有工具时照发 none，实际 %v", got)
+	}
+}
+
 // TestToolChoice_ExtraBodyToolsDecide：「有没有工具」看合并 ExtraBody 之后的请求体——ExtraBody 带了非空 tools
 // （provider 内置工具常走这条）时照发 tool_choice；ExtraBody 用空 tools 把绑定的工具清掉时不发。曾经只看绑定的
 // 工具，前一种静默丢了业务强制的 tool_choice。

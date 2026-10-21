@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -486,9 +487,75 @@ func TestHub_DialFailureWithinTimeout_MarksOffline(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer h.Close()
-	wantFailure(t, call(t, h, "mcp_srv_t"), mcp.ErrCodeServerUnavailable, "连接出错")
+	// 连接都没建起来 ⟹ 请求肯定没发出，文案要说清楚（不然模型会把没执行的写操作当成「可能已执行」）。
+	wantFailure(t, call(t, h, "mcp_srv_t"), mcp.ErrCodeServerUnavailable, "该能力暂时不可用（srv 连不上），这次调用没有发出")
 	if st := statusOf(t, h, "srv"); st.State != mcp.ServerOffline {
 		t.Errorf("dial 失败该标掉线，实际 %+v", st)
+	}
+}
+
+// 迟到的旧连接错误不能把新连接标掉：调用 A 卡在旧连接上，期间旧连接坏了（调用 B 撞上、标掉线）、重连上了新连接；
+// 之后 A 才带着连接错误返回——这时 server 必须仍在线（掉线判定只认当前这一代连接）。
+func TestHub_LateErrorFromOldConnection_DoesNotKnockNewOne(t *testing.T) {
+	releaseA := make(chan struct{})
+	enteredA := make(chan struct{})
+	old := &memClient{name: "s", tools: specs("slow", "fast"), onCall: func(_ context.Context, name string, _ map[string]any) (*mcp.CallResult, error) {
+		if name == "slow" {
+			close(enteredA)
+			<-releaseA
+		}
+		return nil, errDown // 旧连接上的调用最终都是连接错误
+	}}
+	fresh := &memClient{name: "s", tools: specs("slow", "fast")}
+	f := &seqFactory{build: func(n int) (mcp.Client, error) {
+		if n == 1 {
+			return old, nil
+		}
+		return fresh, nil
+	}}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("s", f.New))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	doneA := make(chan *tool.Result, 1)
+	go func() { doneA <- call(t, h, "mcp_s_slow") }()
+	<-enteredA
+	wantFailure(t, call(t, h, "mcp_s_fast"), mcp.ErrCodeServerUnavailable, "连接出错")
+	waitFor(t, "重连上新连接", func() bool { return statusOf(t, h, "s").State == mcp.ServerOnline })
+	close(releaseA)
+	wantFailure(t, <-doneA, mcp.ErrCodeServerUnavailable, "连接出错")
+	if st := statusOf(t, h, "s"); st.State != mcp.ServerOnline {
+		t.Fatalf("旧连接迟到的错误把新连接标掉了：%+v", st)
+	}
+	if res := call(t, h, "mcp_s_fast"); !res.Success {
+		t.Errorf("新连接该照常可用：%+v", res)
+	}
+}
+
+// stdio 子进程退了（崩溃）：调用返回「该能力暂时不可用」，后台新起一个子进程重连上，调用恢复。
+// （Client 关了不能再用、stdio 的子进程只能重起——这就是 WithClientFactory 存在的理由。）
+func TestHub_StdioFactory_RespawnsAfterChildExit(t *testing.T) {
+	var spawned atomic.Int32
+	f := func(context.Context) (mcp.Client, error) {
+		mode := "ok"
+		if spawned.Add(1) == 1 {
+			mode = "exit" // 第一个子进程收到 tools/call 就退出
+		}
+		return mcp.NewStdioClient("mock", os.Args[0], nil, mcp.WithStdioEnv("MCP_MOCK_MODE="+mode))
+	}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("mock", f))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	wantFailure(t, call(t, h, "mcp_mock_t"), mcp.ErrCodeServerUnavailable, "连接出错")
+	waitFor(t, "新起的子进程连上", func() bool { return statusOf(t, h, "mock").State == mcp.ServerOnline })
+	if res := call(t, h, "mcp_mock_t"); !res.Success {
+		t.Fatalf("重起子进程后该恢复：%+v", res)
+	}
+	if got := spawned.Load(); got != 2 {
+		t.Errorf("该起过 2 个子进程，实际 %d", got)
 	}
 }
 

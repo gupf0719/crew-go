@@ -266,7 +266,12 @@ func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint6
 		return tool.Failure(tool.ErrCodeInternal, rpcErr.Error()), nil
 	}
 	s.markOffline(gen, err)
-	// 原始错误（地址、端口）只进日志与 Status，不进模型看到的文本。
+	// 原始错误（地址、端口）只进日志与 Status，不进模型看到的文本。连接都没建起来时请求肯定没发出——
+	// 说清楚，模型才不会把一个没执行的写操作当成「可能已执行」。
+	if dialFailed {
+		return tool.Failure(ErrCodeServerUnavailable,
+			fmt.Sprintf("该能力暂时不可用（%s 连不上），这次调用没有发出", s.name)), nil
+	}
 	return tool.Failure(ErrCodeServerUnavailable,
 		fmt.Sprintf("该能力暂时不可用（%s 连接出错），这次调用没拿到结果，不确定是否已执行", s.name)), nil
 }

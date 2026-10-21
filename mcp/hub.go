@@ -64,6 +64,7 @@ type Hub struct {
 	partial        bool
 	namer          func(server, tool string) string
 	connectTimeout time.Duration
+	timeoutSet     bool // 调用方显式给了 WithConnectTimeout
 	backoffInitial time.Duration
 	backoffMax     time.Duration
 	statusHook     func(ServerStatus)
@@ -118,16 +119,18 @@ func WithClientFactory(name string, newClient func(ctx context.Context) (Client,
 	}
 }
 
-// WithPartialStart 开启按 server 降级：Start 不因个别 server 连不上而失败（见 Hub godoc）。调用方 ctx 取消或到期
-// 仍让 Start 失败（视为放弃启动）；单个 server 最多等多久用 WithConnectTimeout 定。工具重名之类的确定性错误照样失败。
+// WithPartialStart 开启按 server 降级：Start 不因个别 server 连不上而失败（见 Hub godoc）。server 报了重名或没名字的
+// 工具也算它连不上。调用方 ctx 取消或到期仍让 Start 失败（视为放弃启动）；单个 server 最多等多久用 WithConnectTimeout
+// 定（默认 30s）。确定性错误照样失败：两个工具生成同一个名字、server 名重复、要用的快照不合法。
 func WithPartialStart() HubOption {
 	return func(h *Hub) { h.partial = true }
 }
 
-// WithConnectTimeout 设每次连接尝试（建实例 + Initialize + ListTools，Start 时与后台重连时都是）的时限，默认 30s；
-// d <= 0 表示不设（只受调用方 ctx 约束）。开了 WithPartialStart 时，它决定一个连不上的 server 让 Start 等多久。
+// WithConnectTimeout 设每次连接尝试（建实例 + Initialize + ListTools）的时限；d <= 0 表示不设（只受调用方 ctx 约束）。
+// 不给时：后台重连与 WithPartialStart 的 Start 默认 30s（一个卡住的 server 不能挡住启动），默认（全有或全无）的
+// Start 不设——首次运行要下载东西的 stdio server 起得慢，失败了整个 Start 都失败。
 func WithConnectTimeout(d time.Duration) HubOption {
-	return func(h *Hub) { h.connectTimeout = d }
+	return func(h *Hub) { h.connectTimeout, h.timeoutSet = d, true }
 }
 
 // WithReconnectBackoff 设后台重连的退避：第一次等 initial，之后每次翻倍、不超过 max。默认 1s → 60s；
@@ -188,9 +191,10 @@ func NewHub(opts ...HubOption) *Hub {
 // Start 并发连接所有 server（Initialize + ListTools），定下工具集并注册进内部 Toolkit。
 //
 // 默认任一 server 失败则整体失败，已连上的 Client 会被 Close 回滚；开了 WithPartialStart 时只有调用方 ctx 结束与
-// 确定性错误（server 名重复、工具重名、快照不合法）才失败，连不上的 server 按快照注册并后台重连（见 Hub godoc）。
-// 失败时可以重试；成功后重复调用是幂等的（工具集已定，不再连）。Close 会打断进行中的 Start（它返回错误），Close 之后
-// 调用返回错误。
+// 确定性错误（server 名重复、工具撞名、要用的快照不合法）才失败，连不上的 server 按快照注册并后台重连（见 Hub godoc）。
+// 失败时可以重试，但回滚关掉了 WithClient 给的实例（stdio 的关了就不能再用），只有 WithClientFactory 注册的 server
+// 重试时会新建连接。成功后重复调用是幂等的（工具集已定，不再连）。Close 会打断进行中的 Start（它返回错误），Close
+// 之后调用返回错误。
 func (h *Hub) Start(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -221,7 +225,11 @@ func (h *Hub) Start(ctx context.Context) error {
 		wg.Add(1)
 		go func(i int, s *server) {
 			defer wg.Done()
-			actx, cancel := h.attemptCtx(ctx)
+			timeout := h.connectTimeout
+			if !h.partial && !h.timeoutSet {
+				timeout = 0 // 见 WithConnectTimeout
+			}
+			actx, cancel := h.attemptCtx(ctx, timeout)
 			defer cancel()
 			c, specs, err := s.connect(actx) // 业务 Client panic 在 connect 里转成 err；Close 打断时 actx 被取消
 			results[i] = result{client: c, specs: specs, err: err}
@@ -359,13 +367,13 @@ func (h *Hub) checkServerNames() error {
 	return nil
 }
 
-// attemptCtx 给一次连接尝试派生 ctx：受 WithConnectTimeout 约束，Close 时被取消（ctx 不存进 Hub，起一个小
-// goroutine 把 done 转成取消；cancel 之后它就退出）。
-func (h *Hub) attemptCtx(parent context.Context) (context.Context, context.CancelFunc) {
+// attemptCtx 给一次连接尝试派生 ctx：timeout > 0 时带时限，Close 时被取消（ctx 不存进 Hub，起一个小 goroutine
+// 把 done 转成取消；cancel 之后它就退出）。
+func (h *Hub) attemptCtx(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	var ctx context.Context
 	var cancel context.CancelFunc
-	if h.connectTimeout > 0 {
-		ctx, cancel = context.WithTimeout(parent, h.connectTimeout)
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, timeout)
 	} else {
 		ctx, cancel = context.WithCancel(parent)
 	}

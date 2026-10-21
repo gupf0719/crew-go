@@ -7,10 +7,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// maxResponseBytes 是一个 JSON-RPC 响应体的上限（同 stdio 的单行上限），超了按「结果解析不了」处理。
+const maxResponseBytes = 10 * 1024 * 1024
+
+// maxErrorBodyBytes 是错误信息里带的响应体长度上限：错误会进日志与 Hub.Status。
+const maxErrorBodyBytes = 512
 
 // StreamableHTTPClient 通过 streamable HTTP JSON-RPC 对接 MCP Server。
 // 每次调用都是独立 POST 请求，适合无状态服务端。
@@ -137,7 +145,7 @@ func (c *StreamableHTTPClient) ListTools(ctx context.Context) ([]ToolSpec, error
 
 func (c *StreamableHTTPClient) CallTool(ctx context.Context, name string, args map[string]any) (*CallResult, error) {
 	if err := c.Initialize(ctx); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrNotSent, err) // 握手没过，tools/call 还没发
 	}
 	if args == nil {
 		args = map[string]any{}
@@ -150,7 +158,11 @@ func (c *StreamableHTTPClient) CallTool(ctx context.Context, name string, args m
 	if err != nil {
 		return nil, fmt.Errorf("mcp tools/call %s: %w", name, err)
 	}
-	return parseCallResult(raw)
+	res, err := parseCallResult(raw)
+	if err != nil {
+		return nil, &badResponseError{fmt.Errorf("mcp tools/call %s: %w", name, err)}
+	}
+	return res, nil
 }
 
 func (c *StreamableHTTPClient) Close() error {
@@ -162,6 +174,10 @@ func (c *StreamableHTTPClient) Close() error {
 }
 
 // rpc 执行一次 JSON-RPC 请求，返回 result 的 raw bytes。
+//
+// 错误分档（Hub 据此决定告诉模型什么、标不标掉线）：请求没写出去就失败 → 包 ErrNotSent；server 答 JSON-RPC 错误
+// （2xx 或非 2xx 响应体里都可能）→ *RPCError；其余非 2xx → httpStatusError；2xx 但响应解析不了 → badResponseError；
+// 写出之后连接出错 → 原样（不确定是否已执行）。
 func (c *StreamableHTTPClient) rpc(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
 	req := rpcRequest{
 		JSONRPC: "2.0",
@@ -171,11 +187,19 @@ func (c *StreamableHTTPClient) rpc(ctx context.Context, method string, params ma
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("encode request: %w", err)
+		return nil, fmt.Errorf("%w: encode request: %w", ErrNotSent, err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	// 记下请求有没有完整写出：没写出就失败（连不上、dial 被时限打断……）时 server 肯定没收到。不能从错误形状推断——
+	// 请求 ctx 结束时 net/http 交出的是 ctx 的错，错误链上没有 dial 错误。
+	var wrote atomic.Bool
+	trace := &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
+		if info.Err == nil {
+			wrote.Store(true)
+		}
+	}}
+	httpReq, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodPost, c.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrNotSent, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
@@ -184,29 +208,54 @@ func (c *StreamableHTTPClient) rpc(ctx context.Context, method string, params ma
 	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
+		if !wrote.Load() {
+			return nil, fmt.Errorf("%w: %w", ErrNotSent, err)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if resp.StatusCode/100 != 2 {
-		// review-v6 M-26 fix: 读 error body 让业务定位错误原因 — 之前 io.Copy(io.Discard)
-		// 只为连接复用丢了 body 含的 JSON-RPC error message / server 返的具体错信息.
-		// 业务调试体验差. ReadAll 同样排空 body 也允许连接复用.
-		body, _ := io.ReadAll(resp.Body)
-		if len(body) > 0 {
-			return nil, fmt.Errorf("http status %d: %s", resp.StatusCode, string(body))
+		// review-v6 M-26 fix: 读 error body 让业务定位错误原因（ReadAll 同样排空 body，连接可复用）。
+		// JSON-RPC 错误放在非 2xx 响应体里的 server 也有：解得出来就按 server 的错误交出（它活着）。
+		var env rpcResponse
+		if json.Unmarshal(respBody, &env) == nil && env.Error != nil {
+			return nil, env.Error
 		}
-		return nil, fmt.Errorf("http status %d", resp.StatusCode)
+		return nil, &httpStatusError{code: resp.StatusCode, body: c.redact(respBody)}
 	}
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+	if readErr != nil {
+		return nil, fmt.Errorf("read response: %w", readErr)
+	}
+	if len(respBody) > maxResponseBytes {
+		return nil, &badResponseError{fmt.Errorf("response exceeds %d bytes", maxResponseBytes)}
 	}
 	var env rpcResponse
 	if err := json.Unmarshal(respBody, &env); err != nil {
-		return nil, fmt.Errorf("decode envelope: %w", err)
+		return nil, &badResponseError{fmt.Errorf("decode envelope: %w", err)}
 	}
 	if env.Error != nil {
 		return nil, env.Error
 	}
 	return env.Result, nil
+}
+
+// redact 把响应体截短，并抹掉自己发出的请求头的值（有的 server 在错误里回显 Authorization）。
+func (c *StreamableHTTPClient) redact(body []byte) string {
+	text := string(body)
+	for _, v := range c.headers {
+		candidates := []string{v}
+		if _, tok, ok := strings.Cut(v, " "); ok { // "Bearer <token>" 只回显 token 的也抹
+			candidates = append(candidates, tok)
+		}
+		for _, cand := range candidates {
+			if len(cand) >= 6 {
+				text = strings.ReplaceAll(text, cand, "<redacted>")
+			}
+		}
+	}
+	if len(text) > maxErrorBodyBytes {
+		text = text[:maxErrorBodyBytes] + "…"
+	}
+	return text
 }

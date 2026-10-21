@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -474,31 +475,43 @@ func TestHub_CallTimeout_FailsWithoutMarkingOffline(t *testing.T) {
 	}
 }
 
-// 建连接（dial）就失败、哪怕是被时限打断的，也算连不上：标掉线，之后的调用直接失败，不再每次干等满时限
-// （笔记本离家时 TCP 连接发不出去，正是这个形状）。
-func TestHub_DialFailureWithinTimeout_MarksOffline(t *testing.T) {
+// Client 明确说「没发出」（ErrNotSent）、哪怕是被时限打断的，也算连不上：标掉线，之后的调用直接失败，不再每次
+// 干等满时限；文案说「这次调用没有发出」（不然模型会把没执行的写操作当成「可能已执行」）。
+func TestHub_NotSentWithinTimeout_MarksOffline(t *testing.T) {
 	fc := &memClient{name: "srv", tools: specs("t"), onCall: func(ctx context.Context, _ string, _ map[string]any) (*mcp.CallResult, error) {
 		<-ctx.Done()
-		return nil, fmt.Errorf("post: %w", &net.OpError{Op: "dial", Net: "tcp", Err: ctx.Err()})
+		return nil, fmt.Errorf("post: %w: %w", mcp.ErrNotSent, ctx.Err())
 	}}
-	f := &seqFactory{
-		build: func(n int) (mcp.Client, error) {
-			if n == 1 {
-				return fc, nil
-			}
-			return nil, errDown
-		},
-	}
-	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("srv", f.New, mcp.WithCallTimeout(20*time.Millisecond)))
+	f := &seqFactory{build: func(n int) (mcp.Client, error) {
+		if n == 1 {
+			return fc, nil
+		}
+		return nil, errDown
+	}}
+	h := mcp.NewHub(mcp.WithReconnectBackoff(time.Hour, time.Hour), mcp.WithClientFactory("srv", f.New, mcp.WithCallTimeout(20*time.Millisecond)))
 	if err := h.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	defer h.Close()
-	// 连接都没建起来 ⟹ 请求肯定没发出，文案要说清楚（不然模型会把没执行的写操作当成「可能已执行」）。
 	wantFailure(t, call(t, h, "mcp_srv_t"), mcp.ErrCodeServerUnavailable, "该能力暂时不可用（srv 连不上），这次调用没有发出")
 	if st := statusOf(t, h, "srv"); st.State != mcp.ServerOffline {
-		t.Errorf("dial 失败该标掉线，实际 %+v", st)
+		t.Errorf("没发出的超时该标掉线，实际 %+v", st)
 	}
+}
+
+// 「没有发出」只认 ErrNotSent，不从错误形状推断：一个包着 dial 错误、却没说没发出的错误（比如写操作已经执行、
+// 取结果的第二个连接 dial 失败）必须按「不确定是否已执行」说——说成「没有发出」模型会再做一遍。
+func TestHub_DialShapedErrorWithoutNotSent_IsUncertain(t *testing.T) {
+	fc := &memClient{name: "srv", tools: specs("t"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+		return nil, fmt.Errorf("fetch result: %w", &net.OpError{Op: "dial", Net: "tcp", Err: errDown})
+	}}
+	f := &seqFactory{build: func(int) (mcp.Client, error) { return fc, nil }}
+	h := mcp.NewHub(mcp.WithReconnectBackoff(time.Hour, time.Hour), mcp.WithClientFactory("srv", f.New))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	wantFailure(t, call(t, h, "mcp_srv_t"), mcp.ErrCodeServerUnavailable, "不确定是否已执行")
 }
 
 // 迟到的旧连接错误不能把新连接标掉：调用 A 卡在旧连接上，期间旧连接坏了（调用 B 撞上、标掉线）、重连上了新连接；
@@ -1054,5 +1067,249 @@ func TestHub_ConcurrentClose_WaitsForFirst(t *testing.T) {
 	}
 	if got := c.closed.Load(); got != 1 {
 		t.Errorf("连接该只关一次，实际 %d 次", got)
+	}
+}
+
+// --- 审计补的用例（错误映射）---
+
+// fullBacklogAddr 起一个 backlog 塞满、从不 accept 的监听：之后的 dial 收不到 SYN-ACK、真挂起（模拟黑洞网络，
+// 比如笔记本离家后对它的 TCP 连接发不出去）。塞不满的环境跳过。
+func fullBacklogAddr(t *testing.T) string {
+	t.Helper()
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Close(fd) })
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Listen(fd, 1); err != nil {
+		t.Fatal(err)
+	}
+	sa, _ := syscall.Getsockname(fd)
+	addr := fmt.Sprintf("127.0.0.1:%d", sa.(*syscall.SockaddrInet4).Port)
+	for i := 0; i < 64; i++ {
+		c, err := net.DialTimeout("tcp", addr, 150*time.Millisecond)
+		if err != nil {
+			return addr
+		}
+		t.Cleanup(func() { _ = c.Close() })
+	}
+	t.Skip("backlog 塞不满，跳过")
+	return ""
+}
+
+// 真 net/http：server 变成黑洞（dial 挂起）后，调用被时限打断时请求还没写出——要按「连不上、没有发出」标掉线，
+// 之后的调用直接失败。请求 ctx 结束时 net/http 交出的是 ctx 的错（链上没有 dial 错误），按错误形状判会判成
+// 「超时、server 那边可能仍在执行」、server 一直算在线、每次都干等满时限。
+func TestStreamableHTTP_BlackholeDial_NotSentAndOffline(t *testing.T) {
+	var executed atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcReq
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "initialize":
+			writeResult(w, req.ID, map[string]any{})
+		case "tools/list":
+			writeResult(w, req.ID, map[string]any{"tools": []map[string]any{{"name": "t"}}})
+		case "tools/call":
+			executed.Add(1)
+			writeResult(w, req.ID, map[string]any{"content": []any{}})
+		}
+	}))
+	defer server.Close()
+	hole := fullBacklogAddr(t)
+	var blackhole atomic.Bool
+	d := &net.Dialer{}
+	tr := &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if blackhole.Load() {
+			addr = hole
+		}
+		return d.DialContext(ctx, network, addr)
+	}}
+	f := func(context.Context) (mcp.Client, error) {
+		return mcp.NewStreamableHTTPClient("bh", server.URL, mcp.WithHTTPClient(&http.Client{Transport: tr}))
+	}
+	h := mcp.NewHub(mcp.WithReconnectBackoff(time.Hour, time.Hour), mcp.WithClientFactory("bh", f, mcp.WithCallTimeout(200*time.Millisecond)))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	blackhole.Store(true)
+	wantFailure(t, call(t, h, "mcp_bh_t"), mcp.ErrCodeServerUnavailable, "该能力暂时不可用（bh 连不上），这次调用没有发出")
+	if st := statusOf(t, h, "bh"); st.State != mcp.ServerOffline {
+		t.Fatalf("黑洞里的调用该把 server 标掉线，实际 %+v", st)
+	}
+	begin := time.Now()
+	wantFailure(t, call(t, h, "mcp_bh_t"), mcp.ErrCodeServerUnavailable, "offline")
+	if d := time.Since(begin); d > 100*time.Millisecond {
+		t.Errorf("掉线后的调用该直接失败，实际等了 %s", d)
+	}
+	if n := executed.Load(); n != 0 {
+		t.Errorf("黑洞期间 server 不该执行任何调用，实际 %d 次", n)
+	}
+}
+
+// HTTP 的错误响应按 server 的意思分档：JSON-RPC 错误（哪怕在非 2xx 响应体里）、只拒绝这一个请求的 4xx、2xx 但结果
+// 解析不了 → 普通失败、server 仍在线；401 / 403 / 404 → 标掉线（每次都会这样）、但说「没有执行」；5xx → 标掉线、
+// 「不确定是否已执行」。错误信息里的响应体截短并抹掉自己发出的 token。
+func TestStreamableHTTP_ErrorResponsesClassified(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		wantCode   string
+		wantMsg    string
+		wantOnline bool
+	}{
+		{"非 2xx 里的 JSON-RPC 错误", 400, `{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params: q is required"}}`,
+			tool.ErrCodeInternal, "invalid params: q is required", true},
+		{"400 纯文本", 400, "bad request", tool.ErrCodeInternal, "拒绝了这次调用（HTTP 400），没有执行", true},
+		{"429", 429, "slow down", tool.ErrCodeInternal, "HTTP 429", true},
+		{"200 但 image 的 base64 坏了", 200, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"image","data":"!!!","mimeType":"image/png"}]}}`,
+			tool.ErrCodeInternal, "解析不了", true},
+		{"200 但不是 JSON", 200, "event: message\ndata: {}\n\n", tool.ErrCodeInternal, "解析不了", true},
+		{"401", 401, "unauthorized: Bearer s3cret-token", mcp.ErrCodeServerUnavailable, "拒绝了请求：HTTP 401），这次调用没有执行", false},
+		{"404", 404, "", mcp.ErrCodeServerUnavailable, "HTTP 404", false},
+		{"500", 500, "boom", mcp.ErrCodeServerUnavailable, "不确定是否已执行", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req rpcReq
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				switch req.Method {
+				case "initialize":
+					writeResult(w, req.ID, map[string]any{})
+				case "tools/list":
+					writeResult(w, req.ID, map[string]any{"tools": []map[string]any{{"name": "t"}}})
+				default:
+					w.WriteHeader(c.status)
+					_, _ = w.Write([]byte(c.body))
+				}
+			}))
+			defer server.Close()
+			f := func(context.Context) (mcp.Client, error) {
+				return mcp.NewStreamableHTTPClient("x", server.URL, mcp.WithHTTPHeader("Authorization", "Bearer s3cret-token"))
+			}
+			h := mcp.NewHub(mcp.WithReconnectBackoff(time.Hour, time.Hour), mcp.WithClientFactory("x", f))
+			if err := h.Start(context.Background()); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer h.Close()
+			wantFailure(t, call(t, h, "mcp_x_t"), c.wantCode, c.wantMsg)
+			st := statusOf(t, h, "x")
+			if got := st.State == mcp.ServerOnline; got != c.wantOnline {
+				t.Errorf("server 在线 = %v，要 %v（%+v）", got, c.wantOnline, st)
+			}
+			if st.Err != nil && strings.Contains(st.Err.Error(), "s3cret-token") {
+				t.Errorf("Status.Err 里带出了 token：%v", st.Err)
+			}
+		})
+	}
+}
+
+// 调用方取消时返回的 error 链上要有 ctx 的错——哪怕 Client 交出的是别的错（连接被关之类）：下游按 errors.Is 判「用户取消」。
+func TestRemoteTool_CallerCanceled_ChainHasCtxError(t *testing.T) {
+	started := make(chan struct{})
+	fc := &memClient{name: "srv", tools: specs("t"), onCall: func(ctx context.Context, _ string, _ map[string]any) (*mcp.CallResult, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, errors.New("mcp stdio: connection closed")
+	}}
+	h := mcp.NewHub(mcp.WithClient(fc))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-started; cancel() }()
+	_, err := h.Toolkit().Call(ctx, "mcp_srv_t", nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error 链上该有 context.Canceled，实际 %v", err)
+	}
+}
+
+// 默认（全有或全无）的 Start 不给连接尝试加时限——首次运行要下载包的 stdio server 起得慢，原来能起来；开了
+// WithPartialStart（或显式 WithConnectTimeout）才有时限，免得一个卡住的 server 挡住启动。
+func TestHub_StrictStart_NoDefaultConnectTimeout(t *testing.T) {
+	deadlineOf := func(opts ...mcp.HubOption) bool {
+		var has bool
+		f := func(ctx context.Context) (mcp.Client, error) {
+			_, has = ctx.Deadline()
+			return &memClient{name: "s", tools: specs("a")}, nil
+		}
+		h := mcp.NewHub(append(opts, mcp.WithClientFactory("s", f))...)
+		if err := h.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		_ = h.Close()
+		return has
+	}
+	if deadlineOf() {
+		t.Error("默认 Start 的连接尝试不该有时限")
+	}
+	if !deadlineOf(mcp.WithPartialStart()) {
+		t.Error("WithPartialStart 的连接尝试该有默认时限")
+	}
+	if !deadlineOf(mcp.WithConnectTimeout(time.Minute)) {
+		t.Error("显式 WithConnectTimeout 该生效")
+	}
+}
+
+// tools/list 里的 annotations 解析出来、随 Status 交出（深拷贝）。
+func TestStreamableHTTP_ToolAnnotations(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcReq
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "initialize":
+			writeResult(w, req.ID, map[string]any{})
+		case "tools/list":
+			writeResult(w, req.ID, map[string]any{"tools": []map[string]any{
+				{"name": "read", "annotations": map[string]any{"readOnlyHint": true, "title": "读"}},
+				{"name": "write"},
+			}})
+		}
+	}))
+	defer server.Close()
+	f := func(context.Context) (mcp.Client, error) { return mcp.NewStreamableHTTPClient("a", server.URL) }
+	h := mcp.NewHub(mcp.WithClientFactory("a", f))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	tools := statusOf(t, h, "a").Tools
+	if len(tools) != 2 || tools[0].Annotations == nil || tools[0].Annotations.ReadOnlyHint == nil ||
+		!*tools[0].Annotations.ReadOnlyHint || tools[0].Annotations.Title != "读" || tools[1].Annotations != nil {
+		t.Fatalf("annotations 没解析对：%+v", tools)
+	}
+	*tools[0].Annotations.ReadOnlyHint = false
+	if again := statusOf(t, h, "a").Tools; !*again[0].Annotations.ReadOnlyHint {
+		t.Error("Status 交出的 annotations 该是深拷贝")
+	}
+}
+
+// stdio 子进程已经退了，请求写不进管道：肯定没发出——告诉模型「没有发出」，标掉线、重起子进程。
+func TestHub_StdioWriteToDeadChild_IsNotSent(t *testing.T) {
+	var spawned atomic.Int32
+	f := func(context.Context) (mcp.Client, error) {
+		mode := "ok"
+		if spawned.Add(1) == 1 {
+			mode = "die" // 第一个子进程报完清单就退出
+		}
+		return mcp.NewStdioClient("mock", os.Args[0], nil, mcp.WithStdioEnv("MCP_MOCK_MODE="+mode))
+	}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("mock", f))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	time.Sleep(200 * time.Millisecond) // 等第一个子进程退出
+	wantFailure(t, call(t, h, "mcp_mock_t"), mcp.ErrCodeServerUnavailable, "这次调用没有发出")
+	waitFor(t, "新起的子进程连上", func() bool { return statusOf(t, h, "mock").State == mcp.ServerOnline })
+	if res := call(t, h, "mcp_mock_t"); !res.Success {
+		t.Fatalf("重起子进程后该恢复：%+v", res)
 	}
 }

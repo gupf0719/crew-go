@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"reflect"
 	"sync"
 	"time"
@@ -262,17 +261,20 @@ func (s *server) admit(source string) (Client, uint64, *tool.Result) {
 	return s.client, s.gen, nil
 }
 
-// callFailed 把一次失败的 CallTool 分档：调用方喊停 → error；自己的时限到了 → 超时失败；server 答了
-// JSON-RPC 错误 → 普通失败（它活着）；其余算连接出错 → 标掉线、后台重连，返回「该能力暂时不可用」。
+// callFailed 把一次失败的 CallTool 分档（见 doc/v2/mcp.md §5）：
+//   - 调用方喊停 → error（链上带着调用方 ctx 的错）；
+//   - 自己的时限到了、请求已发出 → 超时失败（串行的 server 还要按连接不可信处理）；
+//   - server 答了 JSON-RPC 错误 / 答了但结果解析不了 / 拒绝了这一个请求（HTTP 400、408、409、413、422、429）→
+//     普通失败，它活着、不标掉线；
+//   - 其余算连接出错（含没写出就失败、HTTP 401 / 403 / 404 / 5xx）→ 标掉线、后台重连，返回「该能力暂时不可用」。
+//
+// 「没有发出」只认 Client 明确包上的 ErrNotSent，不从错误形状推断（推断错了，模型会把一个已执行的写操作当成没执行、再做一遍）。
 func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint64, err error) (*tool.Result, error) {
 	if ctx.Err() != nil {
-		return nil, fmt.Errorf("mcp call %s: %w", name, err)
+		return nil, fmt.Errorf("mcp call %s: %w: %w", name, ctx.Err(), err)
 	}
-	// 建连接（dial）就失败 = 连不上，哪怕是被时限打断的：按超时处理的话，server 不在时每次调用都要
-	// 干等满时限。
-	var opErr *net.OpError
-	dialFailed := errors.As(err, &opErr) && opErr.Op == "dial"
-	if callCtx.Err() != nil && !dialFailed {
+	notSent := errors.Is(err, ErrNotSent)
+	if callCtx.Err() != nil && !notSent {
 		if s.sem != nil && s.factory != nil {
 			// 串行的 server：超时的调用那边可能还在执行，连接不可信——标掉线、关旧连接再重连（见 WithSerialCalls）。
 			s.markOffline(gen, err)
@@ -282,14 +284,31 @@ func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint6
 		return tool.Failure(tool.ErrCodeTimeout,
 			fmt.Sprintf("工具调用超时（超过 %s 未返回），已放弃等待；%s 那边可能仍在执行", s.cfg.callTimeout, s.name)), nil
 	}
-	var rpcErr *rpcError
+	var rpcErr *RPCError
 	if errors.As(err, &rpcErr) {
 		return tool.Failure(tool.ErrCodeInternal, rpcErr.Error()), nil
 	}
+	var bad *badResponseError
+	if errors.As(err, &bad) {
+		return tool.Failure(tool.ErrCodeInternal,
+			fmt.Sprintf("%s 返回的结果解析不了（%v），这次调用可能已执行", s.name, bad.err)), nil
+	}
+	var st *httpStatusError
+	if errors.As(err, &st) {
+		switch st.code {
+		case 400, 408, 409, 413, 422, 429: // 只是这一个请求被拒，server 活着
+			return tool.Failure(tool.ErrCodeInternal,
+				fmt.Sprintf("%s 拒绝了这次调用（HTTP %d），没有执行", s.name, st.code)), nil
+		case 401, 403, 404: // 鉴权 / 地址 / 会话不对：每次都会这样，标掉线；重连会新建会话
+			s.markOffline(gen, err)
+			return tool.Failure(ErrCodeServerUnavailable,
+				fmt.Sprintf("该能力暂时不可用（%s 拒绝了请求：HTTP %d），这次调用没有执行", s.name, st.code)), nil
+		}
+	}
 	s.markOffline(gen, err)
-	// 原始错误（地址、端口）只进日志与 Status，不进模型看到的文本。连接都没建起来时请求肯定没发出——
-	// 说清楚，模型才不会把一个没执行的写操作当成「可能已执行」。
-	if dialFailed {
+	// 原始错误（地址、端口）只进日志与 Status，不进模型看到的文本。确定没发出时说清楚，模型才不会把一个没执行的
+	// 写操作当成「可能已执行」。
+	if notSent {
 		return tool.Failure(ErrCodeServerUnavailable,
 			fmt.Sprintf("该能力暂时不可用（%s 连不上），这次调用没有发出", s.name)), nil
 	}
@@ -347,7 +366,7 @@ func (s *server) reconnectLoop(stale Client) {
 		if h.isClosed() {
 			return
 		}
-		ctx, cancel := h.attemptCtx(context.Background()) // Close 时被取消
+		ctx, cancel := h.attemptCtx(context.Background(), h.connectTimeout) // Close 时被取消
 		c, specs, err := s.connect(ctx)
 		cancel()
 		if err == nil {
@@ -505,9 +524,24 @@ func cloneSpecs(specs []ToolSpec) []ToolSpec {
 			Description:  sp.Description,
 			InputSchema:  cloneMap(sp.InputSchema),
 			OutputSchema: cloneMap(sp.OutputSchema),
+			Annotations:  cloneAnnotations(sp.Annotations),
 		}
 	}
 	return out
+}
+
+func cloneAnnotations(a *ToolAnnotations) *ToolAnnotations {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	for _, p := range []**bool{&cp.ReadOnlyHint, &cp.DestructiveHint, &cp.IdempotentHint, &cp.OpenWorldHint} {
+		if *p != nil {
+			v := **p
+			*p = &v
+		}
+	}
+	return &cp
 }
 
 func cloneMap(m map[string]any) map[string]any {

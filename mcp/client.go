@@ -35,8 +35,9 @@ type Client interface {
 	ListTools(ctx context.Context) ([]ToolSpec, error)
 	// CallTool 调用远端工具，name 为 server 原始名（非 canonical name）。
 	//
-	// 返回的 error 按「这次调用失败」处理（转成工具失败交给模型，调用方 ctx 已结束时除外）：JSON-RPC 错误
-	// 响应（server 活着、只是这次调用报错）按普通失败，其余算连接出错（Hub 把 server 标成掉线、后台重连）。
+	// 返回的 error 按「这次调用失败」处理（转成工具失败交给模型，调用方 ctx 已结束时除外）：server 答的 JSON-RPC
+	// 错误交出 *RPCError（server 活着，不标掉线）；确定请求没发出时包上 ErrNotSent（模型被告知「没有发出」）；
+	// 其余算连接出错（Hub 把 server 标成掉线、后台重连，模型被告知「不确定是否已执行」）。
 	// 不要从这里返回控制流信号（中断等）——它们会被当成工具失败。
 	CallTool(ctx context.Context, name string, args map[string]any) (*CallResult, error)
 	// Close 释放资源（子进程、HTTP 连接、goroutine）；多次调用应安全。
@@ -54,6 +55,19 @@ type ToolSpec struct {
 	InputSchema map[string]any
 	// OutputSchema 可选的输出 schema，V1 暂不使用。
 	OutputSchema map[string]any
+	// Annotations 是 server 给的行为提示（MCP tools/list 的 annotations）；没给为 nil。不发给模型，给审批之类的
+	// 策略用。提示不可信：server 说只读不等于真只读，只能用来放宽「不知道」的情况，不能推翻显式的确认规则。
+	Annotations *ToolAnnotations
+}
+
+// ToolAnnotations 是 MCP 的工具行为提示。指针字段为 nil 表示 server 没给（规范默认值：ReadOnlyHint false、
+// DestructiveHint true、IdempotentHint false、OpenWorldHint true）。
+type ToolAnnotations struct {
+	Title           string `json:"title,omitempty"`
+	ReadOnlyHint    *bool  `json:"readOnlyHint,omitempty"`
+	DestructiveHint *bool  `json:"destructiveHint,omitempty"`
+	IdempotentHint  *bool  `json:"idempotentHint,omitempty"`
+	OpenWorldHint   *bool  `json:"openWorldHint,omitempty"`
 }
 
 // CallResult 是一次 MCP 工具调用的结果。

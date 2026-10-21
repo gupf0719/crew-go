@@ -1,0 +1,180 @@
+{"id":"ecomf-01","sc":"ecomf","gold":"track_package","tags":["direct"],"zh":"帮我看下我那单到哪了，预计哪天能到","en":"Can you check where my order is and when it's expected to arrive?"}
+{"id":"ecomf-02","sc":"ecomf","gold":"track_package","tags":["implicit"],"zh":"单号 SF1234567890 现在什么情况","en":"What's the status of tracking number SF1234567890?"}
+{"id":"ecomf-03","sc":"ecomf","gold":"track_package","tags":["context"],"zh":"用户：我昨天下的单发货了吗\n客服：您的订单已于今早发出。\n用户：好的，那大概什么时候能到","en":"User: Has the order I placed yesterday shipped?\nAgent: Your order shipped this morning.\nUser: Great, so roughly when will it arrive?"}
+{"id":"ecomf-04","sc":"ecomf","gold":"track_package","tags":["dialect"],"zh":"我嘅快递而家去到边度啦","en":"Where's my parcel at right now?"}
+{"id":"ecomf-05","sc":"ecomf","gold":"track_package","tags":["negation","trap"],"zh":"不用催发货，已经发了，我就想看看物流到哪了","en":"No need to rush the shipment, it's already been sent. I just want to see where it is."}
+{"id":"ecomf-06","sc":"ecomf","gold":"urge_shipping","tags":["direct"],"zh":"下单三天了还没发货，麻烦催一下","en":"I ordered three days ago and it still hasn't shipped. Please hurry them up."}
+{"id":"ecomf-07","sc":"ecomf","gold":"urge_shipping","tags":["colloquial"],"zh":"付完款一直显示待发货，到底啥时候发","en":"It's said awaiting shipment ever since I paid. When on earth will it ship?"}
+{"id":"ecomf-08","sc":"ecomf","gold":"urge_shipping","tags":["implicit"],"zh":"急用！！能不能今天就给我发出去","en":"I need it urgently!! Can you ship it out today?"}
+{"id":"ecomf-09","sc":"ecomf","gold":"urge_shipping","tags":["slang"],"zh":"发货速度能不能快点，等到花儿都谢了","en":"Can you ship any faster? I've been waiting forever."}
+{"id":"ecomf-10","sc":"ecomf","gold":"urge_shipping","tags":["context"],"zh":"用户：我 18 号下的单\n客服：请问有什么可以帮您？\n用户：到今天还是待发货，帮我催催","en":"User: I placed an order on the 18th.\nAgent: How can I help you?\nUser: It's still awaiting shipment today. Please chase it up."}
+{"id":"ecomf-11","sc":"ecomf","gold":"change_address","tags":["direct"],"zh":"收货地址填错了，能改吗","en":"I entered the wrong delivery address. Can I change it?"}
+{"id":"ecomf-12","sc":"ecomf","gold":"change_address","tags":["implicit"],"zh":"我搬家了，东西别寄到老地方","en":"I've moved, don't send it to my old place."}
+{"id":"ecomf-13","sc":"ecomf","gold":"change_address","tags":["fine"],"zh":"收件人电话写成我同事的了，帮我换成我自己的","en":"I put my coworker's phone number as the recipient's. Please change it to mine."}
+{"id":"ecomf-14","sc":"ecomf","gold":"change_address","tags":["trad"],"zh":"還沒發貨的話，幫我把地址改成公司","en":"If it hasn't shipped yet, please change the address to my office."}
+{"id":"ecomf-15","sc":"ecomf","gold":"change_address","tags":["context"],"zh":"用户：这单能今天发吗\n客服：可以的，今天下午发出。\n用户：等下，先别发，地址我要换一下","en":"User: Can this order ship today?\nAgent: Yes, it'll go out this afternoon.\nUser: Wait, hold off, I need to change the address."}
+{"id":"ecomf-16","sc":"ecomf","gold":"package_issue","tags":["direct"],"zh":"物流显示已签收，可我根本没收到","en":"Tracking says delivered, but I never got it."}
+{"id":"ecomf-17","sc":"ecomf","gold":"package_issue","tags":["fine"],"zh":"箱子到的时候已经压扁了，里面的杯子碎了两个","en":"The box was crushed when it arrived and two of the cups inside were broken."}
+{"id":"ecomf-18","sc":"ecomf","gold":"package_issue","tags":["fine"],"zh":"快递好像丢了，一个礼拜没有任何更新","en":"My parcel seems to be lost. No updates at all for a week."}
+{"id":"ecomf-19","sc":"ecomf","gold":"package_issue","tags":["implicit"],"zh":"签收人不是我，我也没授权别人代收","en":"Someone else signed for it, and I never authorized anyone to receive it for me."}
+{"id":"ecomf-20","sc":"ecomf","gold":"package_issue","tags":["dialect"],"zh":"個包裹話簽收咗，但係我冇收到喎","en":"It says the parcel was signed for, but I didn't get it."}
+{"id":"ecomf-21","sc":"ecomf","gold":"return_goods","tags":["direct"],"zh":"衣服收到了不喜欢，想退货","en":"Got the clothes but don't like them. I want to return them."}
+{"id":"ecomf-22","sc":"ecomf","gold":"return_goods","tags":["implicit"],"zh":"7天无理由还能用吗，东西我还没拆","en":"Can I still use the 7-day no-reason return? I haven't even opened it."}
+{"id":"ecomf-23","sc":"ecomf","gold":"return_goods","tags":["double_neg"],"zh":"不是不能用，就是跟图片差太多了，退了吧","en":"It's not that it doesn't work, it just looks nothing like the photos. I'll return it."}
+{"id":"ecomf-24","sc":"ecomf","gold":"return_goods","tags":["slang"],"zh":"买的鞋子踩雷了，退退退","en":"These shoes were a total dud. Return, return, return."}
+{"id":"ecomf-25","sc":"ecomf","gold":"return_goods","tags":["negation","trap"],"zh":"不用换新的，直接给我退货退钱","en":"I don't want a replacement, just let me return it for my money back."}
+{"id":"ecomf-26","sc":"ecomf","gold":"exchange_goods","tags":["direct"],"zh":"鞋子大了一码，能换小一码吗","en":"The shoes are a size too big. Can I swap for one size smaller?"}
+{"id":"ecomf-27","sc":"ecomf","gold":"exchange_goods","tags":["fine","trap"],"zh":"颜色发错了，我要的是黑色，给我换一下","en":"You sent the wrong color. I ordered black. Please swap it."}
+{"id":"ecomf-28","sc":"ecomf","gold":"exchange_goods","tags":["negation","trap"],"zh":"不想退，就想换个没瑕疵的","en":"I don't want to return it, I just want one without the defect."}
+{"id":"ecomf-29","sc":"ecomf","gold":"exchange_goods","tags":["dialect"],"zh":"件衫細咗，可唔可以換大一碼","en":"The shirt's too small. Can I exchange it for a size up?"}
+{"id":"ecomf-30","sc":"ecomf","gold":"exchange_goods","tags":["context"],"zh":"用户：上周买的电动牙刷\n客服：请问遇到什么问题了？\n用户：充不进电，给我换个新的","en":"User: The electric toothbrush I bought last week.\nAgent: What problem are you having?\nUser: It won't charge. Give me a new one."}
+{"id":"ecomf-31","sc":"ecomf","gold":"refund_only","tags":["direct"],"zh":"还没发货，我不想要了，帮我取消订单退款","en":"It hasn't shipped yet and I don't want it anymore. Please cancel and refund."}
+{"id":"ecomf-32","sc":"ecomf","gold":"refund_only","tags":["fine","trap"],"zh":"东西一直没收到，也不想要了，直接退钱吧","en":"I never received it and I don't want it anymore. Just refund me."}
+{"id":"ecomf-33","sc":"ecomf","gold":"refund_only","tags":["implicit"],"zh":"下错单了，刚付完款，能直接撤回吗","en":"I placed the wrong order and just paid. Can I take it back right away?"}
+{"id":"ecomf-34","sc":"ecomf","gold":"refund_only","tags":["slang"],"zh":"拍错了拍错了，tk 一下","en":"Ordered the wrong thing, oops. Refund pls."}
+{"id":"ecomf-35","sc":"ecomf","gold":"refund_only","tags":["fine","trap"],"zh":"不用寄回来是吧？商家说少发了一件，那件直接退钱就行","en":"So I don't need to send anything back? The seller said they shipped one item short. Just refund that one."}
+{"id":"ecomf-36","sc":"ecomf","gold":"refund_progress","tags":["direct"],"zh":"退款申请了三天了，怎么还没到账","en":"I applied for a refund three days ago. Why hasn't it arrived yet?"}
+{"id":"ecomf-37","sc":"ecomf","gold":"refund_progress","tags":["fine","trap"],"zh":"退货已经寄回去了，钱什么时候退","en":"I already shipped the return back. When do I get my money?"}
+{"id":"ecomf-38","sc":"ecomf","gold":"refund_progress","tags":["slang"],"zh":"上次那笔 tk 审核过了没","en":"Has that refund from last time been approved yet?"}
+{"id":"ecomf-39","sc":"ecomf","gold":"refund_progress","tags":["double_neg"],"zh":"不是没申请退款，申请了，一直没动静","en":"It's not that I didn't request a refund. I did, and nothing has happened since."}
+{"id":"ecomf-40","sc":"ecomf","gold":"refund_progress","tags":["context"],"zh":"用户：我要退款\n客服：您的退款申请已在 5 号提交。\n用户：对，就是那笔，现在到哪一步了","en":"User: I want a refund.\nAgent: Your refund request was submitted on the 5th.\nUser: Right, that one. What stage is it at now?"}
+{"id":"ecomf-41","sc":"ecomf","gold":"price_protect","tags":["direct"],"zh":"买了三天就降价 200，能补差价吗","en":"It dropped 200 yuan three days after I bought it. Can I get the difference back?"}
+{"id":"ecomf-42","sc":"ecomf","gold":"price_protect","tags":["colloquial"],"zh":"我刚买完你们就搞活动，这不是坑老用户吗，差价退给我","en":"You ran a sale right after I bought it. That's a rip-off for loyal customers. Refund me the difference."}
+{"id":"ecomf-43","sc":"ecomf","gold":"price_protect","tags":["implicit","fine"],"zh":"你们家有价保吗？我怕买了就降","en":"Do you have price protection? I'm worried it'll drop right after I buy."}
+{"id":"ecomf-44","sc":"ecomf","gold":"price_protect","tags":["negation","trap"],"zh":"不是用优惠券的问题，是现在同款便宜了一百，想申请价保","en":"It's not a coupon issue. The same item is now 100 cheaper and I want to claim price protection."}
+{"id":"ecomf-45","sc":"ecomf","gold":"price_protect","tags":["dialect"],"zh":"我啱啱買完就減價，可唔可以退返差價俾我","en":"It went on sale right after I bought it. Can you give me back the difference?"}
+{"id":"ecomf-46","sc":"ecomf","gold":"invoice_issue","tags":["direct"],"zh":"帮我开一张电子发票","en":"Please issue me an e-invoice."}
+{"id":"ecomf-47","sc":"ecomf","gold":"invoice_issue","tags":["fine"],"zh":"公司报销要专票，可以开吗","en":"My company needs a special VAT invoice for reimbursement. Can you issue one?"}
+{"id":"ecomf-48","sc":"ecomf","gold":"invoice_issue","tags":["implicit"],"zh":"发票在哪里下载啊，订单详情里没找到","en":"Where do I download the invoice? I couldn't find it on the order details page."}
+{"id":"ecomf-49","sc":"ecomf","gold":"invoice_issue","tags":["context"],"zh":"用户：订单已经收到了\n客服：请问还有什么可以帮您？\n用户：顺便把票开了吧，抬头写个人","en":"User: I've received the order.\nAgent: Anything else I can help with?\nUser: Please issue the invoice too, made out to me personally."}
+{"id":"ecomf-50","sc":"ecomf","gold":"invoice_issue","tags":["typo"],"zh":"fa票能开公司抬头吗","en":"can the invoce have my company name on it"}
+{"id":"ecomf-51","sc":"ecomf","gold":"invoice_fix","tags":["direct"],"zh":"发票抬头写错了，能重开吗","en":"The invoice has the wrong company name. Can it be reissued?"}
+{"id":"ecomf-52","sc":"ecomf","gold":"invoice_fix","tags":["implicit"],"zh":"税号少了一位，财务不收","en":"The tax ID is missing a digit and finance won't accept it."}
+{"id":"ecomf-53","sc":"ecomf","gold":"invoice_fix","tags":["negation","trap"],"zh":"不是要开发票，已经开了，但是金额不对","en":"I'm not asking for a new invoice. It's already issued, but the amount is wrong."}
+{"id":"ecomf-54","sc":"ecomf","gold":"invoice_fix","tags":["context"],"zh":"用户：发票收到了\n客服：好的，请问还有其他问题吗？\n用户：上面公司名称写成简称了，要全称","en":"User: I got the invoice.\nAgent: Great, anything else?\nUser: It uses our company's short name. It needs the full legal name."}
+{"id":"ecomf-55","sc":"ecomf","gold":"invoice_fix","tags":["trad"],"zh":"發票上的統一編號錯了，麻煩更正","en":"The tax number on the invoice is wrong. Please correct it."}
+{"id":"ecomf-56","sc":"ecomf","gold":"payment_fail","tags":["direct"],"zh":"付款的时候一直提示支付失败","en":"It keeps saying payment failed when I try to pay."}
+{"id":"ecomf-57","sc":"ecomf","gold":"payment_fail","tags":["implicit"],"zh":"绑的银行卡付不了，换了张也不行","en":"My linked bank card won't go through, and another card didn't work either."}
+{"id":"ecomf-58","sc":"ecomf","gold":"payment_fail","tags":["slang"],"zh":"付款页面一直转圈圈，蚌埠住了","en":"The payment page just keeps spinning. I can't take it anymore."}
+{"id":"ecomf-59","sc":"ecomf","gold":"payment_fail","tags":["negation","trap"],"zh":"不是扣了两次钱，是压根就付不进去","en":"I wasn't charged twice. The payment just won't go through at all."}
+{"id":"ecomf-60","sc":"ecomf","gold":"payment_fail","tags":["mixed"],"zh":"Apple Pay 一直 failed 是什么情况","en":"Why does Apple Pay keep failing?"}
+{"id":"ecomf-61","sc":"ecomf","gold":"double_charge","tags":["direct"],"zh":"同一个订单扣了我两次钱","en":"I was charged twice for the same order."}
+{"id":"ecomf-62","sc":"ecomf","gold":"double_charge","tags":["fine"],"zh":"钱已经扣了，订单还显示待付款","en":"The money has been taken, but the order still says awaiting payment."}
+{"id":"ecomf-63","sc":"ecomf","gold":"double_charge","tags":["implicit"],"zh":"账单里多了一笔一模一样的消费，是你们重复扣款了吧","en":"There's an identical extra charge on my statement. You charged me twice, right?"}
+{"id":"ecomf-64","sc":"ecomf","gold":"double_charge","tags":["context"],"zh":"用户：刚才付款卡住了我又点了一次\n客服：请问现在订单状态如何？\n用户：订单只有一个，银行卡却少了两笔钱","en":"User: The payment froze just now so I tapped pay again.\nAgent: What's the order status now?\nUser: There's only one order, but two payments came out of my card."}
+{"id":"ecomf-65","sc":"ecomf","gold":"double_charge","tags":["trad"],"zh":"同一筆訂單被扣款兩次","en":"The same order was charged twice."}
+{"id":"ecomf-66","sc":"ecomf","gold":"coupon","tags":["direct"],"zh":"优惠券领了用不了","en":"I claimed a coupon but can't use it."}
+{"id":"ecomf-67","sc":"ecomf","gold":"coupon","tags":["implicit"],"zh":"满 300 减 50 的券怎么没抵扣","en":"Why didn't the 50-off-300 voucher get applied?"}
+{"id":"ecomf-68","sc":"ecomf","gold":"coupon","tags":["fine"],"zh":"新人红包在哪领","en":"Where do I claim the new-user red envelope?"}
+{"id":"ecomf-69","sc":"ecomf","gold":"coupon","tags":["trap"],"zh":"价格没问题，就是结算的时候券没生效","en":"The price is fine. It's just that the coupon didn't take effect at checkout."}
+{"id":"ecomf-70","sc":"ecomf","gold":"coupon","tags":["mixed"],"zh":"这个 voucher 怎么 apply 不上","en":"Why can't I apply this voucher?"}
+{"id":"ecomf-71","sc":"ecomf","gold":"membership","tags":["direct"],"zh":"我的积分怎么查","en":"How do I check my points?"}
+{"id":"ecomf-72","sc":"ecomf","gold":"membership","tags":["colloquial"],"zh":"攒了一万积分能换点啥","en":"I've saved up ten thousand points. What can I get with them?"}
+{"id":"ecomf-73","sc":"ecomf","gold":"membership","tags":["fine"],"zh":"我是金卡会员，包邮权益怎么没了","en":"I'm a gold member. Why did my free shipping perk disappear?"}
+{"id":"ecomf-74","sc":"ecomf","gold":"membership","tags":["implicit"],"zh":"续费了会员但等级没升上去","en":"I renewed my membership but my tier didn't go up."}
+{"id":"ecomf-75","sc":"ecomf","gold":"membership","tags":["trad"],"zh":"會員積分快過期了，怎麼延長","en":"My member points are about to expire. How can I extend them?"}
+{"id":"ecomf-76","sc":"ecomf","gold":"login_issue","tags":["direct"],"zh":"登录一直提示密码错误","en":"Login keeps saying my password is wrong."}
+{"id":"ecomf-77","sc":"ecomf","gold":"login_issue","tags":["fine"],"zh":"收不到登录验证码","en":"I'm not getting the login verification code."}
+{"id":"ecomf-78","sc":"ecomf","gold":"login_issue","tags":["slang"],"zh":"mm 忘了登不进去","en":"forgot pw, can't get in"}
+{"id":"ecomf-79","sc":"ecomf","gold":"login_issue","tags":["negation","trap"],"zh":"账号没被盗，就是我自己一直登不上去","en":"My account wasn't hacked. I just can't log in myself."}
+{"id":"ecomf-80","sc":"ecomf","gold":"login_issue","tags":["dialect"],"zh":"我登入唔到個帳號，話我密碼錯","en":"I can't log into my account, it says my password is wrong."}
+{"id":"ecomf-81","sc":"ecomf","gold":"account_security","tags":["direct"],"zh":"我的账号被盗了","en":"My account has been hacked."}
+{"id":"ecomf-82","sc":"ecomf","gold":"account_security","tags":["implicit"],"zh":"收到提醒说有陌生设备登录我的号","en":"I got an alert that an unknown device logged into my account."}
+{"id":"ecomf-83","sc":"ecomf","gold":"account_security","tags":["fine"],"zh":"想把绑定的手机号换成新号","en":"I want to change the phone number bound to my account to a new one."}
+{"id":"ecomf-84","sc":"ecomf","gold":"account_security","tags":["fine"],"zh":"这个账号我不用了，怎么注销","en":"I don't use this account anymore. How do I delete it?"}
+{"id":"ecomf-85","sc":"ecomf","gold":"account_security","tags":["trap"],"zh":"能登上去，但是有人用我的号下了单","en":"I can log in fine, but someone placed an order using my account."}
+{"id":"ecomf-86","sc":"ecomf","gold":"complain_seller","tags":["direct"],"zh":"我要投诉这个商家","en":"I want to file a complaint against this seller."}
+{"id":"ecomf-87","sc":"ecomf","gold":"complain_seller","tags":["implicit"],"zh":"详情页写的纯棉，收到是化纤的，虚假宣传","en":"The listing said pure cotton but what arrived is synthetic. That's false advertising."}
+{"id":"ecomf-88","sc":"ecomf","gold":"complain_seller","tags":["colloquial"],"zh":"商家客服骂人，这种店你们平台管不管","en":"The seller's support rep swore at me. Does your platform do anything about shops like this?"}
+{"id":"ecomf-89","sc":"ecomf","gold":"complain_seller","tags":["negation","trap"],"zh":"不想换货了，这家店连续发错两次，我要投诉","en":"I don't want another exchange. This shop sent the wrong item twice in a row. I want to file a complaint."}
+{"id":"ecomf-90","sc":"ecomf","gold":"complain_seller","tags":["context"],"zh":"用户：我买的是 256G 的\n客服：请问收到的是什么版本？\n用户：128G 的，商家明显是故意的，我要投诉他","en":"User: I bought the 256 GB version.\nAgent: Which version did you receive?\nUser: 128 GB. The seller clearly did it on purpose. I want to report them."}
+{"id":"ecomf-91","sc":"ecomf","gold":"complain_courier","tags":["direct"],"zh":"我要投诉快递员","en":"I want to file a complaint about the courier."}
+{"id":"ecomf-92","sc":"ecomf","gold":"complain_courier","tags":["implicit"],"zh":"快递员没打电话直接扔驿站了，我备注了送上门","en":"The courier didn't call, just dumped it at the pickup station, even though I noted door delivery."}
+{"id":"ecomf-93","sc":"ecomf","gold":"complain_courier","tags":["colloquial"],"zh":"送快递的态度太差了，还骂人","en":"The delivery guy was really rude and even swore at me."}
+{"id":"ecomf-94","sc":"ecomf","gold":"complain_courier","tags":["negation","trap"],"zh":"包裹没丢也没坏，就是快递员把东西放门口没敲门","en":"The package isn't lost or damaged. The courier just left it outside without knocking."}
+{"id":"ecomf-95","sc":"ecomf","gold":"complain_courier","tags":["dialect"],"zh":"個速遞員成日唔送上樓，我要投訴佢","en":"That courier never brings it upstairs. I want to complain about him."}
+{"id":"ecomf-96","sc":"ecomf","gold":"human_agent","tags":["direct","short"],"zh":"转人工","en":"Human agent."}
+{"id":"ecomf-97","sc":"ecomf","gold":"human_agent","tags":["paraphrase"],"zh":"别让机器人回复了，我要跟真人说","en":"Stop the bot replies, I want to talk to a real person."}
+{"id":"ecomf-98","sc":"ecomf","gold":"human_agent","tags":["implicit"],"zh":"你听不懂，换个能听懂的人来","en":"You don't understand. Get someone who can."}
+{"id":"ecomf-99","sc":"ecomf","gold":"human_agent","tags":["negation","trap"],"zh":"不投诉，就是这个问题比较复杂，想找人工客服聊","en":"I'm not complaining. It's just a complicated issue and I'd like to talk to a human agent."}
+{"id":"ecomf-100","sc":"ecomf","gold":"human_agent","tags":["short","colloquial"],"zh":"人工人工人工","en":"Agent agent agent."}
+{"id":"opsf-01","sc":"opsf","gold":"cpu_mem","tags":["direct"],"zh":"看下 order-service 的内存用了多少","en":"Check how much memory order-service is using."}
+{"id":"opsf-02","sc":"opsf","gold":"cpu_mem","tags":["colloquial"],"zh":"node-12 磁盘是不是快满了","en":"Is node-12's disk about to fill up?"}
+{"id":"opsf-03","sc":"opsf","gold":"cpu_mem","tags":["implicit"],"zh":"这几台机器最近是不是很吃 CPU","en":"Have these machines been eating a lot of CPU lately?"}
+{"id":"opsf-04","sc":"opsf","gold":"cpu_mem","tags":["negation","trap"],"zh":"不用设告警，就想看现在各节点的内存水位","en":"No need to set up an alert, I just want to see the current memory levels on each node."}
+{"id":"opsf-05","sc":"opsf","gold":"cpu_mem","tags":["mixed"],"zh":"帮我看下 prod 集群的 CPU usage","en":"Show me the CPU usage of the prod cluster."}
+{"id":"opsf-06","sc":"opsf","gold":"traffic_latency","tags":["direct"],"zh":"支付接口现在 QPS 多少","en":"What's the payment API's QPS right now?"}
+{"id":"opsf-07","sc":"opsf","gold":"traffic_latency","tags":["fine"],"zh":"下单接口 P99 是不是涨了","en":"Has the order API's P99 gone up?"}
+{"id":"opsf-08","sc":"opsf","gold":"traffic_latency","tags":["implicit"],"zh":"用户反馈 App 很卡，看下网关响应时间","en":"Users say the app is laggy. Check the gateway's response time."}
+{"id":"opsf-09","sc":"opsf","gold":"traffic_latency","tags":["negation","trap"],"zh":"不用写 PromQL，直接告诉我 5xx 错误率是多少","en":"No need to write PromQL, just tell me what the 5xx error rate is."}
+{"id":"opsf-10","sc":"opsf","gold":"traffic_latency","tags":["context"],"zh":"用户：昨晚大促\n助手：请问需要看哪个服务？\n用户：搜索服务，峰值流量到多少了","en":"User: Big sale last night.\nAssistant: Which service do you want to look at?\nUser: Search. How high did peak traffic get?"}
+{"id":"opsf-11","sc":"opsf","gold":"promql_help","tags":["direct"],"zh":"帮我写个 PromQL 算每个接口的错误率","en":"Write me a PromQL query for the error rate of each endpoint."}
+{"id":"opsf-12","sc":"opsf","gold":"promql_help","tags":["fine"],"zh":"histogram_quantile 这个函数怎么用","en":"How do I use the histogram_quantile function?"}
+{"id":"opsf-13","sc":"opsf","gold":"promql_help","tags":["implicit"],"zh":"我这条查询为啥返回空：sum(rate(http_requests_total{job='api'}[5m]))","en":"Why does my query return nothing: sum(rate(http_requests_total{job='api'}[5m]))"}
+{"id":"opsf-14","sc":"opsf","gold":"promql_help","tags":["negation","trap"],"zh":"不是要看数据，是想学下 rate 和 irate 有啥区别","en":"I don't need data, I want to learn the difference between rate and irate."}
+{"id":"opsf-15","sc":"opsf","gold":"promql_help","tags":["mixed"],"zh":"这个 by (instance) 加在哪里才对","en":"Where should I put this by (instance) for it to work?"}
+{"id":"opsf-16","sc":"opsf","gold":"alert_query","tags":["direct"],"zh":"现在有哪些告警在响","en":"Which alerts are firing now?"}
+{"id":"opsf-17","sc":"opsf","gold":"alert_query","tags":["fine"],"zh":"昨晚凌晨两点那个告警是什么原因触发的","en":"What triggered that alert at 2 am last night?"}
+{"id":"opsf-18","sc":"opsf","gold":"alert_query","tags":["colloquial"],"zh":"告警群被刷屏了，都是啥","en":"The alert channel is flooded. What is all that?"}
+{"id":"opsf-19","sc":"opsf","gold":"alert_query","tags":["negation","trap"],"zh":"不是要改阈值，就想看看这周一共响了多少次告警","en":"I'm not changing thresholds, I just want to see how many alerts fired this week."}
+{"id":"opsf-20","sc":"opsf","gold":"alert_query","tags":["trad"],"zh":"查一下支付服務目前的告警","en":"Check the payment service's current alerts."}
+{"id":"opsf-21","sc":"opsf","gold":"alert_silence","tags":["direct"],"zh":"帮我把 test 环境的告警静默两小时","en":"Silence alerts in the test environment for two hours."}
+{"id":"opsf-22","sc":"opsf","gold":"alert_silence","tags":["implicit"],"zh":"今晚做数据库迁移，这段时间别报警","en":"We're migrating the database tonight. No alerts during that window."}
+{"id":"opsf-23","sc":"opsf","gold":"alert_silence","tags":["colloquial"],"zh":"这个告警一直重复发，先让它闭嘴","en":"This alert keeps repeating. Shut it up for now."}
+{"id":"opsf-24","sc":"opsf","gold":"alert_silence","tags":["negation","trap"],"zh":"不用改规则，就是维护窗口内临时屏蔽一下","en":"No need to change the rule, just mute it temporarily during the maintenance window."}
+{"id":"opsf-25","sc":"opsf","gold":"alert_silence","tags":["mixed"],"zh":"帮我 mute 一下 disk 相关的 alert，到明早","en":"Mute the disk-related alerts until tomorrow morning."}
+{"id":"opsf-26","sc":"opsf","gold":"alert_rule","tags":["direct"],"zh":"给订单服务加一条错误率超过 1% 就告警的规则","en":"Add a rule to alert when the order service error rate exceeds 1%."}
+{"id":"opsf-27","sc":"opsf","gold":"alert_rule","tags":["fine"],"zh":"磁盘使用率 85% 的阈值太敏感了，改成 90%","en":"The 85% disk usage threshold is too sensitive. Change it to 90%."}
+{"id":"opsf-28","sc":"opsf","gold":"alert_rule","tags":["implicit"],"zh":"告警别打电话了，改成发钉钉","en":"Stop phoning me for alerts, send DingTalk messages instead."}
+{"id":"opsf-29","sc":"opsf","gold":"alert_rule","tags":["negation","trap"],"zh":"不是要静默，是这条规则本身写错了，要改表达式","en":"I don't want to silence it. The rule itself is wrong and the expression needs fixing."}
+{"id":"opsf-30","sc":"opsf","gold":"alert_rule","tags":["context"],"zh":"用户：刚才那个 CPU 告警\n助手：是 node-3 的 CPU 超过 80%。\n用户：以后超过 95% 再报吧","en":"User: That CPU alert just now.\nAssistant: It's node-3's CPU going over 80%.\nUser: From now on only alert above 95%."}
+{"id":"opsf-31","sc":"opsf","gold":"log_search","tags":["direct"],"zh":"查一下今天 order-service 的 ERROR 日志","en":"Pull today's ERROR logs for order-service."}
+{"id":"opsf-32","sc":"opsf","gold":"log_search","tags":["implicit"],"zh":"下午三点二十左右下单报错，看看后台记录","en":"Ordering failed around 3:20 this afternoon. Check what the backend recorded."}
+{"id":"opsf-33","sc":"opsf","gold":"log_search","tags":["mixed"],"zh":"grep 一下 OutOfMemory 最近出现几次","en":"grep how many times OutOfMemory has shown up recently"}
+{"id":"opsf-34","sc":"opsf","gold":"log_search","tags":["negation","trap"],"zh":"不用看调用链，直接把 nginx 日志里 502 的捞出来","en":"Don't bother with the call chain, just pull the 502s out of the nginx logs."}
+{"id":"opsf-35","sc":"opsf","gold":"log_search","tags":["typo"],"zh":"查下日至里有没有 timeout","en":"check the logz for timeout"}
+{"id":"opsf-36","sc":"opsf","gold":"trace_query","tags":["direct"],"zh":"帮我查一下 traceID abc123 的调用链","en":"Look up the call chain for trace ID abc123."}
+{"id":"opsf-37","sc":"opsf","gold":"trace_query","tags":["fine"],"zh":"这个请求慢在哪一跳，帮我看看链路","en":"Which hop is this request slow at? Check the trace."}
+{"id":"opsf-38","sc":"opsf","gold":"trace_query","tags":["implicit"],"zh":"下单接口有个请求 3 秒才返回，想看它经过了哪些服务","en":"One order API request took 3 seconds. I want to see which services it passed through."}
+{"id":"opsf-39","sc":"opsf","gold":"trace_query","tags":["negation","trap"],"zh":"不看日志了，直接看这次调用的 span 耗时分布","en":"Forget the logs, just show me the span timing breakdown for this call."}
+{"id":"opsf-40","sc":"opsf","gold":"trace_query","tags":["mixed"],"zh":"帮我 query 一下这个 span 的 parent 是谁","en":"Find out which span is this span's parent."}
+{"id":"opsf-41","sc":"opsf","gold":"pod_restart","tags":["direct"],"zh":"重启一下 order-service 的 pod","en":"Restart the order-service pods."}
+{"id":"opsf-42","sc":"opsf","gold":"pod_restart","tags":["fine"],"zh":"search-api 有个 pod 卡死了，删了让它重建","en":"One search-api pod is frozen. Delete it so it gets recreated."}
+{"id":"opsf-43","sc":"opsf","gold":"pod_restart","tags":["implicit"],"zh":"user-center 那个实例一直 CrashLoopBackOff，先重启试试","en":"That user-center instance keeps going into CrashLoopBackOff. Try restarting it first."}
+{"id":"opsf-44","sc":"opsf","gold":"pod_restart","tags":["negation","trap"],"zh":"不用扩容，副本数够的，就是有个 pod 状态不对，重启下","en":"No need to scale, we have enough replicas. One pod is in a bad state, restart it."}
+{"id":"opsf-45","sc":"opsf","gold":"pod_restart","tags":["trad"],"zh":"幫我重啟 gateway 的 pod","en":"Restart the gateway pods for me."}
+{"id":"opsf-46","sc":"opsf","gold":"scaling","tags":["direct"],"zh":"把推荐服务扩到 10 个副本","en":"Scale the recommendation service to 10 replicas."}
+{"id":"opsf-47","sc":"opsf","gold":"scaling","tags":["implicit"],"zh":"晚高峰快到了，多开几个实例扛一下","en":"Evening peak is coming. Spin up a few more instances to handle it."}
+{"id":"opsf-48","sc":"opsf","gold":"scaling","tags":["fine"],"zh":"HPA 最大副本数调到 20","en":"Set the HPA max replicas to 20."}
+{"id":"opsf-49","sc":"opsf","gold":"scaling","tags":["negation","trap"],"zh":"不用重启，就是流量太大了，加点机器","en":"No need to restart. Traffic is just too high, add some capacity."}
+{"id":"opsf-50","sc":"opsf","gold":"scaling","tags":["context"],"zh":"用户：活动下周一开始\n助手：需要我做什么准备？\n用户：promo-service 先缩到 2 个，周一再扩回来","en":"User: The campaign starts next Monday.\nAssistant: What should I prepare?\nUser: Scale promo-service down to 2 for now, and back up on Monday."}
+{"id":"opsf-51","sc":"opsf","gold":"deploy_rollback","tags":["direct"],"zh":"刚发的版本有问题，回滚","en":"The release we just pushed is broken. Roll back."}
+{"id":"opsf-52","sc":"opsf","gold":"deploy_rollback","tags":["fine"],"zh":"把 payment 发布到 v2.3.1","en":"Deploy payment to v2.3.1."}
+{"id":"opsf-53","sc":"opsf","gold":"deploy_rollback","tags":["implicit"],"zh":"新版本上线后错误率飙了，赶紧退回去","en":"Error rates spiked after the new version went live. Revert it now."}
+{"id":"opsf-54","sc":"opsf","gold":"deploy_rollback","tags":["negation","trap"],"zh":"不用重启 pod，是镜像版本有 bug，回到上一个版本","en":"Restarting pods won't help. The image version has a bug, go back to the previous version."}
+{"id":"opsf-55","sc":"opsf","gold":"deploy_rollback","tags":["trad"],"zh":"幫我把 gateway 回滾到上一個版本","en":"Roll the gateway back to the previous version."}
+{"id":"opsf-56","sc":"opsf","gold":"incident_report","tags":["direct"],"zh":"线上出故障了，拉个应急群","en":"We have a production outage. Open a war room."}
+{"id":"opsf-57","sc":"opsf","gold":"incident_report","tags":["fine"],"zh":"支付全挂了，影响所有用户，按几级处理","en":"Payments are completely down for all users. What severity is this?"}
+{"id":"opsf-58","sc":"opsf","gold":"incident_report","tags":["implicit"],"zh":"首页打不开半小时了，马上通知所有相关的人","en":"The homepage has been down for half an hour. Notify everyone involved right now."}
+{"id":"opsf-59","sc":"opsf","gold":"incident_report","tags":["negation","trap"],"zh":"不是写复盘，是现在正在出事，赶紧上报","en":"This isn't about a postmortem. It's happening right now. Report it immediately."}
+{"id":"opsf-60","sc":"opsf","gold":"incident_report","tags":["mixed"],"zh":"开个 incident，severity P1","en":"Open an incident, severity P1."}
+{"id":"opsf-61","sc":"opsf","gold":"oncall","tags":["direct"],"zh":"今晚谁值班","en":"Who's on call tonight?"}
+{"id":"opsf-62","sc":"opsf","gold":"oncall","tags":["fine"],"zh":"下周的值班表发我一下","en":"Send me next week's on-call schedule."}
+{"id":"opsf-63","sc":"opsf","gold":"oncall","tags":["implicit"],"zh":"周六我有事，想跟人换个班","en":"I have something on Saturday and want to swap shifts with someone."}
+{"id":"opsf-64","sc":"opsf","gold":"oncall","tags":["negation","trap"],"zh":"不用拉群，就想知道 DBA 这周谁值班","en":"No need for a war room, I just want to know which DBA is on call this week."}
+{"id":"opsf-65","sc":"opsf","gold":"oncall","tags":["dialect","mixed"],"zh":"今晚邊個 on call 呀","en":"Who's on call tonight, then?"}
+{"id":"opsf-66","sc":"opsf","gold":"postmortem","tags":["direct"],"zh":"帮我写上周数据库故障的复盘","en":"Help me write the postmortem for last week's database outage."}
+{"id":"opsf-67","sc":"opsf","gold":"postmortem","tags":["fine"],"zh":"去年双十一那次宕机的复盘报告在哪","en":"Where's the postmortem report for last year's Double 11 outage?"}
+{"id":"opsf-68","sc":"opsf","gold":"postmortem","tags":["implicit"],"zh":"领导让我总结一下昨天停机的原因和改进措施","en":"My manager wants a summary of yesterday's downtime: the cause and the improvements."}
+{"id":"opsf-69","sc":"opsf","gold":"postmortem","tags":["negation","trap"],"zh":"故障已经恢复了，不用拉群，现在要写复盘","en":"The incident is resolved, no war room needed. Now I need to write the postmortem."}
+{"id":"opsf-70","sc":"opsf","gold":"postmortem","tags":["context"],"zh":"用户：周二那次支付故障\n助手：已恢复，持续 23 分钟。\n用户：好，把时间线和根因整理成文档","en":"User: That payment outage on Tuesday.\nAssistant: Resolved, it lasted 23 minutes.\nUser: OK, put the timeline and root cause into a document."}
+{"id":"opsf-71","sc":"opsf","gold":"access_request","tags":["direct"],"zh":"我要申请 prod 集群的只读权限","en":"I need read-only access to the prod cluster."}
+{"id":"opsf-72","sc":"opsf","gold":"access_request","tags":["implicit"],"zh":"新来的同事看不了监控大盘，帮他开个权限","en":"The new teammate can't see the monitoring dashboards. Grant them access."}
+{"id":"opsf-73","sc":"opsf","gold":"access_request","tags":["fine","trap"],"zh":"查日志提示没有权限，怎么申请","en":"Searching logs says I don't have permission. How do I request access?"}
+{"id":"opsf-74","sc":"opsf","gold":"access_request","tags":["negation","trap"],"zh":"不是要重启，是我没有这个 namespace 的操作权限","en":"I'm not trying to restart anything. I just don't have permission for this namespace."}
+{"id":"opsf-75","sc":"opsf","gold":"access_request","tags":["trad"],"zh":"監控平台的權限要怎麼申請","en":"How do I apply for access to the monitoring platform?"}
+{"id":"opsf-76","sc":"opsf","gold":"doc_qa","tags":["direct"],"zh":"新服务怎么接入监控平台，有文档吗","en":"How do I onboard a new service to monitoring? Is there a doc?"}
+{"id":"opsf-77","sc":"opsf","gold":"doc_qa","tags":["fine","trap"],"zh":"告警规则命名有啥规范","en":"Is there a naming convention for alert rules?"}
+{"id":"opsf-78","sc":"opsf","gold":"doc_qa","tags":["implicit","trap"],"zh":"K8s 资源 request 和 limit 一般怎么设比较合理","en":"What's a sensible way to set Kubernetes resource requests and limits?"}
+{"id":"opsf-79","sc":"opsf","gold":"doc_qa","tags":["negation","trap"],"zh":"不是让你扩容，我想了解 HPA 的最佳实践","en":"I'm not asking you to scale anything. I want to learn HPA best practices."}
+{"id":"opsf-80","sc":"opsf","gold":"doc_qa","tags":["mixed"],"zh":"OpenTelemetry SDK 接入有 best practice 文档吗","en":"Is there a best-practice doc for integrating the OpenTelemetry SDK?"}

@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>chat_entry web demo · ISSUE-71</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #1e1e2e; color: #cdd6f4;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 10px 18px; background: #11111b; border-bottom: 1px solid #313244;
+    display: flex; gap: 12px; align-items: baseline;
+  }
+  header h1 { margin: 0; font-size: 14px; color: #89b4fa; }
+  header small { color: #6c7086; font-size: 12px; }
+  header .spacer { flex: 1; }
+  header button {
+    background: transparent; border: 1px solid #45475a; color: #a6adc8;
+    padding: 4px 10px; border-radius: 4px; font-size: 12px; cursor: pointer;
+  }
+  header button:hover { background: #313244; }
+
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 440px; min-height: 0; }
+
+  /* 聊天栏 */
+  .chat-col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .messages { flex: 1; overflow-y: auto; padding: 20px 24px; }
+  .msg { max-width: 720px; margin: 0 auto 18px auto; }
+  .msg.user { text-align: right; }
+  .bubble {
+    display: inline-block; padding: 10px 14px; border-radius: 10px;
+    max-width: 100%; white-space: pre-wrap; word-wrap: break-word; line-height: 1.55;
+    text-align: left;
+  }
+  .msg.user .bubble { background: #89b4fa; color: #11111b; border-bottom-right-radius: 2px; }
+  .msg.assistant .bubble { background: #313244; color: #cdd6f4; border-bottom-left-radius: 2px; }
+  .msg .role { font-size: 11px; color: #6c7086; margin: 0 6px 4px 6px; }
+
+  /* assistant bubble 内 markdown 元素样式（user bubble 是纯文本不渲染 md） */
+  .msg.assistant .bubble code {
+    background: #11111b; color: #f9e2af; padding: 1px 5px; border-radius: 3px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.92em;
+  }
+  .msg.assistant .bubble pre {
+    background: #11111b; padding: 10px 12px; border-radius: 6px;
+    margin: 6px 0; overflow-x: auto;
+  }
+  .msg.assistant .bubble pre code {
+    background: none; color: #cdd6f4; padding: 0; font-size: 12px; line-height: 1.45;
+  }
+  .msg.assistant .bubble strong { color: #f9e2af; font-weight: 600; }
+  .msg.assistant .bubble em { color: #cba6f7; font-style: italic; }
+  .msg.assistant .bubble h1, .msg.assistant .bubble h2, .msg.assistant .bubble h3 {
+    margin: 10px 0 4px 0; color: #89b4fa; font-weight: 600;
+  }
+  .msg.assistant .bubble h1 { font-size: 1.15em; }
+  .msg.assistant .bubble h2 { font-size: 1.08em; }
+  .msg.assistant .bubble h3 { font-size: 1.02em; }
+  .msg.assistant .bubble a { color: #89b4fa; text-decoration: underline; }
+  .msg.assistant .bubble .md-bullet { color: #6c7086; margin-right: 2px; }
+
+  /* 思考卡片：位于 assistant 气泡之前，显示 plan / step 过程 */
+  .thinking {
+    max-width: 720px; margin: 0 auto 8px auto;
+    background: #181825; border: 1px solid #313244; border-radius: 10px;
+    font-size: 12px;
+  }
+  .thinking summary {
+    cursor: pointer; padding: 8px 12px; list-style: none; color: #a6adc8;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .thinking summary::-webkit-details-marker { display: none; }
+  .thinking summary::before {
+    content: "▸"; color: #6c7086; transition: transform 0.15s;
+  }
+  .thinking[open] summary::before { transform: rotate(90deg); display: inline-block; }
+  .thinking[open] summary { border-bottom: 1px solid #313244; }
+  .thinking .spin {
+    width: 12px; height: 12px; border: 2px solid #45475a; border-top-color: #89b4fa;
+    border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .thinking .body { padding: 10px 12px; }
+  .plan-block { margin-bottom: 10px; }
+  .plan-title { color: #f38ba8; font-weight: 600; margin-bottom: 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .plan-step { padding: 2px 0 2px 16px; position: relative; color: #cdd6f4; }
+  .plan-step::before { content: "•"; position: absolute; left: 0; color: #6c7086; }
+  .plan-step .agent { color: #89b4fa; font-weight: 600; }
+  .plan-step.running::before { content: "◐"; color: #f9e2af; }
+  .plan-step.done::before { content: "✓"; color: #a6e3a1; }
+  .step-output {
+    margin: 4px 0 0 16px; padding: 6px 8px; background: #11111b; border-radius: 4px;
+    color: #a6adc8; font-size: 11px; font-family: ui-monospace, monospace;
+    white-space: pre-wrap; word-break: break-word;
+  }
+
+  /* 输入区 */
+  .composer {
+    padding: 12px 24px 16px 24px; background: #181825; border-top: 1px solid #313244;
+  }
+  .composer-inner { max-width: 720px; margin: 0 auto; position: relative; }
+  #q {
+    width: 100%; padding: 12px 128px 12px 14px; background: #313244; color: #cdd6f4;
+    border: 1px solid #45475a; border-radius: 10px; font: inherit; resize: none;
+    min-height: 48px; max-height: 160px;
+  }
+  #q:focus { outline: none; border-color: #89b4fa; }
+  #send {
+    position: absolute; right: 80px; bottom: 8px;
+    background: #89b4fa; color: #11111b; border: none; width: 36px; height: 32px;
+    border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px;
+  }
+  #send:disabled { opacity: 0.4; cursor: not-allowed; }
+  /* mode toggle 放在 send 键右侧，sticky 跨 query；点击切换 Normal / Plan */
+  #mode-toggle {
+    position: absolute; right: 8px; bottom: 8px;
+    background: #11111b; color: #a6e3a1; border: 1px solid #45475a;
+    height: 32px; min-width: 64px; padding: 0 10px; border-radius: 6px;
+    font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+  #mode-toggle:hover { background: #1e1e2e; }
+  .composer .hint { font-size: 11px; color: #6c7086; margin-top: 6px; text-align: center; }
+
+  /* 事件栏 */
+  .events-col {
+    border-left: 1px solid #313244; background: #181825;
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .events-head {
+    padding: 10px 14px; border-bottom: 1px solid #313244; color: #a6adc8;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .events-head .dot { width: 8px; height: 8px; border-radius: 50%; background: #6c7086; }
+  .events-head.live .dot { background: #a6e3a1; box-shadow: 0 0 6px #a6e3a1; }
+  #stream { flex: 1; overflow-y: auto; padding: 10px; font-size: 12px; }
+  .row {
+    padding: 5px 8px; margin-bottom: 2px; border-radius: 4px;
+    border-left: 3px solid #45475a; word-break: break-word; white-space: pre-wrap;
+    line-height: 1.45;
+  }
+  .row .tag { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 10px; margin-right: 5px; background: #45475a; color: #cdd6f4; font-weight: 600; }
+  .row .name { color: #f9e2af; }
+  .row .rid { color: #a6e3a1; font-family: ui-monospace, monospace; font-size: 10px; }
+  .row .meta { color: #6c7086; font-size: 10px; margin-left: 4px; }
+  .t-graph_start, .t-graph_end { border-left-color: #cba6f7; }
+  .t-node_start, .t-node_end, .t-node_event { border-left-color: #89b4fa; }
+  .t-agent_start, .t-agent_end { border-left-color: #f9e2af; }
+  .t-model_start, .t-model_end { border-left-color: #a6e3a1; }
+  .t-tool_start, .t-tool_end { border-left-color: #fab387; }
+  .t-plan, .t-step_dispatch { border-left-color: #f38ba8; }
+  .t-user_input { border-left-color: #94e2d5; }
+  .t-resume { border-left-color: #94e2d5; background: rgba(148, 226, 213, 0.08); }
+  .t-interrupted { border-left-color: #fab387; background: rgba(250, 179, 135, 0.12); }
+  .t-final { border-left-color: #a6e3a1; background: rgba(166, 227, 161, 0.08); }
+  .t-error { border-left-color: #f38ba8; background: rgba(243, 139, 168, 0.15); }
+  .t-done { border-left-color: #6c7086; color: #6c7086; }
+  .events-legend {
+    padding: 6px 12px; border-top: 1px solid #313244; color: #6c7086; font-size: 10px;
+  }
+  .events-legend span { margin-right: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>chat_entry web demo</h1>
+  <small>ISSUE-71 chat_entry · mode 切换 demo（Normal vs Plan）</small>
+  <div class="spacer"></div>
+  <button id="clear">清空对话</button>
+</header>
+<main>
+  <div class="chat-col">
+    <div id="messages" class="messages">
+      <div class="msg assistant">
+        <div class="role">agent</div>
+        <div class="bubble">Hi！我是 chat_entry 助手（ISSUE-71 接口合并 demo）。
+
+我会按你的输入自动选合适的专家工具：复杂任务（写博客 / 评审代码 / 故障诊断 / 预算规划 / 代码钻取 / 多源比对）调对应的 scenario tool 处理；简单查询直接回答。
+
+试试：<em>整理 "Go goroutine 调度" 的博客素材，要有批评视角</em>
+
+右侧实时展示图执行、LLM 调用（带 run_id）、工具调用等事件。</div>
+      </div>
+    </div>
+    <div class="composer">
+      <div class="composer-inner">
+        <textarea id="q" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）" autofocus></textarea>
+        <button id="send" title="发送">↑</button>
+        <button id="mode-toggle" title="当前 normal mode（点击切换，下次发消息生效）">Normal</button>
+        <button id="stop" title="挂起当前会话（可恢复）" style="display:none">⏸</button>
+        <button id="resume" title="按原计划继续（可选填写文本，会作为 user 答复 / tool_result 注入）" style="display:none">▶ 继续</button>
+        <button id="replan" title="改方向：跳回 Planner，文本作为新指令重新规划" style="display:none">↻ 改方向</button>
+        <button id="abort" title="放弃本会话：删除 checkpoint" style="display:none">✕ 取消</button>
+      </div>
+      <div class="hint">使用 mock 模式离线响应；真实 LLM 需 `-mock=false` 并设置 HYPERMNESIA_API_KEY 启动</div>
+    </div>
+  </div>
+  <aside class="events-col">
+    <div id="events-head" class="events-head"><span class="dot"></span> 事件流（SSE）</div>
+    <div id="stream"></div>
+    <div class="events-legend">
+      <span style="color:#cba6f7">graph</span>
+      <span style="color:#89b4fa">node</span>
+      <span style="color:#f9e2af">agent</span>
+      <span style="color:#a6e3a1">model/final</span>
+      <span style="color:#fab387">tool/⏸</span>
+      <span style="color:#f38ba8">plan</span>
+      <span style="color:#94e2d5">▶ resume</span>
+    </div>
+  </aside>
+</main>
+<script>
+/* ───────── 共享工具 ───────── */
+const $ = (id) => document.getElementById(id);
+const escape = (s) => (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const scrollToBottom = (el) => { el.scrollTop = el.scrollHeight; };
+
+/* ───────── 轻量 Markdown 渲染（覆盖 80% LLM 常用语法） ─────────
+   策略：先 HTML escape（防 XSS），再用占位符抠 code 段（避免内部内容被其他规则
+   误伤），再处理行级（标题/列表）+ 行内（粗体/斜体/链接），最后回填占位符。
+   流式 chunk 半截语法（如刚到 "**iden"）正则不匹配 → 显示原文，等 "tifier**"
+   补齐后整段 re-render 才转粗体——天然无反向 jitter。
+   不支持：表格 / 代码块语法高亮 / 嵌套列表（demo 不需要，要的话换 marked.js）。 */
+function renderMarkdown(text) {
+  if (!text) return '';
+  let html = escape(text);
+
+  // 抠 ``` 代码块（必须先于行内 code）。占位符前缀 "MDPH" Markdown PlaceHolder
+  // + 类型 + idx，足够 unique（普通文本几乎不会出现）。escape 已先跑，
+  // 所以本段已是 HTML-safe 文本，正则操作不会引入 XSS
+  const codeBlocks = [];
+  html = html.replace(/```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push('<pre><code>' + code.replace(/\n$/, '') + '</code></pre>');
+    return 'MDPHCB' + idx + 'MDPH';
+  });
+
+  // 抠 `行内 code`
+  const inlineCodes = [];
+  html = html.replace(/`([^`\n]+)`/g, (_, code) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push('<code>' + code + '</code>');
+    return 'MDPHIC' + idx + 'MDPH';
+  });
+
+  // 标题（行级）
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+
+  // 粗体 **xx**（必须先于斜体）
+  html = html.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+  // 斜体 *xx*（前后非 * 非字母数字，避开 **xxx** 残留 + 中文星号误匹配）
+  html = html.replace(/(^|[^*\w])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
+
+  // 链接 [text](url)
+  html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  // 无序列表 - xx / * xx（行级，单行加 bullet 不组装 <ul>，对齐 chunk 流式）
+  html = html.replace(/^[-*]\s+(.+)$/gm, '<span class="md-bullet">•</span> $1');
+
+  // 回填占位符
+  html = html.replace(/MDPHIC(\d+)MDPH/g, (_, idx) => inlineCodes[parseInt(idx, 10)]);
+  html = html.replace(/MDPHCB(\d+)MDPH/g, (_, idx) => codeBlocks[parseInt(idx, 10)]);
+
+  return html;
+}
+
+/* ───────── DOM 引用 ───────── */
+const messagesEl = $('messages');
+const streamEl = $('stream');
+const eventsHead = $('events-head');
+const qEl = $('q');
+const sendBtn = $('send');
+const stopBtn = $('stop');
+const resumeBtn = $('resume');
+const replanBtn = $('replan');
+const abortBtn = $('abort');
+const clearBtn = $('clear');
+const modeToggleBtn = $('mode-toggle');
+
+/* ───────── 状态 ───────── */
+let es = null;
+let current = null; // 当前进行中的 assistant turn：{ thinking, summary, body, stepsByIdx, bubble }
+let currentSessionID = null;       // 后端 chat_entry RunSession.ID，挂起 + 恢复都用同一 id
+let currentState = 'idle';         // idle | running | paused | finished
+let currentMode = 'normal';        // normal | plan，sticky 跨 query 持续
+
+/* ───────── 事件流栏渲染 ───────── */
+function row(type, html, meta) {
+  const d = document.createElement('div');
+  d.className = 'row t-' + type;
+  let h = '<span class="tag">' + type + '</span>' + html;
+  if (meta) h += ' <span class="meta">' + meta + '</span>';
+  d.innerHTML = h;
+  streamEl.appendChild(d);
+  scrollToBottom(streamEl);
+}
+
+/* ───────── 聊天栏消息渲染 ───────── */
+function appendUserMessage(text) {
+  const m = document.createElement('div');
+  m.className = 'msg user';
+  m.innerHTML = '<div class="role">you</div><div class="bubble"></div>';
+  m.querySelector('.bubble').textContent = text;
+  messagesEl.appendChild(m);
+  scrollToBottom(messagesEl);
+}
+
+function beginAssistantTurn() {
+  // thinking 卡片（折叠展开），body 里累积 plan/step 条目
+  const thinking = document.createElement('details');
+  thinking.className = 'thinking';
+  thinking.open = true;
+  thinking.innerHTML = `
+    <summary><span class="spin"></span><span class="summary-text">思考中…</span></summary>
+    <div class="body"></div>
+  `;
+  messagesEl.appendChild(thinking);
+
+  const bubble = document.createElement('div');
+  bubble.className = 'msg assistant';
+  bubble.innerHTML = '<div class="role">agent</div><div class="bubble"></div>';
+  messagesEl.appendChild(bubble);
+
+  current = {
+    thinking,
+    summary: thinking.querySelector('.summary-text'),
+    spin: thinking.querySelector('.spin'),
+    body: thinking.querySelector('.body'),
+    bubble: bubble.querySelector('.bubble'),
+    stepsByIdx: new Map(), // idx → {el, outputEl, agent, desc}
+    plannerCalls: 0,
+    currentExecIdx: null,
+  };
+  scrollToBottom(messagesEl);
+}
+
+function setSummary(text) {
+  if (!current) return;
+  current.summary.textContent = text;
+}
+
+function finishAssistantTurn(content, collapsed) {
+  if (!current) return;
+  // 替换 spin 为 ✓
+  current.spin.outerHTML = '<span style="color:#a6e3a1;font-weight:600">✓</span>';
+  if (collapsed) current.thinking.open = false;
+  // ISSUE-63 token 流：若 bubble 已被 chunk 累加过且内容与 final 等价（同 run_id），
+  // 不覆盖（避免闪烁）；否则用 final 内容覆盖（兼容非流式 / 流式失败 fallback Generate 场景）
+  if (current.streamedContent && content && current.streamedContent === content) {
+    // chunk 累加已与 final 内容一致，但用 final 重新 render 一遍 markdown：
+    // 流式中半截语法（**iden|tifier**）每次 chunk 都 partial render，最终 final
+    // 重 render 保完整正确（chunk 路径已 render 过，所以多调一次只是确认而非新增）
+    current.bubble.innerHTML = renderMarkdown(content);
+  } else {
+    current.bubble.innerHTML = renderMarkdown(content || current.streamedContent || '（无文本输出）');
+  }
+  current = null;
+  scrollToBottom(messagesEl);
+}
+
+// ISSUE-63 实时 token 流：按 run_id 累加 chunk content 到当前 assistant bubble。
+// 同一 run_id 的 chunk 增量拼接；新 run_id 视为新一轮 LLM 输出，重置累加。
+// 用 innerHTML + renderMarkdown 渲染（renderMarkdown 内已 escape，安全）。
+// 流式半截语法（如刚到 "**iden"）正则不匹配 → 显示原文，等 "tifier**" 来齐
+// 才整段转粗体——天然无反向 jitter。
+function appendChunkToBubble(runID, chunk) {
+  if (!current || !chunk) return;
+  // 新 run 开始：重置累加器；同 run 继续累加
+  if (current.streamingRunID !== runID) {
+    current.streamingRunID = runID;
+    current.streamedContent = '';
+  }
+  current.streamedContent += chunk;
+  current.bubble.innerHTML = renderMarkdown(current.streamedContent);
+  // 实时滚动让用户看到 token 流
+  scrollToBottom(messagesEl);
+}
+
+function addPlanBlock(kind, steps) {
+  if (!current) return;
+  const label = ({initial: '初始计划', replan: '重新规划', done: '完成'})[kind] || kind;
+  const block = document.createElement('div');
+  block.className = 'plan-block';
+  let h = `<div class="plan-title">${escape(label)} · ${steps.length} 步</div>`;
+  if (steps.length === 0) {
+    h += `<div class="plan-step">目标已达成，无剩余步骤</div>`;
+  } else {
+    for (const s of steps) {
+      const refs = (s.refs && s.refs.length) ? ` <span style="color:#6c7086">refs=${escape(JSON.stringify(s.refs))}</span>` : '';
+      h += `<div class="plan-step"><span class="agent">${escape(s.agent || '(default)')}</span> · ${escape(s.desc)}${refs}</div>`;
+    }
+  }
+  block.innerHTML = h;
+  current.body.appendChild(block);
+  current.thinking.scrollTop = current.thinking.scrollHeight;
+}
+
+function addStepDispatch(idx, agent, desc) {
+  if (!current) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'plan-block';
+  wrap.innerHTML = `
+    <div class="plan-step running" data-idx="${idx}">
+      <span class="agent">${escape(agent)}</span> 正在执行 · ${escape(desc)}
+    </div>
+    <div class="step-output" style="display:none"></div>
+  `;
+  current.body.appendChild(wrap);
+  current.stepsByIdx.set(idx, {
+    stepEl: wrap.querySelector('.plan-step'),
+    outputEl: wrap.querySelector('.step-output'),
+    agent, desc,
+  });
+  current.currentExecIdx = idx;
+  setSummary(`执行步骤 ${idx + 1}：${agent}`);
+}
+
+function stepFinished(idx, content) {
+  if (!current) return;
+  const entry = current.stepsByIdx.get(idx);
+  if (!entry) return;
+  entry.stepEl.classList.remove('running');
+  entry.stepEl.classList.add('done');
+  // Bug 1：原来用 firstElementChild.outerHTML = ... 只替换 span，留下了
+  // "正在执行 · desc" 文本节点累积；这里整体重写 innerHTML 避免残留。
+  entry.stepEl.innerHTML =
+    `<span class="agent">${escape(entry.agent)}</span> · ${escape(entry.desc)}`;
+  if (content) {
+    entry.outputEl.style.display = '';
+    entry.outputEl.textContent = content;
+  }
+  // Bug 2：清空 currentExecIdx，防止后续 planner / 其他 agent 的 model_end
+  // 被误归到这个已完成的 exec step 上（每次 step_dispatch 会重新设值）。
+  current.currentExecIdx = null;
+}
+
+/* ───────── SSE 事件分派 ───────── */
+function handle(ev) {
+  const d = ev.data || {};
+  // 右侧事件流（始终记录）
+  switch (ev.type) {
+    case 'user_input': {
+      let main = '<b>提问</b>：' + escape(d.q);
+      const meta = d.session_id ? 'session=' + escape(d.session_id.slice(0, 8)) + '…' : '';
+      row(ev.type, main, meta);
+      break;
+    }
+    case 'resume': {
+      const meta = d.session_id ? 'session=' + escape(d.session_id.slice(0, 8)) + '…' : '';
+      row(ev.type, '<b>▶ 恢复会话</b>', meta);
+      break;
+    }
+    case 'interrupted': {
+      const meta = d.session_id ? 'session=' + escape(d.session_id.slice(0, 8)) + '…' : '';
+      let main = '<b>⏸ 已挂起</b>：' + escape(d.reason || '');
+      // ISSUE-58 HITL：agent 用 ask_user tool 主动问 user 时，Query 字段非空——
+      // 把问题/选项明显展示出来。
+      if (d.query && d.query.question) {
+        main += '<br><span style="color:#cba6f7">❓ ' + escape(d.query.question) + '</span>';
+        if (d.query.options && d.query.options.length > 0) {
+          main += ' <span style="color:#6c7086">[' + d.query.options.map(escape).join(' / ') + ']</span>';
+        }
+      }
+      if (d.data) main += ' <span style="color:#6c7086">data=' + escape(JSON.stringify(d.data)) + '</span>';
+      // Checkpoint 摘要：让用户看清"框架在挂起瞬间到底存了什么"
+      if (d.checkpoint) {
+        const cp = d.checkpoint;
+        const parts = [];
+        if (cp.current_node) parts.push('node=' + escape(cp.current_node));
+        if (cp.executed_steps !== undefined) parts.push('已完成 ' + cp.executed_steps + ' 步');
+        if (cp.current_step) parts.push('待执行：' + escape(cp.current_step));
+        if (cp.messages_count !== undefined) parts.push('msgs=' + cp.messages_count);
+        if (cp.events_count !== undefined) parts.push('events=' + cp.events_count);
+        if (parts.length > 0) {
+          main += '<br><span style="color:#94e2d5;font-size:11px">  💾 checkpoint：' + parts.join(' · ') + '</span>';
+        }
+      }
+      row(ev.type, main, meta);
+      break;
+    }
+    case 'aborted': {
+      const meta = d.session_id ? 'session=' + escape(d.session_id.slice(0, 8)) + '…' : '';
+      row(ev.type, '<b>✕ 已取消</b>（checkpoint 已删除）', meta);
+      break;
+    }
+    case 'graph_start':   row(ev.type, '图开始 · input=' + escape(d.input || '')); break;
+    case 'graph_end':     row(ev.type, '图结束' + (d.err ? ' · ' + escape(d.err) : '')); break;
+    case 'node_start':    row(ev.type, '→ ' + escape(d.node)); break;
+    case 'node_end':      row(ev.type, '← ' + escape(d.node) + (d.err ? ' (err=' + escape(d.err) + ')' : '')); break;
+    case 'node_event': {
+      // ISSUE-63 实时事件：is_chunk=true 表示 LLM 流式中间 chunk，按 run_id 累加到 bubble；
+      // 否则展开为普通节点事件行（中间消息 / tool_call 等）
+      if (d.is_chunk && d.content) {
+        appendChunkToBubble(d.run_id, d.content);
+      } else if (d.content) {
+        const meta = d.run_id ? 'run_id=' + escape(d.run_id.slice(0, 8)) + '…' : '';
+        row(ev.type, escape(d.node) + ' · ' + escape(d.role || '') + '：' + escape(d.content), meta);
+      }
+      break;
+    }
+    case 'agent_start':   row(ev.type, '<span class="name">' + escape(d.name) + '</span> 输入：' + escape(d.input || ''), 'path=' + JSON.stringify(d.path || [])); break;
+    case 'agent_end':     row(ev.type, '<span class="name">' + escape(d.name) + '</span> 本轮结束', 'round=' + d.round); break;
+    case 'model_start':   row(ev.type, '<span class="name">' + escape(d.name) + '</span> 调用 LLM', 'msgs=' + d.msgs + ' tools=' + d.tools); break;
+    case 'model_end': {
+      let main = '<span class="name">' + escape(d.name) + '</span>';
+      if (d.run_id) main += ' <span class="rid">run_id=' + escape(d.run_id.slice(0, 8)) + '…</span>';
+      if (d.tool_calls) main += ' → tool_calls: ' + escape(JSON.stringify(d.tool_calls));
+      else if (d.content) main += '：' + escape(d.content);
+      row(ev.type, main);
+      break;
+    }
+    case 'tool_start':    row(ev.type, '<span class="name">' + escape(d.agent) + '</span> → ' + escape(d.name) + ' args=' + escape(d.args || '')); break;
+    case 'tool_end':      row(ev.type, (d.ok ? 'ok' : 'FAIL ' + escape(d.err_code || '')) + (d.result ? ' · ' + escape(d.result) : '')); break;
+    case 'plan': {
+      const kind = ({initial: '初始计划', replan: '重规划', done: '收尾'})[d.kind] || d.kind;
+      row(ev.type, '<b>' + kind + '</b>（已完成 ' + d.executed + ' 步）');
+      break;
+    }
+    case 'step_dispatch': row(ev.type, '#' + d.idx + ' → ' + escape(d.agent) + ': ' + escape(d.desc)); break;
+    case 'final':         row(ev.type, '最终答复（' + (d.content || '').length + ' 字符）' + (d.run_id ? ' <span class="rid">run_id=' + escape(d.run_id.slice(0,8)) + '…</span>' : '')); break;
+    case 'error':         row(ev.type, '<b>错误</b>：' + escape(d.message || JSON.stringify(d))); break;
+    case 'done': {
+      let main = '执行结束';
+      if (d && d.interrupted) main += '（中断挂起，可恢复）';
+      if (d && d.history_size !== undefined) main += ' history=' + d.history_size;
+      row(ev.type, main);
+      break;
+    }
+    default:              row(ev.type || 'unknown', '<code>' + escape(JSON.stringify(d)) + '</code>');
+  }
+
+  // 左侧聊天栏（只映射关键事件）
+  switch (ev.type) {
+    case 'plan':
+      addPlanBlock(d.kind, d.curr || []);
+      // 同步更新 summary：done 时切到"完成"，避免停在"重新规划中…"
+      if (d.kind === 'done') {
+        setSummary(`✓ 完成（共 ${d.executed || 0} 步）`);
+      } else if (d.kind === 'replan') {
+        setSummary(`重规划：还剩 ${(d.curr || []).length} 步`);
+      } else if (d.kind === 'initial') {
+        setSummary(`初始计划 · ${(d.curr || []).length} 步`);
+      }
+      break;
+    case 'step_dispatch':
+      addStepDispatch(d.idx, d.agent || '(default)', d.desc || '');
+      break;
+    case 'model_end':
+      // 把 LLM 输出挂到当前正在执行的 step 上作为 output 预览（tool-call 跳过）。
+      // 双保险：planner / 其他 agent 的 model_end 不能命中——只在 d.name 匹配
+      // 当前 exec step 的 agent 时才 stepFinished。
+      if (current && current.currentExecIdx !== null && d.content && !d.tool_calls) {
+        const entry = current.stepsByIdx.get(current.currentExecIdx);
+        if (entry && entry.agent === d.name) {
+          stepFinished(current.currentExecIdx, d.content);
+        }
+      }
+      break;
+    case 'agent_start':
+      // 只在 sub-agent 接管时更新 summary，让用户看到进展
+      if (current && d.name && d.name !== 'planner') {
+        setSummary(`执行子 agent：${d.name}`);
+      } else if (current && d.name === 'planner') {
+        current.plannerCalls += 1;
+        setSummary(current.plannerCalls === 1 ? '规划中…' : '重新规划中…');
+      }
+      break;
+    case 'final':
+      finishAssistantTurn(d.content, true);
+      break;
+    case 'error':
+      if (current) {
+        current.body.insertAdjacentHTML('beforeend',
+          `<div class="plan-step" style="color:#f38ba8">错误：${escape(d.message || '')}</div>`);
+      }
+      break;
+    case 'user_input':
+      if (d.session_id) currentSessionID = d.session_id;
+      break;
+    case 'resume':
+      if (d.session_id) currentSessionID = d.session_id;
+      break;
+    case 'interrupted':
+      // 服务端确认挂起，checkpoint 已存——切到 paused 状态，三按钮（继续/改方向/取消）+ textarea 等用户操作
+      if (current) {
+        let line = `⏸ 已挂起 · ${escape(d.reason || 'paused')}`;
+        if (d.query && d.query.question) {
+          line += `<br>❓ ${escape(d.query.question)}`;
+          if (d.query.options && d.query.options.length > 0) {
+            line += ` <span style="color:#6c7086">[${d.query.options.map(escape).join(' / ')}]</span>`;
+          }
+        } else {
+          line += '（可选填文本后点 ▶ 继续 / ↻ 改方向 / ✕ 取消）';
+        }
+        current.body.insertAdjacentHTML('beforeend',
+          `<div class="plan-step" style="color:#fab387">${line}</div>`);
+      }
+      setUIState('paused');
+      break;
+    case 'aborted':
+      if (current) finishAssistantTurn('(已取消)', false);
+      setUIState('finished');
+      break;
+    case 'done':
+      // 服务端关流。interrupted/aborted 路径已切状态；其他路径走 finished。
+      if (d && (d.interrupted || d.aborted)) break;
+      if (current) finishAssistantTurn('(未收到最终答复)', false);
+      setUIState('finished');
+      break;
+  }
+}
+
+/* ───────── 状态机：UI 按钮可见性 / 启用态 ───────── */
+function setUIState(s) {
+  currentState = s;
+  switch (s) {
+    case 'idle':
+    case 'finished':
+      sendBtn.style.display = '';
+      sendBtn.disabled = false;
+      stopBtn.style.display = 'none';
+      resumeBtn.style.display = 'none';
+      replanBtn.style.display = 'none';
+      abortBtn.style.display = 'none';
+      eventsHead.classList.remove('live');
+      qEl.disabled = false;
+      qEl.placeholder = '说点什么…（Enter 发送，Shift+Enter 换行）';
+      currentSessionID = null;
+      break;
+    case 'running':
+      sendBtn.style.display = '';
+      sendBtn.disabled = true;
+      stopBtn.style.display = '';
+      stopBtn.disabled = false;
+      resumeBtn.style.display = 'none';
+      replanBtn.style.display = 'none';
+      abortBtn.style.display = 'none';
+      eventsHead.classList.add('live');
+      qEl.disabled = true;
+      break;
+    case 'paused':
+      sendBtn.style.display = 'none';
+      stopBtn.style.display = 'none';
+      resumeBtn.style.display = '';
+      resumeBtn.disabled = false;
+      replanBtn.style.display = '';
+      replanBtn.disabled = false;
+      abortBtn.style.display = '';
+      abortBtn.disabled = false;
+      eventsHead.classList.remove('live');
+      // ISSUE-58 HITL：paused 时启用 textarea，让用户可选填"答案 / 新指令"。
+      // 三按钮（继续/改方向/取消）共用 textarea 文本，按钮决定 action。
+      qEl.disabled = false;
+      qEl.placeholder = '可选：填答案/新指令（继续=ask_user 答复 · 改方向=replan 输入）';
+      break;
+  }
+}
+
+/* ───────── 连接控制 ───────── */
+function send() {
+  const q = qEl.value.trim();
+  if (!q || es) return;
+  appendUserMessage(q);
+  beginAssistantTurn();
+  qEl.value = '';
+  autoResize();
+  setUIState('running');
+  // ISSUE-71 chat_entry mode 切换 demo：把当前 mode 拼进 URL（sticky 跨 query 持续）
+  openStream('/api/chat?q=' + encodeURIComponent(q) + '&mode=' + encodeURIComponent(currentMode));
+}
+
+// ISSUE-58 HITL：三种 resume action 共享同一入口，发到 /api/chat?session_id=..&action=..&text=..
+// action: continue（默认重跑被中断节点 / 把文本作为 ask_user 答复）|
+//         replan（跳回 plan 节点 + 文本作新指令）|
+//         abort（删除 checkpoint 直接结束）
+function resumeWithAction(action) {
+  if (!currentSessionID || es) return;
+  const text = qEl.value.trim();
+  qEl.value = '';
+  autoResize();
+  // 如果有文本，先在聊天栏 echo 一下，让 user 看到自己输入了什么
+  if (text) appendUserMessage(text);
+  // Replan 语义 = 用户改方向，本质是"开新对话"——必须 finish 旧 turn + 开新 turn，
+  // 否则后续 plan/step_dispatch 事件继续 append 到旧 bubble，用户以为没改方向
+  // (ISSUE-72 cross-audit Round 6 修：实战才暴露的 UX bug)
+  // Continue 是续跑同节点（典型 ask_user 答复），保持现有 turn 不动
+  //
+  // **inline finish 不走 finishAssistantTurn**：避免它的 placeholder 逻辑
+  // （`(改方向，开新对话)` / `（无文本输出）` 等会让旧 bubble 显示假回复，
+  // Round 6.1 修）。直接收尾 spin + 清 current，旧 bubble 保留中断前已渲染
+  // 的内容（researcher / writer 等的产出原样），让用户视觉上看到"旧对话
+  // 自然完结 + 新对话开始"。
+  if (action === 'replan') {
+    if (current) {
+      current.spin.outerHTML = '<span style="color:#a6e3a1;font-weight:600">✓</span>';
+      current.thinking.open = false; // 折叠旧 thinking 区
+      current = null;
+    }
+    beginAssistantTurn();
+  }
+  setUIState('running');
+  let url = '/api/chat?session_id=' + encodeURIComponent(currentSessionID) +
+            '&action=' + encodeURIComponent(action) +
+            '&mode=' + encodeURIComponent(currentMode); // mode 也透到 Resume，让 chat_entry 重建装新 prompt
+  if (text) url += '&text=' + encodeURIComponent(text);
+  openStream(url);
+}
+
+function resume()  { resumeWithAction('continue'); }
+function replan()  { resumeWithAction('replan'); }
+function abort()   { resumeWithAction('abort'); }
+
+function stop() {
+  if (!currentSessionID || currentState !== 'running') return;
+  stopBtn.disabled = true; // 防止重复点击；等服务端 'interrupted' 事件确认后切 paused
+  fetch('/api/interrupt?session_id=' + encodeURIComponent(currentSessionID), { method: 'POST' })
+    .catch(err => row('error', '中断请求失败：' + escape(err.message)));
+}
+
+function openStream(url) {
+  es = new EventSource(url);
+  es.onmessage = (m) => {
+    try { handle(JSON.parse(m.data)); }
+    catch (e) { row('error', 'parse error: ' + escape(e.message)); }
+  };
+  es.onerror = () => {
+    if (es) { es.close(); es = null; }
+    // 服务端关流后 onerror 触发——done 事件通常已经处理完，这里只做兜底
+    if (currentState === 'running') {
+      if (current) finishAssistantTurn('(连接已断开)', false);
+      setUIState('finished');
+    }
+  };
+}
+
+/* textarea 自适应高度 */
+function autoResize() {
+  qEl.style.height = 'auto';
+  qEl.style.height = Math.min(qEl.scrollHeight, 160) + 'px';
+}
+
+qEl.addEventListener('input', autoResize);
+qEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    // paused 状态下 Enter = 继续（最常用 action）；其它 action（改方向 / 取消）
+    // 显式点按钮避免误操作。idle/finished 时 Enter = 发新消息。
+    if (currentState === 'paused') {
+      resume();
+    } else {
+      send();
+    }
+  }
+});
+sendBtn.addEventListener('click', send);
+stopBtn.addEventListener('click', stop);
+resumeBtn.addEventListener('click', resume);
+replanBtn.addEventListener('click', replan);
+abortBtn.addEventListener('click', abort);
+
+// ISSUE-71 mode toggle：点按钮在 Normal / Plan 之间切换。sticky——切了就持续到下次切，
+// 对话历史保留（toolkit 不变，只切 system prompt）。
+modeToggleBtn.addEventListener('click', () => {
+  currentMode = (currentMode === 'normal') ? 'plan' : 'normal';
+  modeToggleBtn.textContent = (currentMode === 'normal') ? 'Normal' : 'Plan';
+  modeToggleBtn.style.color = (currentMode === 'normal') ? '#a6e3a1' : '#fab387'; // 绿 / 橙
+  modeToggleBtn.title = '当前 ' + currentMode + ' mode（点击切换，下次发消息生效）';
+});
+
+clearBtn.addEventListener('click', () => {
+  messagesEl.innerHTML = '';
+  streamEl.innerHTML = '';
+  if (es) { es.close(); es = null; }
+  setUIState('idle');
+});
+
+/* ISSUE-71 chat_entry 模式：scenario dropdown 已删 — chat_entry BasicAgent
+   内部 toolkit 注册 8 scenario 包成 AgentAsTool，LLM 看用户输入决定调哪个。 */
+
+// 初始化 UI 状态
+setUIState('idle');
+</script>
+</body>
+</html>

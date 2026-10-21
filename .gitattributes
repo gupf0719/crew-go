@@ -1,0 +1,1 @@
+.claude/trace/**/*.jsonl merge=union

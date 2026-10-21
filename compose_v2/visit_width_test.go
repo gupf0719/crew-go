@@ -1,0 +1,142 @@
+package compose_v2_test
+
+// maxVisit 语义：限制的是**迭代深度**（同一节点被反复回边访问多少轮），不是
+// fan-out **宽度**（一个超步里同一 NodeID 有多少个并发实例）。
+//
+// 两者混淆的后果不是报错了事——业务把 worker 并发数调到 maxVisit 以上，整张图
+// 在第一个超步就假触顶，worker 一次都没跑。
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"crew-go/compose_v2"
+)
+
+// TestVisitCount_FanoutWidthIsNotIterationDepth：单超步内 N 个并发实例不该被当作
+// N 次迭代。
+//
+// sanity-revert：把 graph_loop 的 distinctNodeIDs(frontier) 换回 range frontier
+// → visits[worker] 一超步跳到 5 > maxVisit(3) → worker 跑 0 次 + 返
+// MaxIterationsError。
+func TestVisitCount_FanoutWidthIsNotIterationDepth(t *testing.T) {
+	const width = 5
+	var ranWorker atomic.Int32
+
+	b := compose_v2.NewBuilder().WithName("width").WithMaxVisit(3)
+	b.AddNode("split", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		ds := make([]compose_v2.SendDirective, 0, width)
+		for i := 0; i < width; i++ {
+			ds = append(ds, compose_v2.SendDirective{Target: "worker"})
+		}
+		compose_v2.SendFrom(ctx, ds...)
+		return nil, nil
+	})
+	b.AddNode("worker", func(_ context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		ranWorker.Add(1)
+		return nil, nil
+	})
+	b.AddEdge(compose_v2.StartNode, "split")
+	b.AddEdge("worker", compose_v2.EndNode)
+
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := compose_v2.Run(context.Background(), g, compose_v2.NewChannelManager()); err != nil {
+		var mie *compose_v2.MaxIterationsError
+		if errors.As(err, &mie) {
+			t.Fatalf("fan-out 宽度 %d 被当成迭代深度触顶（maxVisit=3）：%v\n"+
+				"  maxVisit 限的是同一节点被回边反复访问的**轮数**，不是一超步里的并发**份数**",
+				width, err)
+		}
+		t.Fatalf("Run: %v", err)
+	}
+	if got := ranWorker.Load(); got != width {
+		t.Errorf("worker 应跑 %d 次（fan-out 宽度），实际 %d 次", width, got)
+	}
+}
+
+// TestVisitCount_LoopDepthStillCapped 守另一半：改成按 distinct NodeID 计数后，
+// 真正的迭代深度（循环回边反复访问同一节点）**仍然**要被 maxVisit 拦住。
+//
+// 没有这条，上面那个测试可以靠"干脆不计数"作弊通过——防护就被拆没了。
+func TestVisitCount_LoopDepthStillCapped(t *testing.T) {
+	var rounds atomic.Int32
+
+	b := compose_v2.NewBuilder().WithName("depth").WithMaxVisit(3)
+	b.AddNode("loop", func(_ context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		rounds.Add(1)
+		return nil, nil
+	})
+	b.AddEdge(compose_v2.StartNode, "loop")
+	// 无条件回边——只能靠 maxVisit 收敛
+	b.AddEdge("loop", "loop")
+
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	// ctx deadline：防护若失效，失败模式是挂死烧光 -timeout 预算、断言那行永远
+	// 执行不到（整包 panic: test timed out）。有 deadline 就退化成干净的断言失败。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = compose_v2.Run(ctx, g, compose_v2.NewChannelManager())
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(err, &mie) {
+		t.Fatalf("无限回边应触 MaxIterationsError（否则 maxVisit 防护形同虚设），got %v", err)
+	}
+	if got := rounds.Load(); got > 4 {
+		t.Errorf("loop 跑了 %d 轮，maxVisit=3 应在第 4 轮拦住", got)
+	}
+}
+
+// TestVisitCount_CompoundSelfFanoutIsBounded 守 fan-out 宽度的兜底。
+//
+// maxVisit 计的是深度、一个超步至多 +1 —— 它拦不住宽度。节点在自己的 NodeFunc 里
+// SendFrom 自己 N(≥2) 次时宽度**逐超步相乘**：业务终止条件写错就是 N^超步数。等
+// maxVisit 触顶时进程早已 OOM（实测 N=2/maxVisit=6 执行 63 次 = 2^6−1；默认
+// maxVisit=100 是 2^100）。
+//
+// 用 ctx deadline 而不是裸跑：防护若失效，失败模式是挂死烧光 -timeout 预算，
+// 断言那行永远执行不到。有 deadline 就退化成干净的断言失败。
+func TestVisitCount_CompoundSelfFanoutIsBounded(t *testing.T) {
+	var ran atomic.Int32
+
+	b := compose_v2.NewBuilder().WithName("compound").
+		WithMaxVisit(60).          // 深度给够，逼宽度那道防线出场
+		WithMaxFrontierWidth(2000) // 宽度上限调小让测试快
+	b.AddNode("W", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		ran.Add(1)
+		// 每个实例再投 2 个自己——终止条件写错的典型形态
+		compose_v2.SendFrom(ctx,
+			compose_v2.SendDirective{Target: "W"},
+			compose_v2.SendDirective{Target: "W"},
+		)
+		return nil, nil
+	})
+	b.AddEdge(compose_v2.StartNode, "W")
+
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = compose_v2.Run(ctx, g, compose_v2.NewChannelManager())
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(err, &mie) {
+		t.Fatalf("宽度指数爆炸应被 MaxIterationsError 拦住，got %v（执行了 %d 次）\n"+
+			"  没拦住 = 宽度无界，默认 maxVisit=100 时是 2^100 次执行，OOM 先到",
+			err, ran.Load())
+	}
+	// 拦在宽度上限量级，而不是等指数涨到天上
+	if got := ran.Load(); got > 8000 {
+		t.Errorf("拦得太晚：已执行 %d 次（宽度上限 2000，应在同量级拦住）", got)
+	}
+	t.Logf("宽度防线在 %d 次执行后拦住", ran.Load())
+}

@@ -1,0 +1,47 @@
+.DS_Store
+.idea/
+# .claude/ 仅排除本地配置 + audit marker，settings.json + scripts/ 入 git 让强制
+# 规则团队共享 (audit hook + race test 等)
+.claude/settings.local.json
+.claude/settings.local.json.bak
+.claude/worktrees/
+.claude/audit/*.done
+.claude/projects/
+.claude/scheduled_tasks.lock
+*.test
+*.out
+.env
+
+# pandoc 从 doc/v2/*.md 转出的 Word 辅助产物（每次 md 改都得重新生成，不入仓库防 stale）
+*.docx
+
+# 根目录误生成的 example 可执行文件（来自 go build -o <name> ./example/<name>；应改用
+# go run 或 -o /tmp/）。按 example/ 子目录名后缀**根锚定**匹配，一次覆盖现有 + 未来同后缀
+# example，不误伤同名 example/ 源目录（前导 / 锚根、* 不跨目录）。
+/*_smoke
+/*_demo
+/*_web
+/*_chat
+/*_server
+/*_client
+/*_list
+/*_trace
+/*_backend
+/*_wrap
+/envloader
+/llmtrace
+/scenarios
+
+# 其他工具的 worktree 目录（误提交清理，对齐 .claude/worktrees/）
+.claire/
+
+# 审计探针（agent 临时文件，绝不入仓）
+zzprobe_*
+zz_*_test.go
+# 探针**二进制**（go test -c / go build -o 的产物，无后缀所以上面两条都不匹配）——
+# 曾有一个 12MB 的 Mach-O 被 `git add -A` 一起提交进去
+zz_*
+!zz_*.go
+
+# make cover / CI coverage job 落在仓库根的 profile
+coverage.out

@@ -1,0 +1,93 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/.claude/scripts/check-audit-stop.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/.claude/scripts/check-comment-audit-stop.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/.claude/scripts/check-threeway-stop.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(rm -rf ~)",
+      "Bash(rm -rf $HOME*)",
+      "Bash(sudo rm *)",
+      "Bash(curl * | sh)",
+      "Bash(curl * | bash)",
+      "Bash(wget * | sh)",
+      "Bash(wget * | bash)",
+      "Bash(git push --force *)",
+      "Bash(git push -f *)"
+    ],
+    "allow": [
+      "Bash(go test*)",
+      "Bash(go build*)",
+      "Bash(go vet*)",
+      "Bash(go mod*)",
+      "Bash(go list*)",
+      "Bash(go env*)",
+      "Bash(go doc*)",
+      "Bash(go fmt*)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git rebase *)",
+      "Bash(git rev-list *)",
+      "Bash(git stash *)",
+      "Bash(git restore *)",
+      "Bash(git checkout *)",
+      "Bash(git reset *)",
+      "Bash(git -C *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(mkdir *)",
+      "Bash(touch *)",
+      "Bash(rm /tmp/*)",
+      "Bash(ln *)",
+      "Bash(chmod *)",
+      "Bash(pkill *)",
+      "Bash(kill *)",
+      "Bash(killall *)",
+      "Bash(awk *)",
+      "Bash(diff *)",
+      "Bash(rg *)",
+      "Bash(jq *)",
+      "Bash(printf *)",
+      "Bash(sed *)",
+      "Bash(xargs *)",
+      "Bash(bash *)",
+      "Bash(sh *)",
+      "Bash(file *)",
+      "Bash(lsof *)",
+      "Bash(chmod *)",
+      "Bash(rm *)",
+      "Bash(cat *)",
+      "Bash(cat)",
+      "Bash(tee *)",
+      "Bash(printf *)",
+      "Read(//Users/gupengfei/program/go/src/crew-go/**)",
+      "Read(//Users/gupengfei/program/go/src/agentdock-spec/**)",
+      "Read(//Users/gupengfei/program/go/src/eino/**)",
+      "Read(//tmp/**)",
+      "Edit(//Users/gupengfei/program/go/src/crew-go/**)",
+      "Edit(//tmp/**)",
+      "Write(//Users/gupengfei/program/go/src/crew-go/**)",
+      "Write(//tmp/**)"
+    ]
+  }
+}

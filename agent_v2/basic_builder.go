@@ -303,7 +303,8 @@ const (
 )
 
 // markToolFailure 给 tool_result message 打上失败 marker——见上方 annotation 常量 godoc。
-// 返回入参 m 便于链式写在 return 里。
+// 同时置上 tool_result 块的 IsError：原生支持失败标记的 provider（Anthropic 的 is_error）据它发
+// wire 字段，marker 是给框架与观测层的，模型看不见。返回入参 m 便于链式写在 return 里。
 func markToolFailure(m *schema.Message, code, message string) *schema.Message {
 	if m == nil {
 		return m
@@ -313,6 +314,11 @@ func markToolFailure(m *schema.Message, code, message string) *schema.Message {
 	}
 	m.Annotations[toolErrorCodeAnnotation] = code
 	m.Annotations[toolErrorMessageAnnotation] = message
+	for _, cb := range m.ContentBlocks {
+		if cb != nil && cb.Toolresult != nil {
+			cb.Toolresult.IsError = true
+		}
+	}
 	return m
 }
 
@@ -970,6 +976,8 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				r.Content = content
 				if len(r.ContentBlocks) > 0 && r.ContentBlocks[0].Toolresult != nil {
 					r.ContentBlocks[0].Toolresult.Content = content
+					// 失败标记跟着模型看到的结论走（钩子可能把失败改成成功，反之亦然）
+					r.ContentBlocks[0].Toolresult.IsError = failed
 				}
 				failedAfterHook[i] = failed
 			} else {

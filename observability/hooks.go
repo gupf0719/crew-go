@@ -680,17 +680,21 @@ func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *
 			intAttr("gen_ai.usage.output_tokens", int64(out.Usage.OutputTokens)),
 			intAttr("gen_ai.usage.total_tokens", int64(out.Usage.TotalTokens)),
 		)
-		// 属性名对齐 OTel GenAI semconv (2026 Q2): reasoning.output_tokens / cache_read.input_tokens
-		// (旧名 reasoning_tokens / cached_input_tokens). AI_TRACE_SPEC 未定义这俩 (crew-go 扩展),
-		// 改名加性不破坏 CS-OSS Monitor. cache_creation.input_tokens 待 Claude-native provider 报
-		// cache-write token 时再加 (现 openai/qwen/deepseek 只报 cache read, 现加字段=死字段).
+		// 属性名对齐 OTel GenAI semconv (2026 Q2): reasoning.output_tokens / cache_read.input_tokens /
+		// cache_creation.input_tokens (旧名 reasoning_tokens / cached_input_tokens). AI_TRACE_SPEC 未定义
+		// 这几个 (crew-go 扩展), 加性不破坏 CS-OSS Monitor.
 		if out.Usage.ThinkTokens > 0 {
 			attrs = append(attrs, intAttr("gen_ai.usage.reasoning.output_tokens", int64(out.Usage.ThinkTokens)))
 		}
-		// cache_read.input_tokens — OpenAI prompt cache 命中数, 业务降本核心 (provider 半价计费).
-		// qwen / deepseek 也兼容. Cache 未命中为 0, 不 emit 避免噪音.
+		// cache_read.input_tokens — prompt cache 命中数, 业务降本核心 (provider 折价计费).
+		// openai / qwen / deepseek / anthropic 都报. Cache 未命中为 0, 不 emit 避免噪音.
 		if out.Usage.CachedInputTokens > 0 {
 			attrs = append(attrs, intAttr("gen_ai.usage.cache_read.input_tokens", int64(out.Usage.CachedInputTokens)))
+		}
+		// cache_creation.input_tokens — 本次写入 prompt cache 的 token (按写入价计费, 比普通输入贵).
+		// 目前只有 model/anthropic 报; 只报 cache 读的 provider 为 0, 不 emit.
+		if out.Usage.CacheCreationInputTokens > 0 {
+			attrs = append(attrs, intAttr("gen_ai.usage.cache_creation.input_tokens", int64(out.Usage.CacheCreationInputTokens)))
 		}
 	}
 	if out != nil && out.Message != nil && out.Message.Metadata != nil {
@@ -751,7 +755,8 @@ func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *
 			}
 		}
 	}
-	// gen_ai.llm.tokens.total counter — 按 token type (input/output/think/total) 4 series.
+	// gen_ai.llm.tokens.total counter — 按 token type 分 series (input/output/think/total/cached/
+	// cache_creation, 值 <= 0 的不 emit).
 	// Round 5 Q1+Q2 fix: label 对齐 OTel — gen_ai.agent.name + gen_ai.request.model +
 	// gen_ai.usage.type (OTel 推荐 "token type" 字段名).
 	if out != nil && out.Usage != nil {
@@ -774,6 +779,8 @@ func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *
 		// HIGH-2.2 fix: cached 单独 1 series 让业务算 cache 命中率 =
 		// cached / input (PromQL 直接 join 算). 业务 dashboard 看降本进度核心.
 		emitToken("cached", out.Usage.CachedInputTokens)
+		// cache_creation: 写入 cache 的 token (Anthropic 按写入价计费), 跟 cached 一起才算得出缓存的净收益.
+		emitToken("cache_creation", out.Usage.CacheCreationInputTokens)
 	}
 
 	// **iter-5-Q Phase 2** metrics_mapping span attribute — 关联本 model span 到

@@ -161,6 +161,10 @@ func (w digestWriter) block(b *schema.ContentBlock) {
 		w.str("toolresult.type", string(b.Toolresult.Type))
 		w.str("toolresult.call_id", b.Toolresult.ToolCallId)
 		w.str("toolresult.content", b.Toolresult.Content)
+		// 失败标记只在置上时写入：加这个字段之前的存档（都是 false）算出的摘要不变
+		if b.Toolresult.IsError {
+			w.str("toolresult.is_error", "true")
+		}
 	}
 	w.present("data", b.Data != nil)
 	if b.Data != nil {

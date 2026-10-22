@@ -21,6 +21,7 @@ type instruments struct {
 	usageInput         metric.Int64Counter
 	usageOutput        metric.Int64Counter
 	usageCacheRead     metric.Int64Counter
+	usageCacheWrite    metric.Int64Counter
 	usageReasoning     metric.Int64Counter
 	agentDuration      metric.Float64Histogram
 	agentInferences    metric.Int64Histogram
@@ -81,6 +82,7 @@ func newInstruments(m metric.Meter) *instruments {
 		usageInput:        ctr(MetricUsageInputTokens, "{token}", "The number of input (prompt) tokens used, including cached tokens."),
 		usageOutput:       ctr(MetricUsageOutputTokens, "{token}", "The number of output (completion) tokens used, including reasoning tokens."),
 		usageCacheRead:    ctr(MetricUsageCacheReadTokens, "{token}", "The number of input tokens served from a provider-managed cache."),
+		usageCacheWrite:   ctr(MetricUsageCacheWriteTokens, "{token}", "The number of input tokens written to a provider-managed cache."),
 		usageReasoning:    ctr(MetricUsageReasoningTokens, "{token}", "The number of output tokens used for reasoning."),
 		agentDuration:     f64h(MetricInvokeAgentDuration, "s", "The end-to-end duration of a single in-process agent invocation.", durationBuckets),
 		agentInferences:   i64h(MetricInvokeAgentInferences, "{inference_call}", "The number of inference calls an agent makes during a single invocation."),

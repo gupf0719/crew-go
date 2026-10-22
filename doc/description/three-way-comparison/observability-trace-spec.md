@@ -81,7 +81,7 @@ ID。业务的检索 / 嵌入工具走工具路径：`execute_tool {工具名}` 
 | `gen_ai.output.type` | Cond. Required | 结构化输出（`WithOutputSchema`）时可以记 `json`，未接 |
 | `gen_ai.response.id` | Recommended | `MessageMetadata` 没有这个字段 |
 | `server.address` / `server.port` | Recommended | 地址在模型客户端里，钩子看不到 |
-| `gen_ai.usage.{text,image,audio}.*`、`cache_write.input_tokens` | Recommended | `MessageUsage` 只有总数、缓存读取、推理 token |
+| `gen_ai.usage.{text,image,audio}.*` | Recommended | `MessageUsage` 不按模态拆分（缓存读写、推理 token 已记；缓存写入目前只有 `model/anthropic` 报） |
 | `gen_ai.agent.description` / `.id` / `.version` | Cond. Required | `hook.AgentInfo` 只有名字与类型 |
 | `gen_ai.tool.description` / `gen_ai.tool.definitions` | Recommended / Opt-In | 工具定义不在 `ToolInput` / `ModelInput` 里（`OnModelStart` 的 `Tools` 恒 nil） |
 | `gen_ai.client.inference.time_per_output_chunk`、`gen_ai.client.inference.operation.{input,output}_tokens` | Recommended | 第一版只记首片时长与用量计数 |

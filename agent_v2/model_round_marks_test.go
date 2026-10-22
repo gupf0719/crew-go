@@ -2,8 +2,9 @@ package agent_v2_test
 
 // model 节点每轮给本轮打的两个标记（软降落轮、这个任务里调过工具）只属于这一轮——这一轮的模型回调
 // （OnModelEnd、ToolFilter、ChatModel 本身）里调起的子 agent 不该继承。曾经只在为真时才推，子 agent 的
-// model 节点为假时不推，于是沿用了父的真：父在软降落轮调起的子 agent 第 0 轮就被摘光工具，父调过工具之后
-// 调起的子 agent 自己要求的 required 在第 0 轮就被复位（审计实测，均 err == nil）。
+// model 节点为假时不推，于是沿用了父的真：父在软降落轮调起的子 agent 第 0 轮就被摘光工具（软降落那时摘工具，
+// 现在是关掉工具调用），父调过工具之后调起的子 agent 自己要求的 required 在第 0 轮就被复位（审计实测，均
+// err == nil）。软降落轮的标记 tools 节点也推（它据此不执行那一轮硬调的工具），同样每轮都推。
 
 import (
 	"context"
@@ -107,11 +108,34 @@ func TestModelRoundMarks_ToolsUsedNotInheritedByChild(t *testing.T) {
 }
 
 // TestModelRoundMarks_FinalRoundNotInheritedByChild：父在软降落轮（maxRounds=1 的第 1 轮）的模型回调里调起子 agent
-// ——子 agent 第 0 轮应照常拿到自己的工具。
+// ——子 agent 第 0 轮应照常拿到自己的工具、不带 tool_choice。承重的是 tool_choice：软降落轮的工具集照旧，继承了父的
+// 标记的子 agent 照样拿得到工具，区别只在那一轮被关掉了工具调用（none）。
 func TestModelRoundMarks_FinalRoundNotInheritedByChild(t *testing.T) {
 	probe := runParentSpawningChild(t, 1)
-	if len(probe.first) == 0 {
-		t.Errorf("子 agent 第 0 轮不是软降落轮，应拿到自己的工具，实际 %v", probe.first)
+	if len(probe.first) == 0 || probe.choice != nil {
+		t.Errorf("子 agent 第 0 轮不是软降落轮，应拿到自己的工具、不带 tool_choice，实际工具 %v tool_choice %v",
+			probe.first, choiceNames([]*schema.ToolChoice{probe.choice}))
+	}
+}
+
+// TestModelRoundMarks_FinalRoundNotInheritedByChildTools：父在软降落轮的模型回调里调起的子 agent，自己调的工具照常
+// 执行。子 agent 的 tools 节点也要推自己的值（为假也推）：只在为真时推的话它沿用父的真，子 agent 调的每个工具都被当成
+// 软降落轮硬调的、一个不执行。
+func TestModelRoundMarks_FinalRoundNotInheritedByChildTools(t *testing.T) {
+	var childNoop atomic.Int32
+	child := agent_v2.NewBasicAgent(agent_v2.WithName("child"),
+		agent_v2.WithModel(&gateModel{script: []*schema.Message{callMsg(tcall("cc", "noop", "{}"))}}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &childNoop, "ok"))))
+	h := &spawnInModelEnd{atRound: 1, child: child}
+	parent := agent_v2.NewBasicAgent(agent_v2.WithName("parent"), agent_v2.WithHooks(h),
+		agent_v2.WithModel(&gateModel{script: []*schema.Message{callMsg(tcall("c1", "noop", "{}"))}}),
+		agent_v2.WithToolkit(noopKit()), agent_v2.WithMaxRounds(1))
+	_, _ = parent.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("hi"))
+	if !h.ran.Load() || h.err != nil {
+		t.Fatalf("fixture 没搭对：父软降落轮的 OnModelEnd 应调起子 agent，ran=%v childErr=%v", h.ran.Load(), h.err)
+	}
+	if got := childNoop.Load(); got != 1 {
+		t.Errorf("子 agent 第 0 轮调的 noop 应照常执行 1 次（子 agent 不在软降落轮），实际执行 %d 次", got)
 	}
 }
 

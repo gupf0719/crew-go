@@ -3,12 +3,13 @@ package mcp
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 )
 
-// MCP 协议默认版本，对齐 agentdock-spec 的 "2025-03-26"。
+// MCP 协议默认版本 "2025-03-26"。
 const defaultProtocolVersion = "2025-03-26"
 
 // rpcRequest 是 JSON-RPC 2.0 请求信封。
@@ -20,6 +21,42 @@ type rpcRequest struct {
 	Params  map[string]any `json:"params,omitempty"`
 }
 
+// ErrNotSent 标记「这次请求肯定没有发到 server」：连接没建起来、请求没写出去、连接早已关闭。Client 实现
+// （CallTool）在确定没发出时用 %w 包上它，Hub 据此告诉模型「这次调用没有发出」——没包上的连接错误一律按
+// 「不确定是否已执行」说，所以拿不准时别包。内置的 StdioClient / StreamableHTTPClient 都按这条做。
+var ErrNotSent = errors.New("mcp: request was not sent")
+
+// RPCError 是 server 答的 JSON-RPC 错误（server 活着，只是这次请求报错）。Client 实现（CallTool）把 server 的
+// JSON-RPC 错误响应按它交出（可以 %w 包着），Hub 据此把它当成这次调用的失败、不把 server 标成掉线。
+type RPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
+}
+
+func (e *RPCError) Error() string {
+	return fmt.Sprintf("mcp rpc error %d: %s", e.Code, e.Message)
+}
+
+// badResponseError 是「server 答了，但结果解析不了」：请求已经到了 server（可能已执行），server 也活着。
+type badResponseError struct{ err error }
+
+func (e *badResponseError) Error() string { return "bad response: " + e.err.Error() }
+func (e *badResponseError) Unwrap() error { return e.err }
+
+// httpStatusError 是 HTTP 非 2xx 且响应体不是 JSON-RPC 错误。body 已截短、抹掉了自己发出的请求头的值。
+type httpStatusError struct {
+	code int
+	body string
+}
+
+func (e *httpStatusError) Error() string {
+	if e.body == "" {
+		return fmt.Sprintf("http status %d", e.code)
+	}
+	return fmt.Sprintf("http status %d: %s", e.code, e.body)
+}
+
 // rpcResponse 是 JSON-RPC 2.0 响应信封；Result 和 Error 互斥。
 // ID 使用 json.RawMessage：协议允许 id 为 number | string | null，
 // 部分 server 实现会将数字 id 序列化为字符串（如 `"id":"1"`），
@@ -28,7 +65,7 @@ type rpcResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id"`
 	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
+	Error   *RPCError       `json:"error,omitempty"`
 }
 
 // responseIDKey 把响应的 raw id（可能是 number 或 string）规范化为字符串，
@@ -53,16 +90,6 @@ func idKey(id int64) string {
 	return strconv.FormatInt(id, 10)
 }
 
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	Data    any    `json:"data,omitempty"`
-}
-
-func (e *rpcError) Error() string {
-	return fmt.Sprintf("mcp rpc error %d: %s", e.Code, e.Message)
-}
-
 // buildInitializeParams 构造 initialize 请求的 params。
 func buildInitializeParams(protocolVersion, clientName, clientVersion string) map[string]any {
 	return map[string]any{
@@ -80,10 +107,11 @@ func buildInitializeParams(protocolVersion, clientName, clientVersion string) ma
 func parseToolsList(raw json.RawMessage, allow []string) ([]ToolSpec, error) {
 	var body struct {
 		Tools []struct {
-			Name         string         `json:"name"`
-			Description  string         `json:"description"`
-			InputSchema  map[string]any `json:"inputSchema"`
-			OutputSchema map[string]any `json:"outputSchema"`
+			Name         string           `json:"name"`
+			Description  string           `json:"description"`
+			InputSchema  map[string]any   `json:"inputSchema"`
+			OutputSchema map[string]any   `json:"outputSchema"`
+			Annotations  *ToolAnnotations `json:"annotations"`
 		} `json:"tools"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
@@ -102,6 +130,7 @@ func parseToolsList(raw json.RawMessage, allow []string) ([]ToolSpec, error) {
 			Description:  t.Description,
 			InputSchema:  t.InputSchema,
 			OutputSchema: t.OutputSchema,
+			Annotations:  t.Annotations,
 		})
 	}
 	return out, nil

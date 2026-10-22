@@ -163,11 +163,11 @@ func mockTools(_ context.Context, tcs []schema.ToolCall, callCtxs []context.Cont
 			if err != nil {
 				return nil, err
 			}
-			results = append(results, schema.ToolResultMessage(tc.ID, "ask_user", ansMsg.Content))
+			results = append(results, schema.ToolResultMessage(tc.ID, ansMsg.Content))
 			continue
 		}
 		// 其他工具正常返
-		results = append(results, schema.ToolResultMessage(tc.ID, tc.Function.Name, "tool_result_for_"+tc.Function.Name))
+		results = append(results, schema.ToolResultMessage(tc.ID, "tool_result_for_"+tc.Function.Name))
 	}
 	return results, nil
 }

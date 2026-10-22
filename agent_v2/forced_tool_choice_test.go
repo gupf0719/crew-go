@@ -109,6 +109,22 @@ func TestForcedRequired_OnlyUntilFirstToolCall(t *testing.T) {
 	}
 }
 
+// TestForcedRequired_DroppedWhenNoToolsBound：业务强制了 tool_choice=required，而这一轮 toolkit 这条路一件工具都没
+// 绑上（这里是 ToolFilter 把业务工具滤光了）——required 一并摘掉：「必须调工具」配「没有工具」provider 直接拒绝（返
+// 400），业务自己的 ChatModel 未必替你兜。
+func TestForcedRequired_DroppedWhenNoToolsBound(t *testing.T) {
+	m := &enforcingModel{}
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("fr"), agent_v2.WithModel(m), agent_v2.WithToolkit(noopToolkit()),
+		agent_v2.WithToolFilter(func(context.Context, *schema.Message) []string { return []string{} }))
+	if _, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"),
+		agent_v2.WithRunModelOptions(model.WithToolChoice(schema.ToolChoiceRequired))); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := m.seen(); len(got) != 1 || got[0] != nil {
+		t.Errorf("一件工具都没绑上时业务强制的 required 应一并摘掉，实际每轮的 tool_choice %v", choiceNames(got))
+	}
+}
+
 // TestForcedRequired_StructuredOutputKeepsOwnRequired：配了结构化输出时，框架自己设的 required 每轮都在——复位
 // 只针对业务强制的那份。第 1 轮业务强制 + 框架 required，第 2 轮仍是 required（框架那份），模型经 final_output
 // 收尾。

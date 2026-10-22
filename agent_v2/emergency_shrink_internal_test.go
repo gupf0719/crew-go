@@ -12,7 +12,7 @@ import (
 func protectedBig() []*schema.Message {
 	mem := schema.SystemMessage("记忆")
 	mem.Annotations = map[string]any{StoreInjectedAnnotation: true}
-	skill := schema.ToolResultMessage("c1", "activate_skill", "HEAD"+strings.Repeat("z", 40000)+"TAIL")
+	skill := schema.ToolResultMessage("c1", "HEAD"+strings.Repeat("z", 40000)+"TAIL")
 	skill.Annotations = map[string]any{SkillBodyAnnotation: true}
 	return []*schema.Message{
 		schema.SystemMessage("前导"),
@@ -47,7 +47,7 @@ func TestEmergencyDrop_ShrinksWhenNothingDroppable(t *testing.T) {
 		// 出口二：多组但全部受保护
 		"多组全 protected": func() []*schema.Message {
 			out := protectedBig()
-			s2 := schema.ToolResultMessage("c2", "activate_skill", "H2"+strings.Repeat("y", 40000)+"T2")
+			s2 := schema.ToolResultMessage("c2", "H2"+strings.Repeat("y", 40000)+"T2")
 			s2.Annotations = map[string]any{SkillBodyAnnotation: true}
 			return append(out, schema.UserMessage("u2"), s2)
 		}(),
@@ -55,7 +55,7 @@ func TestEmergencyDrop_ShrinksWhenNothingDroppable(t *testing.T) {
 		"只有一组可丢": func() []*schema.Message {
 			out := protectedBig() // [system 前导][system 记忆][user u1][tool skill body]（受保护）
 			// 第二组不带任何保护 marker ⟹ droppable，且正文更大，确保它被优先挖空
-			free := schema.ToolResultMessage("c3", "read_file", "H3"+strings.Repeat("w", 50000)+"T3")
+			free := schema.ToolResultMessage("c3", "H3"+strings.Repeat("w", 50000)+"T3")
 			return append(out, schema.UserMessage("u2"), free)
 		}(),
 	}
@@ -129,7 +129,7 @@ func TestEmergencyShrink_OnlyToolResults(t *testing.T) {
 	// 变异验证时才发现它不承重。
 	bigSys := schema.SystemMessage("SYSHEAD" + strings.Repeat("规", 100000) + "SYSTAIL")
 	bigUser := schema.UserMessage("USERHEAD" + strings.Repeat("问", 100000) + "USERTAIL")
-	bigTool := schema.ToolResultMessage("c1", "f", strings.Repeat("z", 200000))
+	bigTool := schema.ToolResultMessage("c1", strings.Repeat("z", 200000))
 	bigTool.Annotations = map[string]any{SkillBodyAnnotation: true}
 	in := []*schema.Message{bigSys, bigUser, bigTool}
 
@@ -157,7 +157,7 @@ func TestEmergencyShrink_OnlyToolResults(t *testing.T) {
 // 浅拷的话业务打个 tag 就写进原消息的 `Annotations` map 里（实测过端到端泄漏）。
 // 同包另两个 clone 函数早就深拷了，这里不该例外。
 func TestEmergencyShrink_DoesNotLeakIntoOriginal(t *testing.T) {
-	bigTool := schema.ToolResultMessage("c1", "f", strings.Repeat("z", 200000))
+	bigTool := schema.ToolResultMessage("c1", strings.Repeat("z", 200000))
 	bigTool.Annotations = map[string]any{SkillBodyAnnotation: true}
 	in := []*schema.Message{schema.UserMessage("u"), bigTool}
 

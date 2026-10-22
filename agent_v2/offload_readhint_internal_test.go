@@ -19,7 +19,7 @@ import (
 // 两个方向都要断言：配了要有、没配**一定不能有**。只断言「配了要有」的话，
 // 一个无脑恒拼的实现照样全绿。
 func TestOffloadPlaceholder_ReadHint(t *testing.T) {
-	src := schema.ToolResultMessage("c1", "f", strings.Repeat("z", 500))
+	src := schema.ToolResultMessage("c1", strings.Repeat("z", 500))
 
 	t.Run("没配就不拼", func(t *testing.T) {
 		got := cloneToolResultWithOffloadRef(src, "k1", 50, "")

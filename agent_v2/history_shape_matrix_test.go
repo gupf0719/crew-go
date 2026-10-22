@@ -49,12 +49,12 @@ func mCall(content string, ids ...string) *schema.Message {
 }
 
 func mResult(id string) *schema.Message {
-	return schema.ToolResultMessage(id, "f_"+id, "result_of_"+id)
+	return schema.ToolResultMessage(id, "result_of_"+id)
 }
 
 // mResultWith 造内容可区分的结果——用来验「认领了哪一条」，而不只是「认领了某一条」。
 func mResultWith(id, content string) *schema.Message {
-	return schema.ToolResultMessage(id, "f_"+id, content)
+	return schema.ToolResultMessage(id, content)
 }
 
 // assertWireLegal 验出口契约：每条带 tool_call 的 assistant 之后，必须**紧跟**回应它全部

@@ -438,7 +438,7 @@ func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, arg
 	case ApprovalDecisionAllow:
 		return approvalResult{proceed: true}
 	case ApprovalDecisionDeny:
-		return approvalResult{denyMsg: schema.ToolResultMessage(tc.ID, name,
+		return approvalResult{denyMsg: schema.ToolResultMessage(tc.ID,
 			fmt.Sprintf("[tool_denied] 工具 %q 被审批策略拒绝执行。", name))}
 	}
 
@@ -477,7 +477,7 @@ func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, arg
 			markCallApproved(ctx)
 			return approvalResult{proceed: true}
 		default: // deny / 空 / 未识别 → 拒绝（保守 fail-closed）
-			return approvalResult{denyMsg: schema.ToolResultMessage(tc.ID, name,
+			return approvalResult{denyMsg: schema.ToolResultMessage(tc.ID,
 				fmt.Sprintf("[tool_denied] 用户拒绝执行工具 %q。", name))}
 		}
 	}

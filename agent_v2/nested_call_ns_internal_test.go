@@ -391,7 +391,7 @@ func TestInputDigest_CoversEveryField(t *testing.T) {
 		"FileContentBlock":       {"Type", "File"},
 		"FileData":               {"FileData", "Filename", "URL"},
 		"ToolcallContentBlock":   {"Type", "Id", "Arguments", "Name"},
-		"ToolresultContentBlock": {"Type", "ToolCallId", "Content"},
+		"ToolresultContentBlock": {"Type", "ToolCallId", "Content", "IsError"},
 		"DataContentBlock":       {"Type", "Data"},
 	}
 	types := []any{

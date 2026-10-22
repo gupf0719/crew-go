@@ -30,7 +30,7 @@ func TestBasicAgentBuilder_ReActLoop(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			results = append(results, schema.ToolResultMessage(tc.ID, tc.Function.Name, out))
+			results = append(results, schema.ToolResultMessage(tc.ID, out))
 		}
 		return results, nil
 	}
@@ -99,7 +99,7 @@ func TestBasicAgentBuilder_MaxRoundsDefense(t *testing.T) {
 	infiniteTool := func(_ context.Context, tcs []schema.ToolCall, _ []context.Context) ([]*schema.Message, error) {
 		var out []*schema.Message
 		for _, tc := range tcs {
-			out = append(out, schema.ToolResultMessage(tc.ID, tc.Function.Name, "noop_result"))
+			out = append(out, schema.ToolResultMessage(tc.ID, "noop_result"))
 		}
 		return out, nil
 	}
@@ -142,7 +142,7 @@ func TestBasicAgentBuilder_HITL_InToolFn(t *testing.T) {
 			if tc.Function.Name == "needs_confirm" {
 				if ans, ok := compose_v2.GetResumeAnswerText(ctx, "tool_ask"); ok {
 					return []*schema.Message{
-						schema.ToolResultMessage(tc.ID, tc.Function.Name, "confirmed:"+ans),
+						schema.ToolResultMessage(tc.ID, "confirmed:"+ans),
 					}, nil
 				}
 				return nil, &compose_v2.InterruptError{

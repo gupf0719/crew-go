@@ -190,10 +190,10 @@ type Config struct {
 	// tool_search / transfer_to_agent / route_to / ...）恒保留、不受白名单影响**（与审批层
 	// 豁免一致，防业务漏带导致搜索/技能/问用户/路由静默失效）。判的是实例不是名字（见
 	// frameworkMintedTool）：业务工具恰好叫这些名字时照常受白名单约束。
-	// ⚠️ **「恒保留」只对 [ToolFilter] 这条路成立**——软降落轮（轮次预算最后一轮，见
-	// [withFinalRound]）另有一道过滤，那里框架工具全部摘掉（配了结构化输出时**只留 `final_output`**）。两道过滤的语义
-	// 相反：这道防「业务白名单漏带把问用户/技能静默关掉」，那道要的正是摘掉它们。
-	// 用同一个 helper 表达两者曾让软降落的白名单一行没生效，故各有各的载体。
+	// ⚠️ **「恒保留」只对 [ToolFilter] 这条路成立**——配了结构化输出时，软降落轮（轮次预算最后一轮，见
+	// [withFinalRound]）另有一道过滤，那里框架工具全部摘掉、**只留 `final_output`**（没配时那一轮工具集照旧，
+	// 用 tool_choice=none 关掉工具调用）。两道过滤的语义相反：这道防「业务白名单漏带把问用户/技能静默关掉」，
+	// 那道要的正是摘掉它们。用同一个 helper 表达两者曾让软降落的白名单一行没生效，故各有各的载体。
 	// input 是本轮发给 LLM 的最后一条**真实**消息（首轮通常是 user 输入，round 2+ 通常是
 	// tool_result）——框架合成的记账文本（见 UnresolvedCallsRecordAnnotation）会被跳过，
 	// 否则 Handoff 共享视图下它恰好排在末尾、业务拿到的是框架记账而不是对话内容；
@@ -422,10 +422,9 @@ func WithToolMiddleware(mws ...ToolMiddleware) Option {
 // 工具名白名单，在 bind 前过滤（fn 返 nil = 不裁、返子集 = 只 bind 这些业务工具）。框架
 // 工具（ask_user/activate_skill/tool_search/...）恒保留、不受影响。fn 为 nil 不挂。
 //
-// ⚠️ **上面两句在轮次预算的最后一轮都不成立**（软降落，见 [withFinalRound]）：那一轮
-// fn **不被调用**（实测 4 次模型调用只调 3 次 fn），且工具**只剩 `final_output`**（配了
-// WithOutputSchema 时框架那件），其余全被摘掉。
-// 把 fn 当轮次计数器的用法会数少一次——那本来就是误用，但值得知道。典型
+// ⚠️ **轮次预算的最后一轮**（软降落，见 [withFinalRound]）fn 照常被调用，但那一轮模型不调工具：
+// 没配 WithOutputSchema 时照常按 fn 的白名单 bind，只是 tool_choice=none 关掉了工具调用；配了时工具
+// **只剩 `final_output`**（框架那件），fn 的白名单不生效。那一轮模型硬调的工具一律不执行。典型
 // 用法：RoutingAgent classifier 分类意图后只开相关工具子集。详见 Config.ToolFilter。
 func WithToolFilter(fn func(ctx context.Context, input *schema.Message) []string) Option {
 	return func(c *Config) {

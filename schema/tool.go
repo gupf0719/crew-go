@@ -6,7 +6,7 @@ import (
 	"crew-go/modules/common"
 )
 
-// ToolInfo 是 spec 生成类型的 alias，跨语言保持一致。
+// ToolInfo 是 modules/common.ToolInfo 的别名。
 type ToolInfo = common.ToolInfo
 
 // ToolCall 表示模型请求的工具调用。

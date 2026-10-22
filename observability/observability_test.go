@@ -415,6 +415,45 @@ func TestMetrics_ReActRun(t *testing.T) {
 	}
 }
 
+// TestTokenUsage_GenAISemantics：token 按 GenAI 约定的口径记——输出 token 包含推理 token（本仓 OutputTokens 不含
+// ThinkTokens，要加回去），推理 / 缓存读 / 缓存写各自是输出或输入的子集。
+func TestTokenUsage_GenAISemantics(t *testing.T) {
+	h := newHarness(t)
+	ah := h.obs.AgentHooks()
+	info := &hook.AgentInfo{Name: "a", Type: "base"}
+	ctx, _ := ah.OnAgentStart(context.Background(), info, &hook.AgentInput{})
+	mctx, _ := ah.OnModelStart(ctx, info, &schema.ModelInput{Messages: []*schema.Message{schema.UserMessage("hi")}})
+	out := schema.AssistantMessage("ok")
+	out.Metadata = &schema.MessageMetadata{Model: "claude-x", System: "anthropic"}
+	ah.OnModelEnd(mctx, info, &schema.ModelOutput{Message: out, Usage: &schema.MessageUsage{
+		InputTokens: 100, CachedInputTokens: 60, CacheCreationInputTokens: 30, OutputTokens: 20, ThinkTokens: 5, TotalTokens: 125}})
+	ah.OnAgentEnd(ctx, info, &hook.AgentOutput{})
+	chat := h.span(t, "chat claude-x")
+	for key, want := range map[attribute.Key]string{
+		observability.AttrUsageInputTokens:      "100",
+		observability.AttrUsageOutputTokens:     "25",
+		observability.AttrUsageReasoningTokens:  "5",
+		observability.AttrUsageCacheReadTokens:  "60",
+		observability.AttrUsageCacheWriteTokens: "30",
+	} {
+		if got := strAttr(t, chat, key); got != want {
+			t.Errorf("%s=%s 应=%s", key, got, want)
+		}
+	}
+	rm := h.collect(t)
+	for name, want := range map[string]int64{
+		observability.MetricUsageInputTokens:      100,
+		observability.MetricUsageOutputTokens:     25,
+		observability.MetricUsageReasoningTokens:  5,
+		observability.MetricUsageCacheReadTokens:  60,
+		observability.MetricUsageCacheWriteTokens: 30,
+	} {
+		if got := sumInt(t, rm, name, map[string]string{"gen_ai.provider.name": "anthropic"}); got != want {
+			t.Errorf("%s=%d 应=%d", name, got, want)
+		}
+	}
+}
+
 // ─── 失败、中断、超时 ───
 
 // TestModelError_ChatSpanEndsWithError：模型报错时框架不调 OnModelEnd，chat span 由 OnError 以失败收尾，

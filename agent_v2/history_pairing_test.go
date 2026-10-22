@@ -161,7 +161,7 @@ func TestHistory_Pairing_SurvivesMarkerHoisting(t *testing.T) {
 		Function: schema.FunctionCall{Name: "activate_skill", Arguments: `{"skill":"x"}`},
 	}})
 	tc.Annotations = map[string]any{agent_v2.HistoryAgentAnnotation: "clerk"}
-	body := schema.ToolResultMessage("skill-1", "activate_skill", "skill body 正文")
+	body := schema.ToolResultMessage("skill-1", "skill body 正文")
 	body.Annotations = map[string]any{
 		agent_v2.HistoryAgentAnnotation: "clerk",
 		agent_v2.SkillBodyAnnotation:    true,
@@ -278,7 +278,7 @@ func TestHistory_Pairing_MarkerMessageSurvives(t *testing.T) {
 		Function: schema.FunctionCall{Name: "activate_skill", Arguments: `{"skill":"x"}`},
 	}})
 	tc.Annotations = map[string]any{agent_v2.HistoryAgentAnnotation: "clerk"}
-	body := schema.ToolResultMessage("skill-1", "activate_skill", "SKILL_BODY_MARK")
+	body := schema.ToolResultMessage("skill-1", "SKILL_BODY_MARK")
 	body.Annotations = map[string]any{
 		agent_v2.HistoryAgentAnnotation: "clerk",
 		agent_v2.SkillBodyAnnotation:    true,
@@ -342,12 +342,12 @@ func TestHistory_Pairing_MarkerSiblingNotSeparated(t *testing.T) {
 			Function: schema.FunctionCall{Name: "查库存", Arguments: `{"sku":"A"}`}},
 	})
 	tc.Annotations = map[string]any{agent_v2.HistoryAgentAnnotation: "clerk"}
-	body := schema.ToolResultMessage("skill-1", "activate_skill", "SKILL_BODY_MARK")
+	body := schema.ToolResultMessage("skill-1", "SKILL_BODY_MARK")
 	body.Annotations = map[string]any{
 		agent_v2.HistoryAgentAnnotation: "clerk",
 		agent_v2.SkillBodyAnnotation:    true,
 	}
-	biz := schema.ToolResultMessage("biz-2", "查库存", "库存 3 件")
+	biz := schema.ToolResultMessage("biz-2", "库存 3 件")
 	biz.Annotations = map[string]any{agent_v2.HistoryAgentAnnotation: "clerk"}
 
 	seed := []*schema.Message{}

@@ -91,7 +91,7 @@ func buildBasicAgentReAct(llm *mockLLM) (*compose_v2.Graph, error) {
 			if err != nil {
 				return nil, fmt.Errorf("tool %q: %w", tc.Function.Name, err)
 			}
-			toolMsg := schema.ToolResultMessage(tc.ID, tc.Function.Name, out)
+			toolMsg := schema.ToolResultMessage(tc.ID, out)
 			results = append(results, toolMsg)
 		}
 		return []compose_v2.ChannelWrite{
@@ -253,7 +253,7 @@ func TestBasicAgent_MultiRoundReAct(t *testing.T) {
 		var results []*schema.Message
 		for _, tc := range schema.GetToolCalls(last) {
 			out, _ := mockTool(ctx, tc.Function.Name, tc.Function.Arguments)
-			results = append(results, schema.ToolResultMessage(tc.ID, tc.Function.Name, out))
+			results = append(results, schema.ToolResultMessage(tc.ID, out))
 		}
 		return []compose_v2.ChannelWrite{
 			compose_v2.Write(basicAgentMessagesCh, results),

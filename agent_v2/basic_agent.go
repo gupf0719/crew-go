@@ -316,7 +316,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	// **软降落之后仍然报错**——见 [withFinalRound] 的 godoc。
 	//
 	// **能走到那一轮本身就是信号**——模型把 maxRounds 个 tool 轮全用完了还没收尾，是被
-	// 摘掉工具逼停的。模型自己提前答完的运行根本到不了这个轮次，err 照旧是 nil。
+	// 关掉工具调用逼停的。模型自己提前答完的运行根本到不了这个轮次，err 照旧是 nil。
 	//
 	// 不这么做的话软降落会把 `MaxIterationsError` **吃掉**：模型产出文本 ⟹ 条件边判无
 	// tool_call ⟹ 循环自然退出 ⟹ 从没撞 maxVisit。那就是「静默截断」——`maxRounds` 当
@@ -325,7 +325,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	// 判据是 `lastRound > maxRounds`：model 节点每轮访问一次，maxVisit = maxRounds+1，
 	// 所以「跑满」意味着访问了 maxRounds+1 次。模型自己提前答完的运行到不了这个数。
 	if mr := resolveMaxRounds(ctx, a.config.MaxRounds); err == nil && mr > 0 && int(lastRound) > mr {
-		err = fmt.Errorf("basic agent %q: 轮次预算耗尽，最后一轮摘掉了工具（配了结构化输出时只留 final_output）逼模型收尾"+
+		err = fmt.Errorf("basic agent %q: 轮次预算耗尽，最后一轮关掉了工具调用（tool_choice=none；配了结构化输出时只留 final_output）逼模型收尾"+
 			"（答复在 events 里，用 FinalMessage 取）: %w",
 			a.config.Name, &compose_v2.MaxIterationsError{Iterations: int(lastRound)})
 	}
@@ -480,7 +480,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	// 所以判据在这条路上同样成立（实测 lastRound=4 > maxRounds=3）。
 	if mr := resolveMaxRounds(ctx, a.config.MaxRounds); runErr == nil && mr > 0 &&
 		int(info.Round) > mr {
-		runErr = fmt.Errorf("basic agent %q: 轮次预算耗尽，最后一轮摘掉了工具（配了结构化输出时只留 final_output）逼模型收尾"+
+		runErr = fmt.Errorf("basic agent %q: 轮次预算耗尽，最后一轮关掉了工具调用（tool_choice=none；配了结构化输出时只留 final_output）逼模型收尾"+
 			"（答复在 events 里，用 FinalMessage 取）: %w",
 			a.config.Name, &compose_v2.MaxIterationsError{Iterations: int(info.Round)})
 	}
@@ -1155,8 +1155,8 @@ const unfinishedToolResultText = "[未完成] 这次工具调用没有返回结�
 // ReturnDirectToolAnnotation 记录「这条 tool_result 是哪个 return-direct 工具产出的」（工具名），给业务
 // 看是谁收的尾。
 //
-// 存在的理由很实际：`schema.ToolResultMessage` **不保存工具名**（签名里那个参数写着
-// `_ /* name unused */`）。靠 tool_call ID 反查也能得到名字，但那需要扫消息列表，而消息列表**含 prior**
+// 存在的理由很实际：`schema.ToolResultMessage` **不保存工具名**（tool_result 块里只有
+// tool_call ID 与内容）。靠 tool_call ID 反查也能得到名字，但那需要扫消息列表，而消息列表**含 prior**
 // ——那正是我们已经踩过的那类坑（在含历史的列表里找本轮的东西）。名字在产出那一刻就是已知的，记下来
 // 比事后找回来可靠。
 //
@@ -1432,7 +1432,7 @@ func dropDanglingToolCalls(msgs []*schema.Message) []*schema.Message {
 				continue
 			}
 			// 这个 id 的结果用完了（或压根没有）→ 补占位，保证这一块自洽
-			block = append(block, schema.ToolResultMessage(tc.ID, tc.Function.Name, unfinishedToolResultText))
+			block = append(block, schema.ToolResultMessage(tc.ID, unfinishedToolResultText))
 		}
 
 		if anyReal {
@@ -2458,8 +2458,8 @@ func withFrameworkTools(cfg *Config, tk *tool.Toolkit) *tool.Toolkit {
 //
 // 跟 [filterToolsByName] 的差别就在这一句，而那一句是承重的：那个函数服务
 // `WithToolFilter`（裁业务工具、框架工具恒保留，防业务漏带把问用户/技能静默关掉），
-// 本函数服务软降落（要摘的恰恰就是那些框架工具）。**同一个词「过滤」，两种相反的语义**
-// ——所以是两个函数，不是一个函数加参数。
+// 本函数服务配了结构化输出时的软降落轮（只留 `final_output`，要摘的恰恰就是那些框架工具）。
+// **同一个词「过滤」，两种相反的语义**——所以是两个函数，不是一个函数加参数。
 func keepOnlyTools(infos []*schema.ToolInfo, names ...string) []*schema.ToolInfo {
 	keep := make(map[string]bool, len(names))
 	for _, n := range names {
@@ -2474,7 +2474,8 @@ func keepOnlyTools(infos []*schema.ToolInfo, names ...string) []*schema.ToolInfo
 	return out
 }
 
-// finalRoundKey 标「这是轮次预算的最后一轮」——modelFn 据它摘掉工具，逼模型收尾。
+// finalRoundKey 标「这是轮次预算的最后一轮」——modelFn 据它关掉这一轮的工具调用、逼模型收尾，工具函数据它不执行
+// 这一轮模型硬调的工具。
 type finalRoundKey struct{}
 
 // withFinalRound 标记本次 model 调用是**软降落轮**。
@@ -2486,8 +2487,15 @@ type finalRoundKey struct{}
 // 于是调用方拿到一个 `MaxIterationsError` 和一堆没有结论的 events：**模型从没得到把手上
 // 的东西收个尾的机会**。
 //
-// 软降落把那格预留兑现：最后一轮**只留 `final_output`**（配了 WithOutputSchema 时框架那件——结构化输出的唯一
-// 投递通道；没配时这个名字是业务工具、照样摘），其余一律摘掉——模型要么直接产文本，要么经 `final_output` 交结构化答复。
+// 软降落把那格预留兑现：最后一轮**关掉工具调用**——模型要么直接产文本，要么经 `final_output` 交结构化答复。
+//
+//   - 没配 WithOutputSchema：工具集**照旧**（跟前几轮同一套），tool_choice 设成 none，盖掉调用方强制的那份。
+//     不摘工具：工具集是 Anthropic 给 thinking 块签名时绑定的前缀之一，摘掉就让之前的 thinking 全部作废
+//     （理由与代价见 makeModelFn 软降落那段）。
+//   - 配了：只留框架那件 `final_output`（结构化输出的唯一投递通道），其余一律摘掉。
+//
+// 这一轮模型仍硬调的工具不执行，以失败结果交回（框架那件 `final_output` 除外）：none 不是每家 provider 都强制执行，
+// 业务自己的 ChatModel 也未必认它。tools 节点从 basicFinalRoundCh 读出同一个标记交给工具函数，见 makeToolsFn。
 //
 // # 为什么仍然返回 MaxIterationsError
 //
@@ -2508,7 +2516,8 @@ type finalRoundKey struct{}
 //
 // v 为 false 也要推：model 节点每轮都推自己的值，盖掉从调用方继承来的那份——父 agent 在软降落轮的模型回调
 // （OnModelEnd、ToolFilter、ChatModel 本身）里调起的子 agent，ctx 上带着父的标记，只在为真时才推的话子 agent
-// 第 0 轮就被摘光工具（审计实测）。
+// 第 0 轮就被摘光工具（审计实测，那时软降落摘工具；现在是第 0 轮就被关掉工具调用）。tools 节点同理每轮都推：
+// 不推的话子 agent 调的工具全被当成软降落轮硬调的、一个不执行。
 func withFinalRound(ctx context.Context, v bool) context.Context {
 	return context.WithValue(ctx, finalRoundKey{}, v)
 }
@@ -2702,6 +2711,7 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			}
 		}
 
+		finalRound := isFinalRound(ctx)
 		toolsBound := false
 		if toolkit != nil {
 			tools := toolkit.ToolInfos()
@@ -2728,9 +2738,21 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 					tools = filterToolsByName(tools, allowed, toolkit)
 				}
 			}
-			// **软降落**：最后一轮摘掉全部工具；配了结构化输出时留下框架那件 `final_output`（见 [withFinalRound]）。
+			// **软降落**（轮次预算的最后一轮，见 [withFinalRound]）分两档：
 			//
-			// ⚠️ **不能整个 `toolkit = nil`**——那样会把 `final_output` 一起摘掉，而它是
+			//   - **没配结构化输出：工具集照旧，tool_choice 设成 none**（在下面定 tool_choice 那处）。工具集要跟前几轮
+			//     是同一套：Anthropic 给 thinking 块签名时绑定它产生时的前缀（system、tools、之前的每条消息），回放时
+			//     对不上就按 `prefix_mismatch_behavior` 处理——摘掉工具 ⟹ 之前每个 thinking 块都对不上，默认 drop_block
+			//     下 API 丢掉第一个对不上的块及其后的全部 thinking（开着会话历史时下一次 Run 工具恢复、这一轮的块又对不上，
+			//     之后每次请求都再丢一遍），error 档下这一轮直接 400。tool_choice 不在那个前缀里，Anthropic 的建议就是保留
+			//     工具、发 none。prompt cache 也少失效一截：tool_choice 变了只失效 messages 段，摘工具是 tools 段起全部失效。
+			//     这一轮模型仍硬调的工具不执行（provider 不强制执行 none、业务自己的 ChatModel 不认它），见 makeToolsFn。
+			//   - **配了结构化输出：只留框架那件 `final_output`**，其余（含全部框架工具）一律摘掉——它是结构化答复的唯一
+			//     投递通道，none 会把它一起关掉。⚠️ **这对 Anthropic 就是一次工具集变化**，代价同上一档说的：之前的
+			//     thinking 块全部作废。要保住前缀得留着整套工具、用 tool_choice 指定只能调 final_output，而 Opus 5.5 对
+			//     指定工具（tool / any）返回 400。
+			//
+			// ⚠️ **配了结构化输出时不能整个 `toolkit = nil`**——那样会把 `final_output` 一起摘掉，而它是
 			// `WithOutputSchema` 下**唯一的答案投递通道**。实测那样做的后果有两层：
 			//   - 请求体畸形：`tool_choice=required` 更早无条件填上（本函数上方），而 tools
 			//     字段没了 —— 「必须调工具」配「没有工具」。
@@ -2739,31 +2761,22 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			//     `errors.As(&mie)` 检测预算耗尽，**配了 OutputSchema 就永远检测不到**；
 			//     而错误正文写着「已尝试 0 次」，把排查方向指反。软降落还一个答案都没交付。
 			//
-			// **软降落轮至多留 `final_output`**（配了结构化输出时），其余（含全部框架工具）一律摘掉。
-			//
 			// ⚠️ **不能用 [filterToolsByName]**——它带框架工具（isFrameworkMintedIn）的**恒豁免**，
 			// 那是给 `WithToolFilter` 用的语义（裁业务工具、框架工具恒保留，防业务白名单漏带
-			// 导致问用户/技能静默失效）。软降落要的**正好相反**：要摘的就是 `activate_skill` /
+			// 导致问用户/技能静默失效）。结构化输出那档要的**正好相反**：要摘的就是 `activate_skill` /
 			// `tool_search` / `run_skill_action` / `ask_user`，而它们全在那道豁免里。
 			// 一度直接借它，实测「白名单」一行没生效——软降落轮留下的正是点名要摘的那三个，
 			// 模型继续调 `ask_user`，`maxRounds=2` 却问了 12 次不收敛。**这就是「一个函数被
 			// 两种语义共用」那条规约的实例，修法是给第二种语义自己的载体、不是给共用的加参数。**
 			//
-			// ⚠️ **为什么只留 `final_output`，不留 `transfer_to_agent` / `route_to`**：
-			// 它们确实也是「靠工具收尾」，但**下游不认**——本次 Run 挂着 `MaxIterationsError`，
-			// 而 Handoff 见错整个作废那次尝试（转交根本没发生、`State` 停在原 agent）、Routing
-			// 走降级分支擦掉路由信号（用户拿到 fallback 的答案而 `err == nil`）。留着等于
-			// 让模型把最后一格花在一个**注定被扔掉**的动作上。要么修下游让它们认，要么别给
-			// ——**不该维持「给了又不认」的中间态**。已登记 backlog。
-			if isFinalRound(ctx) {
-				// 留的是框架那件 final_output，所以只在配了结构化输出时留：没配 WithOutputSchema 时这个
-				// 名字是业务工具，软降落要摘的正是业务工具。按名字留的时候，业务那件在最后一轮照样绑着，
-				// 模型调了它就跑满轮次、报原始的超限错误、拿不到收尾答复（审计实测）。
-				if cfg.OutputSchema != nil {
-					tools = keepOnlyTools(tools, FinalOutputToolName)
-				} else {
-					tools = nil
-				}
+			// ⚠️ **为什么只放行 `final_output`，不放行 `transfer_to_agent` / `route_to`**（没配结构化输出时它们
+			// 照旧绑着，但 none 关着、硬调了也不执行；配了时直接摘）：它们确实也是「靠工具收尾」，但**下游不认**——
+			// 本次 Run 挂着 `MaxIterationsError`，而 Handoff 见错整个作废那次尝试（转交根本没发生、`State` 停在原
+			// agent）、Routing 走降级分支擦掉路由信号（用户拿到 fallback 的答案而 `err == nil`）。放行等于让模型把
+			// 最后一格花在一个**注定被扔掉**的动作上。要么修下游让它们认，要么别给——**不该维持「给了又不认」的
+			// 中间态**。已登记 backlog。
+			if finalRound && cfg.OutputSchema != nil {
+				tools = keepOnlyTools(tools, FinalOutputToolName)
 			}
 			if len(tools) > 0 {
 				bound, err := llm.WithTools(tools)
@@ -2774,12 +2787,17 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 				toolsBound = true
 			}
 		}
-		if !toolsBound {
-			// toolkit 这条路这一轮没绑上工具（软降落摘光、白名单滤光、本来就没配）：调用方强制的 tool_choice 一并
-			// 摘掉——按次经 model.WithTools 传、或模型预先绑好的工具不算，那些工具本 agent 派发不了，强制调也没用。
-			// 「必须调工具」配「没有工具」provider 直接拒绝（required 返 400），而没有工具这个状态多半是框架
-			// 自己造成的（软降落）。各家 client 不都替你兜（openai client 兜了，业务自己的 ChatModel 未必）。
+		switch {
+		case !toolsBound:
+			// toolkit 这条路这一轮没绑上工具（白名单滤光、本来就没配）：调用方强制的 tool_choice 一并摘掉——按次经
+			// model.WithTools 传、或模型预先绑好的工具不算，那些工具本 agent 派发不了，强制调也没用。「必须调工具」配
+			// 「没有工具」provider 直接拒绝（required 返 400）；各家 client 不都替你兜（openai client 兜了，业务自己的
+			// ChatModel 未必）。软降落轮同样不设 none：没有工具可关。
 			modelRunOpts = append(modelRunOpts, clearToolChoice)
+		case finalRound && cfg.OutputSchema == nil:
+			// 软降落轮（没配结构化输出）：工具照旧绑着，用 none 关掉工具调用（理由见上面软降落那段）。排在调用方强制的
+			// tool_choice 之后，盖掉它——照发 required 的话模型被逼着调工具，而这一轮调的工具不执行。
+			modelRunOpts = append(modelRunOpts, model.WithToolChoice(schema.ToolChoiceNone))
 		}
 
 		// callLLM 优先 Stream（chunk 实时投递）；流不支持时 fallback 到 Generate。
@@ -3051,6 +3069,9 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 		if dispatchDeferred != nil {
 			revealedAtEntry = newRevealedNames(revealedFromChannelCtx(ctx))
 		}
+		// 这一批是不是软降落轮的模型调用产出的（tools 节点从 channel 读出来放进 ctx，见 [withFinalRound]）。从节点交进来的
+		// ctx 读，不从每个调用的 ctx 读——那份经过 OnToolStart 钩子采纳。
+		finalRound := isFinalRound(ctx)
 
 		// outcome 单 tc 处理结果——并发收集后按 idx 排序保 tool_result 配对顺序
 		type outcome struct {
@@ -3186,6 +3207,19 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 					panicerr.Log(callCtx, slog.LevelError, "agent_v2: 工具 panic，已转成错误", pe, panicerr.KeyError, oc.err.Error())
 				}
 			}()
+			// **软降落轮模型硬调的工具不执行**（见 [withFinalRound]）：那一轮发的是 tool_choice=none（配了结构化输出时
+			// 只绑着 final_output），模型照样调了——provider 不强制执行 none、或业务自己的 ChatModel 不认它。执行的话就是
+			// 在轮次预算之外多跑一批副作用，而结果再没有一轮可以消化。以失败结果交回（同下面的 tool_not_revealed：调了这一轮
+			// 不让调的工具是失败的 tool call）；回到 model 节点时以 MaxIterationsError 结束，不再调模型（顶层 Run 上是引擎的
+			// maxVisit 先拦下，续跑时是 model 节点开头「每个任务至多一个软降落轮」那道闸）。
+			// 放在审批之前：框架的审批不会去问一个注定不执行的调用。业务的 OnToolStart / OnToolEnd 照常触发（钩子在工具函数
+			// 之外、每个调用都触发）——在 OnToolStart 里做 HITL 确认的业务会被问到这次调用。
+			//
+			// 放行的只有框架那件 final_output：配了结构化输出时那一轮只给它留了它，它是答复的唯一投递通道。按实例认、不按
+			// 名字——没配 WithOutputSchema 时 final_output 这个名字是业务工具，跟别的业务工具一样不执行。
+			if finalRound && !isFrameworkFinalOutput(dispatchToolkit, tc.Function.Name) {
+				return outcome{toolMsg: failedToolResult(tc.ID, "round_budget_exhausted", "轮次预算已用完，这次工具调用没有执行。")}
+			}
 			// 这次派发的那件是不是框架铸的——下面渐进披露、审批、超时、中间件几道闸都据它豁免框架工具，
 			// 判的是实例不是名字（见 frameworkMintedTool）。
 			minted := isFrameworkMintedIn(dispatchToolkit, tc.Function.Name)
@@ -3199,7 +3233,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 					// 同样标记让 observability 把工具 span 记成失败。对比 approval 的 tool_denied
 					// **不标**——那是用户的主动决定、不是错误，计进错误率会污染告警。
 					msg := fmt.Sprintf("tool_call.Arguments JSON 解析失败: %v", jerr)
-					return outcome{toolMsg: failedToolResult(tc.ID, tc.Function.Name, "invalid_arguments", msg)}
+					return outcome{toolMsg: failedToolResult(tc.ID, "invalid_arguments", msg)}
 				}
 			}
 			// fail-closed：LLM 调了未揭示的 deferred 工具（不在它的 bind list 却硬调=幻觉）→
@@ -3213,7 +3247,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			if dispatchDeferred[tc.Function.Name] && !revealedAtEntry[tc.Function.Name] {
 				// finding 3: 同 invalid_arguments——LLM 硬调未解锁工具是失败的 tool call
 				msg := fmt.Sprintf("工具 %q 未解锁——请先调 tool_search(query) 检索解锁后再调用。", tc.Function.Name)
-				return outcome{toolMsg: failedToolResult(tc.ID, tc.Function.Name, "tool_not_revealed", msg)}
+				return outcome{toolMsg: failedToolResult(tc.ID, "tool_not_revealed", msg)}
 			}
 			// **工具审批 gate（harness P1）**：业务工具执行前查审批决策链（ApprovalMode!=Auto
 			// 或有 heuristic 时才有实际开销，默认 Auto 路径零开销）。Ask 未 resume → InterruptError
@@ -3337,7 +3371,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				// `Success=true`、`gen_ai.tool.error.total` 不计这一类、span 标成功——
 				// 最需要被观测到的工具失败反而是唯一不可见的（合成入口收敛见
 				// failedToolResult godoc）。
-				return outcome{toolMsg: failedToolResult(tc.ID, tc.Function.Name, "tool_timeout",
+				return outcome{toolMsg: failedToolResult(tc.ID, "tool_timeout",
 					fmt.Sprintf("工具调用超时（超过 %s 未返回），本次调用已放弃", cfg.ToolTimeout))}
 			}
 			if err != nil {
@@ -3405,7 +3439,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 						"skill", skillName, "max", maxChars, "original_chars", len(content))
 				}
 				ackContent := fmt.Sprintf("Skill %q activated; see next system reminder for content.", skillName)
-				toolMsg := schema.ToolResultMessage(tc.ID, tc.Function.Name, ackContent)
+				toolMsg := schema.ToolResultMessage(tc.ID, ackContent)
 				// R19 audit HIGH-1 fix: terse ack toolMsg 也打 SkillBodyAnnotation
 				toolMsg.Annotations = map[string]any{SkillBodyAnnotation: true}
 				bodyMsg := schema.UserMessage(fmt.Sprintf("[system_reminder] Skill %q content:\n%s", skillName, body))
@@ -3413,7 +3447,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				return outcome{toolMsg: toolMsg, bodyMsg: bodyMsg}
 			}
 
-			toolMsg := schema.ToolResultMessage(tc.ID, tc.Function.Name, content)
+			toolMsg := schema.ToolResultMessage(tc.ID, content)
 			if origBytes > 0 {
 				toolMsg.Annotations = map[string]any{TruncatedOriginalBytesAnnotation: origBytes}
 			}
@@ -3441,7 +3475,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 					}
 					toolMsg.Annotations[ReturnDirectAnnotation] = true
 					// 顺带记下是**哪个**工具一调即出——`schema.ToolResultMessage` 不存工具名
-					// （签名里那个参数是 `_ /* name unused */`）。只给业务看是谁收的尾，框架判身份不读它
+					// （见 ReturnDirectToolAnnotation godoc）。只给业务看是谁收的尾，框架判身份不读它
 					// （名字业务占得到）：结构化输出那件看收结果时盖的 finalOutputAttemptAnnotation。
 					toolMsg.Annotations[ReturnDirectToolAnnotation] = tc.Function.Name
 					// 身份在**这一层**判掉（手上有 toolkit 和真实实例），消费侧读事实

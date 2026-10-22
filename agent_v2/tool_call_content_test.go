@@ -94,7 +94,7 @@ func TestBasicAgentBuilder_CustomToolsFn_GetsFixedContent(t *testing.T) {
 					return nil, err
 				}
 			}
-			out = append(out, schema.ToolResultMessage(tc.ID, tc.Function.Name, tc.Function.Name+" ok"))
+			out = append(out, schema.ToolResultMessage(tc.ID, tc.Function.Name+" ok"))
 		}
 		return out, nil
 	}

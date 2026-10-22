@@ -325,9 +325,12 @@ func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *
 	}
 	if usage != nil {
 		extra = append(extra, AttrUsageInputTokens.Int(int(usage.InputTokens)),
-			AttrUsageOutputTokens.Int(int(usage.OutputTokens)))
+			AttrUsageOutputTokens.Int(int(outputTokens(usage))))
 		if usage.CachedInputTokens > 0 {
 			extra = append(extra, AttrUsageCacheReadTokens.Int(int(usage.CachedInputTokens)))
+		}
+		if usage.CacheCreationInputTokens > 0 {
+			extra = append(extra, AttrUsageCacheWriteTokens.Int(int(usage.CacheCreationInputTokens)))
 		}
 		if usage.ThinkTokens > 0 {
 			extra = append(extra, AttrUsageReasoningTokens.Int(int(usage.ThinkTokens)))
@@ -355,7 +358,7 @@ func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *
 		o.inst.inferenceTTFC.Record(ctx, ttfc, metric.WithAttributes(labels...))
 	}
 	if usage != nil {
-		// cache_read 是输入的子集、reasoning 是输出的子集，各跟所属那一侧的模态。
+		// cache_read / cache_write 是输入的子集、reasoning 是输出的子集，各跟所属那一侧的模态。
 		in := metric.WithAttributes(append(labels, AttrTokenModality.String(mh.inputModality))...)
 		var outMsg *schema.Message
 		if out != nil {
@@ -364,7 +367,8 @@ func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *
 		outTok := metric.WithAttributes(append(labels, AttrTokenModality.String(tokenModality([]*schema.Message{outMsg})))...)
 		addTokens(ctx, o.inst.usageInput, usage.InputTokens, in)
 		addTokens(ctx, o.inst.usageCacheRead, usage.CachedInputTokens, in)
-		addTokens(ctx, o.inst.usageOutput, usage.OutputTokens, outTok)
+		addTokens(ctx, o.inst.usageCacheWrite, usage.CacheCreationInputTokens, in)
+		addTokens(ctx, o.inst.usageOutput, outputTokens(usage), outTok)
 		addTokens(ctx, o.inst.usageReasoning, usage.ThinkTokens, outTok)
 	}
 	return ctx, nil
@@ -382,6 +386,13 @@ func inferenceLabels(provider, requestModel, responseModel string) []attribute.K
 		a = append(a, AttrResponseModel.String(responseModel))
 	}
 	return a
+}
+
+// outputTokens 是 GenAI 约定口径的输出 token：包含推理 token（约定要求 reasoning.output_tokens 计入
+// output_tokens，output_tokens 取计费口径——推理 token 按输出计费）。本仓的 MessageUsage.OutputTokens 不含
+// ThinkTokens（模型客户端单列），这里加回去。
+func outputTokens(u *schema.MessageUsage) int32 {
+	return u.OutputTokens + u.ThinkTokens
 }
 
 func addTokens(ctx context.Context, c metric.Int64Counter, n int32, opt metric.AddOption) {

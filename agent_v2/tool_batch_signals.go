@@ -101,7 +101,7 @@ func finishToolBatchSignals(ctx context.Context, toolCalls []schema.ToolCall, re
 			b.WriteString(orig.Content)
 		}
 		tc := toolCalls[i]
-		results[i] = failedToolResult(tc.ID, tc.Function.Name, SupersededDecisionErrCode, b.String())
+		results[i] = failedToolResult(tc.ID, SupersededDecisionErrCode, b.String())
 	}
 	compose_v2.EmitSignals(ctx, merged)
 }

@@ -366,7 +366,7 @@ func (b *interruptingActivateBox) ActivateSkill(_ context.Context, name string) 
 	}
 }
 func (b *interruptingActivateBox) RunSkillAction(_ context.Context, _, _ string, _ map[string]any) (*skill.SkillExecutionResult, error) {
-	return nil, skill.ErrActionNotImplemented
+	return nil, skill.ErrSkillActionNotFound
 }
 
 var _ skill.SkillBox = (*interruptingActivateBox)(nil)

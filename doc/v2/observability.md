@@ -156,7 +156,7 @@ invoke_agent assistant
 | agent / 编排（`OnAgentStart`） | `gen_ai.agent.name` 或 `gen_ai.workflow.name`、`crew.agent.kind`、`crew.run.id`（`RunSession.RunID`）、`gen_ai.conversation.id`（推了 `compose_v2.WithThreadIDCtx` 才有）、`crew.graph.ns`（嵌套时）；结束时 `crew.agent.inference_calls` / `crew.agent.tool_calls` |
 | 工作流（`OnGraphStart`） | `gen_ai.workflow.name`、`crew.run.id`、`gen_ai.conversation.id`、`crew.graph.ns`（非顶层时） |
 | node | `crew.node.id`、`crew.graph.ns`、`crew.node.instance`（扇出实例）、`crew.node.component`；有流式片段时 `crew.stream.chunks`、`crew.stream.first_chunk_seconds` |
-| chat | `gen_ai.agent.name`、`crew.agent.round`、`gen_ai.request.model` / `.temperature` / `.max_tokens` / `.top_p`（有才记）、`gen_ai.request.stream`（流式时为 true，非流式不记）、`gen_ai.conversation.id`；结束时 `gen_ai.provider.name`、`gen_ai.response.model`、`gen_ai.response.finish_reasons`、`gen_ai.usage.input_tokens` / `.output_tokens`（有用量就记，含 0）、`gen_ai.usage.cache_read.input_tokens` / `.reasoning.output_tokens`（大于 0 才记）、`gen_ai.response.time_to_first_chunk`（流式） |
+| chat | `gen_ai.agent.name`、`crew.agent.round`、`gen_ai.request.model` / `.temperature` / `.max_tokens` / `.top_p`（有才记）、`gen_ai.request.stream`（流式时为 true，非流式不记）、`gen_ai.conversation.id`；结束时 `gen_ai.provider.name`、`gen_ai.response.model`、`gen_ai.response.finish_reasons`、`gen_ai.usage.input_tokens` / `.output_tokens`（有用量就记，含 0；输出含推理 token）、`gen_ai.usage.cache_read.input_tokens` / `.cache_write.input_tokens` / `.reasoning.output_tokens`（大于 0 才记）、`gen_ai.response.time_to_first_chunk`（流式） |
 | execute_tool | `gen_ai.tool.name`、`gen_ai.tool.type`（`function`）、`gen_ai.tool.call.id`、`gen_ai.agent.name`、`gen_ai.conversation.id`、`crew.tool.category`（`retrieval` / `embedding` / `guardrail` / `skill`）、`gen_ai.skill.name`（`activate_skill` 调用） |
 | A2A client | `gen_ai.provider.name`=`a2a`、`gen_ai.agent.name`、`crew.a2a.method`、`crew.a2a.transport`、`gen_ai.conversation.id`（A2A contextId）、`crew.a2a.task_id` |
 | A2A server | `crew.a2a.operation`、`gen_ai.conversation.id`、`crew.a2a.task_id` |
@@ -259,6 +259,7 @@ trace。
 | `gen_ai.client.inference.usage.input_tokens` | 计数 / {token} | 同上 + `gen_ai.token.modality` |
 | `gen_ai.client.inference.usage.output_tokens` | 计数 / {token} | 同上 |
 | `gen_ai.client.inference.usage.cache_read.input_tokens` | 计数 / {token} | 同上 |
+| `gen_ai.client.inference.usage.cache_write.input_tokens` | 计数 / {token} | 同上 |
 | `gen_ai.client.inference.usage.reasoning.output_tokens` | 计数 / {token} | 同上 |
 | `gen_ai.invoke_agent.duration` | 直方图 / s | `gen_ai.agent.name`、`gen_ai.request.model`（知道时）；失败时 `error.type` |
 | `gen_ai.invoke_agent.inference_calls` | 直方图 / {inference_call} | `gen_ai.agent.name` |
@@ -267,8 +268,11 @@ trace。
 | `gen_ai.execute_tool.duration` | 直方图 / s | `gen_ai.tool.name`、`gen_ai.tool.type`、`gen_ai.agent.name`；失败时 `error.type` |
 
 - token 计数只在模型调用成功（`OnModelEnd`）时记，数量为 0 的不记。
+- 口径照约定：输入 token 含缓存读写（cache_read / cache_write 是它的子集）；输出 token 含推理 token（约定要求推理计入
+  输出、输出取计费口径）。`MessageUsage.OutputTokens` 不含 `ThinkTokens`（模型客户端单列），记的时候加回去。缓存写入目前只有
+  `model/anthropic` 报。
 - `gen_ai.token.modality`：供应商只给总数。输入里全是文本时记 `text`；有图片 / 音频 / 文件块时分不出各模态
-  各占多少，按约定记 `unknown`。输出同理。cache_read 跟输入那一侧、reasoning 跟输出那一侧。
+  各占多少，按约定记 `unknown`。输出同理。cache_read / cache_write 跟输入那一侧、reasoning 跟输出那一侧。
 - `gen_ai.request.model` 只填调用方请求的模型；请求时不知道就不填，不拿响应里的模型名去顶（两者可以不同，
   比如别名解析到具体版本）。
 

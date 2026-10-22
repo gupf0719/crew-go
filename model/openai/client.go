@@ -271,7 +271,7 @@ func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ..
 
 func (c *Client) buildRequest(messages []*schema.Message, o *model.Options, stream bool) *openaiRequest {
 	modelName := c.model
-	if o.Model != nil {
+	if o.Model != nil && *o.Model != "" { // 空的覆盖不算（跟 model.RequestConfig、anthropic 客户端一致）
 		modelName = *o.Model
 	}
 

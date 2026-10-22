@@ -96,3 +96,28 @@ func TestCircuitBreaker_HalfOpen_ProbeSuccessCloses(t *testing.T) {
 		t.Fatal("再过 cooldown 应再放行单次探测")
 	}
 }
+
+// TestCircuitBreaker_WouldAllowIsReadOnly：WouldAllow 跟 Allow 判定一致，但不占半开的探测名额——问多少次都不影响随后
+// 那次 Allow；Allow 占下名额之后 WouldAllow 跟着变成 false。
+func TestCircuitBreaker_WouldAllowIsReadOnly(t *testing.T) {
+	cb := compose_v2.NewCircuitBreakerWithCooldown(1, 20*time.Millisecond)
+	if !cb.WouldAllow() {
+		t.Fatal("没熔断时应放行")
+	}
+	cb.RecordFailure()
+	if cb.WouldAllow() {
+		t.Fatal("熔断、cooldown 内不该放行")
+	}
+	time.Sleep(30 * time.Millisecond)
+	for i := 0; i < 3; i++ {
+		if !cb.WouldAllow() {
+			t.Fatalf("cooldown 过后第 %d 次 WouldAllow 应放行（只读，不占探测名额）", i+1)
+		}
+	}
+	if !cb.Allow() {
+		t.Fatal("WouldAllow 问过之后，Allow 仍应拿到探测名额")
+	}
+	if cb.WouldAllow() || cb.Allow() {
+		t.Error("探测名额被占之后，WouldAllow 与 Allow 都不该再放行")
+	}
+}

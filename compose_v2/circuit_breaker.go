@@ -82,6 +82,28 @@ func NewCircuitBreakerWithCooldown(maxFailures int, cooldown time.Duration) *Cir
 func (cb *CircuitBreaker) Allow() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	if !cb.wouldAllowLocked() {
+		return false
+	}
+	if cb.tripped {
+		// cooldown 过——**half-open 单次探测**：占下探测名额，其他并发 Allow 返 false 防 thundering herd。
+		cb.probing = true
+		cb.probeAt = time.Now()
+	}
+	return true
+}
+
+// WouldAllow 是 Allow 的只读版本：此刻调 Allow 会不会放行。不占半开的探测名额、不改任何状态，给只想预估
+// 「下一次会不会请求它」的观测用（如 fallback 报起手候选的模型名）。判定跟 Allow 是同一个函数；结果到真正调用
+// Allow 时可能已经变了（别的调用先占了探测名额、cooldown 刚好过了）。
+func (cb *CircuitBreaker) WouldAllow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.wouldAllowLocked()
+}
+
+// wouldAllowLocked 是放行判定本身（调用方持锁）：Allow 与 WouldAllow 共用，免得两份条件漂开。
+func (cb *CircuitBreaker) wouldAllowLocked() bool {
 	if !cb.tripped {
 		return true
 	}
@@ -91,15 +113,9 @@ func (cb *CircuitBreaker) Allow() bool {
 	if time.Since(cb.trippedAt) < cb.cooldownDuration {
 		return false // cooldown 未过
 	}
-	// cooldown 过——**half-open 单次探测**：只放行一个探测，其他并发 Allow 返 false
-	// 防 thundering herd。probing 卡死兜底：探测方未回报（panic/忘记 Record*）超过一个
-	// cooldown 时 probing 视为过期，重置允许新探测（防永久禁用）。
-	if cb.probing && time.Since(cb.probeAt) < cb.cooldownDuration {
-		return false
-	}
-	cb.probing = true
-	cb.probeAt = time.Now()
-	return true
+	// cooldown 过：只放行一个探测。probing 卡死兜底：探测方未回报（panic/忘记 Record*）超过一个 cooldown 时
+	// probing 视为过期，允许新探测（防永久禁用）。
+	return !(cb.probing && time.Since(cb.probeAt) < cb.cooldownDuration)
 }
 
 // RecordFailure 记录一次失败；连续达到 maxFailures 触发 trip。已 tripped 时

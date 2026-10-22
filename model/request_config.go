@@ -10,7 +10,8 @@ import (
 // 配的那个）。框架据此把本次调用的请求模型交给钩子（ModelInput.Config.ModelName，观测层记成
 // gen_ai.request.model）。不实现时请求模型记不上，只剩响应里带回来的模型名。
 //
-// 包装别的 ChatModel 的实现（装饰器、故障切换）应当转发里面那个的模型名。
+// 包装别的 ChatModel 的实现（装饰器、故障切换）应当转发里面那个的模型名；包装自己往调用里注入 WithModel 覆盖时，
+// 报的应是注入的那个。经 WithExtraBody 往请求体里塞 "model" 键也能改掉实际发出的模型名，这条路不在报告范围内。
 type ModelNamer interface {
 	ModelName() string
 }

@@ -37,6 +37,28 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
 - ~~AG-UI 标准审批答案被当成拒绝（`{"approved":true}`、`Yes.` 都落进拒绝分支，实测）~~ 已修（2026-10-19，`fix/approval-answers`）
 - ~~中断时根 cp 写失败，agui / a2a 仍当成正常挂起（实测：用户答完续跑找不到存档，工具 0 次执行）~~ 已修（2026-10-19，`fix/interrupt-not-persisted`）
 
+**review-v7 修复轮自审新发现（2026-10-22，3 个单视角 agent 审 `af7c45a` 自己的改动）**
+
+预存缺陷（不是那次改动引入的，各自独立）：
+- **业务 Client 返回的 error 的方法 panic 照旧冲出 `RemoteTool.Call`，还会把 `Hub.Close` 永久挂住**。
+  `mcp/server.go` 的 `markOffline` 里 `cause.Error()` 裸跑业务 error 的方法：业务返 typed-nil error
+  （`var e *badErr` + 值接收者的 `Error()`）⟹ panic 落在 `s.hub.bg.Add(1)` 与 `go s.reconnectLoop(stale)`
+  **之间** ⟹ `bg.Done()` 永不调 ⟹ `Hub.Close` 的 `bg.Wait()` 死锁（探针实测 25s 超时）。同家族还有
+  `s.hub.events.push(s.statusLocked())` 把 `Err: cause` 交给业务 status hook。
+  ⚠️ 这是「业务代码进框架的入口不止 `Client` 接口那 4 个方法」——`callClient` 只罩住 `CallTool` 那一行。
+  修 `CallTool` 时做过的机械对账把「入口」定义成了接口方法，漏掉了「业务返回的 error 的方法」这一类。
+- **`compose_v2.MaxIterationsError.Iterations` 在三条路上不是同一个量**（同一个 `maxRounds=2` 实测）：
+  BasicAgent 软降落奏效那条给 `lastRound`=3（轮数）、引擎 `maxVisit` 那条给 `visits[id]`=4（访问计数，
+  `graph_loop.go` 的 `Iterations: visits[id]`）、Resume 那道闸给 `round`=3。`withFinalRound` 的 godoc 教
+  调用方「当预算用：`errors.As(&mie)` 之后读」，而同一个诊断给两个数。若语义是「这个预算烧了几轮」，
+  引擎那条该由 BasicAgent 重铸成 `lastRound`（引擎的原错误仍留在链上）。
+- `fallback.startIndex` 在 `len(members)==0` 时返回越界下标 0，当前唯一调用方 `ModelName` 的守卫兜住了；
+  第二个调用方出现时就是 index out of range。返 -1 或一句 godoc 即可。
+
+哨兵/文档缺口：
+- `mcp` 的 `WithSerialCalls` godoc 只举了「超时、调用方取消」两个例子，而统辖句是「请求发出之后没等到
+  结果」——panic 也落在里面。`connectionUntrusted` 的 godoc 已写明，那处 option godoc 没同步。
+
 **review-v7 未实施项（2026-10-22，审计见 [doc/review/review-v7.md](../review/review-v7.md)）**
 
 拍板类（需要设计决策，不是补哨兵能解决的）：

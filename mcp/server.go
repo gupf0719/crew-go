@@ -233,8 +233,17 @@ func (s *server) call(ctx context.Context, name, source string, args map[string]
 
 	res, err, panicked := s.callClient(callCtx, c, source, args)
 	if panicked != nil {
-		// 业务自定义 Client 的 CallTool panic：按这次调用失败交回模型，**不标掉线**——panic 是
-		// 调用方代码里的 bug，连接本身可能好着，标掉线会把一个工具的 bug 变成整个 server 的降级。
+		// 业务自定义 Client 的 CallTool panic：按这次调用失败交回模型。
+		//
+		// **健康降级那一维跳过**——panic 是调用方代码里的 bug，连接本身可能好着，把整个 server 标掉线
+		// 会让一个工具的 bug 变成所有工具快速失败。
+		//
+		// **但「连接还能不能接着用」那一维照样成立**（见 connectionUntrusted）：panic 不带 ErrNotSent，
+		// 按既有规则就是「请求可能已发出、结果不明」，串行 server 上旧连接那边可能还在执行，必须换一条。
+		// 不换的实测后果：工厂只建 1 个连接、硬件并发峰值 2（WithSerialCalls 要至多 1 个），而 err == nil。
+		if s.connectionUntrusted(false) {
+			s.markOffline(gen, fmt.Errorf("%s: 工具 %s 执行时 panic，连接状态不明", s.name, source))
+		}
 		return panicked, nil
 	}
 	if err != nil {
@@ -314,10 +323,23 @@ func (s *server) admit(source string) (Client, uint64, *tool.Result) {
 //   - 其余算连接出错（含没写出就失败、HTTP 401 / 403 / 404 / 5xx）→ 标掉线、后台重连，返回「该能力暂时不可用」。
 //
 // 「没有发出」只认 Client 明确包上的 ErrNotSent，不从错误形状推断（推断错了，模型会把一个已执行的写操作当成没执行、再做一遍）。
+// connectionUntrusted 判「这次调用之后这条连接还能不能接着用」。
+//
+// ⚠️ 它问的**不是**「连接健康吗」，而是「请求可能已经发出、而我不知道结果吗」——串行的 server
+// （[WithSerialCalls]）上那边可能还在执行，下一个调用发给同一条连接就是让硬件上同时有两个操作。
+// 默认假定**已经发出**：只有 Client 明确包上 [ErrNotSent] 才算没发出（从错误形状推断会让模型把一个
+// 已执行的写操作当成没执行、再做一遍）。固定实例（[WithClient]）换不了连接，所以不适用。
+//
+// 两条路共用这一份：业务 Client 返回 error（callFailed）与业务 Client panic（call 里的 panic 分支）。
+// 判据只长在其中一处的后果实测过：panic 那条路跳过重置 ⟹ 工厂只建了 1 个连接、硬件并发峰值 2，
+// 而 err == nil。
+func (s *server) connectionUntrusted(notSent bool) bool {
+	return s.sem != nil && s.factory != nil && !notSent
+}
+
 func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint64, err error) (*tool.Result, error) {
 	notSent := errors.Is(err, ErrNotSent)
-	// 串行的 server：请求发出之后没等到结果，那边可能还在执行，连接不可信——标掉线、关旧连接再重连（见 WithSerialCalls）。
-	untrusted := s.sem != nil && s.factory != nil && !notSent
+	untrusted := s.connectionUntrusted(notSent)
 	if ctx.Err() != nil {
 		if untrusted {
 			s.markOffline(gen, err)

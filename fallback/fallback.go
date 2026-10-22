@@ -510,7 +510,23 @@ func (f *FallbackChatModel) ModelName() string {
 // 该有一份，放在 nextMember 里，这里跟着它走。tryMembers 的挑法以后再改，这里自动跟上。
 //
 // 与 tryMembers 的唯一差别是**不判调用方期限**（exceedsDeadline）：那需要 ctx，而 model.ModelNamer 不带 ctx。
-// 实际请求时等不到门开的候选会被跳过，所以期限很紧时真正起手的可能比这里报的更靠后。
+// 期限很紧时 tryMembers 会把推迟中的候选全标 done、一个都不请求，所以分叉恒为「报了一个谁也没请求的候选」，
+// 那次调用注定失败、span 上带着错，此时报「最早能用的那个」无害。
+//
+// # ⚠️ 终止性依赖「两处同钟」——改这里之前先读这段
+//
+// 循环靠「每次迭代把一个候选移出『此刻可请求集』」终止：门关着时置 deferred 且 readyAt = until，而
+// [gate.closedUntil] 报 closed 的充要条件就是 until > now，所以下一次 nextMember 不会再以 wait==0 返回它。
+// **这条推理成立的前提是 closedUntil 与 nextMember 拿的是同一个 now**（两次比较的操作数完全相同，于是必然
+// 同答案；跟单调钟 / 墙钟 / 时钟回拨都无关）。
+//
+// 把 `nextMember(states, now)` 改成 `nextMember(states, time.Now())`（看着像「用最新时间更准」）会**死循环**：
+// 某个候选的门在取 now 与读活钟之间刚好到期 ⟹ nextMember 给 wait==0、closedUntil(冻结的 now) 仍报 closed
+// ⟹ 反复 defer。审计实测：既有全部 fallback 用例照样全绿，而 ModelName 在每次模型调用前被 observability
+// 调用 ⟹ 整个 Run 卡死且出不来（活钟只会越过越远）。
+//
+// tryMembers **不等价**：它两处都用活钟、同向单调，所以安全。安全的是「两处同钟」，不是「冻结」或「活钟」
+// 本身——混用才死。
 func (f *FallbackChatModel) startIndex(now time.Time) int {
 	states := make([]memberState, len(f.members))
 	for {

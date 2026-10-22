@@ -1642,11 +1642,104 @@ func TestHub_ClientCallToolPanic_IsFailureNotPanic(t *testing.T) {
 		t.Errorf("期望 tool.Failure(%s)，got %+v", tool.ErrCodeInternal, res)
 	}
 
-	// panic 不标掉线：同一个 server 的另一件工具照常调得通。
+	// panic 不做健康降级：同一个 server 的另一件工具照常调得通。
+	//
+	// ⚠️ 这两条断言在**固定实例**（WithClient）上**恒真**，钉不住「不标掉线」那个决定——markOffline
+	// 第一行就是 `if s.factory == nil { return false }`，对固定实例是结构性 no-op。真正钉它的是下面那条
+	// 用 WithClientFactory 的姊妹用例（审计实测：panic 分支插入 markOffline，本用例照样 PASS）。
 	if res, err := fine.Call(context.Background(), map[string]any{"q": "x"}); err != nil || res == nil || res.Error != nil {
 		t.Errorf("panic 把 server 标成掉线了：后续调用 res=%+v err=%v", res, err)
 	}
 	if st := h.Status(); len(st) != 1 || st[0].State != mcp.ServerOnline {
 		t.Errorf("panic 之后 server 状态应仍是 online，got %+v", st)
+	}
+}
+
+// TestHub_ClientCallToolPanic_NonSerialKeepsConnection：**非串行**的 factory server 上 panic 只毁掉这一次
+// 调用——不做健康降级、也不换连接（没有重叠风险，panic 是代码 bug 而不是连接坏了）。
+//
+// 这条与下一条是一对，分开钉 connectionUntrusted 的两种答案。用 factory 而不是固定实例：markOffline 对
+// 固定实例是 no-op，拿它验不出「标没标掉线」。
+func TestHub_ClientCallToolPanic_NonSerialKeepsConnection(t *testing.T) {
+	var built atomic.Int32
+	newC := func(context.Context) (mcp.Client, error) {
+		built.Add(1)
+		var boom atomic.Bool
+		return &memClient{name: "s", tools: specs("t"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+			if boom.CompareAndSwap(false, true) {
+				panic("炸了")
+			}
+			return &mcp.CallResult{Content: []mcp.Block{{Type: "text", Text: "ok"}}}, nil
+		}}, nil
+	}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("s", newC))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	tl := h.Tools()[0]
+	if res, _ := tl.Call(context.Background(), map[string]any{}); res == nil || res.Error == nil {
+		t.Fatalf("fixture 没搭对：第一次应被兜成失败结果")
+	}
+	time.Sleep(120 * time.Millisecond) // 给重连（若发生）时间
+	if st := h.Status(); len(st) != 1 || st[0].State != mcp.ServerOnline {
+		t.Errorf("非串行 server 上 panic 不该标掉线，got %+v", st)
+	}
+	if n := built.Load(); n != 1 {
+		t.Errorf("非串行 server 上 panic 不该换连接，工厂建了 %d 个", n)
+	}
+}
+
+// TestHub_ClientCallToolPanic_SerialResetsConnection：**串行** factory server 上 panic 之后必须换连接。
+//
+// panic 不带 ErrNotSent ⟹ 按既有规则「请求可能已发出、结果不明」⟹ 旧连接那边可能还在执行，下一个调用
+// 发给它就让硬件上同时有两个操作，而 WithSerialCalls 的全部意义就是至多一个。
+//
+// ⚠️ 这条是 af7c45a 的回归哨兵：那次只跳过了健康降级，连带把这一维也跳过了。实测后果（本用例在修复前红）：
+// 工厂只建 1 个连接、硬件并发峰值 2，而 err == nil。既有哨兵一条都钉不住它。
+func TestHub_ClientCallToolPanic_SerialResetsConnection(t *testing.T) {
+	var built atomic.Int32
+	var mu sync.Mutex
+	var clients []*memClient
+	newC := func(context.Context) (mcp.Client, error) {
+		built.Add(1)
+		var boom atomic.Bool
+		c := &memClient{name: "cam", tools: specs("shoot"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+			if boom.CompareAndSwap(false, true) {
+				// 请求已写出、硬件已开始执行，解码响应时炸了——那边还在动，而我们不知道结果
+				panic("解码响应炸了")
+			}
+			return &mcp.CallResult{Content: []mcp.Block{{Type: "text", Text: "ok"}}}, nil
+		}}
+		mu.Lock()
+		clients = append(clients, c)
+		mu.Unlock()
+		return c, nil
+	}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("cam", newC, mcp.WithSerialCalls()))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	tl := h.Tools()[0]
+	if res, _ := tl.Call(context.Background(), map[string]any{}); res == nil || res.Error == nil {
+		t.Fatalf("fixture 没搭对：第一次应被兜成失败结果")
+	}
+	time.Sleep(150 * time.Millisecond) // 等后台重连
+	_, _ = tl.Call(context.Background(), map[string]any{})
+
+	if n := built.Load(); n < 2 {
+		t.Fatalf("串行 server 上 panic 后应换连接（旧连接那边可能还在执行），工厂只建了 %d 个", n)
+	}
+	// 承重的断言是「第二次调用没有发给那条状态不明的旧连接」。
+	//
+	// ⚠️ 不要断言「硬件并发峰值 <= 1」：模拟「硬件还在动」要让 panic 那次永不收尾，于是它永久占着
+	// 一个槽，换连接之后峰值必然是 2——那个量在 bug 发生与修复后都是 2，不承重（第一版就写错了，实测
+	// 修复后照样红）。旧连接收到几次调用才会随这个 bug 变。
+	mu.Lock()
+	first := clients[0]
+	mu.Unlock()
+	if got := len(first.calls()); got != 1 {
+		t.Errorf("第二次调用被发给了那条状态不明的旧连接：它累计收到 %d 次（应只有 panic 那一次）", got)
 	}
 }

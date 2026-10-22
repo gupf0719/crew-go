@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -759,13 +760,92 @@ func TestSoftLanding_HardToolCallErrorMentionsSoftLanding(t *testing.T) {
 	if err == nil {
 		t.Fatal("fixture 没搭对：软降落轮硬调工具、整批被拦，应以错误收尾")
 	}
-	for _, want := range []string{"软降落轮", "round_budget_exhausted", "FinalMessage 可能为 nil"} {
+	for _, want := range []string{"软降落轮", "FinalMessage 可能为 nil", "跑满 3 轮"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("错误正文应点出 %q，实际正文：%v", want, err)
 		}
 	}
+	// 「跑满 N 轮」必须是**本 agent 自己的**轮数：正文的其余部分讲的是本 agent 的预算，数字跟着别人跑
+	// 就是把假归属写进了头条（见 TestSoftLanding_BudgetMessageDoesNotMisattribute）。
 	var mie *compose_v2.MaxIterationsError
 	if !errors.As(err, &mie) {
 		t.Errorf("仍应能 errors.As 出 MaxIterationsError（调用方据它判预算耗尽），实际 %v", err)
+	}
+}
+
+// hookErrAtNth：第 n 次 OnToolStart 返回一个包着「别人的」MaxIterationsError 的错误——模拟业务钩子里
+// 按 RegrantFromNode 范式调起的校验子 agent 自己预算耗尽。
+type hookErrAtNth struct {
+	hook.NoOpHooks
+	nth   int32
+	extra error // 非 nil 时与 MaxIterationsError 一起 Join（验「中断并存」那一档）
+	seen  atomic.Int32
+}
+
+func (h *hookErrAtNth) OnToolStart(ctx context.Context, _ *hook.AgentInfo, _ *schema.ToolInput) (context.Context, error) {
+	if h.seen.Add(1) != h.nth {
+		return ctx, nil
+	}
+	mie := &compose_v2.MaxIterationsError{Iterations: 99} // 99 便于辨认归属
+	if h.extra != nil {
+		return ctx, errors.Join(h.extra, mie)
+	}
+	return ctx, fmt.Errorf("校验子 agent 失败: %w", mie)
+}
+
+// TestSoftLanding_BudgetMessageDoesNotMisattribute：预算耗尽的正文**只陈述本 agent 能确定的事**，不把
+// 别人的 MaxIterationsError 说成「我的软降落轮模型硬调了工具」。
+//
+// 可达窗口（审计实测）：软降落轮的 tools 节点里业务 OnToolStart 对被拦下的那一批**照样 fire**，钩子返错
+// 让节点失败，而那个错里可以包着钩子自己调起的子 agent 的 MaxIterationsError。此刻 round 恰好是 mr+1，
+// 于是出口判据 `errors.As(err, &mie)` 成立 —— 但它问的是「链上任何位置有没有」，不足以支撑那句断言。
+//
+// ⚠️ 这条钉的是「正文不做假陈述」+「数字是自己的」两件事。断言挑的是**会随这个 bug 变**的量：
+// 正文里不许出现「仍硬调了工具」这种对本 agent 的断言式陈述，而「跑满 N 轮」必须是本 agent 的 3 而不是
+// 钩子里那个 99。af7c45a 的版本实测报出 `…模型仍硬调了工具…: 达到最大迭代：99`。
+func TestSoftLanding_BudgetMessageDoesNotMisattribute(t *testing.T) {
+	var n atomic.Int32
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("parent"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithHooks(&hookErrAtNth{nth: 3}), // maxRounds=2 ⟹ tools 跑 3 次，第 3 次是软降落轮
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))),
+		agent_v2.WithMaxRounds(2))
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+	if err == nil {
+		t.Fatal("fixture 没搭对：钩子在软降落轮返错，应以错误收尾")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "仍硬调了工具") {
+		t.Errorf("正文对本 agent 做了谓词不支撑的断言（真因是钩子里的子 agent 预算耗尽）：%v", err)
+	}
+	if !strings.Contains(msg, "跑满 3 轮") {
+		t.Errorf("正文里的轮数应是本 agent 自己的 3，实际：%v", err)
+	}
+	if !strings.Contains(msg, "校验子 agent 失败") {
+		t.Errorf("真正的错误应保留在链上可读，实际：%v", err)
+	}
+}
+
+// TestSoftLanding_BudgetMessageSkipsInterrupt：错误链上同时带中断时**整个不改写**。
+//
+// a2a/server 与 agui 按 IsInterrupt 走中断分支、把问题呈现给用户请他作答，而同一个错误的头条说「预算
+// 耗尽、FinalMessage 可能为 nil」是自相矛盾的。改写只放宽、不收窄——中断原样穿过。
+func TestSoftLanding_BudgetMessageSkipsInterrupt(t *testing.T) {
+	var n atomic.Int32
+	ie := &compose_v2.InterruptError{Reason: "需要人工确认", Query: &compose_v2.AskQuery{
+		InterruptID: "probe-id", Question: "批准吗",
+	}}
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("p"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithHooks(&hookErrAtNth{nth: 3, extra: ie}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))),
+		agent_v2.WithMaxRounds(2))
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+	got, isInt := compose_v2.IsInterrupt(err)
+	if !isInt {
+		t.Fatalf("fixture 没搭对：钩子返的错里带中断，IsInterrupt 应为真，err=%v", err)
+	}
+	if strings.Contains(err.Error(), "轮次预算耗尽") {
+		t.Errorf("前端会按中断请用户回答 %q，正文却说预算耗尽、FinalMessage 可能为 nil：%v", got.Query.Question, err)
 	}
 }

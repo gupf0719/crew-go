@@ -113,7 +113,7 @@ var DefaultCompactableTools = []string{
 3. 早于该 tool 第 N 个的 tool_result 内容替换为占位符：
    "[Old tool result content cleared by microcompact]"
 4. tool_use 块完全保留（保持 API 配对完整性）
-5. 入参已带 cleared / offloaded marker 的 tool_result 原样透传（仅业务直接喂带 marker 消息时生效——BasicAgent 图路径下压缩产物不写回 channel，这个短路永不命中）；offload 的跨轮 `store.Put` 去重由 ctx 内 `offloadDedup` 集合承担，同一 Run 内同一 (ns, key) 只写一次
+5. 入参已带 cleared / offloaded marker 的 tool_result 原样透传（BasicAgent 图路径下压缩产物不写回消息 channel，命中的只有业务直接喂进来的、与 AutoCompact 备忘套用之后 Head 里保下的清理过的结果——见「压缩结果的复用」）；offload 的跨轮 `store.Put` 去重由 ctx 内 `offloadDedup` 集合承担，同一 Run 内同一 (ns, key) 只写一次
 6. 带 `SkillBodyAnnotation` marker 的 tool_result **跳过不清**
    （跨层契约保护：清了会让 skill body 被压成占位符 + AutoCompact 整组保留无意义占位符，R17 MED-2）
 ```
@@ -196,7 +196,10 @@ func (cfg *AutoCompactConfig) Threshold() int {
 ```
 input:
   system: 原系统提示词（不动）
-  user/assistant: 早期对话组 early（已剔除 tail 当前轮 + skill body + memory / offloaded 保护段；tool_use/tool_result 配对保留）
+  user/assistant: 早期对话组 early（已剔除 tail 当前轮 + skill body + memory / offloaded 保护段；tool_use/tool_result 配对保留。
+                  tail 从最后一条用户消息所在组起——框架以 user 角色追加的提示（后台任务通知、工具重复调用提醒、inline skill
+                  正文，`IsFrameworkNote`）不是用户说的话，定 tail 时跳过，否则它们排在用户这一轮的提问之后，提问连同这一轮的
+                  工具往返被摘进摘要，见 background-tasks.md §2.5）
   user: 抽取压缩提示词（NO_TOOLS_PREAMBLE + 9 段摘要要求）
 
 output:
@@ -240,7 +243,11 @@ output:
    防止 LLM 忽略尾部指令尝试调用工具浪费 maxTurns（Claude Code 实测 Sonnet 4.6+
    会忽略弱尾部指令）
 3. **附件重注入**：压缩后下一轮 input 中重新注入近期读过的文件——压缩丢失了具体
-   内容，重注入保证 LLM 还能引用它们
+   内容，重注入保证 LLM 还能引用它们。从压缩之前的原始消息流里挑，跳过 MicroCompact 这一轮会清掉的（同一个判据
+   `microCompactToClear`，不把已经清掉的原文按预算注回去）与转存过的结果（正文只是说明 + 预览，见
+   [tool-output-spill.md](tool-output-spill.md)）
+3b. **转存的取回 id 不随摘要消失**：被摘要掉的消息里的取回 id 收成一份索引（id、工具名、大小、行数，最近 50 条）
+   附在摘要后面、并记在摘要的标注上——下一次增量摘要时上一份索引接着带
 4. **断路器**：连续失败 3 次后停止，不再尝试自动压缩本会话——避免上下文不可恢复
    时无限消耗 API（Claude Code 实测：1,279 个会话曾连续失败 50+ 次，最多 3,272
    次，每天浪费约 250K 次 API 调用）
@@ -252,12 +259,12 @@ type AutoCompactConfig struct {
     Enabled                bool                 // 默认 false（需显式启用 + 配 Model）
     Model                  model.ChatModel      // 摘要用 LLM（推荐用更便宜的 model）
     ModelContextWindow     int                  // 必填，model 的 context window 大小
-    SummaryMaxTokens       int                  // 默认 20_000
+    SummaryMaxTokens       int                  // 默认 20_000：阈值公式给摘要留的预算，也是摘要的上限（超过判无效）
     SummaryBufferTokens    int                  // 默认 13_000
     MaxConsecutiveFailures int                  // 默认 3
-    // 两道成本守卫（见下方「成本守卫」小节）
-    MinCompactableTokens   int                  // 默认 5_000：可压缩区小于它就静默跳过
-    MaxReductionRatio      float64              // 默认 0.8：摘要没比原文小够就判压缩无效
+    // 成本守卫的两个开关（第三道是上面的 SummaryMaxTokens；见下方「成本守卫」小节）
+    MinCompactableTokens   int                  // 默认 5_000：可压缩区（上一份摘要之外的）小于它就静默跳过
+    MaxReductionRatio      float64              // 默认 0.8：摘要没比原文小够就判压缩无效（增量摘要时按新内容算）
     CustomInstructions     string               // 附加摘要指令（如"重点关注 TS 代码"）
     Language               AutoCompactLanguage  // 提示词语言；默认 CN
     SystemPromptOverride   string               // 摘要 Call 的 system prompt 自定义（空时回落见下方注）
@@ -292,6 +299,50 @@ type AutoCompactConfig struct {
   Current Work / Optional Next Step
 - **`<analysis>` + `<summary>` XML 块格式**（程序化解析依赖此格式）
 - **CustomInstructions** 变量在末尾插入（用户自定义摘要要求）
+
+### 压缩结果的复用：单次 Run 内的备忘与跨 Run 的压缩边界
+
+**问题**：压缩只作用于喂给模型的那一份、不写回消息流（消息流里留的是完整原文，会话历史、工具账都靠它）。于是
+越过阈值之后，下一轮读出来的仍是原始全量、仍超阈值，又摘要一次。实测一次 Run 里 200 轮工具调用（窗口 64k、
+每轮工具结果约 4KB）：摘要被调 189 次，摘要输入累计 77.7MB 字符，随轮数平方增长。跨 Run 同理：关掉轮数截断
+（`WithMaxHistoryPairs(0)`）、靠摘要控制上下文的会话，每次 Run 的 prior 是整场历史，第一轮先把它整个摘要一遍。
+
+**单次 Run 内：备忘**（`agent_v2/compaction_memo.go`）。真摘要成功时把结果记成一份备忘，放进 BasicAgent 图的
+一条 channel（`basicCompactionCh`，随存档走，续跑接着用）：「消息流的前 Upto 条由 Head 这几条代表」，Head 是那次
+压缩输出里尾部之前的部分（前导 system、长期记忆注入、受保护的组、摘要、文件重注入）。每轮在 MicroCompact
+**之前**先把前 Upto 条换成 Head，再照常跑 MicroCompact / AutoCompact：没超阈值就直接用；又超了就在「Head +
+之后新增的」上再摘要一次，上一份摘要成了这次的输入。消息流本身一条不改。
+
+- **只在前缀没变时套用**：前缀逐条送给模型的全部内容进指纹（`prefixAnchor`：角色、ID、正文、推理文本、拒答、
+  内容块——工具调用的名字与参数、工具结果、图片等），`OnModelStart` 钩子插入、删除、换掉或改了其中任何一处（比如
+  给历史里某次调用的参数脱敏）都让备忘作废，这一轮照旧在全量上压缩。标注不进指纹：它不发给模型。
+- **套用之后显式告诉 AutoCompact Head 在哪**（`compactCut`）：Head 与新增部分分开分组，尾部只在新增部分里找；
+  上一次的文件重注入丢掉，这次从套用之前的原始消息流重新倒扫。不这样的话，Head 里的摘要与重注入都是 user 角色，
+  会被尾部规则当成「用户的最新一轮」——Head 里有受保护的组或开了重注入时，摘要一次之后就再也压不动（60 轮工具
+  调用，模型输入涨到 20 万字符，`err == nil`）。
+- **钩子留下的 nil 先去掉**：`OnModelStart` 钩子往消息列表里留了 nil 时，压缩分组会跳过它、备忘的 Upto 却把它算进去，
+  套用之后模型输入里出现找不到声明者的 tool_result。钩子改写之后先去掉 nil，下面每一层都不必再防。
+- **重注入从原始消息流挑**：套用备忘之后，文件重注入照样从套用之前的原始消息流倒扫，跳过 MicroCompact 这一轮会清
+  掉的与转存过的（见上文 AutoCompact 第 3 条）。
+- 同样的 200 轮任务：摘要 18 次、摘要输入 0.8MB；喂给模型的上限不变。不变量：**同一个 Run 里模型输入有界、
+  不随轮数涨，跟 Head 里装了什么无关**。
+
+**跨 Run：压缩边界**（`agent_v2/compaction_boundary.go`）。某一轮真摘要了一次、且 `OnModelStart` 钩子这一轮
+没动消息列表（钩子插入或改写的内容不该被当成历史重放），模型节点成功时往会话历史追加一条边界记录：带着这一刻
+的完整替代历史（受保护的组 + 摘要 + 尾部原文，去掉每次 Run 都会重新算出来的长期记忆注入与派生输入），盖本
+agent 的归属与视图模式，正文是摘要，标注 `HistoryCompactionAnnotation`。读 prior 时往前读到本 agent、同视图的
+最新一条边界就停：prior = 替代历史 + 边界之后的记录（别的 agent 的、别的视图的、解不出来的当它不存在）。原始
+记录一条不动，历史仍是 append-only；第 0 层截断把摘要当受保护消息（它代表边界之前的全部对话）。1000 轮的
+会话：每次 Run 从读 4008 条、摘要两次（每次输入 3.8MB）降到读约 190 条、不重新摘要。读历史这一侧见
+[usage-guide.md](usage-guide.md) 会话历史节。
+
+**代价与限制**（开放项见 [`doc/code/todo.md`](../code/todo.md)）：
+
+- 边界的体量：替代历史带着尾部原文，实测 60 轮的会话里边界 JSON 约占原始记录的 15%；受保护的组（skill 正文）
+  每条边界复制一遍。
+- 替代历史经 JSON 往返：内存后端下一个 Run 读回时，数字型 annotation 变成 float64（持久后端本来如此）；框架
+  自己的读点都不受影响。
+- 指纹不含标注：钩子只改标注（它不发给模型，只影响压缩时哪些组受保护）时备忘照用。
 
 ---
 
@@ -393,7 +444,7 @@ type ReactiveCompactConfig struct {
 
 ### 关键设计点
 
-1. **抢救式删消息组**：ReactiveCompact 走「删最旧消息组」路径（`emergencyDropOldestGroups`），一组也丢不动时先把超过 2000 字节的 tool_result 就地挖空（`3eebc447`，从整条消息流里挑，不限受保护组）——不复用 AutoCompact 摘要。原 PoC 设计的 PreferAutoCompact 优先逻辑未实现
+1. **抢救式删消息组**：ReactiveCompact 走「删最旧消息组」路径（`emergencyDropOldestGroups`），一组也丢不动时先把超过 2000 字节的 tool_result 就地挖空（`3eebc447`，从整条消息流里挑，不限受保护组）——不复用 AutoCompact 摘要。原 PoC 设计的 PreferAutoCompact 优先逻辑未实现。丢掉的组里带转存取回 id 的（转存过的结果、摘要附的索引），补一条索引消息放在最前——全文还在 store 里，不留 id 模型就取不回（见 [tool-output-spill.md](tool-output-spill.md) §2.6）
 2. **API 不变量保护**：删消息组时按 `Annotations["run_id"]` 分组（user 开新组，同 RunID 的 assistant + thinking + tool_use 不分离）；首条 assistant 时补 user marker
 3. **断路器**：MaxAttempts 是硬上限——避免压完还是太长时无限重试
 
@@ -473,8 +524,8 @@ type StoreMemoryCompactProvider interface {
 │   │    │       1 次 LLM 调用生成 9 段结构化摘要                      │
 │   │    │       summary 打 AutoCompactSummaryAnnotation               │
 │   │    │       附件重注入 + breaker 记账                             │
-│   │    │   压缩后的切片只喂给本次 LLM 调用（modelFn 局部变量）      │
-│   │    │   —— 不写回 basicMessagesCh、不进 cp                        │
+│   │    │   压缩后的切片只喂给本次 LLM 调用、不写回 basicMessagesCh  │
+│   │    │   真摘要成功时记备忘进 basicCompactionCh（随 cp，下轮先套用）│
 │   │    │                                                             │
 │   │    ├─ ChatModel.WithTools(toolkit) → LLM 实际调用                │
 │   │    │   ╭─ chatModel.Stream 优先（chunk 实时投递 OnNodeEvent）    │
@@ -621,13 +672,21 @@ MicroCompact → AutoCompact → ChatModel.WithTools(toolkit) → LLM 调用
   └─ 看 EstimateTokens(messages) 实际值（slog.Debug 可打）
 
 现象：跨 Run 历史每次都 AutoCompact 重摘（很慢）
-  ├─ ⚠️ **当前已知设计权衡，非配置问题**：AutoCompact summary 走 channel 注入当轮 LLM 输入，
-  │   **不 AddEvent 进 session.Events**（对齐「chunk / 摘要不写审计」原则）→ SelfHistoryCompacted
-  │   倒扫 AutoCompactSummaryAnnotation 永不命中 → 跨 Run **恒退化为全量 SelfHistory** 重摘
-  ├─ ⚠️ 单 Run 内多轮**会**重复摘：channel 里始终是原始全量 + 每轮 LLM 输出，压缩产物不写回。
-  │  下一轮读出来仍然超阈值 ⟹ 再调一次摘要 LLM（断路器就是给这个兜底的）
-  └─ 真要跨 Run 复用长期记忆：用第 4 层 StoreMemory（store.Put 落持久层）承载，
-     而非依赖 AutoCompact summary 跨 Run 复用（后者当前不生效）
+  ├─ 开了会话历史层（WithHistory / WithHistoryCtx）吗？开了时某一轮真摘要过，会话历史里就有一条压缩边界，
+  │   下一次 Run 从本 agent、同视图的最新边界读起、不重摘（见「压缩结果的复用」）。查：
+  │   ├─ 那一轮 OnModelStart 钩子动了消息列表——那一轮不写边界（钩子插入 / 改写的内容不该当历史重放）
+  │   └─ 换了 agent 名或视图模式——边界按归属 + 视图认，对不上的当它不存在
+  ├─ 没开会话历史层（prior 来自 session.Events）：AutoCompact summary **不 AddEvent 进 session.Events**
+  │   （对齐「chunk / 摘要不写审计」原则）→ SelfHistoryCompacted 倒扫 AutoCompactSummaryAnnotation 永不命中 →
+  │   跨 Run **恒退化为全量 SelfHistory** 重摘。要跨 Run 复用就开会话历史层
+  └─ 单 Run 内多轮不再重复摘：真摘要成功时记备忘，下一轮先套用、只在「Head + 新增的」又超阈值时才再摘一次。
+     仍然每轮都摘时查备忘有没有被作废——OnModelStart 钩子每轮插入 / 删除 / 改写前缀里的消息会让前缀指纹对不上
+
+现象：AutoCompact 反复判无效、断路器跳闸（压缩事件的 After.Err）
+  ├─ insufficient reduction：摘要没比新内容小够（增量时上限 = 上一份摘要 + 新内容 × MaxReductionRatio）
+  │   → 摘要模型在原样复述；换更听指令的模型，或在 CustomInstructions 里要求压缩
+  └─ exceeds SummaryMaxTokens：摘要模型写的那部分超过预算（预算写在摘要请求里）——常见于每次把上一份摘要原样保留再追加的模型
+      → 在 CustomInstructions 里要求把旧摘要与新内容合并压缩，或调大 SummaryMaxTokens（触发阈值跟着降）
 
 现象：MicroCompact 把 PASS 状态的 tool_result 也清了
   ├─ MicroCompact 默认按白名单清最旧 N 个（KeepRecent 默认 5）
@@ -768,7 +827,7 @@ Group 后:
 func AdjustIndexToPreserveAPIInvariants(messages []*schema.Message, start int) int { ... }
 ```
 
-### 成本守卫：两种「调了 LLM 却净亏」的场景
+### 成本守卫：三种「调了 LLM 却净亏」的场景
 
 摘要调用是**要花钱的**，而它有两条路会白花：
 
@@ -792,6 +851,26 @@ before/after 事件 ⟹ 接了 observability 的业务会看到 `crew.compaction
 ⚠️ **这一条计入断路器**——底层 `Generate` 成功 **≠** 业务成功（同 empty summary block）。
 持续无效必须让断路器跳，否则每轮白烧一次调用。设 **> 1.0** 才等于放弃此校验（恰好 1.0 时
 判据是严格大于，「摘要比原文更长」这种最该拦的仍会被拒）。
+
+**增量摘要时这两道都只按上一份摘要之外的新内容算**。可压缩区里有上一份摘要（带 `AutoCompactSummaryAnnotation`：
+套用了备忘，或 prior 从压缩边界读起）时，它已经是压缩过的——可压缩量是 early 减去它，缩减比的上限是「上一份摘要
++ 新内容 × `MaxReductionRatio`」（没有上一份摘要时就是 early × `MaxReductionRatio`，跟原来一样）。按整个 early 算的话，
+上一份摘要越长、两次触发之间的新内容越少（触发看的是整段输入，上一份摘要也在里面），合法的增量摘要越难小于 0.8 倍：
+被反复判成无效、每次白调一次 LLM，连续几次就让断路器跳闸——实测一个 220 轮的任务里摘要被调 135 次、64 次被判无效。
+上一份摘要原样保留、新内容压到这个比例以内都算有效；把新内容原样抄进去的照样被拦下。可压缩区里有几份摘要时只有
+**最新一份**算「上一份」，更早的算新内容——框架自己的路径上至多一份，业务自己写进来几份时合并它们能压小，都算
+「不可再压」会让压缩一直被跳过（哨兵 `TestAutoCompact_IncrementalSummaryNotRejectedAsSummaryGrows` /
+`TestAutoCompactRun_LongPreviousSummaryLittleNewContentSkips` / `TestAutoCompactRun_VerbatimIncrementalSummaryRejected` /
+`TestAutoCompactRun_OnlyLatestSummaryIsPrevious`）。
+
+**三、摘要超出预算**（`SummaryMaxTokens`，默认 20000）。触发阈值是按「摘要不超过它」留的空间
+（`ModelContextWindow - SummaryMaxTokens - SummaryBufferTokens`），摘要超过它时压完照样在阈值之上、下一轮又触发。
+上面的比例上限没有绝对量：把上一份摘要原样保留、只追加新内容的模型会让摘要一轮轮变长，每次按比例算都有效——审计
+实测 600 轮里 515 次「有效」压缩、466 次压完仍在阈值之上，摘要涨到窗口的三倍。超过就判无效、回退原 messages、
+**计入断路器**，同第二道。只比摘要模型写的那部分（标题 + `<summary>` 块），这个数写在摘要请求里（「控制在约 N token
+以内」）；框架附在摘要后面的取回索引不算——它最多 50 条、约 1100 token，模型控制不了，算进去的话 `SummaryMaxTokens`
+配得小时一句话的摘要也判无效、每轮判无效、断路器跳闸（审计实测）。哨兵 `TestAutoCompactRun_SummaryOverBudgetRejected` /
+`TestAutoCompactRun_SpillIndexNotCountedAgainstSummaryCap` / `TestAutoCompact_PromptCarriesSummaryBudget`。
 
 ⚠️ **写微缩配置的测试和 example 都要显式调小 `MinCompactableTokens`**：window 只有几百
 token 的 fixture 天然低于默认的 5000，不调小的话压缩根本不会发生——测试**照样绿**（它被
@@ -1090,5 +1169,5 @@ SSE 适配层会看到：第一次失败前可能已 emit 部分 chunks → 失�
 |---|---|---|
 | ISSUE-65 | 基础设施（token 估算 / 消息分组 / 配对感知切割 / 断路器） | ✅ 已实现 |
 | ISSUE-66 | MicroCompact 微压缩 | ✅ 已实现 |
-| ISSUE-67 | AutoCompact 自动压缩（含提示词 + 附件重注入 + 断路器 + 并发串行化） | ✅ 已实现（⚠️ 当年清单里的「跨 Run 持久化」**没有落地**：压缩产物不写回 channel、不进 cp，每次 LLM 调用重算，见 §协作语义图）|
+| ISSUE-67 | AutoCompact 自动压缩（含提示词 + 附件重注入 + 断路器 + 并发串行化） | ✅ 已实现（⚠️ 当年清单里的「跨 Run 持久化」2026-10 才落地、形态也不同：压缩产物仍不写回消息 channel；单次 Run 内是备忘（`basicCompactionCh`，随 cp 走），跨 Run 是会话历史里的压缩边界（要开会话历史层），见「压缩结果的复用」）|
 | ISSUE-68 | ReactiveCompact 被动压缩 | ✅ 已实现 |

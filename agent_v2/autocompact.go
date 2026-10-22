@@ -40,7 +40,9 @@ type AutoCompactConfig struct {
 	// 阈值 = ModelContextWindow - SummaryMaxTokens - SummaryBufferTokens。
 	ModelContextWindow int
 
-	// SummaryMaxTokens 摘要输出预留 token 数。<= 0 时使用默认值 20_000。
+	// SummaryMaxTokens 摘要输出预留 token 数。<= 0 时使用默认值 20_000。它也是摘要的上限：摘要模型写的那部分
+	// 超过它判压缩无效（回退原 messages + 计入断路器）——阈值是按「摘要不超过它」留的空间。这个数写在摘要请求里；
+	// 框架附在摘要后面的取回索引不算。
 	SummaryMaxTokens int
 
 	// SummaryBufferTokens 距硬上限的安全缓冲。<= 0 时使用默认值 13_000。
@@ -49,8 +51,9 @@ type AutoCompactConfig struct {
 	// MaxConsecutiveFailures 断路器阈值；连续失败 N 次后跳过。<= 0 时使用默认值 3。
 	MaxConsecutiveFailures int
 
-	// MinCompactableTokens 可压缩区（early）最小 token 数；低于此值静默跳过不调 LLM。
-	// <= 0 时使用默认值 5_000。
+	// MinCompactableTokens 可压缩区（early）里上一份摘要之外的新内容最小 token 数；低于此值静默跳过不调 LLM。
+	// <= 0 时使用默认值 5_000。增量摘要时（early 里有上一份摘要）上一份摘要不算可压缩量——它已经压缩过，
+	// 见 autoCompactRun 里算 freshTokens 的那段。
 	//
 	// **为什么需要**：触发阈值算的是整个对话，early 却可能远小于它——典型是单个
 	// 巨大当前轮（一次超大 tool_result）把总量顶过阈值，可压缩的历史其实没多少。
@@ -65,7 +68,8 @@ type AutoCompactConfig struct {
 	MinCompactableTokens int
 
 	// MaxReductionRatio 摘要相对原文的最大占比；摘要 token > early * 此比例时判定
-	// 压缩无效，回退原 messages + 计入断路器。<= 0 时使用默认值 0.8。
+	// 压缩无效，回退原 messages + 计入断路器。<= 0 时使用默认值 0.8。增量摘要时（early 里有上一份摘要）
+	// 上限是「上一份摘要 + 新内容 * 此比例」：上一份摘要原样保留、新内容压到这个比例以内都算有效。
 	//
 	// **为什么需要**：LLM 摘要可能失控——不遵循指令原样复述、甚至比原文更长。没有
 	// 这层校验时框架照单全收：白花一次调用，还把上下文搞得更大，下轮更容易再次触发
@@ -218,10 +222,7 @@ func (cfg *AutoCompactConfig) CleanupSession(sessionID string) {
 
 // Threshold 返回触发 AutoCompact 的 token 阈值。
 func (cfg *AutoCompactConfig) Threshold() int {
-	smax := cfg.SummaryMaxTokens
-	if smax <= 0 {
-		smax = defaultAutoCompactSummaryMaxTokens
-	}
+	smax := cfg.summaryMaxTokens()
 	sbuf := cfg.SummaryBufferTokens
 	if sbuf <= 0 {
 		sbuf = defaultAutoCompactSummaryBufferTokens
@@ -325,6 +326,25 @@ func (cfg *AutoCompactConfig) shouldTrigger(entry *sessionBreakerEntry, messages
 //   - 单 user 历史 + 多 agent 轮（BasicAgent 典型）：每个 LLM 调用一组，
 //     tail = 最近一组，early = 之前所有组——能正确触发摘要
 func AutoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*schema.Message) (out []*schema.Message, err error) {
+	return autoCompactRun(ctx, cfg, messages, nil)
+}
+
+// compactCut 是 BasicAgent 交给本轮压缩的上下文（见 compaction_memo.go）。
+//
+// 套用了上一次的压缩结果时，messages 的前 headLen 条是那次的输出（前导 system、长期记忆、受保护的组、
+// 摘要、文件重注入），不是原始消息流——压缩对输入的几条默认假设在它上面都不成立：「最后一条 user 是用户的
+// 最新提问」（摘要与重注入都是 user 角色）、文件重注入要从原始消息流倒扫。所以这里显式告诉压缩 Head 在哪：
+// Head 与之后新增的部分分开分组，尾部只在新增部分里找，上一次的重注入丢掉重算。
+type compactCut struct {
+	headLen  int               // messages 的前 headLen 条是上一次压缩的输出；0 = 没套用
+	original []*schema.Message // 套用之前、MicroCompact 之前的原始消息流——文件重注入从这里倒扫；nil = 用 messages
+	cleared  map[string]bool   // MicroCompact 在 original 上会清掉的 tool_use_id（microCompactToClear）：重注入跳过它们
+	tailLen  int               // 输出：真做了一次摘要时尾部原样保留的条数（输入的后缀），否则保持 -1
+}
+
+// autoCompactRun 是 [AutoCompactRun] 的本体。cut 非 nil 时按它处理上一次的压缩结果，并在**真做了一次
+// 摘要**（输出里有新的摘要消息）时写 cut.tailLen；其余所有出口（没触发、跳过、失败）都不写。
+func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*schema.Message, cut *compactCut) (out []*schema.Message, err error) {
 	// 取 per-session breaker entry——sessionID 来自 ctx 注入的 RunSession（修
 	// ISSUE-72 跨 session 共享单例 breaker bug）。无 session 上下文时用 "" 作 key。
 	var sessionID string
@@ -413,14 +433,36 @@ func AutoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	//    - 优先：含最近 user 消息的那组及之后所有组——保留用户最新提问的完整上下文
 	//    - 兜底：若 user 在第 1 组（典型 ReAct：1 user + N agent rounds），用最后 1 组作 tail
 	//      这种情况下用户消息会被 summarize 进 summary（trade-off：换取压缩能力）
-	groups := compose_v2.GroupMessagesByAPIRound(conv)
-	if len(groups) <= 1 {
-		return messages, nil
+	var groups [][]*schema.Message
+	var tailStartIdx int
+	if headInConv := headLenInConv(cut, sysEnd, len(conv)); headInConv > 0 {
+		// 套用了上一次的压缩结果：Head 与新增部分分开分组——合在一起分的话，Head 末尾那条摘要（user 角色）
+		// 会把新增的 assistant / tool 消息吞进它的组；尾部只在新增部分里找（Head 里的摘要、重注入不是用户的
+		// 最新提问）；上一次的重注入丢掉，下面从原始消息流重新倒扫。
+		headGroups := dropReinjectionGroups(compose_v2.GroupMessagesByAPIRound(conv[:headInConv]))
+		newGroups := compose_v2.GroupMessagesByAPIRound(conv[headInConv:])
+		if len(newGroups) == 0 {
+			return messages, nil
+		}
+		t := lastUserGroupIndex(newGroups)
+		if t < 0 {
+			t = len(newGroups) - 1 // 新增部分里没有用户消息（同一次 Run 的 ReAct 轮）：最后 1 组作 tail
+		}
+		groups = append(headGroups, newGroups...)
+		tailStartIdx = len(headGroups) + t
+	} else {
+		groups = compose_v2.GroupMessagesByAPIRound(conv)
+		if len(groups) <= 1 {
+			return messages, nil
+		}
+		tailStartIdx = lastUserGroupIndex(groups)
+		if tailStartIdx <= 0 {
+			// user 在第 1 组或没有 user → 兜底用最后 1 组作 tail
+			tailStartIdx = len(groups) - 1
+		}
 	}
-	tailStartIdx := lastUserGroupIndex(groups)
 	if tailStartIdx <= 0 {
-		// user 在第 1 组或没有 user → 兜底用最后 1 组作 tail
-		tailStartIdx = len(groups) - 1
+		return messages, nil
 	}
 	// **ISSUE-76 fix**：buildInitialMessages 注入 store.Search 让 GroupMessagesByAPIRound
 	// 把 StoreMemory items（无 runID）独成 group 0，UserInput 落 group 1 → lastUserGroupIndex
@@ -430,8 +472,16 @@ func AutoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	// 修法：检测 [0..tailStartIdx) 内所有 group 是否全是 protected (storeMem/skill body/
 	// skill body marker) — 是则 effectively user 在第 1 个真实组，reset 走 fallback
 	// 让最后 1 组作 tail，前面真实 ReAct 轮组进 early summarize。
-	if tailStartIdx > 0 && allProtectedGroups(groups[:tailStartIdx]) {
+	if headLenInConv(cut, sysEnd, len(conv)) == 0 && tailStartIdx > 0 && allProtectedGroups(groups[:tailStartIdx]) {
 		tailStartIdx = len(groups) - 1
+	}
+	// 末尾是刚接进消息流、模型还没回应的插话 / 闸门反馈（user 消息，各自单独成组）：tail 从它们前面那一轮
+	// 算起。插话说的是刚才那批工具结果（「只看 2026 年的」），闸门反馈说的是刚才那条答复（「漏了价格」）——
+	// 只按「最后一条 user 所在的组」起算，那一轮就被摘要掉，模型只能对着摘要回应。退到 0 时整段都是 tail、
+	// 这一轮不压（同只有一组时）。放在上面那条重置之后：先往前带的话，前面只剩受保护组时又会被它重置回最后
+	// 一组（只剩插话），那一轮照样被摘要掉（审计实测）。
+	for tailStartIdx > 0 && allPendingUserInput(groups[tailStartIdx]) {
+		tailStartIdx--
 	}
 	earlyGroups := groups[:tailStartIdx]
 	tailGroups := groups[tailStartIdx:]
@@ -488,8 +538,24 @@ func AutoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	// 不计断路器——"没东西可压"不是失败，跟 errBreakerTripped 一样静默返回原
 	// messages。注意**不能**走 len(early)==0 那条拼装路径：early 非空，丢弃它会
 	// 真丢消息。
+	//
+	// 上一份摘要（增量摘要时它在 early 里：套用了备忘，或 prior 从压缩边界读起）已经是压缩过的，可压缩量与下面的
+	// 缩减比都只按它之外的新内容算。按整个 early 算的话，上一份摘要越长、两次触发之间的新内容越少（触发看的是整段
+	// 输入，上一份摘要也在里面），合法的增量摘要越难小于 early 的 MaxReductionRatio 倍：被反复判成无效、每次白调
+	// 一次 LLM，连续几次就让断路器跳闸（实测 220 轮里摘要被调 135 次、64 次被判无效）。
+	//
+	// 只认最新的那一份：框架自己的路径上可压缩区里至多一份（备忘的 Head、本 agent 压缩边界的替代历史）；业务自己
+	// 写进来几份时，更早的那几份算新内容——把它们合进这一次的摘要能压小。
 	earlyTokens := compose_v2.EstimateMessageTokens(early)
-	if earlyTokens < cfg.minCompactableTokens() {
+	prevSummaryTokens := 0
+	for i := len(early) - 1; i >= 0; i-- {
+		if isCompactSummary(early[i]) {
+			prevSummaryTokens = compose_v2.EstimateMessageTokens(early[i : i+1])
+			break
+		}
+	}
+	freshTokens := earlyTokens - prevSummaryTokens
+	if freshTokens < cfg.minCompactableTokens() {
 		return messages, nil
 	}
 
@@ -608,17 +674,43 @@ func AutoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	// 提前到此处构造：下面的缩减比校验要按**实际写回的消息**量，而非裸 summary 串。
 	summaryMsg := schema.UserMessage("# Previous Conversation Summary\n\n" + summary)
 	summaryMsg.Annotations = map[string]any{AutoCompactSummaryAnnotation: true}
+	// 摘要模型写的那部分有多大——SummaryMaxTokens 只比它（见下面那道判定），下面附的取回索引不算。
+	writtenTokens := compose_v2.EstimateMessageTokens([]*schema.Message{summaryMsg})
+	// 被摘要掉的消息里带取回 id 的（转存过的工具结果、上一份摘要附的索引）：摘要不保留 id，而全文还在 store 里——
+	// 在摘要后面附一份索引，模型照样取得回（见 tool_spill.go 的 spillIndex）。记在标注上，下一次增量摘要接着带。
+	if idx := spillIndex(early); len(idx) > 0 {
+		summaryMsg.Content += "\n\n" + spillIndexText(idx)
+		summaryMsg.Annotations[spillIndexAnnotation] = strings.Join(idx, "\n")
+	}
 
 	// 摘要没比原文小够 → 压缩无效。LLM 可能不遵循指令原样复述甚至更长；照单全收
 	// 会白花一次调用还把上下文搞更大，下轮更容易再触发形成恶性循环。
 	// 按失败计断路器——底层 Generate 成功 ≠ 业务成功（同 empty summary block）。
+	//
+	// 上限是「上一份摘要 + 新内容的 MaxReductionRatio 倍」（没有上一份摘要时就是 early 的那么多倍）：上一份摘要
+	// 原样保留、新内容压到这个比例以内都算有效，把新内容原样抄进去的照样被拦下。
 	summaryTokens := compose_v2.EstimateMessageTokens([]*schema.Message{summaryMsg})
-	if limit := int(float64(earlyTokens) * cfg.maxReductionRatio()); summaryTokens > limit {
+	if limit := prevSummaryTokens + int(float64(freshTokens)*cfg.maxReductionRatio()); summaryTokens > limit {
 		if entry != nil {
 			entry.breaker.RecordFailure()
 		}
-		return messages, fmt.Errorf("auto compact: insufficient reduction: summary %d tokens > limit %d (early %d tokens * %.2f)",
-			summaryTokens, limit, earlyTokens, cfg.maxReductionRatio())
+		return messages, fmt.Errorf("auto compact: insufficient reduction: summary %d tokens > limit %d "+
+			"(previous summary %d tokens + new %d tokens * %.2f)",
+			summaryTokens, limit, prevSummaryTokens, freshTokens, cfg.maxReductionRatio())
+	}
+	// 摘要本身放不进阈值公式给它留的预算（SummaryMaxTokens）时同样判无效：Threshold() 是按「摘要不超过它」留的
+	// 空间，超过了压完照样在阈值之上、下一轮又触发。上面的比例上限没有绝对量——把上一份摘要原样保留、只追加
+	// 新内容的模型会让摘要一轮轮变长，每次都按比例算有效（审计实测 600 轮里 515 次「有效」压缩、466 次压完仍在
+	// 阈值之上，摘要涨到窗口的三倍）。超出预算就必须真压，压不下来按失败计、交给断路器。
+	//
+	// 只比摘要模型写的那部分（标题 + <summary> 块，预算写在摘要请求里，见 buildExtractionPrompt）：后面附的取回索引
+	// 是框架加的、模型控制不了（最多 50 条，约 1100 token），算进去的话 SummaryMaxTokens 配得小时，可压缩区里转存过的
+	// 工具结果多到一定程度，一句话的摘要也判无效、每轮判无效、断路器跳闸，这个会话的压缩就停了（审计实测）。
+	if smax := cfg.summaryMaxTokens(); writtenTokens > smax {
+		if entry != nil {
+			entry.breaker.RecordFailure()
+		}
+		return messages, fmt.Errorf("auto compact: summary %d tokens exceeds SummaryMaxTokens %d", writtenTokens, smax)
 	}
 
 	// 真实 success（有效 summary + 缩减达标）才计 breaker
@@ -641,7 +733,14 @@ func AutoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		// 已通过 idToPath 双 pass 扫 assistant tool_call + tool_result，
 		// 重复扫 sys/已 reinject 的 user message 不会误识别（非 Read tool_call
 		// 不会进 idToPath）。
-		files := extractRecentFiles(messages,
+		// 从原始消息流（套用备忘之前、MicroCompact 之前）倒扫：套用了上一次的结果时，更早读过的文件已在摘要里。
+		// 原始流里的结果没经过 MicroCompact，它会清掉的那些（cut.cleared，同一个判据 microCompactToClear）不注回
+		// 原文——跟没套用备忘时、从 MicroCompact 之后的输入倒扫看到的是同一批。
+		src, skip := messages, map[string]bool(nil)
+		if cut != nil && cut.original != nil {
+			src, skip = cut.original, cut.cleared
+		}
+		files := extractRecentFiles(src, skip,
 			cfg.reinjectMaxFiles(),
 			cfg.reinjectPerFileBudget(),
 			cfg.reinjectTotalBudget())
@@ -661,8 +760,40 @@ func AutoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	out = append(out, summaryMsg)
 	out = append(out, reinjected...)
 	out = append(out, tail...)
+	if cut != nil {
+		cut.tailLen = len(tail)
+	}
 	return out, nil
 }
+
+// headLenInConv 把 cut.headLen 换算成 conv（去掉前导 system 之后）里的下标；没套用、或 Head 全是前导
+// system 时返回 0。
+func headLenInConv(cut *compactCut, sysEnd, convLen int) int {
+	if cut == nil || cut.headLen <= sysEnd {
+		return 0
+	}
+	if h := cut.headLen - sysEnd; h < convLen {
+		return h
+	}
+	return 0
+}
+
+// dropReinjectionGroups 去掉上一次压缩的文件重注入（它在 Head 里自成一组）——这次重新从原始消息流倒扫。
+func dropReinjectionGroups(groups [][]*schema.Message) [][]*schema.Message {
+	out := groups[:0:0]
+	for _, g := range groups {
+		if len(g) == 1 && g[0] != nil && g[0].Annotations != nil {
+			if v, ok := g[0].Annotations[autoCompactReinjectAnnotation].(bool); ok && v {
+				continue
+			}
+		}
+		out = append(out, g)
+	}
+	return out
+}
+
+// autoCompactReinjectAnnotation 标「这条是压缩后的文件重注入」——下一次压缩据它丢掉旧的、重新倒扫。
+const autoCompactReinjectAnnotation = "crew_autocompact_reinject"
 
 // splitProtectedGroups 按 group 分流 earlyGroups 为「含保护 marker 的整组保留」和
 // 「不含的进 summary input」。返回两段 flatten 后的 messages（保 group 内序 + 组间
@@ -720,12 +851,31 @@ func groupContainsProtectedMarker(group []*schema.Message) bool {
 func lastUserGroupIndex(groups [][]*schema.Message) int {
 	for i := len(groups) - 1; i >= 0; i-- {
 		for _, m := range groups[i] {
-			if m != nil && m.Role == schema.RoleUser {
+			// 框架以 user 角色追加的提示（后台任务通知、重复调用提醒、inline skill 正文，见 IsFrameworkNote）不是用户说的
+			// 话：它们排在用户这一轮的提问之后，按它们定尾部会把用户刚问的话连同这一轮的工具往返摘进摘要（实测）。跳过，
+			// 尾部跟没有这些提示时一样。
+			if m != nil && m.Role == schema.RoleUser && !IsFrameworkNote(m) {
 				return i
 			}
 		}
 	}
 	return -1
+}
+
+// allPendingUserInput 报 g 是不是整组都是模型还没回应的、框架接进消息流的用户输入（运行中插话 / 闸门反馈，
+// 见 isPendingUserInput）。空组不算。
+func allPendingUserInput(g []*schema.Message) bool {
+	n := 0
+	for _, m := range g {
+		if m == nil {
+			continue
+		}
+		if !isPendingUserInput(m) {
+			return false
+		}
+		n++
+	}
+	return n > 0
 }
 
 // allProtectedGroups 判 groups 内每个 group 是否全是 protected message——即每条
@@ -761,14 +911,23 @@ func allProtectedGroups(groups [][]*schema.Message) bool {
 	return true
 }
 
-// buildExtractionPrompt 拼前 preamble + 主体 + 自定义 instructions + 后 trailer。
+// buildExtractionPrompt 拼前 preamble + 主体 + 摘要长度预算 + 自定义 instructions + 后 trailer。
+//
+// 长度预算是 SummaryMaxTokens：摘要超过它判无效（见 autoCompactRun），模型得知道这个数，不然照 9 段提示词写出的
+// 摘要在它配得小时每次都超、每次白调一次。
 func buildExtractionPrompt(cfg *AutoCompactConfig) string {
 	preamble, trailer, mainPrompt := selectPromptByLanguage(cfg.Language)
 	var sb strings.Builder
-	sb.Grow(len(preamble) + len(mainPrompt) + len(trailer) + len(cfg.CustomInstructions) + 64)
+	sb.Grow(len(preamble) + len(mainPrompt) + len(trailer) + len(cfg.CustomInstructions) + 160)
 	sb.WriteString(preamble)
 	sb.WriteString("\n\n")
 	sb.WriteString(mainPrompt)
+	sb.WriteString("\n\n")
+	if cfg.Language == AutoCompactLangEN {
+		fmt.Fprintf(&sb, "Keep the <summary> block within about %d tokens — a longer summary is discarded and the conversation is kept as is.", cfg.summaryMaxTokens())
+	} else {
+		fmt.Fprintf(&sb, "<summary> 块控制在约 %d token 以内——超出时这次摘要作废、对话原样保留。", cfg.summaryMaxTokens())
+	}
 	if cfg.CustomInstructions != "" {
 		sb.WriteString("\n\n## Compact Instructions\n")
 		sb.WriteString(cfg.CustomInstructions)
@@ -821,7 +980,9 @@ type reinjectedFile struct {
 //
 // path 提取：从 assistant tool_call.Function.Arguments 解析 JSON 取 "path" 字段。
 // 简化处理：直接字符串匹配 `"path":"..."`，避免引入 json 解析依赖。
-func extractRecentFiles(messages []*schema.Message, maxFiles, perFileBudget, totalBudget int) []reinjectedFile {
+//
+// skip 是要跳过的 tool_use_id（MicroCompact 会清掉的那些，见 microCompactToClear）；nil 不跳。
+func extractRecentFiles(messages []*schema.Message, skip map[string]bool, maxFiles, perFileBudget, totalBudget int) []reinjectedFile {
 	if maxFiles <= 0 || perFileBudget <= 0 || totalBudget <= 0 {
 		return nil
 	}
@@ -856,6 +1017,13 @@ func extractRecentFiles(messages []*schema.Message, maxFiles, perFileBudget, tot
 			continue
 		}
 		seen[path] = true
+		if skip[id] {
+			continue // MicroCompact 会清掉的
+		}
+		// 产生时就转存过的：正文是转存说明 + 预览，不是文件内容
+		if sid, _ := m.Annotations[ToolResultSpillAnnotation].(string); sid != "" {
+			continue
+		}
 
 		// 关键过滤：MicroCompact 已清掉/已 offload 的 tool_result 不能再注入——优先按
 		// MicroCompactClearedAnnotation / MicroCompactOffloadedAnnotation marker
@@ -937,7 +1105,9 @@ func buildReinjectionMessage(files []reinjectedFile) *schema.Message {
 		sb.WriteString(f.Content)
 		sb.WriteString("\n```\n\n")
 	}
-	return schema.UserMessage(sb.String())
+	m := schema.UserMessage(sb.String())
+	m.Annotations = map[string]any{autoCompactReinjectAnnotation: true}
+	return m
 }
 
 // reinjectRecentFiles / reinject* 取默认值（cfg 字段未设时）。
@@ -989,6 +1159,14 @@ func firstNonInjectedSystem(sys []*schema.Message) string {
 		return m.Content
 	}
 	return ""
+}
+
+// summaryMaxTokens 是摘要的预算：阈值公式按「摘要不超过它」留出空间，压出来的摘要超过它就判无效。
+func (cfg *AutoCompactConfig) summaryMaxTokens() int {
+	if cfg.SummaryMaxTokens <= 0 {
+		return defaultAutoCompactSummaryMaxTokens
+	}
+	return cfg.SummaryMaxTokens
 }
 
 func (cfg *AutoCompactConfig) minCompactableTokens() int {

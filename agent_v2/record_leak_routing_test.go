@@ -31,7 +31,7 @@ func routeToolCall(callID, target string) *schema.Message {
 // 没配 fallback 时直接把框架内部记账文本返给调用方。err 全程为 nil。
 //
 // **为什么业务躲不掉**：classifier 走 `WithoutHistoryCtx`（`routing_agent.go`），
-// `loadHistory` 对它恒返 (nil,false) ⟹ prior 恒是 session events 源 ⟹ 开不开
+// `historyPrior` 对它恒返 (nil,false) ⟹ prior 恒是 session events 源 ⟹ 开不开
 // `WithHistory` 都一样。
 //
 // 修法：最终产出改由决策点写进专用 channel，记账文本在 preamble 侧合成、结构上进不去

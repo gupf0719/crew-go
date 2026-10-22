@@ -71,7 +71,7 @@ func (p *shapeProbe) leaf(name, reply string) *agent_v2.BasicAgent {
 
 func (p *shapeProbe) load(t *testing.T) {
 	t.Helper()
-	msgs, err := p.hs.Load(p.ctx, agent_v2.HistoryKey{Owner: p.tenant, ConvID: p.convID})
+	msgs, err := agent_v2.LoadAllHistory(p.ctx, p.hs, agent_v2.HistoryKey{Owner: p.tenant, ConvID: p.convID})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}

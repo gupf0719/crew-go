@@ -153,9 +153,9 @@ func (cm *ChannelManager) effectiveRerunGen(a *nodeStateAccessor) int {
 // bumpRerunGen 把 nodeKey 这次执行里 scope 这个分域的代际加一（读改写在同一把写锁里；scope 为空
 // = 执行级）。
 //
-// 只由引擎在条件边按 [CondFailRerunFrom] 否决时调（[condRejected]）：成员自己的出边否决时推进
+// 引擎在条件边按 [CondFailRerunFrom] 否决时调（[condRejected]）：成员自己的出边否决时推进
 // 成员这次执行的执行级，嵌套图的入口条件边否决时推进产出那份输入的分域（等成员以这个错失败时，
-// 见 [applyNestedEntryRejections]）。
+// 见 [applyNestedEntryRejections]）。节点自己判定一格的产出作废时经 [AdvanceRerunGeneration] 调。
 func (cm *ChannelManager) bumpRerunGen(nodeKey, scope string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -188,6 +188,25 @@ func RerunGeneration(ctx context.Context) int {
 	return a.cm.effectiveRerunGen(a)
 }
 
+// AdvanceRerunGeneration 宣布 ctx 所在这一格（分域）的产出作废、要重新产出：推进这一格的重做代际，效果同条件边按
+// [CondFailRerunFrom] 否决这一格的产出——这一格里按 [Rerunnable] 记的步骤从此不可达，这一格里的提问换新 ID（提问的
+// 身份带着代际），普通记录照常拿回（同一个地方的扣费、问过人的把关不跟着重做）。在相位、tool_call 这类分域里调只推进
+// 那一格；在节点体里调推进整次执行。
+//
+// 给「节点自己判定这一格处理过的产出作废」用，而且只在这次执行随后以失败退出时调：代际随这次执行的私有态一起落盘
+// （失败出口的存档带着它），执行成功之后连同它一起不可达。典型是 BasicAgent 的 model 节点：OnModelEnd 钩子处理过
+// （可能问过人）的那份答复被作废、续跑重新调模型时推进 OnModelEnd 那一格——不推进的话，调用方累积传的、对旧答复
+// 的批准按同一个 ID 兑付给用户从没看过的新一份。
+//
+// 不在节点执行里时是 no-op。
+func AdvanceRerunGeneration(ctx context.Context) {
+	a := nodeStateAccessorFrom(ctx)
+	if a == nil {
+		return
+	}
+	a.cm.bumpRerunGen(a.key, a.scope)
+}
+
 // outerRerunGensKey 携带「承载这张图的每一层外层执行此刻的重做代际」，从外到里（见
 // [InterruptSite] 的 OuterRerunGens）。执行状态：进每张图时重铺，DetachExecution 剥掉。
 type outerRerunGensKey struct{}
@@ -202,8 +221,8 @@ func withOuterRerunGens(ctx context.Context, gens []int) context.Context {
 // 上一层的链按 host 所在的 cm 取（ChannelManager.outerGens），不按 ctx 取：两者在节点体里相同，在
 // 图级钩子相位里不同（见 outerGens 的说明）。
 //
-// 在进图那一刻取：代际只在成员失败 / 出边否决之后推进（见 rerunGeneration），承载这张图的执行
-// 正在跑、它的代际在这期间不变。
+// 在进图那一刻取：代际只在成员失败 / 出边否决之后推进（见 rerunGeneration），或由节点在以失败退出之前
+// 自己推进（[AdvanceRerunGeneration]）——承载这张图的执行正在跑、它的代际在这期间不变。
 func outerRerunGensFor(host *nodeStateAccessor) []int {
 	if host == nil {
 		return nil

@@ -112,13 +112,13 @@ func (n Namespace) String() string {
 
 // Item 是 Store 的存储单元——key-value 加创建/更新时间元数据。
 //
-// Value 必须 JSON 可序列化（业务存到 Redis/PG 后端时框架要序列化）。InMemoryStore
-// 阶段不强制校验，业务自负；接 Redis/PG 后端时违反会失败。
+// **Value 的往返契约**：Put 进去的值按它的 JSON 形状存、读、比较（见 [NormalizeValue]）——读回来对象是
+// `map[string]any`、数组是 `[]any`、数字是 `json.Number`，字符串、布尔原样。业务传 struct、`map[string]string`、
+// `*schema.Message`，在每个后端上读回来都是 `map[string]any`；要原来的 Go 类型，读回之后自己解码
+// （`json.Marshal` 再 `json.Unmarshal` 进目标类型）。编不成 JSON 的值（chan、func、NaN）Put 报错。
 //
-// **Value 浅持有约定**：Put 时 store 内部直接持有业务传入的 Value 指针（不 deep
-// copy）；Get/Search 返回的 Item.Value 也是同一指针。业务约定：把 Value 视为不可
-// 变——Put 后不再 mutate value 内 map/slice；Get 返的 Value 想改先 deep copy。违反
-// 会跟 store 内部状态产生 race。
+// Put 之后业务再改自己的对象不影响 store 里的值（存的是归一化出来的那份）。Get / Search 返回的 Value 当只读用：
+// 内存后端每次返回它存的那份，就地改会改到存储里。
 type Item struct {
 	Namespace Namespace
 	Key       string
@@ -371,14 +371,10 @@ type searchConfig struct {
 //     按嵌套部分匹配），别依赖。**直值是对象时同理**——`{"f": {"x": 1}}` 会被当成嵌套
 //     filter 而不是「等于这个对象」
 //
-// ⚠️ **filter 只认顶层值是 `map[string]any` 的记录**（客户端过滤后端）：`MatchFilter`
-// 开头就断言 `value.(map[string]any)`，所以 `Put` 存 `map[string]string` /
-// `struct` / 其他具体类型时，in-memory 与 example 后端**一格都匹配不上**（返 0 条、
-// `err == nil`），而 redis 与三个 sql 方言因为存的是 JSON、读回来恒是
-// `map[string]any`，**同一个 filter 照常命中**。实测 `map[string]string{"z":"1"}` +
-// filter `{"z":"1"}`：in-memory 0 条、SQLite 1 条。**要跨后端可移植，Put 的值请用
-// `map[string]any`**（或先自己过一次 JSON 往返）。根因是 `Item.Value` 的往返契约
-// 没定死——修法（Put 入口统一 JSON 归一化）见 doc/code/todo.md。
+// filter 两侧比的都是 JSON 形状（[Item] 的往返契约）：`Put` 存 `map[string]string` / struct 也照常按字段命中；
+// filter 的比较值同样先换成 JSON 形状（[NormalizeValue]），比较值是 struct、`map[string]string` 也一样，对象相等
+// 不看键序也不看 struct 字段的声明序。直值编成 JSON 是对象时等同 `{"$eq": 对象}`（直接写 `map[string]any` 的直值
+// 仍按嵌套 filter 处理，见上）。（曾经两侧都原样比：同一个 filter 在内存后端上 0 条、在 SQLite 上 1 条。）
 //
 // ⚠️ **另两处已知的跨后端不一致**（6 后端 × 74 组的差分实测，2026-09-04；修法与进展见
 // `doc/code/todo.md`）：
@@ -396,6 +392,7 @@ type searchConfig struct {
 //     `map[string]any` 再 Put 时，大整数已经变成 float64 了（标准库默认行为），框架这层
 //     再精确也救不回来。要保精度用 `json.NewDecoder(r).UseNumber().Decode(&v)`，或直接传 int64
 func WithFilter(filter map[string]any) SearchOption {
+	filter = normalizeFilter(filter)
 	return func(c *searchConfig) { c.filter = filter }
 }
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,9 +30,8 @@ func (h *panicHook) OnAgentEnd(ctx context.Context, _ *hook.AgentInfo, _ *hook.A
 // agent_v2/basic_agent.go::Run defer 直接调 a.config.Hooks.OnAgentEnd，业务 hook
 // panic 整 Run goroutine 崩；嵌套场景父 cp save 路径被打断。
 //
-// **预期行为**：业务 hook panic 被 recover 转 slog.Warn，Run 正常返回。
-//
-// **当前 bug**：caller 看到 panic 冒泡。
+// **预期行为**：业务 hook panic 被兜住、不冒泡到调用方；这次调用已经成功时它不改变结果（记一条带栈的 ERROR，Run 正常返回），
+// 调用失败时 panic 并进那次调用的错误里。
 func TestRepro_R7_Bug1_BasicAgentOnAgentEndPanicCrashesRun(t *testing.T) {
 	stub := newStubModel([]*schema.Message{schema.AssistantMessage("ok")})
 	hook1 := &panicHook{}
@@ -55,12 +53,9 @@ func TestRepro_R7_Bug1_BasicAgentOnAgentEndPanicCrashesRun(t *testing.T) {
 
 	sess := &agent_v2.RunSession{RunID: "bug1_sid"}
 	_, err := ag.Run(context.Background(), sess, schema.UserMessage("hi"))
-	// audit² eino-aligned: hook panic 由 outer recover 转 wrapped err
-	if err == nil {
-		t.Fatal("hook panic 后 Run 应返 wrapped err")
-	}
-	if !strings.Contains(err.Error(), "panic") {
-		t.Fatalf("Run 应返 panic-wrapped err, got %v", err)
+	// 这次调用已经成功：OnAgentEnd 是观测钩子，它 panic 不把成功报成失败（就地兜住、记 ERROR，见 observer_hook_panic_test.go）
+	if err != nil {
+		t.Fatalf("调用成功时 OnAgentEnd panic 不该让 Run 失败，got %v", err)
 	}
 	if hook1.endCalled.Load() == 0 {
 		t.Fatal("OnAgentEnd should have been called once")

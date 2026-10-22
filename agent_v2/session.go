@@ -54,15 +54,16 @@ func newUUID() string {
 //
 // **lane events 协议**（ISSUE-80 修）：ParallelAgent
 // fan-out 多 branch 并发跑时，每 branch 通过 `ForkLane()` 获得独立 lane—— branch 内
-// `AddEvent` 进 lane 私有 slice (lock-free，每 goroutine 一份) 不污染 parent 共享
-// events；branch 完成后 `CommitLaneEvents` 把 lane events 按 TS 排序后合并回 parent。
-// 解决 R31 视角 D HIGH-1 sibling 串台根因，删 R31 临时 `FinalMessageByAgent` name filter
-// 限制（业务可同 sub-agent 实例作多 branch）。
+// `AddEvent` 进 lane 私有 slice 不污染 parent 共享 events；branch 完成后 `CommitLaneEvents`
+// 把 lane events 按原有顺序合并回 parent。解决 R31 视角 D HIGH-1 sibling 串台根因，删 R31
+// 临时 `FinalMessageByAgent` name filter 限制（业务可同 sub-agent 实例作多 branch）。
+// 编排成员每次尝试也跑在一条 lane 上（attemptLanes）：失败的尝试被下一次从头再跑的尝试
+// 取代时，它写的事件不提交。
 //
 // **并发安全**：父子共享 valuesMu 让 ParallelAgent fan-out N branch × M sub-agent
 // 嵌套场景下并发 SetValue/GetValue 仍 race-free。eventsMu 每 sess 独立——子 events
-// 写入不会与父 events 竞争。lane events slice 在 branch 内 lock-free（每 goroutine
-// 独立 lane 不共享）。
+// 写入不会与父 events 竞争。lane events slice 由 lane.mu 保护（lane 内业务可能再起
+// goroutine 写同一条 lane，嵌套时几条子 lane 也会同时提交到同一条外层 lane）。
 type RunSession struct {
 	// RunID 标识**一次任务**——从一次 Run 开始，到终结为止（成功 / 终局失败 / 被放弃）。
 	// 它是 checkpointer 的主索引，也是 Resume 的入口。
@@ -97,13 +98,10 @@ type RunSession struct {
 	// 这个理由，见本文件上面那段）。别拿 ConvID 当 RunID 使。
 	RunID string
 
-	// eventsMu 保护 events slice。**主线 sess 独立**——业务字面量构造的 sess 用此
-	// 字段。**ForkLane child sess** 走 eventsMuRef 共享父锁 (R33 B HIGH-1 fix)。
-	// AddEvent / Events / RestoreEvents 都通过
-	// `effectiveEventsMu()` 获取实际锁——eventsMuRef 非 nil 优先，否则用 &eventsMu。
-	eventsMu    sync.RWMutex
-	eventsMuRef *sync.RWMutex // R33 B HIGH-1: ForkLane child 共享 parent.eventsMu 指针
-	events      []*AgentEvent
+	// eventsMu 保护 events slice，每个 sess 自己一把。ForkLane 派生的 lane 的 events 是派生那一刻父的事件
+	// 快照（私有、之后不变），不跟父共享切片，也就不用共享父的锁。
+	eventsMu sync.RWMutex
+	events   []*AgentEvent
 
 	// valuesMu 保护 values map。**父子共享指针**（NewSharedChildSession 让 child
 	// 复制父 valuesMu 指针）—— 父子并发 SetValue/GetValue 同 map 走同一个锁
@@ -118,19 +116,16 @@ type RunSession struct {
 	// 业务用 ParentSession() / RootSession() 访问，不要直接读字段。
 	parentSess *RunSession
 
-	// laneEvents 非 nil 表示本 sess 是 ParallelAgent fan-out lane 内的 child sess——
-	// AddEvent 路由到 laneEvents.Events (lock-free 每 goroutine 一份) 而非 events，
-	// CommitLaneEvents 在 branch 完成时把 lane events 按 TS 排序合并回 parent。
+	// laneEvents 非 nil 表示本 sess 是 ForkLane 派生的 lane child sess（并行分支、编排成员的
+	// 一次尝试）——AddEvent 路由到 laneEvents.Events（lane.mu 保护）而非 events，
+	// CommitLaneEvents 把 lane events 按原有顺序合并回 parent；这时 events 字段是派生那一刻父的事件快照（只读）。
 	// nil 表示主线 sess，AddEvent 直接写 events + eventsMu。
-	// 业务用 ForkLane() 创建，不直接构造。
+	// 用 ForkLane() 创建，不直接构造。
 	laneEvents *laneEvents
 }
 
-// laneEvents 是 ParallelAgent fan-out branch 私有 events slice + 父链。
-//
-// 字段语义：
-//   - Events: branch 内 AddEvent 的目标
-//   - Parent: 嵌套 fan-out 时父 lane（业务多层 ParallelAgent 嵌套时）
+// laneEvents 是一条 lane（并行分支 / 编排成员的一次尝试）私有的 events slice：lane 内 AddEvent 的目标，从它
+// 派生的子 lane 提交上来的也追加在这里。不记父 lane——lane 读上文读的是派生那一刻的快照（见 ForkLane）。
 //
 // **R33 audit A HIGH-1 fix**：嵌套 fan-out (Parallel 内嵌 Parallel) 时多个 inner
 // branch 同时 commit 到同一 outer lane.Events → race detector 100% 触发。lane
@@ -138,13 +133,11 @@ type RunSession struct {
 // branchFn 各自 commit 不同时间到达 outer lane → 必须加 mu。同时 Events() 拼接
 // 路径读 lane.Events 也走同 mu 防 read-while-write race。
 //
-// branch 完成时 `CommitLaneEvents(parent, child)` 把 child.laneEvents.Events
-// 按 TS 排序后 append 到 parent.events（或 parent.laneEvents.Events 如果 parent
-// 也在 lane 内，写时加 mu）。
+// 提交时 `CommitLaneEvents(parent, child)` 把 child.laneEvents.Events 按原有顺序
+// append 到 parent.events（或 parent.laneEvents.Events 如果 parent 也在 lane 内，写时加 mu）。
 type laneEvents struct {
 	mu     sync.Mutex // R33 A HIGH-1: 嵌套 fan-out 时多 inner branch 同时 append 同 outer Events 必须加锁
 	Events []*AgentEvent
-	Parent *laneEvents
 }
 
 // NewRunSession 创建空 root RunSession，自动生成 RunID。
@@ -224,19 +217,6 @@ func NewSharedChildSession(parent *RunSession) *RunSession {
 	}
 }
 
-// effectiveEventsMu 返回保护 events 的实际锁——eventsMuRef 非 nil 用 ref（ForkLane
-// child 共享父锁），否则用本地 eventsMu 地址（主线 sess / 业务字面量构造）。
-//
-// **why**：ForkLane child 必须与 parent 共享 events + 共享 eventsMu 才能让 read 路径
-// race-free（parent 主线 goroutine 可能并发 AddEvent 写 events，child 在 lane 内 Events()
-// 读 committed 部分需要走同一 mu）。sync.RWMutex 是值类型不能直接复制，用 ref 字段实现。
-func (s *RunSession) effectiveEventsMu() *sync.RWMutex {
-	if s.eventsMuRef != nil {
-		return s.eventsMuRef
-	}
-	return &s.eventsMu
-}
-
 // ensureValues lazy init valuesMu + values。供 SetValue/GetValue/NewSharedChildSession
 // 调用。sync.Once 保 init 自身 race-free。
 func (s *RunSession) ensureValues() {
@@ -306,7 +286,7 @@ type sessionKey struct{}
 // span 缺 crew.run.id）与嵌套图都读它。覆盖而不是「没有才补」：
 // 长寿的 ctx 上可能钉着上一个任务的 sid（业务按契约 `NextTask` 换了 RunID），「没有才补」的话框架
 // 照旧认那个旧 sid、新任务接着跑被放弃任务的存档（实测）。嵌套位置上的 session 的 RunID 必须等于
-// 所在任务（编排成员拿父 session 本身、并行分支拿 `ForkLane` 派生的、嵌套调用的被调方拿框架给的，
+// 所在任务（编排成员与并行分支拿 `ForkLane` 派生的、嵌套调用的被调方拿框架给的，
 // RunID 都是所在任务；业务自己传的对不上时入口直接拒，见 [resolveRunSession]），覆盖不改变它沿用
 // 所在任务 sid 的行为。
 func WithSession(ctx context.Context, s *RunSession) context.Context {
@@ -416,13 +396,12 @@ func GetSession(ctx context.Context) *RunSession {
 // 防御性过滤：chunk 事件（IsChunk=true）不入 events——chunk 应通过
 // OrchestrationHooks.OnNodeEvent 实时投递给前端 SSE，写历史会刷爆 sess.Events。
 //
-// CreatedAt 为 0 时自动填充 time.Now().UnixNano()——同时作 lane events 合并时的
-// 时序排序键（TS）。
+// CreatedAt 为 0 时自动填充 time.Now().UnixNano()（lane 提交时不按它排序，按原有顺序）。
 // nil event 静默跳过。
 //
 // **lane events 路由**（ISSUE-80）：sess.laneEvents 非 nil（ForkLane 后的 child
-// sess）→ append 到 lane.Events lock-free（每 goroutine 独立 lane）；nil（主线
-// sess）→ append 到 events + eventsMu。
+// sess）→ append 到 lane.Events（lane.mu 保护）；nil（主线 sess）→ append 到
+// events + eventsMu。
 func (s *RunSession) AddEvent(e *AgentEvent) {
 	if e == nil {
 		return
@@ -440,143 +419,98 @@ func (s *RunSession) AddEvent(e *AgentEvent) {
 		s.laneEvents.mu.Unlock()
 		return
 	}
-	// 主线 → 锁保护写共享 events
-	mu := s.effectiveEventsMu()
-	mu.Lock()
+	// 主线 → 锁保护写 events
+	s.eventsMu.Lock()
 	s.events = append(s.events, e)
-	mu.Unlock()
+	s.eventsMu.Unlock()
 }
 
 // Events 返回所有事件的快照（按追加顺序）。
 //
-// **lane events 拼接视图**（ISSUE-80）：sess.laneEvents 非 nil 时返 committed events
-// + lane 链所有未 commit events——业务读 sess.Events() 在 lane 内时能看到完整视图
-// （含父已提交 + 自己 lane 链 in-flight），与主线行为一致。
+// **lane 的视图**（ISSUE-80）：sess.laneEvents 非 nil 时返回派生那一刻父的事件快照 + 自己 lane 上的事件（含从
+// 它派生的子 lane 提交上来的）。派生之后父那边再追加的（兄弟分支提交、父自己写的）看不到——并行分支之间互不
+// 可见、agent 按进入时的事件数切出「本次产生的事件」，都靠这一条（见 ForkLane）。
 func (s *RunSession) Events() []*AgentEvent {
-	// 主线 sess（无 lane） → 直接返 events 副本
-	if s.laneEvents == nil {
-		mu := s.effectiveEventsMu()
-		mu.RLock()
-		defer mu.RUnlock()
-		out := make([]*AgentEvent, len(s.events))
-		copy(out, s.events)
-		return out
-	}
-	// lane 内 → 拼 committed + lane 链
-	mu := s.effectiveEventsMu()
-	mu.RLock()
-	committed := make([]*AgentEvent, len(s.events))
-	copy(committed, s.events)
-	mu.RUnlock()
-
-	// 沿 lane 链上追（外层 lane → 内层 lane）—— Parent 指针不可变 (创建后只读) 安全无锁；
-	// 但 lane.Events slice 可变 → 走 lane.mu RLock-equivalent (Mutex.Lock + 复制) 防 race
-	// (R33 A MED-1: 与 A HIGH-1 同根因)
-	var laneSlices [][]*AgentEvent
-	totalLaneSize := 0
-	for lane := s.laneEvents; lane != nil; lane = lane.Parent {
-		lane.mu.Lock()
-		if len(lane.Events) > 0 {
-			snapshot := make([]*AgentEvent, len(lane.Events))
-			copy(snapshot, lane.Events)
-			laneSlices = append(laneSlices, snapshot)
-			totalLaneSize += len(snapshot)
-		}
-		lane.mu.Unlock()
-	}
-	out := make([]*AgentEvent, 0, len(committed)+totalLaneSize)
-	out = append(out, committed...)
-	// 反序：父 lane events 在前，子 lane events 在后（时序正确）
-	for i := len(laneSlices) - 1; i >= 0; i-- {
-		out = append(out, laneSlices[i]...)
+	s.eventsMu.RLock()
+	out := make([]*AgentEvent, len(s.events))
+	copy(out, s.events)
+	s.eventsMu.RUnlock()
+	if s.laneEvents != nil {
+		s.laneEvents.mu.Lock()
+		out = append(out, s.laneEvents.Events...)
+		s.laneEvents.mu.Unlock()
 	}
 	return out
 }
 
-// ForkLane 创建 ParallelAgent fan-out 用的 lane child sess——共享 values 指针 +
-// 共享 valuesMu + 共享 events 主线 (commit 时合并回此) + 独立 laneEvents slice
-// (每 branch goroutine 一份；R33 起 lane.mu 保护——branch 内业务可能再 spawn
-// goroutine 写同 lane，纯 lock-free 不成立)。
+// ForkLane 派生一条 lane child sess：看到的上文是派生这一刻 s 的全部事件（快照——之后 s 再追加的看不到），自己
+// 写的事件落在 lane 私有的 slice 上，调用方在它们该生效时用 `CommitLaneEvents(s, child)` 交回 s；values 与 s 共享
+// （共享 values 指针 + valuesMu）。
+//
+// 框架里编排成员每次尝试用它派生一条（attemptLanes：失败的尝试被下一次从头再跑的尝试取代时，它写的事件不提交）；
+// ParallelAgent 的分支 lane 走同一个实现 forkLaneFrom，上文去掉兄弟分支提交上来的（见 parallel_agent.go 的
+// siblingEvents）。
+//
+// **为什么是快照**：lane 是拿来隔离的——兄弟分支之后提交进父的、父那边后来追加的，都不该出现在这条 lane 的上文里。
+// 曾经 lane 对主线只记切片（长度在派生时定住）、对祖先 lane 却挂着实时指针：并行作为编排成员跑在成员的暂存 lane
+// 上时，兄弟分支提交进那条暂存 lane，别的分支实时读得到——同名的 agent 把兄弟的问答当成自己的上文，agent 按进入
+// 时的事件数切出的「本次产生的事件」也混进兄弟的（审计实测）。
 //
 // **使用约束**：
-//   - 仅由 ParallelAgent.branchFn 调用——业务 NodeFunc 通常不直接用
-//   - 调用方负责 branch 完成后调 `CommitLaneEvents(parent, child)` 合并回父
-//   - 同时支持嵌套 fan-out (ParallelAgent 内嵌 ParallelAgent)——child.laneEvents.Parent
-//     指向 parent.laneEvents 自动建链
+//   - 框架内部用——业务 NodeFunc 通常不直接用
+//   - 调用方负责在 lane 的事件该生效时调 `CommitLaneEvents(parent, child)` 合并回父；不调就是丢掉
+//   - 支持嵌套（lane 上再 ForkLane：ParallelAgent 内嵌 ParallelAgent、分支成员的尝试 lane）——子 lane 提交进父
+//     lane 自己的 slice，父 lane 再往上提交
 //
 // **vs NewSharedChildSession 区别**：
 //   - NewSharedChildSession (AgentAsTool 用)：events + eventsMu 完全独立 — 子 events
 //     不进父，沿 RootSession 链可看父
-//   - ForkLane (ParallelAgent 用)：events 共享主线 (committed) + lane 私有 (in-flight)
-//     — branch 完成时 lane events commit 回父，业务侧最终全可见
+//   - ForkLane：派生那一刻父的事件快照 + lane 私有 (in-flight) — 提交之后 lane events 进父、业务侧可见；
+//     提交之前只在这条 lane（及从它派生的）上看得到
 func (s *RunSession) ForkLane() *RunSession {
+	return s.forkLaneFrom(s.Events())
+}
+
+// forkLaneFrom 派生一条 lane，它看到的上文是 base——调用方取好的 s 的事件（可以是 s.Events() 的子集）。
+// ParallelAgent 用它让分支看不到兄弟：分支开始时取编排会话的事件、去掉兄弟分支提交上来的，再从结果派生（见
+// parallel_agent.go 的 siblingEvents）。
+//
+// lane 只读 base：lane 的 AddEvent 写自己的 slice，CommitLaneEvents 往父 lane 自己的 slice 上追加，都不碰
+// events；容量截到长度，万一有人往上追加也会另起数组。
+func (s *RunSession) forkLaneFrom(base []*AgentEvent) *RunSession {
 	s.ensureValues()
-	// **R33 audit B HIGH-1 fix**: 共享 parent.events slice + parent.eventsMu 指针
-	// 让 lane 内 sess.Events() 拼接 committed 部分能拿到父历史（child 直接引用
-	// parent 的 events slice）。之前漏共享 → 子 lane 内
-	// sess.Events()/HistoryFor/SelfHistory 拿不到父之前 AddEvent 的历史。
-	//
-	// child 不通过 events 路径写（lane 路由），所以 events 共享是 read-only 视图。
-	// 但 parent 主线 goroutine 可能并发 AddEvent → 共享 eventsMu 让 lane 读时 RLock
-	// 防 race。
-	child := &RunSession{
+	return &RunSession{
 		RunID:      s.RunID,
 		valuesMu:   s.valuesMu,   // 共享 mu 指针 — race-free 父子并发
 		values:     s.values,     // 共享 values map
-		parentSess: s.parentSess, // 沿用父链（lane fork 不改变 sess 嵌套层级）
-		laneEvents: &laneEvents{
-			Events: make([]*AgentEvent, 0),
-			Parent: s.laneEvents, // 嵌套 fan-out 时链回父 lane
-		},
-	}
-	// events + eventsMu 共享父的指针 — sync.RWMutex 是值类型不能直接赋值，
-	// 用辅助 helper 让 child Events() 走父的 mu。
-	child.shareEventsFrom(s)
-	return child
-}
-
-// shareEventsFrom 让 child sess 的 events 读路径走 parent 的 events + eventsMu。
-// 这是 ForkLane 的辅助 helper——通过 events 字段共享指针 + eventsMu 必须用同一 RWMutex 实例。
-//
-// 实现技巧：sync.RWMutex 是值类型，直接赋值会复制锁状态——用指针字段 (eventsMuRef)
-// 让 child 引用 parent 的 mu。由于现有 RunSession 字段 eventsMu 是值类型（兼容 v1
-// 业务直接构造），加新 eventsMuRef *sync.RWMutex 字段：非 nil 时优先用，nil 时走
-// 自己的 eventsMu。
-//
-// **并发安全 (R34 ISSUE-87 fix)**：读 parent.events slice header 必须持 parent
-// effective mu RLock — parent 主线 goroutine 并发 AddEvent (Lock 写) 或 sibling
-// branch CommitLaneEvents (Lock 写) 时无锁读会触发 race detector (TestAggregator_Basic
-// 在 ParallelAgent fan-out 各 branch goroutine 并发 ForkLane → shareEventsFrom 时
-// ~40% 命中). parent.eventsMuRef 在 parent 自身 ForkLane 内一次写定之后只读,
-// goroutine spawn 已建 happens-before, 无并发写不需锁. s 是新 child 尚未对外暴露,
-// 写 s.events / s.eventsMuRef 不需锁.
-func (s *RunSession) shareEventsFrom(parent *RunSession) {
-	mu := parent.effectiveEventsMu()
-	mu.RLock()
-	s.events = parent.events // 共享 slice 指针 (read-only 视图)
-	mu.RUnlock()
-	s.eventsMuRef = parent.eventsMuRef // 共享父的 mu 引用 (parent 也可能是 lane)
-	if s.eventsMuRef == nil {
-		// parent 是主线 sess (无 ref) — 用 parent 自己的 mu 地址
-		s.eventsMuRef = &parent.eventsMu
+		parentSess: s.parentSess, // 沿用父链（lane 不改变 sess 嵌套层级）
+		events:     base[:len(base):len(base)],
+		laneEvents: &laneEvents{Events: make([]*AgentEvent, 0)},
 	}
 }
 
 // CommitLaneEvents 把 child sess 的 lane events 合并回 parent sess（按 child lane 内原有
-// 顺序 append，不跨 branch 排序）。
+// 顺序 append，不跨 lane 排序）。
 //
-// 用于 ParallelAgent.branchFn 完成时把 lane 内 in-flight events 提交到 parent。各 branch
-// 完成时分别调用——父审计流跨 branch 顺序 = branch 完成顺序（各 branch 内部事件连续且 TS 有序）。
+// 框架里编排成员的尝试 lane 经它提交（attemptLanes）；ParallelAgent 的分支 lane 经同一个实现提交、顺带记下
+// 提交了哪些事件（commitLane / siblingEvents.commit）。几条 lane 各自完成时分别提交——父的事件跨 lane 的顺序
+// = 完成顺序（各 lane 内部事件连续且有序）。
 //
 // **路由规则**：
-//   - parent.laneEvents != nil（parent 也在 lane 内，嵌套 fan-out）→ append 到
-//     parent.laneEvents.Events（不加锁，单 goroutine）
+//   - parent.laneEvents != nil（parent 也在 lane 内：嵌套 fan-out、分支成员的尝试 lane）→
+//     append 到 parent.laneEvents.Events（加 parent lane.mu：几条子 lane 可能同时提交）
 //   - 主线 parent → events + eventsMu 加锁
 //
 // child 必须是 parent.ForkLane() 的产物——其他情况行为未定义。
 func CommitLaneEvents(parent, child *RunSession) {
+	commitLane(parent, child)
+}
+
+// commitLane 是 CommitLaneEvents 的实现，返回这次提交上去的事件——ParallelAgent 据此记下兄弟分支提交了什么
+// （见 parallel_agent.go 的 siblingEvents）。
+func commitLane(parent, child *RunSession) []*AgentEvent {
 	if parent == nil || child == nil || child.laneEvents == nil {
-		return
+		return nil
 	}
 	// 读 child lane.Events 走 lane.mu (R33 A HIGH-1: 防 child branch 内还在写时 commit 读)
 	child.laneEvents.mu.Lock()
@@ -584,20 +518,20 @@ func CommitLaneEvents(parent, child *RunSession) {
 	copy(laneEvts, child.laneEvents.Events)
 	child.laneEvents.mu.Unlock()
 	if len(laneEvts) == 0 {
-		return
+		return nil
 	}
 	// parent 也在 lane 内（嵌套 fan-out）— 走 parent lane.mu 保护 (R33 A HIGH-1)
 	if parent.laneEvents != nil {
 		parent.laneEvents.mu.Lock()
 		parent.laneEvents.Events = append(parent.laneEvents.Events, laneEvts...)
 		parent.laneEvents.mu.Unlock()
-		return
+		return laneEvts
 	}
 	// 主线 parent
-	mu := parent.effectiveEventsMu()
-	mu.Lock()
+	parent.eventsMu.Lock()
 	parent.events = append(parent.events, laneEvts...)
-	mu.Unlock()
+	parent.eventsMu.Unlock()
+	return laneEvts
 }
 
 // RestoreEvents 用持久化的事件切片填充 events——业务从外部存储（数据库 / KV）
@@ -610,10 +544,9 @@ func CommitLaneEvents(parent, child *RunSession) {
 // 直接赋值不触发 hook / 观测回调避免事件重放造成的告警二次触发。
 // 调用方应保证 events 切片此后不再被修改（此处不做深拷贝）。
 func (s *RunSession) RestoreEvents(events []*AgentEvent) {
-	mu := s.effectiveEventsMu()
-	mu.Lock()
+	s.eventsMu.Lock()
 	s.events = events
-	mu.Unlock()
+	s.eventsMu.Unlock()
 }
 
 // History 从会话事件重建对话消息历史（按时序）。

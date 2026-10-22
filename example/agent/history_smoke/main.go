@@ -122,11 +122,11 @@ func (s *faultyStore) Append(ctx context.Context, _ agent_v2.HistoryKey, _ []*sc
 	return nil
 }
 
-func (s *faultyStore) Load(_ context.Context, _ agent_v2.HistoryKey) ([]*schema.Message, error) {
+func (s *faultyStore) Load(_ context.Context, _ agent_v2.HistoryKey, _ agent_v2.HistoryQuery) (agent_v2.HistoryPage, error) {
 	if s.failLoad {
-		return nil, errors.New("faulty backend: load refused")
+		return agent_v2.HistoryPage{}, errors.New("faulty backend: load refused")
 	}
-	return nil, nil
+	return agent_v2.HistoryPage{}, nil
 }
 
 func main() {
@@ -350,7 +350,7 @@ func scenarioConcurrent() bool {
 
 	crossTalk, incomplete := 0, 0
 	for c := 0; c < convs; c++ {
-		msgs, err := hs.Load(context.Background(),
+		msgs, err := agent_v2.LoadAllHistory(context.Background(), hs,
 			agent_v2.HistoryKey{Owner: "tenant-S", ConvID: fmt.Sprintf("stress-%d", c)})
 		if err != nil {
 			fmt.Printf("  ✗ Load conv%d 失败: %v\n", c, err)
@@ -432,7 +432,7 @@ func scenarioRealModelMultiAgent() bool {
 		return false
 	}
 
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-M", ConvID: "conv-panel"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-M", ConvID: "conv-panel"})
 	if err != nil {
 		fmt.Println("  ✗ Load 失败:", err)
 		return false
@@ -520,7 +520,7 @@ func scenarioRealModelNestedOrchestration() bool {
 		return false
 	}
 
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-N", ConvID: "conv-nested"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-N", ConvID: "conv-nested"})
 	if err != nil {
 		fmt.Println("  ✗ Load 失败:", err)
 		return false

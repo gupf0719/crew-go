@@ -288,7 +288,7 @@ crew-go 实施前**建议先 clone eino-ext** 看实际 adapter 设计模式 (�
 2. **Stream callback 异步** — eino Stream Handler 需 spawn goroutine + close, 实现复杂易泄漏。crew-go 当前 `OnModelEndStream` 返新 reader 让框架继续消费聚合 final 的模式更简单, 保留。
 
 ### 🤔 取舍点
-- **Handler 链顺序 (OnStart 逆序 / OnEnd 正序)** — eino 选这个让最先注入的 handler 在最外层 (类似 middleware), crew-go 当前 `ChainHooks` 按 append 顺序串行 fire。**Sub-5 落地后实证决策** (2026-05 [observability-callback.md](observability-callback.md) §"关键决策 2"): **crew-go 仍用 append 序串行不学 eino 逆序**, 但**业务侧推荐 obs.AgentHooks() 在最前** (`NewChainHooks(obs.AgentHooks(), business)`) — 让 obs 最早 fire start + defer 最晚 fire end, 防业务 hook panic 跳过 obs.OnAgentEnd 让 MetricAgentRunTotal 漏 fire.
+- **Handler 链顺序 (OnStart 逆序 / OnEnd 正序)** — eino 选这个让最先注入的 handler 在最外层 (类似 middleware), crew-go 当前 `ChainHooks` 按 append 顺序串行 fire。**Sub-5 落地后实证决策** (2026-05 [observability-callback.md](observability-callback.md) §"关键决策 2"): **crew-go 仍用 append 序串行不学 eino 逆序**, 但**业务钩子交给 observability 包在里面**（`obs.AgentHooks(business...)`，observability 在最外层：最早开 span、最晚收尾），里面的钩子开始失败、在结束一侧停下时 observability 都能当场收尾——span 不会收不了尾、调用不会漏记（见 [doc/v2/observability.md](../../v2/observability.md) §1.2）。
 - **`gen_ai.*` semantic conventions 强制对齐** — eino 没强制, 留给 adapter。crew-go 应**强制对齐 OpenTelemetry gen_ai.* 标准** (LLM 调用 span 用 `gen_ai.request.model` / `gen_ai.usage.*_tokens` 等标准 attribute 名), 让业务接 OTel collector 自动兼容主流 dashboard (Grafana / Honeycomb / Datadog)。**Sub-5 落地实证**: span attr 已对齐 OTel (`gen_ai.agent.kind` / `gen_ai.request.model` 等), 但 metric label 简化为短名 (`kind` / `model`) — 跨源 join 仍需业务自管 mapping. Round 5 audit Q1 决定全改 metric label 对齐 OTel 长名.
 
 ## 8. 跨文档启示综合 (LangGraph + eino → crew-go 决策矩阵)

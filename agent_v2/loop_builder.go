@@ -221,7 +221,10 @@ func (b *LoopAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			//
 			// **ISSUE-77 修后**：exitCheck 是独立节点，抛 Interrupt 时 cp 含 exitCheck
 			// frontier；Resume 重跑 exitCheck，body 已 commit 的 lastOut 不动 → b.body 不重跑。
-			exitCtx := compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), fmt.Sprintf("round_%d_check", round-1)))
+			//
+			// 退出判断是内部决策（同 Reflector / EvalFunc，见 decisionCtx）：它里面请教的 agent 不进会话历史、
+			// 不取用户的插话。
+			exitCtx := decisionCtx(compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), fmt.Sprintf("round_%d_check", round-1))))
 			exited, condErr := exitCond(exitCtx, out, nextRound)
 			if condErr != nil {
 				// InterruptError / ctx.Err / 业务错统一 propagate——graph_loop defer

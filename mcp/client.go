@@ -55,19 +55,40 @@ type ToolSpec struct {
 	InputSchema map[string]any
 	// OutputSchema 可选的输出 schema，V1 暂不使用。
 	OutputSchema map[string]any
-	// Annotations 是 server 给的行为提示（MCP tools/list 的 annotations）；没给为 nil。不发给模型，给审批之类的
-	// 策略用。提示不可信：server 说只读不等于真只读，只能用来放宽「不知道」的情况，不能推翻显式的确认规则。
+	// Annotations 是 server 对这个工具行为的自述（MCP 的 tool annotations），server 没给时为 nil。
 	Annotations *ToolAnnotations
 }
 
-// ToolAnnotations 是 MCP 的工具行为提示。指针字段为 nil 表示 server 没给（规范默认值：ReadOnlyHint false、
-// DestructiveHint true、IdempotentHint false、OpenWorldHint true）。
+// ToolAnnotations 是 MCP server 对工具行为的自述。按 MCP 规范它们**全是提示、不保证如实**：
+// 来自不受信任的 server 时不能据此做决定（比如跳过审批）。框架只在调用方显式信任这个 server 时
+// （[WithTrustedClient]）才认它的只读声明，见 [RemoteTool.ReadOnly]。
+//
+// 字段是指针：没给与给了 false 分得开。规范的缺省语义是保守的——没给 readOnlyHint 即不是只读、
+// 没给 destructiveHint 即可能有破坏性。
 type ToolAnnotations struct {
 	Title           string `json:"title,omitempty"`
 	ReadOnlyHint    *bool  `json:"readOnlyHint,omitempty"`
 	DestructiveHint *bool  `json:"destructiveHint,omitempty"`
 	IdempotentHint  *bool  `json:"idempotentHint,omitempty"`
 	OpenWorldHint   *bool  `json:"openWorldHint,omitempty"`
+}
+
+// clone 深拷贝（指针字段各拷一份）。
+func (a *ToolAnnotations) clone() *ToolAnnotations {
+	if a == nil {
+		return nil
+	}
+	c := *a
+	dup := func(p *bool) *bool {
+		if p == nil {
+			return nil
+		}
+		v := *p
+		return &v
+	}
+	c.ReadOnlyHint, c.DestructiveHint = dup(a.ReadOnlyHint), dup(a.DestructiveHint)
+	c.IdempotentHint, c.OpenWorldHint = dup(a.IdempotentHint), dup(a.OpenWorldHint)
+	return &c
 }
 
 // CallResult 是一次 MCP 工具调用的结果。

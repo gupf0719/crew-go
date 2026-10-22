@@ -50,6 +50,8 @@ const (
 	AttrNodeInstance   = attribute.Key("crew.node.instance")
 	AttrNodeComponent  = attribute.Key("crew.node.component")
 	AttrToolCategory   = attribute.Key("crew.tool.category")
+	AttrToolOutcome    = attribute.Key("crew.tool.outcome")  // denied：被审批拒绝、没有执行（crew.outcome=blocked）
+	AttrToolReplayed   = attribute.Key("crew.tool.replayed") // true：续跑时从工具账重放，这一次没有执行
 	AttrResumeAction   = attribute.Key("crew.resume.action")
 	AttrInterruptID    = attribute.Key("crew.interrupt.id")
 	AttrInterruptCount = attribute.Key("crew.interrupt.queries")

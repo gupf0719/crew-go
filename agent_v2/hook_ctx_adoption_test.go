@@ -157,7 +157,7 @@ func TestHookCtx_ModelHookStaleCtx_HistoryKept(t *testing.T) {
 					t.Fatalf("Run %d: %v", i, err)
 				}
 			}
-			msgs, err := hs.Load(context.Background(), agent_v2.HistoryKey{Owner: "u1", ConvID: "c1"})
+			msgs, err := agent_v2.LoadAllHistory(context.Background(), hs, agent_v2.HistoryKey{Owner: "u1", ConvID: "c1"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -288,7 +288,7 @@ func historyOfTwoRuns(t *testing.T, orch agent_v2.OrchestrationHooks) []string {
 			t.Fatalf("Run %d: %v", i, err)
 		}
 	}
-	msgs, err := hs.Load(context.Background(), agent_v2.HistoryKey{Owner: "u1", ConvID: "c1"})
+	msgs, err := agent_v2.LoadAllHistory(context.Background(), hs, agent_v2.HistoryKey{Owner: "u1", ConvID: "c1"})
 	if err != nil {
 		t.Fatal(err)
 	}

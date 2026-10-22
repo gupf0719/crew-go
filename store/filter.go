@@ -79,6 +79,47 @@ func checkFilterValueSerializable(key, opName string, v any) error {
 	return nil
 }
 
+// normalizeFilter 返回 filter 的一份拷贝，比较值换成它们的 JSON 形状（同 [NormalizeValue]）：存进去的值按 JSON 形状
+// 比，filter 这一侧也得是。不换的话比较值是具体 Go 类型时各后端答案不同——`{"meta": {"$eq": map[string]string{...}}}`
+// 在客户端过滤的后端上 0 条（`map[string]any` 跟 `map[string]string` 不相等）、在 SQLite 上 1 条（两侧都编成 JSON
+// 文本）；struct 比较值按字段声明序编码，在 SQLite 上也对不上键已排序的存储。
+//
+// 直值编成 JSON 是对象（struct、`map[string]string`）时包成 `{"$eq": 对象}`：它的意思是「等于这个对象」，换成
+// `map[string]any` 之后不能被当成 op map。编不成 JSON 的比较值（NaN、chan）留原样，由 [ValidateFilter] 报
+// [ErrFilterTypeMismatch]。
+func normalizeFilter(filter map[string]any) map[string]any {
+	if len(filter) == 0 {
+		return filter
+	}
+	out := make(map[string]any, len(filter))
+	for key, v := range filter {
+		if opMap, ok := v.(map[string]any); ok {
+			ops := make(map[string]any, len(opMap))
+			for op, operand := range opMap {
+				ops[op] = normalizeOperand(operand)
+			}
+			out[key] = ops
+			continue
+		}
+		norm := normalizeOperand(v)
+		if obj, ok := norm.(map[string]any); ok {
+			out[key] = map[string]any{"$eq": obj}
+			continue
+		}
+		out[key] = norm
+	}
+	return out
+}
+
+// normalizeOperand 把一个比较值换成它的 JSON 形状；编不成 JSON 的原样返回。
+func normalizeOperand(v any) any {
+	norm, err := NormalizeValue(v)
+	if err != nil {
+		return v
+	}
+	return norm
+}
+
 // isRangeOp 判 op 是否 4 个数值范围操作符之一。
 func isRangeOp(op string) bool {
 	switch op {

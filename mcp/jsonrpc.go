@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 )
@@ -104,14 +105,18 @@ func buildInitializeParams(protocolVersion, clientName, clientVersion string) ma
 
 // parseToolsList 把 tools/list 的 raw result 解析为 []ToolSpec。
 // 对 allow 白名单做服务端原始名过滤；allow 为空表示放行全部。
+//
+// annotations 逐个工具宽松地解：一个工具的注解形状不对（字段类型错之类）只丢掉它自己的注解（按没有注解处理，
+// 于是也不算只读）并告警，不让整份列表解析失败——注解只是提示（MCP 规范），一个写错的提示不该让这个 server
+// 的所有工具都用不了。
 func parseToolsList(raw json.RawMessage, allow []string) ([]ToolSpec, error) {
 	var body struct {
 		Tools []struct {
-			Name         string           `json:"name"`
-			Description  string           `json:"description"`
-			InputSchema  map[string]any   `json:"inputSchema"`
-			OutputSchema map[string]any   `json:"outputSchema"`
-			Annotations  *ToolAnnotations `json:"annotations"`
+			Name         string          `json:"name"`
+			Description  string          `json:"description"`
+			InputSchema  map[string]any  `json:"inputSchema"`
+			OutputSchema map[string]any  `json:"outputSchema"`
+			Annotations  json.RawMessage `json:"annotations"`
 		} `json:"tools"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
@@ -130,10 +135,23 @@ func parseToolsList(raw json.RawMessage, allow []string) ([]ToolSpec, error) {
 			Description:  t.Description,
 			InputSchema:  t.InputSchema,
 			OutputSchema: t.OutputSchema,
-			Annotations:  t.Annotations,
+			Annotations:  parseToolAnnotations(t.Name, t.Annotations),
 		})
 	}
 	return out, nil
+}
+
+// parseToolAnnotations 解一个工具的 annotations；没有、是 null、或者形状不对时返回 nil（形状不对时告警）。
+func parseToolAnnotations(toolName string, raw json.RawMessage) *ToolAnnotations {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var a ToolAnnotations
+	if err := json.Unmarshal(raw, &a); err != nil {
+		slog.Warn("mcp: 工具的 annotations 解析失败，按没有注解处理（也不算只读）", logKeyTool, toolName, logKeyErr, err.Error())
+		return nil
+	}
+	return &a
 }
 
 // parseCallResult 把 tools/call 的 raw result 解析为 CallResult。

@@ -225,7 +225,7 @@ usage-guide 写明）。与各家不同的一点是固定内容本身：各家�
 | 域 | dsh | crew-go | 判断 |
 |---|---|---|---|
 | 压缩 | seam + 摘要 provider + model-free tool-result pruner + 人工 `/compact` 命令；**basic provider 内含 overflow recovery**（provider 确认溢出经 `agent/request-error` 进入，绕过常规压力阈值，剪枝 + 一次最大化平衡头部缩减、保留最新不可分割单元；失败时保留原始 provider 错误）| 4 层（Micro / Auto / Reactive / Store） | **组织方式不同，不是层次多少**：它的 overflow recovery 就是我们 `Reactive` 的对应物（⚠️ 本表原写「它没有」，错）。两边都有「无实质进展不重试」的保护——它看 `surface.replaceGeneration` 是否前进，我们看压缩后长度是否缩短（`reactive_compact.go`「长度 >= curMsgs 时提前 break」）。**真差距是人工触发**：我们导出了 `MicroCompactRun`/`AutoCompactRun`/`ReactiveCompactRun` 纯函数，但它们不写回，agent 运行中没有能让主动压缩生效的入口 |
-| 溢出 | **独立 seam** `ctx.spillStore` + local + policy：**超大**工具输出转文件，inline 换成有界预览 + 检索定位符 | MicroCompact 内部的 offload 动作 | **它更正交**——原文限定的是 **oversized** 工具输出（不是任何输出），但存储可换后端、且不依赖压缩触发；我们的 offload 只在 MicroCompact 触发时发生 |
+| 溢出 | **独立 seam** `ctx.spillStore` + local + policy：**超大**工具输出转文件，inline 换成有界预览 + 检索定位符 | MicroCompact 内部的 offload 动作 | **它更正交**——原文限定的是 **oversized** 工具输出（不是任何输出），但存储可换后端、且不依赖压缩触发；我们的 offload 只在 MicroCompact 触发时发生。**2026-10 已补**：`WithToolResultSpill` 独立于压缩，超阈值的结果在这一批调用收尾时（`OnToolEnd` 之后）转存进 `store.Store`、原位留预览 + 取回 id，模型用 `read_tool_output` 取，见 [tool-output-spill.md](../../v2/tool-output-spill.md) |
 | 文件 | 三实现 + **观察策略层**（read-before-edit、版本守卫写） | 无 | 纯差距；那个策略层是正确性约束不是便利功能 |
 | shell | seam + bash-local / bash-sandbox / pwsh-local + 托管 `DSH_*` 环境 | 单一路径 | 无 Windows、无环境管理、无沙箱变体 |
 | 沙箱 | seam + 平台后端（bwrap / Landlock / Seatbelt）+ **持久 per-session 策略** | 接口 seam，零内置后端 | 纯差距 |
@@ -267,7 +267,7 @@ usage-guide 写明）。与各家不同的一点是固定内容本身：各家�
 
 1. **`fs` 家族含观察策略层**——单 agent 干活的地基，且业务每接一次就重造一次
 2. **`guard` 那一层**——监听工具事件 + 注入提醒，成本极低，收益是防 agent 空转
-3. **`spill` 拆成独立 seam**——实现我们已有（offload），只是绑在压缩层里
+3. ~~**`spill` 拆成独立 seam**——实现我们已有（offload），只是绑在压缩层里~~——**已完成**（2026-10-20，`WithToolResultSpill`，见 [tool-output-spill.md](../../v2/tool-output-spill.md)）
 4. ~~**重估 `todo`**~~——**已完成**（2026-08-13，结论仍 defer 但换了判据，见 §四 决策记录）
 5. terminal / goal 靠后
 
@@ -371,9 +371,9 @@ untrusted 的项目此后每条命令都要审批，除非有显式 exec policy 
 
 | 缺口 | 它怎么做 | 我们的现状 | 判断 |
 |---|---|---|---|
-| **长跑工具的统一 job 协议** | dsh `ctx.jobs`：一套 owner 围栏的后台 job 契约，覆盖观察 / 取消 / 等待 / 完成通知，配 `tool-jobs` 让**模型**能查状态和取消 | 工具是同步的（`tool.Tool.Call` 返回即结束）。长跑只能阻塞，或业务自己在工具内起 goroutine 并自管生命周期 | **真缺口**。⚠️ 注意它跟 §四 defer 的「后台子 agent」**不是一回事**：这是**工具级**，不涉及 ns/cp，比 agent 级简单得多。后台能力的最小单元可能是工具而非 agent——先有它，再谈后台 agent |
+| **长跑工具的统一 job 协议** | dsh `ctx.jobs`：一套 owner 围栏的后台 job 契约，覆盖观察 / 取消 / 等待 / 完成通知，配 `tool-jobs` 让**模型**能查状态和取消 | 工具是同步的（`tool.Tool.Call` 返回即结束）。长跑只能阻塞，或业务自己在工具内起 goroutine 并自管生命周期 | **真缺口**。⚠️ 注意它跟 §四 defer 的「后台子 agent」**不是一回事**：这是**工具级**，不涉及 ns/cp，比 agent 级简单得多。后台能力的最小单元可能是工具而非 agent——先有它，再谈后台 agent。**2026-10-21 已做**（`WithBackgroundTasks`），取舍见 §9 A-3 末尾 |
 | **两级审批：异步打分 → 按分数升级为同步拦截** | Codex `guardian-v2/async_scorer`：第一级用小模型**异步非阻塞**打分，评估「当前动作风险」**与「agent 的轨迹是否会导向高风险动作」**；**分数 ≥ 0.50 才让后续动作进入阻塞式全量审查** | 审批只有一档：`ApprovalAsk` 下每个业务工具都抛中断等答案 | **缺口，且解法值得学**。它解的约束是「全量同步审批太贵、全不审不安全」——用便宜的异步观察**动态调节**审批强度 |
-| **授权化的会话检索** | dsh `ctx.sessionQuery`：trusted reads + 关系查询 + SQLite 全文搜索，**独立于压缩**，配 `tool-session-query` 暴露**workspace-authorized**查询给模型 | 历史层只有 `Load(HistoryKey{Owner, ConvID})`，是给 `prior` 用的框架读，无检索、无模型入口 | 缺口。但见 §9.2 第 3 条——我们的 `Owner` 维度正是现成的授权边界 |
+| **授权化的会话检索** | dsh `ctx.sessionQuery`：trusted reads + 关系查询 + SQLite 全文搜索，**独立于压缩**，配 `tool-session-query` 暴露**workspace-authorized**查询给模型 | 历史层的 `Load` 是给 `prior` 与去重用的框架读：2026-10 起分页（`Before` / `Limit`）+ 按消息 ID / 任务章 / 归属过滤，**仍无按内容检索、无模型入口** | 缺口。但见 §9.2 第 3 条——我们的 `Owner` 维度正是现成的授权边界 |
 
 ### 9.2 现有功能的优化点（不是缺口，是我们已有的东西可以做得更好）
 
@@ -581,6 +581,21 @@ turn」），闲就**开新 turn 唤醒**。⚠️ **映射到我们**：`inject
 而是**生命周期归属**——owner 销毁要 cancel 并 await 所有 owned job，而我们的 `RunSession` **没有
 disposal 钩子**，得先长一个。
 
+> **落地（2026-10-21，`WithBackgroundTasks`，见 [background-tasks.md](../../v2/background-tasks.md)）**：取了 registry +
+> 一个工具（`background_task`：status / wait / cancel / list）+ inject 道（模型节点入口、`OnModelStart` 之前追加通知），
+> 没做 followup 唤醒（同上，call-and-return 的执行模型下没有常驻对象可唤醒）。跟对方的差异与理由：
+> - **不显式 start，先同步等 `YieldAfter` 再转后台**：对方由工具自己决定起 job；我们让业务点名哪些工具可以转后台，
+>   每次调用先同步等一会儿——快的当场拿结果，只有真慢的才付后台的代价，模型不用预判耗时。
+> - **生命周期归一个进程级的管理器，不归 `RunSession`**：上面说的 disposal 钩子没长——任务本来就要活过 Run（跨 Run
+>   收通知是主要用法），归 session 反而要解决「session 结束了任务怎么办」。`Close` 取消全部并等工具返回。
+> - **「没有 controller 就拒绝 start」的对应物是「只在顶层生效」**：嵌套的 agent（编排成员、被当工具调的）这一次
+>   调用结束之后没有一个确定会再来的模型调用接住结果，它们照旧同步执行，而不是起一个没人接的后台任务。
+> - **送达按「已提交的消息流里看到它」记**：那一轮没成（模型调用失败、写入被回滚）就下次再发；模型经工具拿到过结局的
+>   不再通知。
+> - **点名的工具在脱离当前执行、去掉这次请求的编排钩子与 checkpointer 的 ctx 里跑**：任务可能比请求活得久，
+>   对方 job 的围栏是 session id，我们的是「调用方身份 + 会话」（跟转存同一把尺）。
+> - 同样不落盘、不跨进程。
+
 #### B. 现有功能的优化点
 
 **B-1 决策做成有序枚举、冲突取 max。** 对方整个策略引擎的冲突裁决就是一行
@@ -602,7 +617,12 @@ CLAUDE.md 那条 checklist（grep 全调用点 + `go doc` 看一眼）。
 序号**而不读整个文件（长会话续跑从 O(n) 变 O(1)）。<br>我们的 `HistoryStore` 只有 `Append` /
 `Load`（已核实），而 `Load` 的契约是「返回该会话**全部**消息」——一个一万条消息的会话**每次 Run
 都要全量拉一遍**，然后 4 层压缩再把大部分扔掉。这是会随使用时长线性恶化的真实成本。⚠️ 但加方法
-= **破 `history_conformance` 契约**、所有业务自研 backend 都要跟。**建议先量再改**。
+= **破 `history_conformance` 契约**、所有业务自研 backend 都要跟。**建议先量再改**。<br>**已做（量过再改）**：
+2026-10-20 实测 1000 轮、三步顺序编排一次 Run 读回 30071 条 / 72MB，读历史占 Run 耗时 99%。改法是把 `Load` 改成分页
+（`Load(ctx, key, HistoryQuery{Before, Limit})`，后端铸游标，`dac3285d`）——不加反向扫描器那种新方法：我们的后端是
+Redis / SQL 这类能直接下推「Before 之前最近 Limit 条」的存储，不是本地文件；2026-10-21 再加按消息 ID / 任务章 / 归属
+过滤（`84c0f515`），框架的去重直接问后端。同一场景一次 Run 读回 240 条 / 0.6MB。见
+[usage-guide.md 会话历史节](../../v2/usage-guide.md)。
 
 #### C. 明确不适用
 

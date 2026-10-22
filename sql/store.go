@@ -124,7 +124,13 @@ func (s *Store) Put(ctx context.Context, namespace store.Namespace, key string, 
 		return store.ErrTTLNotSupported
 	}
 
-	valueJSON, err := json.Marshal(value)
+	// 落盘的是值的 JSON 形状（store.NormalizeValue）再编码一遍：编码 map 时键已排序，SQLite 按 JSON 文本比的
+	// 整对象相等因此不受 struct 字段声明序影响（PG / MySQL 原生无序相等，本来就不受）
+	norm, err := store.NormalizeValue(value)
+	if err != nil {
+		return fmt.Errorf("sql store put: marshal value: %w", err)
+	}
+	valueJSON, err := json.Marshal(norm)
 	if err != nil {
 		return fmt.Errorf("sql store put: marshal value: %w", err)
 	}

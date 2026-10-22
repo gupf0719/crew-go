@@ -212,7 +212,7 @@ func (l *LoopAgent) Run(ctx context.Context, session *RunSession, input *schema.
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "LoopAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: msgs})
+		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: msgs}, retErr)
 	}()
 
 	// 「这是不是新任务」已在钩子之前判定（enterRunTask），下面那个 input 事件判断读的是同一个信号。
@@ -298,7 +298,7 @@ func (l *LoopAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "LoopAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: msgs})
+		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: msgs}, retErr)
 	}()
 
 	cm := compose_v2.NewChannelManager()

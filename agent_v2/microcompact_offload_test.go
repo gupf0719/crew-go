@@ -2,6 +2,7 @@ package agent_v2_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -69,9 +70,20 @@ func TestAudit5_HIGH2_MicroCompact_OffloadToStore_StoresOriginalMessage(t *testi
 			t.Fatalf("audit⁵ HIGH-2 regression: callID=%s 应被 offload 到 store 但 store.Get 返 nil\n"+
 				"sanity-revert: 删 microcompact.go offload block (offloadStore != nil 分支) → 此测 fail", callID)
 		}
-		storedMsg, ok := item.Value.(*schema.Message)
-		if !ok || storedMsg == nil {
-			t.Fatalf("store value should be *schema.Message, got %T", item.Value)
+		// store 按值的 JSON 形状存（每个后端读回都是 map），按 godoc 教的办法解回消息
+		if _, ok := item.Value.(map[string]any); !ok {
+			t.Fatalf("store value should be the message's JSON object, got %T", item.Value)
+		}
+		raw, err := json.Marshal(item.Value)
+		if err != nil {
+			t.Fatalf("marshal stored value: %v", err)
+		}
+		var storedMsg schema.Message
+		if err := json.Unmarshal(raw, &storedMsg); err != nil {
+			t.Fatalf("decode stored value into schema.Message: %v", err)
+		}
+		if storedMsg.Role != schema.RoleTool || schema.GetToolResultID(&storedMsg) != callID {
+			t.Errorf("offloaded message for %s decoded as role=%q id=%q", callID, storedMsg.Role, schema.GetToolResultID(&storedMsg))
 		}
 		if storedMsg.Content != expectedOriginal[callID] {
 			t.Errorf("offloaded content mismatch for %s: want %q got %q", callID, expectedOriginal[callID], storedMsg.Content)

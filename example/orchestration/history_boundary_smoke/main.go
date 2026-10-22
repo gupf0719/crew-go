@@ -103,7 +103,7 @@ func dump(msgs []*schema.Message) string {
 }
 
 func load(ctx context.Context, hs agent_v2.HistoryStore, conv string) []*schema.Message {
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: tenant, ConvID: conv})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: tenant, ConvID: conv})
 	if err != nil {
 		log.Printf("  Load 失败：%v", err)
 		return nil
@@ -521,8 +521,26 @@ func scToolAndSuppressed(ctx context.Context) error {
 	fmt.Print("  (a) AgentAsTool " + dump(msgs))
 	if sub.runs.Load() == 0 {
 		fmt.Println("  (a) 模型这次没调工具，跳过重复性断言")
-	} else if n := countContains(msgs, "TOOL_SUB_PAYLOAD"); n != 1 {
-		return fmt.Errorf("(a) 子 agent 产出出现 %d 次，应恰好 1 次（经父的 tool_result）", n)
+	} else {
+		// 模型可能调不止一次（换个说法再查一遍）：每次调用的产出经父的 tool_result 各一份；父自己的答复引用它不算重记，
+		// 重记是它以别的归属（子 agent 自己的名义）又出现一份
+		runs, inTool, elsewhere := sub.runs.Load(), int64(0), 0
+		for _, m := range msgs {
+			if !strings.Contains(m.Content, "TOOL_SUB_PAYLOAD") {
+				continue
+			}
+			if m.Role == schema.RoleTool {
+				inTool++
+				continue
+			}
+			if owner, _ := m.Annotations[agent_v2.HistoryAgentAnnotation].(string); owner != "router_bot" {
+				elsewhere++
+			}
+		}
+		if inTool != runs || elsewhere > 0 {
+			return fmt.Errorf("(a) 子 agent 跑了 %d 次、tool_result 里 %d 份、别的归属下 %d 份，应每次恰好一份（经父的 tool_result）",
+				runs, inTool, elsewhere)
+		}
 	}
 
 	// (b) Routing 的分类器被 WithoutHistoryCtx 摘除：它的产出不该进历史，

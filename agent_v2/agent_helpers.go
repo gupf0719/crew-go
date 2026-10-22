@@ -7,6 +7,7 @@ import (
 	"reflect"
 
 	"crew-go/compose_v2"
+	"crew-go/hook"
 	"crew-go/internal/panicerr"
 )
 
@@ -220,7 +221,7 @@ func shouldEmitInputEvent(ctx context.Context, sid string) bool {
 //	defer func() {
 //	    recoverPanicToErr(ctx, "XxxAgent.OnAgentEnd", recover(), &retErr) // recover() 在闭包内直接求值，有效
 //	    ctxOut := WithEndError(ctx, retErr)
-//	    _ = hooks.OnAgentEnd(ctxOut, info, out)
+//	    fireAgentEnd(ctxOut, hooks, info, out, retErr)
 //	}()
 //
 // 与顶部 `defer recoverToErr`（最早注册→最后跑）配合：本闭包（后注册→先跑）先消费 panic 设
@@ -241,6 +242,24 @@ func recoverPanicToErr(ctx context.Context, what string, r any, retErr *error) {
 	}
 	*retErr = panicerr.Wrap(what+" panic recovered", pe)
 	panicerr.Log(ctx, slog.LevelError, "agent_v2: 编排收尾兜住 panic，已转成错误", pe, panicerr.KeyError, (*retErr).Error())
+}
+
+// fireAgentEnd 调 OnAgentEnd。它是观测钩子（返回值不往后流、不影响执行结果）：这次调用已经成功（retErr 为 nil）时它 panic
+// 就地兜住、带栈记一条 ERROR，结果照旧算成功。转成错误的话，一次已经做完的调用被报成失败：它自己的存档已经按成功清掉，
+// 编排续跑 / 重试时它从头再跑、做过的副作用重放（实测）。调用失败时照旧让 panic 交给外层兜底、并进那次调用的错误里。
+func fireAgentEnd(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo, out *hook.AgentOutput, retErr error) {
+	if retErr == nil {
+		defer func() {
+			if r := recover(); r != nil {
+				name := ""
+				if info != nil {
+					name = info.Name
+				}
+				panicerr.Log(ctx, slog.LevelError, "agent_v2: OnAgentEnd 钩子 panic（这次调用已经成功，结果不变）", panicerr.New(r), "agent", name)
+			}
+		}()
+	}
+	_ = hooks.OnAgentEnd(ctx, info, out)
 }
 
 // isFrameworkNil 是包级通用 typed nil 检测 — audit⁶ 视角 1 揭露协议六复证后抽包级

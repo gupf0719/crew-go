@@ -112,13 +112,22 @@ func (s *mapStore) Put(ctx context.Context, ns store.Namespace, key string, valu
 		// 本 backend 不实现 TTLAware (不提供 SupportsTTL)——业务调 WithTTL 返哨兵
 		return store.ErrTTLNotSupported
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if value == nil { // value=nil 等价 Delete
+	// value=nil 等价 Delete——判的是业务传进来的值：typed nil、json.RawMessage("null") 这类编成 JSON 是 null 的值
+	// 不是删除，存一条 Value 为 nil 的记录（跟别的后端一样），所以得在归一化之前判
+	if value == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		s.deleteLocked(ns, key)
 		return nil
 	}
+	// 存值的 JSON 形状（store.NormalizeValue）：读回与 filter 匹配跟别的后端一样，编不成 JSON 的值报错
+	stored, err := store.NormalizeValue(value)
+	if err != nil {
+		return fmt.Errorf("mapStore put: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	bk := joinNS(ns)
 	bucket, ok := s.data[bk]
 	if !ok {
@@ -127,13 +136,13 @@ func (s *mapStore) Put(ctx context.Context, ns store.Namespace, key string, valu
 	}
 	now := time.Now().UTC()
 	if existing, ok := bucket[key]; ok {
-		existing.Value = value
+		existing.Value = stored
 		existing.UpdatedAt = now
 		return nil
 	}
 	nsCopy := make(store.Namespace, len(ns))
 	copy(nsCopy, ns)
-	bucket[key] = &store.Item{Namespace: nsCopy, Key: key, Value: value, CreatedAt: now, UpdatedAt: now}
+	bucket[key] = &store.Item{Namespace: nsCopy, Key: key, Value: stored, CreatedAt: now, UpdatedAt: now}
 	return nil
 }
 

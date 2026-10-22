@@ -391,7 +391,7 @@ func unmarshalSendDirectives(sds []SerializedSend) ([]SendDirective, error) {
 // mutate `cp.PendingInterrupts[i].Question` 等字段会**回污染 cm.pendingInterrupts**.
 // 业务想改 cp 字段先 `*cp.PendingInterrupts[i] = ...struct copy...` 或调用
 // `cm.PendingInterrupts()`（channel_manager.go 深拷贝版）. Restore 反向恢复已深拷贝
-// （本文件 Restore 内 `qc := *q`）, Snapshot 浅拷贝是性能 / 一致性权衡——业务 cp 多数走
+// （本文件 Restore 内 `q.clone()`）, Snapshot 浅拷贝是性能 / 一致性权衡——业务 cp 多数走
 // `MarshalCheckpoint` 序列化 round-trip 隐式深拷贝, 直接 mutate 是反模式.
 func (cm *ChannelManager) Snapshot() (*Checkpoint, error) {
 	cm.mu.RLock()
@@ -422,6 +422,7 @@ func (cm *ChannelManager) Snapshot() (*Checkpoint, error) {
 		// frontier 在后续超步里还会被改写。
 		cp.CurrentFrontier = make([]FrontierMember, len(cm.frontierAtExit))
 		copy(cp.CurrentFrontier, cm.frontierAtExit)
+		cp.FrontierStarted = cm.frontierStarted
 	}
 	if len(cm.pendingInterrupts) > 0 {
 		cp.PendingInterrupts = make([]*AskQuery, len(cm.pendingInterrupts))
@@ -722,6 +723,7 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 	prevRecipientKey := cm.recipientKey
 	prevDeferred := cm.deferredSends
 	prevFrontier := cm.frontierAtExit
+	prevFrontierStarted := cm.frontierStarted
 	prevPendingSends := cm.pendingSendWrites
 	// nodeStates 的赋值在 DeferredSends / PendingSendWrites 两个会 rollback 的步骤**之前**
 	// ——不快照它，那两步失败时它就留在半还原状态（旧 cm 上盖了新 cp 的 memo）。
@@ -745,6 +747,7 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 		cm.recipientKey = prevRecipientKey
 		cm.deferredSends = prevDeferred
 		cm.frontierAtExit = prevFrontier
+		cm.frontierStarted = prevFrontierStarted
 		cm.pendingSendWrites = prevPendingSends
 		cm.nodeStates = prevNodeStates
 	}
@@ -832,11 +835,7 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 				continue
 			}
 			// 深拷贝避免 caller 后续 mutate cp.PendingInterrupts 串到 cm
-			qc := *q
-			if q.Options != nil {
-				qc.Options = append([]string(nil), q.Options...)
-			}
-			cm.pendingInterrupts = append(cm.pendingInterrupts, &qc)
+			cm.pendingInterrupts = append(cm.pendingInterrupts, q.clone())
 		}
 	}
 	// PA-H1：恢复部分失败超步的成功成员 + 其 SendDirectives——Resume 重跑失败
@@ -904,6 +903,7 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 	if len(cp.CurrentFrontier) > 0 {
 		cm.frontierAtExit = make([]FrontierMember, len(cp.CurrentFrontier))
 		copy(cm.frontierAtExit, cp.CurrentFrontier)
+		cm.frontierStarted = cp.FrontierStarted
 	}
 
 	// **实例身份发号器要跨进程续上**（ISSUE-96）：instanceCounter 是进程级的，重启后

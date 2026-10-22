@@ -33,6 +33,10 @@ eino 实现参考：`/Users/gupengfei/program/go/src/eino/adk/runctx.go:31-353`�
 
 ## 修法（eino lane events 模型 port）
 
+> **后续（2026-10-21）**：下面是当时的设计。lane 现在看到的上文冻结在派生那一刻（`ForkLane` 拷一份父的事件快照），
+> `Parent` 链与共享父锁已删——实时读祖先 lane 会让并行作为编排成员时兄弟分支互相可见。见 `agent_v2/session.go` 的
+> ForkLane godoc 与 `doc/code/todo.md`「并行分支看得到兄弟分支的事件」。
+
 ### `agent_v2/session.go`
 
 新加 `laneEvents` struct + `RunSession.laneEvents` 字段:

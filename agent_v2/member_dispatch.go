@@ -44,10 +44,12 @@ import (
 type memberSpec struct {
 	// agent 是被调用的成员。
 	agent Agent
-	// sess 是交给成员的会话。调 [runMember] 的 6 个编排（Sequential / Parallel / Loop /
-	// Routing / Reflect / Plan——**不含 Handoff**，它的铸造点形状不同、单独留在原地）
-	// 一律共享**父** session（step1→step2 的 events 互相看得到、Loop body 跨轮累积），
-	// 只有 ParallelAgent 传 lane 子会话（分支间物理隔离）。
+	// sess 是成员事件最终提交到的会话。调 [runMember] 的 6 个编排（Sequential / Parallel /
+	// Loop / Routing / Reflect / Plan——**不含 Handoff**，它的铸造点形状不同、单独留在原地，
+	// 每次尝试同样经 attemptLanes 跑）传**父** session，只有 ParallelAgent 传分支自己的 lane
+	// （分支间物理隔离）。成员每次尝试拿到的是从 sess 派生的一条暂存 lane（见 attemptLanes）：
+	// 读得到 sess 已提交的事件（step1→step2 的 events 互相看得到、Loop body 跨轮累积），
+	// 这次尝试写的事件等它有了结局才提交给 sess。
 	// 跟 [RunSubAgent] 的差别就在这一项——那条路径建 NewSharedChildSession 做 events 隔离。
 	sess *RunSession
 	// input 是成员这一次的输入。
@@ -98,8 +100,16 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 	// 成员拿编排转授给它的那几份（签名），拿不到编排上方放给 RegrantFromNode 的那份（见 shadowNodeGrants）。
 	subCtx = shadowNodeGrants(subCtx)
 
+	// 每次尝试写进会话的事件先落在暂存 lane 上：被下一次从头再跑的尝试取代时作废，其余照常提交（见 attemptLanes）
+	lanes := newAttemptLanes(subCtx, m.sess)
+	defer lanes.finish()
 	return compose_v2.RunWithRetry(subCtx, m.retryCfg, func(ctx context.Context) (*schema.Message, error) {
-		events, err := m.agent.Run(ctx, m.sess, m.input, grants.regrantOpts(m.agent)...)
+		var events []*AgentEvent
+		err := lanes.run(func(s *RunSession) error {
+			var runErr error
+			events, runErr = m.agent.Run(ctx, s, m.input, grants.regrantOpts(m.agent)...)
+			return runErr
+		})
 		if err != nil {
 			// 可 Resume 的退出先落输入——输入的持久点在跨进边界那一刻，不等成功
 			// （见 settleHistoryOnPause）。随后 propagate 让框架 SaveNS 存档。
@@ -158,9 +168,23 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 func runDecisionAgent(ctx context.Context, nsSuffix string, ag Agent, sess *RunSession, input *schema.Message, route *routeGrant) ([]*AgentEvent, error) {
 	subCtx := compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), nsSuffix))
 	subCtx = WithSubAgentStoreScope(subCtx, true)
-	subCtx = WithoutHistoryCtx(subCtx)
+	subCtx = decisionCtx(subCtx)
 	// 同 runMember：决策 LLM 的执行交给它、它的 agent 级钩子有自己的相位
 	subCtx = compose_v2.HandOver(subCtx, nsSuffix)
 	subCtx = shadowNodeGrants(subCtx)
 	return ag.Run(subCtx, sess, input, withRouteGrant(route))
+}
+
+// decisionCtx 是框架调**内部决策方**时给的 ctx：编排的决策 agent（分类器、评审 / 评估 agent、反馈教练，见
+// runDecisionAgent）与业务交给编排的决策函数（路由函数、路由决策方、规划器、Reflector / EvalFunc、Loop 的
+// 退出判断、回合结束闸门）都用它。产出是内容而不是判定的回调（Parallel 的 Merger / Aggregator、Plan 的
+// ExecInputBuilder）不在此列。两件事：
+//
+//   - 不进会话历史（[WithoutHistoryCtx]）：下游只需要它的判定，把它请教的对话灌进历史，下一回合模型会把
+//     评审请求当成用户说过的话。
+//   - 不取用户的运行中插话（见 [Inbox]）：插话给正在对话的那个 agent，一句话不该被决策方里跑的 agent 取走。
+//
+// 决策函数里经 RunSubAgent / 直接 Run 请教的 agent 都继承它。
+func decisionCtx(ctx context.Context) context.Context {
+	return withoutInbox(WithoutHistoryCtx(ctx))
 }

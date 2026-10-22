@@ -211,7 +211,13 @@ func (h *agentHooks) OnModelStart(ctx context.Context, info *hook.AgentInfo, in 
 }
 
 // startModel 开 chat span。最内层已经是一个还开着的模型句柄时（同一个 Observability 装了两层），不再开第二个。
+//
+// 沿用原答复续跑的那一遍（见 hook.ModelResponseReusedKey）没有模型调用，不开 span：那次调用在停下的那一遍已经按自己的
+// 结局收过尾（里面的钩子停下时包装层照样收，见 wrappedHooks.OnModelEnd），再开一个就是一次调用记两次。
 func (o *Observability) startModel(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, *handle) {
+	if in != nil && hook.IsModelResponseReused(in.Extra) {
+		return ctx, nil
+	}
 	if cur := o.handleFrom(ctx); cur != nil && cur.kind == kindModel && !cur.ended.Load() {
 		return ctx, nil
 	}
@@ -297,6 +303,9 @@ func (r *firstChunkReader) Close() error { return r.inner.Close() }
 
 func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
 	o := h.o
+	if out != nil && hook.IsModelResponseReused(out.Extra) {
+		return ctx, nil // 沿用原答复续跑的那一遍，见 startModel
+	}
 	mh := o.handleFrom(ctx)
 	if mh == nil || mh.kind != kindModel {
 		return ctx, nil
@@ -512,21 +521,43 @@ func (h *agentHooks) OnToolEnd(ctx context.Context, info *hook.AgentInfo, out *s
 			extra = append(extra, AttrToolCallResult.String(o.jsonText(res.Output)))
 		}
 	}
+	// 被审批拒绝的调用没有执行：不是失败（span 不标 Error），也不是一次成功的执行——记 blocked、带 crew.tool.outcome。
+	denied := false
+	if v, _ := out.Extra[agent_v2.ToolOutcomeExtraKey].(string); v == agent_v2.ToolOutcomeDenied {
+		denied = true
+		r = result{outcome: OutcomeBlocked}
+		extra = append(extra, AttrToolOutcome.String(agent_v2.ToolOutcomeDenied))
+	}
+	// 续跑时从工具账重放的调用（上一次那批里已经跑完的）这一次没有执行：它在上一次那批的 OnToolEnd 里已经按自己的结局
+	// 记过，这次 span 标上重放、不记时长样本、不算进 agent 的调用次数。
+	replayed, _ := out.Extra[agent_v2.ToolReplayedExtraKey].(bool)
+	if replayed {
+		extra = append(extra, AttrToolReplayed.Bool(true))
+		if th.scope != nil {
+			th.scope.toolCalls.Add(-1)
+		}
+	}
 	th.scope.remove(th)
 	if !o.finish(th, r, extra...) {
 		return ctx, nil
 	}
-	o.recordToolDuration(ctx, th, info.Name, r)
+	if replayed {
+		return ctx, nil
+	}
+	o.recordToolDuration(ctx, th, info.Name, r, denied)
 	if th.skill != "" && r.outcome == OutcomeSuccess {
 		o.inst.skillActivations.Add(ctx, 1, metric.WithAttributes(AttrAgentName.String(info.Name), AttrSkillName.String(th.skill)))
 	}
 	return ctx, nil
 }
 
-func (o *Observability) recordToolDuration(ctx context.Context, th *handle, agentName string, r result) {
+func (o *Observability) recordToolDuration(ctx context.Context, th *handle, agentName string, r result, denied bool) {
 	a := []attribute.KeyValue{AttrToolName.String(th.name), AttrToolType.String("function"), AttrAgentName.String(agentName)}
 	if r.failed() {
 		a = append(a, AttrErrorType.String(r.errType))
+	}
+	if denied {
+		a = append(a, AttrToolOutcome.String(agent_v2.ToolOutcomeDenied))
 	}
 	o.inst.toolDuration.Record(ctx, seconds(th.start), metric.WithAttributes(a...))
 }
@@ -564,12 +595,12 @@ func (h *agentHooks) OnError(ctx context.Context, info *hook.AgentInfo, err *sch
 	case cur != nil && cur.kind == kindTool && strings.HasPrefix(err.Code, "tool_"):
 		cur.scope.remove(cur)
 		if o.finish(cur, r) {
-			o.recordToolDuration(ctx, cur, info.Name, r)
+			o.recordToolDuration(ctx, cur, info.Name, r, false)
 		}
 	case err.Code == "tool_start_error" || err.Code == "tool_call_error":
 		for _, th := range o.scopeFrom(ctx).drain(kindTool) {
 			if o.finish(th, r) {
-				o.recordToolDuration(ctx, th, info.Name, r)
+				o.recordToolDuration(ctx, th, info.Name, r, false)
 			}
 		}
 	}

@@ -35,7 +35,8 @@ func init() {
 
 // fixToolCallContent 让一批工具调用的内容只定一次：这一批第一次交给工具执行时（全部 OnToolStart 跑完、改写之后）
 // 记下每个调用的工具名与参数；之后的执行（中断续跑、失败续跑）把 toolCalls 换回记下的那一份，`OnToolStart` 在这些
-// 执行里对 Name / ArgumentsJSON 的改写不生效。钩子照样每次都触发，它返回的 ctx、错误与中断照常算数。
+// 执行里对 Name / ArgumentsJSON 的改写不生效。钩子照样触发，它返回的 ctx、错误与中断照常算数（这一批处理完之后才
+// 作废的调用除外：续跑时不再处理，钩子不触发，见 fixedToolResults）。
 //
 // toolCalls 是这一次改写之后的（就地换回），original 是模型给的原样（同一条 assistant 消息，每次执行都相同）。
 //
@@ -71,6 +72,22 @@ func init() {
 // ——会落盘，短时令牌还会冻在第一次的值上；放钩子返回的 ctx，或用工具中间件在每次执行时注入（见 hook.Hooks 的
 // OnToolStart 方法注释）。给每个调用都注入一个字段的钩子会让每个调用的整份参数另存一份。改写让这次调用出错时，
 // 修好钩子再续跑也不生效，只能放弃这个任务重开。
+// fixedToolCallContentOf 读这一批定下的调用内容（只读，不记）：这一批已经交给工具执行过时返回定下的那份（original 的
+// 拷贝、换上改写过的工具名与参数），否则返回 false。OnToolStart 之前要知道工具账的键时用（见 fixedToolResults）。
+func fixedToolCallContentOf(ctx context.Context, original []schema.ToolCall) ([]schema.ToolCall, bool) {
+	rec, ok := compose_v2.GetStepResult[*fixedToolCalls](ctx, fixedToolCallsStep)
+	if !ok || rec == nil || len(rec.Rewritten) != len(original) {
+		return nil, false
+	}
+	out := append([]schema.ToolCall(nil), original...)
+	for i := range out {
+		if r := rec.Rewritten[i]; r != nil {
+			out[i].Function.Name, out[i].Function.Arguments = r.Name, r.Arguments
+		}
+	}
+	return out, true
+}
+
 func fixToolCallContent(ctx context.Context, toolCalls, original []schema.ToolCall) {
 	if len(original) != len(toolCalls) {
 		return // 同一条消息取出来的两份，长度必然相同

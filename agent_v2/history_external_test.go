@@ -51,7 +51,7 @@ func TestHistory_ExternalAgentInOrchestration_NotSilent(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-ext"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-ext"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestHistory_ExternalAgent_NoDoubleRecord(t *testing.T) {
 	if _, err := seq.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("原话")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	msgs, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-nodup"})
+	msgs, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-nodup"})
 
 	counts := map[string]int{}
 	for _, m := range msgs {

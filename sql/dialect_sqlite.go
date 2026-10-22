@@ -84,9 +84,10 @@ func (SQLite) JSONFieldExists(col, field string, b ParamBinder) string {
 //     `'false'` / `'null'` 文本比；缺失路径 json_type 是 SQL NULL ⟹ 不命中 ✓
 //   - string / array / object：`json(col) -> '$.f' = json(?)`——`->` 返子元素的 JSON
 //     **文本**（字符串带引号、数组 / 对象是压缩后的 JSON），两侧都经 `json()` 规范化
-//     再比文本；缺失路径 `->` 返 SQL NULL ⟹ 不命中 ✓。对象键序：本模块 `Put` 与 filter
-//     值都经 Go `json.Marshal`（map 键排序），所以两侧序一致；业务绕过 `Put` 直写的
-//     乱序对象文本比会不等，那一档 PG / MySQL（原生无序相等）不受影响
+//     再比文本；缺失路径 `->` 返 SQL NULL ⟹ 不命中 ✓。对象键序：本模块 `Put` 存的是
+//     `store.NormalizeValue` 的结果再经 Go `json.Marshal`（struct 也先变成 map，键排序），
+//     filter 值在 `store.WithFilter` 里同样先换成 JSON 形状、再经 `json.Marshal`，所以两侧序一致；
+//     业务绕过 `Put` 直写的乱序对象文本比会不等，那一档 PG / MySQL（原生无序相等）不受影响
 //
 // 语义与 [store.ValueEqual] 逐格一致：10 == 10.0、true != 1、"10" != 10、null 只等
 // null、数组逐元素（不是包含）、对象逐键。

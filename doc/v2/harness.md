@@ -24,20 +24,25 @@ crew-go 把 harness 做成**横切能力**：不绑某个编排，在图引擎 +
 | **Checkpoint 断点续跑** | 停下来之后能接着跑（HITL 等人回答 / 崩溃 / 软取消）——**下面几项的底座** | `compose_v2.WithCheckpointerCtx`（9 编排）、`WithCheckpointer`（RunOption）；落盘时机与并发保护另有三个旋钮：`WithDurability` / `WithStaleWriteGuard` / `NewSoftCancelSignal` | [checkpoint.md](checkpoint.md)（权威篇）| `example/orchestration/nested_smoke`（HITL 闭环）、`example/harness/durability_smoke`（落盘时机）|
 | **4 层上下文压缩** | ctx 会爆 → 分层压缩不丢关键信息 | `WithMicroCompact` / `WithAutoCompact` / `WithReactiveCompact` + `WithStoreMemory` | [context-compaction.md](context-compaction.md) | `example/compact/compact_demo` |
 | **Store 长期记忆** | 跨 Run 记住用户偏好 / 长期事实 / 共享黑板 | `WithStore` / `WithStoreMemory` | [store.md](store.md) | `example/store/v2_store_demo` |
-| **会话历史层** | cp 是单次 Run 临时态、成功即清 → 对话流跨 Run 留不住；按会话 append-only 留存 | `WithHistory` / `WithHistoryCtx` | [usage-guide.md](usage-guide.md) 会话历史节 + [ISSUE-98](../issue/issue-98-conversation-history.md) | `example/agent/history_smoke`、`example/orchestration/history_boundary_smoke` |
+| **会话历史层** | cp 是单次 Run 临时态、成功即清 → 对话流跨 Run 留不住；按会话 append-only 留存，每次 Run 只从末尾读用得上的那段（压缩过的会话从最新的压缩边界读起），去重按消息 ID / 任务 / 归属直接问后端 | `WithHistory` / `WithHistoryCtx` | [usage-guide.md](usage-guide.md) 会话历史节 + [ISSUE-98](../issue/issue-98-conversation-history.md) | `example/agent/history_smoke`、`example/orchestration/history_boundary_smoke` |
+| **超大工具输出转存** | 一条几百 KB 的工具结果跟着进每一轮 prompt、每份存档、会话历史 → 这一批调用收尾时（`OnToolEnd` 之后）就转存进 store，消息流里只留预览 + 取回 id，模型用 `read_tool_output` 按需分段读 / 搜；压缩掉之后取回 id 留在摘要里 | `WithToolResultSpill` | [tool-output-spill.md](tool-output-spill.md) | `example/harness/spill_smoke` |
+| **长时工具转入后台** | 慢工具阻塞整轮 → 跑过 YieldAfter 还没返回就先给任务 id、这一轮接着走，结束后作为通知送进对话；模型可查询 / 等待 / 取消 | `WithBackgroundTasks` | [background-tasks.md](background-tasks.md) | `example/harness/background_smoke` |
 | **Skill 能力包** | 按需激活专项能力（SKILL.md，fork / inline + go-func action 执行） | `WithSkills` | [skill.md](skill.md) | `example/graph/v2_skill_demo`、`example/harness/skill_action_smoke` |
 | **toolsearch 渐进披露** | 工具 / MCP 聚合太多爆 ctx → deferred 工具按需揭示（fail-closed） | `WithToolSearch` | [toolsearch.md](toolsearch.md) | `example/harness/toolsearch_smoke` |
 | **toolfilter 工具裁剪** | 每轮 model 调用前裁业务工具子集 | `WithToolFilter` | [tool-visibility.md](../description/three-way-comparison/tool-visibility.md) | `example/orchestration/plan_chat_web` |
 | **工具调用中间件** | 每次工具调用统一拦一道（观测 / 短路 / 挂起），且**不碰 `tool.Tool` 对象** | `WithToolMiddleware` | godoc `agent_v2/tool_middleware.go` | `example/harness/tool_middleware_demo` |
 | **sandbox 远端执行** | LLM 发起的命令在远端沙箱跑（可插拔 seam + 输出不可信框定）；后端另可当远程 skill 源 | `sandbox.NewBashTool(sb)` + `WithToolkit` | [sandbox.md](sandbox.md) | — |
 | **AgentsMD 指令注入** | 注入 AGENTS.md 外部规范作 harness 指令（transient，不进历史累积） | `WithAgentsMD` | godoc `agent_v2/agents_md.go` | `example/harness/agents_md_demo` |
-| **approval 工具审批** | 危险工具执行前 HITL 审批（权限层，复用 InterruptError / Resume） | `WithApprovalMode` | godoc `agent_v2/approval.go` | `example/harness/approval_smoke` |
+| **approval 工具审批** | 危险工具执行前 HITL 审批（权限层，复用 InterruptError / Resume）；`ApprovalAskWrites` 只读放行档（只读工具直接执行、其余问人）；审批生效时自动把审批方式写进系统提示 | `WithApprovalMode` / `WithApprovalHeuristic` / `WithApprovalPrompt` | godoc `agent_v2/approval.go` + [execution-control.md](execution-control.md) §3 | `example/harness/approval_smoke`、`example/harness/execution_control_smoke` ② |
+| **运行中插话** | agent 执行过程中用户补充的话，在安全位置接进当前回合（不插进工具调用中间；取走之后随存档走，这次调用续不了时放回收件箱） | `WithInboxCtx` + `NewInbox` | [execution-control.md](execution-control.md) §4 | `example/harness/execution_control_smoke` ③ |
+| **回合结束闸门** | 模型要收尾时先过业务检查（可问人、可请评审），不满意带着反馈接着干；有否决上限 | `WithTurnGate` / `WithTurnGateMaxVetoes` | [execution-control.md](execution-control.md) §5 | `example/harness/execution_control_smoke` ④ |
 | **节点私有中断态** | 一个节点内做了 N 件带副作用的事、其中一件中断 → 重跑时跳过已做成的（**引擎层原语，不是 Option**）；做的事里要问人时每件的提问放进自己的相位（`EnterPhase`），否则跳过做完的那件会让后面的提问挪到它的 ID 上（累积传答案时拿到它的答案） | `compose_v2.SaveNodeState` / `GetNodeState` | godoc `compose_v2/node_state.go` | `example/harness/node_state_demo` |
 
 ## 3. 组合（业务接法）
 
-§2 里除**节点私有中断态**（引擎层原语，由节点自己在 `NodeFunc` 内调）外，其余都是 BasicAgent
-的 `Option`，按需叠加：
+§2 里除**节点私有中断态**（引擎层原语，由节点自己在 `NodeFunc` 内调）、**checkpoint**（经 ctx 配，
+`compose_v2.WithCheckpointerCtx`）与**运行中插话**（收件箱经 ctx 交给这次 Run，`WithInboxCtx`，编排会把它交给
+正在对话的成员）外，其余都是 BasicAgent 的 `Option`，按需叠加：
 
 ```go
 ag := agent_v2.NewBasicAgent(

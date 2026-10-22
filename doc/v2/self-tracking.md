@@ -97,7 +97,7 @@
 
 | 件 | 现状 | 对方案的意义 |
 |---|---|---|
-| `HistoryStore` | 只有 `Append` / `Load`，key = `HistoryKey{Owner, ConvID}`，**append-only 硬约定** | 逐字流在，但 `Load` 返**全部**、无检索、无有界读 |
+| `HistoryStore` | 只有 `Append` / `Load`，key = `HistoryKey{Owner, ConvID}`，**append-only 硬约定**；2026-10 起 `Load(ctx, key, HistoryQuery)` 分页（`Before` / `Limit`）+ 按条件读（`MessageID` / `Task` / `Agent`） | 逐字流在，有界读与按消息 / 任务 / 归属定位已具备；**按内容检索仍无** |
 | **压缩不改历史写入** | 更硬的依据不是那句 godoc，而是**写入点写的是什么**：model 节点写的是**本轮 LLM 产出**（`basic_builder.go:505`，注释「本轮 LLM 产出」），tools 节点写的是**本轮全部工具结果**（`:666`）——**都是这一轮新产生的东西**；压缩只作用于**喂给 LLM 的输入**，与写入无关 | ⭐ **HistoryStore 里留着的就是完整逐字流**——B 家花一整套 fold + 遮蔽标记才拿到的东西，我们因结构而天然具备 |
 | `store.Store` | `Get` / `Put` / `Delete` / `Search` / `ListNamespaces` / `Batch`；`Search` 带 `WithQuery`（语义检索 seam）+ `WithFilter` + `WithLimit`，`SearchItem` 带 `Score` | **可改写的知识层，检索能力现成** |
 | MicroCompact offload | 原文已 `store.Put`，key 挂在占位符的 `MicroCompactOffloadKeyAnnotation` 上 | 取回通道**在框架侧**已通（`store.Get(NS, key)`）。⚠️ 但 offload 用的是**框架私有 NS + 框架 key schema**（`_micro_offload/<sid>`，key 是 tool_use_id），与便签的 NS/key **两套键空间不相交**——一套按便签路径列/读/搜的工具**读不到任何 offload 内容**。框架 godoc 也明说那是**另一件工具**（业务自注册、框架不自动 inject），且该路径默认关 |
@@ -754,15 +754,16 @@ instruction），**那是更大的一期**。这直接**取消**了 preamble-vs-
 发行组合全部不挂它、全文索引默认不开，理由是「附带教了一套没人要的先前工作检索流程」；另一家用
 三重开关 gate 到只有自家托管账号可用。**造得出来不等于该默认开。**
 
-**缺口是有界读**。现在：
+**有界读 2026-10 已补上，缺口剩按内容检索**。现在：
 
 ```go
 Append(ctx, key, msgs) error
-Load(ctx, key) ([]*schema.Message, error)   // 返回整条会话，喂不进模型
+Load(ctx, key, q HistoryQuery) (HistoryPage, error) // 分页从末尾往前读；按消息 ID / 任务章 / 归属过滤
 ```
 
-要加检索与有界读，**就要改 `HistoryStore` 接口 = 改所有业务自研 backend = 改 `history_conformance`
-套**。所以**先定对形状比先写出来重要**。
+（当初写这一节时 `Load` 只能返回整条会话。）要加按内容检索，**仍要改 `HistoryStore` 接口 = 改所有业务自研
+backend = 改 `history_conformance` 套**——分页与过滤那次已经付过一次这个代价（conformance 15 → 19 条）。所以**先定对
+形状比先写出来重要**。
 
 **形状定下来时，这五条建议值得参考**（每条都有外部踩坑依据）。⚠️ **但别直接照抄理由**——
 外部的论证依赖它们自己的机制，第 1、2、5 条的前提在我们这儿**都不成立**，见各条的 ⚠️：
@@ -786,9 +787,10 @@ Load(ctx, key) ([]*schema.Message, error)   // 返回整条会话，喂不进模
    内部会消费掉 generation 绑定的游标，故不能与兄弟工具并行；而**精确读 / 追溯类工具不在此列**
    （外部明确把它们放回并行）。这条与第 1 条「不给游标」是同一个根因。
 5. **截断不在这个工具里做**。外部的理由是「在这里做会与 harness 级的统一溢出策略重复，并让检索
-   工具与别的工具行为不一致」。⚠️ **那个前提我们没有**——全仓无统一溢出机制（`spill` 零命中），
-   所以这条**现在不能照抄**：要么先立一个跨工具的统一截断策略再遵守它，要么就在工具里做但**明确
-   记一笔「这是权宜，将来有统一策略时要收回」**。别默认外部的分工在我们这儿已经存在。
+   工具与别的工具行为不一致」。写这一条时那个前提我们没有；**2026-10 起有了**：`WithToolResultSpill`
+   在 `OnToolEnd` 之后统一转存所有业务工具的超大结果、消息流里只留预览 + 取回 id（见
+   [tool-output-spill.md](tool-output-spill.md)）。⚠️ 但它**豁免框架铸的工具**——检索工具若做成框架工具
+   （同 `read_tool_output`），统一转存不管它，截断仍要自己做；做成业务工具才走统一转存。
 
 ⚠️ **还有一条外部有、我们必须自己面对的差异：一致性。** A 家在同一个 crate 里给两种保证——
 history 标 **eventually consistent**（「新产生的条目可能要几秒才出现」），notes 标 **strongly

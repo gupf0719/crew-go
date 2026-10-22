@@ -1,6 +1,10 @@
 package agent_v2
 
 import (
+	"context"
+	"log/slog"
+	"strconv"
+
 	"crew-go/compose_v2"
 	"crew-go/schema"
 	"crew-go/tool"
@@ -73,9 +77,16 @@ type toolMemoEntry struct {
 	// （业务工具里经 RunSubAgent 定的路由，在同批兄弟工具中断续跑之后落到兜底，实测）。
 	// 记的是框架在这次调用期间**收到的**，不靠工具自己声明：转交 / 路由只能经框架那几个入口
 	// 做出（见 side_signal.go）——手写一份信号 JSON 冒充不了，因为收件人由引擎铸、算不出来。
-	// 结果是失败的（超时、tool.Failure）也照记——作废在 OnToolEnd 之后按钩子改写后的结果判，续跑命中
-	// 时钩子照样 fire、按同一套规则重判（见 tool_batch_signals.go）。
+	// 结果是失败的（超时、tool.Failure）也照记——作废在 OnToolEnd 之后按钩子改写后的结果判，命中的是原样
+	// （这一批没处理完就停下了）时钩子照样 fire、按同一套规则重判（见 tool_batch_signals.go）；定下了的
+	// （Final）不再交给钩子，按定下时的结论判。
 	Signals compose_v2.Signals `json:"signals,omitzero"`
+	// Final 报 ToolMsg 是这一批处理完（OnToolEnd、批内裁决、按大小处理）之后定下的那份，不是工具刚返回的原样——
+	// 见 [finalizeToolMemo]。
+	Final bool `json:"final,omitempty"`
+	// HookSignals 是定下时这次调用的 OnToolEnd 钩子做出的上行信号（只在 Final 时有意义）：定下了的续跑时不再交给
+	// 钩子（见 fixedToolResults），这里记的原样交出。
+	HookSignals compose_v2.Signals `json:"hook_signals,omitzero"`
 }
 
 // shouldMemoize 判断这次 tool_call 的产出能不能进重放记账。
@@ -137,4 +148,84 @@ func isFrameworkControlToolIn(tk *tool.Toolkit, name string) bool {
 func init() {
 	// 跨 cp 边界持久化 ⟹ 必须注册（同 channel value 一套 tagged JSON 协议）。
 	compose_v2.RegisterValueType[*toolCallMemo]("*agent_v2.toolCallMemo")
+}
+
+// toolMemoKey 是工具账里一条记录的键：`(tc.ID, 批内下标, 工具名)`，理由见 makeToolsFn 里 memoKey 那段。
+func toolMemoKey(callID string, idx int, toolName string) string {
+	return callID + "#" + strconv.Itoa(idx) + "#" + toolName
+}
+
+// fixedToolResults 报这一批里哪些调用的结果已经定下（见 finalizeToolMemo），以及定下时它们的 OnToolEnd 钩子做出的决定。
+//
+// 定下了的续跑时**不再处理**：工具不执行（工具账命中）、OnToolStart / OnToolEnd 都不触发——那一步的处理首跑已经做完。
+// 再交给钩子的只能是处理完的那份（转存说明、钩子自己改写过的结果），不幂等的钩子在它上面报错，续跑就永远过不去
+// （审计实测）；两个钩子一起不触发，钩子在 OnToolStart 开的 span 也不会落单。
+//
+// 在 OnToolStart 之前判：工具账的键用这一批定下的调用内容（见 fixedToolCallContentOf），这一批没交给工具执行过时
+// 没有定下的。original 是模型给的原样。
+func fixedToolResults(ctx context.Context, original []schema.ToolCall) ([]bool, []compose_v2.Signals) {
+	content, ok := fixedToolCallContentOf(ctx, original)
+	if !ok {
+		return nil, nil
+	}
+	memo, ok := compose_v2.GetNodeState[*toolCallMemo](ctx)
+	if !ok || memo == nil || len(memo.Done) == 0 {
+		return nil, nil
+	}
+	fixed := make([]bool, len(content))
+	sigs := make([]compose_v2.Signals, len(content))
+	for i, tc := range content {
+		if e := memo.Done[toolMemoKey(tc.ID, i, tc.Function.Name)]; e != nil && e.Final && e.ToolMsg != nil {
+			fixed[i], sigs[i] = true, e.HookSignals
+		}
+	}
+	return fixed, sigs
+}
+
+// finalizeToolMemo 在这一批调用都处理完（OnToolEnd、批内裁决、按大小处理）之后，把这次执行的工具账里这几个调用的
+// 产出换成处理完的那份、标为定下（Final），连同当时 OnToolEnd 钩子做出的决定（hookSignals[i]）重存一次。
+//
+// 三条不变量：
+//
+//   - **一次调用的结果在这一批第一次处理完时定下**：之后这次执行在提交之前作废（节点成功之后的钩子 Goexit、提交
+//     出错）、续跑时不再处理（见 fixedToolResults）——工具不执行、OnToolStart / OnToolEnd 不触发，交出定下的那份：
+//     内容、结论（成没成）、钩子做出的决定都跟那次处理完的一样。不定下的话钩子在续跑时重新处理一遍，而工具账里留的
+//     已经不是它第一次看到的东西（开了转存时是转存说明）：按全文做判断的钩子会把首跑判成功的翻成失败，模型看到的
+//     结论跟着翻；定下了却照样交给钩子的话，不幂等的钩子在处理完的那份上报错，续跑永远过不去（两条均审计实测）。
+//     被批内裁决换掉的那几条定下的是替换后的失败结果：续跑时它按失败判、它的决定作废，生效的仍是首跑排在前面的那个。
+//   - **处理完之前作废的照常重新处理**：同批别的调用中断或出错、OnToolEnd 报错时走不到这里，工具账里还是工具刚返回的
+//     原样，续跑时钩子在它上面第一次处理，改写照常生效。
+//   - **一次 Run 里工具账不随轮数 × 原文大小增长**：开了转存时，工具账在每个调用成功那一刻记下的是「待处理」的全文
+//     （转存在 OnToolEnd 之后才做，中断的那一批续跑时钩子要看到全文）；节点私有态在一次 Run 里不设清除点，每一轮的账
+//     都留在内存里——实测 20 轮、每轮 2MB 的输出，Run 结束前多占 80MB。定下的是处理之后的那份，内存回到预览的量级。
+//
+// 没开转存也定下：结果定下之后不再变这条规矩跟结果多大、配没配转存无关。代价是每一批多存一次工具账。
+func finalizeToolMemo(ctx context.Context, toolCalls []schema.ToolCall, results []*schema.Message, hookSignals []compose_v2.Signals) {
+	memo, ok := compose_v2.GetNodeState[*toolCallMemo](ctx)
+	if !ok || memo == nil || len(memo.Done) == 0 {
+		return
+	}
+	changed := false
+	for i, tc := range toolCalls {
+		if i >= len(results) || results[i] == nil {
+			continue
+		}
+		e := memo.Done[toolMemoKey(tc.ID, i, tc.Function.Name)]
+		if e == nil || e.ToolMsg == nil || e.Final {
+			continue
+		}
+		cp := *results[i]
+		e.ToolMsg, e.Final = &cp, true
+		if i < len(hookSignals) {
+			e.HookSignals = hookSignals[i]
+		}
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	// 存不下时工具账停在定下之前：续跑照常重新处理（改动之前的行为），这一批转存前的全文留在内存里直到 Run 结束。
+	if err := compose_v2.SaveNodeState(ctx, memo); err != nil {
+		slog.WarnContext(ctx, "agent_v2: 定下工具账失败，续跑时这一批会重新处理", "err", err)
+	}
 }

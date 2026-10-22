@@ -175,7 +175,8 @@ func (b *RoutingAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	router := b.router
 	classifyFn := func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 		input, _ := compose_v2.Get(chs, routingAgentInputCh)
-		target, err := router(ctx, input)
+		// 路由函数是内部决策（见 decisionCtx）：它里面请教的 agent 不进会话历史、不取用户的插话
+		target, err := router(decisionCtx(ctx), input)
 		if err != nil {
 			// 控制流（compose_v2.InterruptError / ctx.Err）与业务硬错都 propagate：
 			//   - InterruptError → runNodeWithHooks 走标准 node interrupt

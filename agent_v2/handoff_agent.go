@@ -310,7 +310,7 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "HandoffAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: msgs})
+		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: msgs}, retErr)
 	}()
 
 	// 「这是不是新任务」已在钩子之前判定（enterRunTask），下面那个 input 事件判断读的是同一个信号。
@@ -396,7 +396,7 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "HandoffAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: msgs})
+		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: msgs}, retErr)
 	}()
 
 	cm := compose_v2.NewChannelManager()
@@ -584,6 +584,11 @@ func (h *HandoffAgent) buildComposeGraph(
 		// 挡 billing 的（any-stream 会让被转交方的流永远缺问，实测 {front:1, billing:0}）。
 		// 见 inputAlreadyInAnyStream 的 godoc。
 		sharedView := h.historyMode != HandoffHistorySelfOnly
+		// 每次尝试写进会话的事件先落在暂存 lane 上：被下一次从头再跑的尝试取代时作废，其余照常提交（见 attemptLanes）。
+		// 结账放在 defer 里：重试判据或退避 panic 时最后那次失败尝试也照常提交。下一跳是 step 节点的下一次执行，
+		// 这次执行返回时已经结完账，看得到这一跳的事件。
+		lanes := newAttemptLanes(subCtx, parentSession)
+		defer lanes.finish()
 		attempt, err := compose_v2.RunWithRetry(subCtx, retryCfg, func(ctx context.Context) (handoffAttempt, error) {
 			// **一次尝试收一次**：候选这次调用做出的决定只在它成功时交上来；失败 / 中断的这次
 			// 尝试做出的随它作废（compose_v2.CaptureSignals）。停下时候选图里已提交的那些留在
@@ -595,11 +600,13 @@ func (h *HandoffAgent) buildComposeGraph(
 			// 每次尝试铸一份新的。
 			var events []*AgentEvent
 			sigs, err := compose_v2.CaptureSignals(ctx, func(c context.Context) error {
-				var runErr error
-				events, runErr = ag.Run(c, parentSession, input,
-					withHandoffGrant(&handoffGrant{grantee: ag, candidates: candSet}),
-					withRouteGrant(route.regrant(ag)))
-				return runErr
+				return lanes.run(func(s *RunSession) error {
+					var runErr error
+					events, runErr = ag.Run(c, s, input,
+						withHandoffGrant(&handoffGrant{grantee: ag, candidates: candSet}),
+						withRouteGrant(route.regrant(ag)))
+					return runErr
+				})
 			})
 			if err != nil {
 				if !sharedView || !inputAlreadyInAnyStream(ctx, input) {

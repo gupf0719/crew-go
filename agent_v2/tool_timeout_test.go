@@ -143,7 +143,7 @@ func TestToolTimeout_StubbornToolStillReportsTimeout(t *testing.T) {
 // tool_result 从来不进（实测：一次带工具的 Run 只有 `[user, assistant]` 两条 event）。
 func lastToolResult(t *testing.T, hs agent_v2.HistoryStore, ctx context.Context) string {
 	t.Helper()
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{
 		Owner: "t", ConvID: compose_v2.GetThreadID(ctx)})
 	if err != nil {
 		t.Fatalf("读历史: %v", err)

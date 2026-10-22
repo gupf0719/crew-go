@@ -2,7 +2,8 @@ package agent_v2
 
 import "sort"
 
-// 各编排交出自己的直接子执行体，供 startHistoryForOrchestration 借历史配置。
+// 各编排交出自己的直接子执行体，供 startHistoryForOrchestration 借历史配置。借配置的那一趟（borrowHistoryConfig）
+// 遇到子执行体也是编排时接着往下走，所以整棵静态子树都算配置来源。
 //
 // # 为什么单独抽出来
 //

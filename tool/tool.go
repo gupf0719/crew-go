@@ -72,6 +72,34 @@ type Categorizer interface {
 	Category() string
 }
 
+// ReadOnlyDeclarer 是可选接口：工具实现它、ReadOnly 返回 true，即声明「本工具不产生副作用」——不写文件、
+// 不改远端状态、不发消息，只读取。
+//
+// 用途是审批：`agent_v2.ApprovalAskWrites` 档下声明只读的工具直接执行，其余的执行前问人。
+//
+// **没声明就按有副作用处理**（[IsReadOnly] 返回 false）：拿不准就问，而不是拿不准就放行。反过来的话，
+// 业务加了一个危险工具、忘了声明，就静默绕过了审批。
+//
+// 声明的是**这个工具实例的能力**，不是某一次调用的结果：参数决定危险性的工具（执行 SQL、跑 shell 命令）
+// 别声明只读，按参数判请用 `agent_v2.WithApprovalHeuristic`。声明准不准业务自负——框架没法验证一个工具
+// 真的没有副作用。
+//
+// 不借 [Categorizer]：那是 trace 上的展示类别（检索 / 向量化 / 护栏），跟「有没有副作用」是两件事——
+// 检索工具可能顺手写日志库，护栏工具可能改写内容。
+type ReadOnlyDeclarer interface {
+	// ReadOnly 返回 true 表示本工具不产生副作用。
+	ReadOnly() bool
+}
+
+// IsReadOnly 报 t 是否声明了只读（见 [ReadOnlyDeclarer]）。t 为 nil、没实现接口、返回 false 都算不是只读。
+func IsReadOnly(t Tool) bool {
+	if isToolNil(t) {
+		return false
+	}
+	d, ok := t.(ReadOnlyDeclarer)
+	return ok && d.ReadOnly()
+}
+
 // Category 常量 — 字符串值小写, 跟 langfuse OBSERVATION_TYPE / OTel
 // `gen_ai.operation.name` semconv 一致.
 //
@@ -309,26 +337,44 @@ type FuncTool struct {
 	description string
 	inputSchema map[string]any
 	fn          func(ctx context.Context, args map[string]any) (*Result, error)
+	readOnly    bool
+}
+
+// FuncToolOption 配置 [NewFuncTool] 建出的工具。
+type FuncToolOption func(*FuncTool)
+
+// WithReadOnly 声明这个函数工具没有副作用（见 [ReadOnlyDeclarer]）：只读查询、读配置这类。
+func WithReadOnly() FuncToolOption {
+	return func(t *FuncTool) { t.readOnly = true }
 }
 
 // NewFuncTool 从函数创建工具。
-func NewFuncTool(name, description string, inputSchema map[string]any, fn func(ctx context.Context, args map[string]any) (*Result, error)) *FuncTool {
+func NewFuncTool(name, description string, inputSchema map[string]any, fn func(ctx context.Context, args map[string]any) (*Result, error), opts ...FuncToolOption) *FuncTool {
 	// audit¹⁷ HIGH-1 fix: nil fn 检 (协议十七复证). 业务 `var fn FuncType; NewFuncTool(...)`
 	// typed nil func → Call 时 fn(...) nil deref panic 难定位.
 	if fn == nil {
 		panic("NewFuncTool: nil fn — tool 必须有可调用实现")
 	}
-	return &FuncTool{
+	t := &FuncTool{
 		name:        name,
 		description: description,
 		inputSchema: inputSchema,
 		fn:          fn,
 	}
+	for _, o := range opts {
+		if o != nil {
+			o(t)
+		}
+	}
+	return t
 }
 
 func (t *FuncTool) Name() string                { return t.name }
 func (t *FuncTool) Description() string         { return t.description }
 func (t *FuncTool) InputSchema() map[string]any { return t.inputSchema }
+
+// ReadOnly 实现 [ReadOnlyDeclarer]：构造时给了 [WithReadOnly] 才返回 true。
+func (t *FuncTool) ReadOnly() bool { return t.readOnly }
 func (t *FuncTool) Call(ctx context.Context, args map[string]any) (*Result, error) {
 	return t.fn(ctx, args)
 }

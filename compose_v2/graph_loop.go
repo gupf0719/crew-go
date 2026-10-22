@@ -60,6 +60,11 @@ type runOptions struct {
 	// softCancel 软取消信号（nil = 无）——业务在另一 goroutine Trigger，Run 在超步边界
 	// 检查、当前超步善终后优雅停并存档（见 soft_cancel.go）。
 	softCancel *SoftCancelSignal
+
+	// interruptBefore / interruptAfter 见 WithInterruptBefore / WithInterruptAfter：运行期断点，只本次
+	// Run、只本层图，与图上编译期声明的取并集。
+	interruptBefore []NodeID
+	interruptAfter  []NodeID
 }
 
 // withImportOverlay 是**两条路径都生效**的 baseline：新开与续跑都在 `OnGraphStart` 之前、
@@ -549,7 +554,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		if r := recover(); r != nil {
 			pe := panicerr.New(r)
 			panicErr := panicerr.Wrap("compose_v2.Run panic recovered", pe)
-			panicerr.Log(ctx, slog.LevelError, "compose_v2: Run 收尾段（OnGraphEnd 钩子 / 存档读写）panic，已转成错误", pe)
+			panicerr.Log(ctx, slog.LevelError, "compose_v2: Run 收尾段（图失败时的 OnGraphEnd 钩子）panic，已转成错误", pe)
 			if runErr != nil {
 				runErr = errors.Join(runErr, panicErr)
 			} else {
@@ -596,6 +601,15 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	// 运行期断点的节点名在这里校验——此刻一个字节都还没动，报错不碰存档（见 errInvalidBreakpoint）
+	if err := checkBreakpointNodes(g.nodes, "before", cfg.interruptBefore); err != nil {
+		return &errInvalidBreakpoint{msg: "compose_v2.WithInterruptBefore: " + err.Error()}
+	}
+	if err := checkBreakpointNodes(g.nodes, "after", cfg.interruptAfter); err != nil {
+		return &errInvalidBreakpoint{msg: "compose_v2.WithInterruptAfter: " + err.Error()}
+	}
+	breakBefore := g.breakBefore.with(cfg.interruptBefore)
+	breakAfter := g.breakAfter.with(cfg.interruptAfter)
 	// **RunOption 版的「新开」声明立刻落进 ctx**——否则它只管本层，嵌套子图读不到。
 	//
 	// 子图的判据是 `IsFreshRunCtx(ctx)`（`subgraph.go`），而 `cfg.freshRun` 只在本文件的
@@ -919,10 +933,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				rootCp.Status = CPStatusPending
 			}
 			rootCp.GraphID = g.ID() // Phase 5.1.b ISSUE-50 P0 防串台
-			// Phase 2 Sub-3: opt-in cp.save event fire
-			// Run defer 走 cfg.hooks.OnNodeEvent 直接 emit（不经 EventSink——R33 后
-			// ctx 内有 Run-level sink，但 defer 直调 hooks 等价且不绕一层）。
-			// node ID 用 "" 标"非节点 framework 级 event".
+			// opt-in 的 cp.save 事件经 deliverCpEvent 直接调 hooks（不经 EventSink；钩子 panic 就地兜住、
+			// 只记日志）。node ID 用 "" 标"非节点 framework 级 event".
 			// 统一写入口：世代比对 + mint + SaveNS + 更新基线（见 guardedSaveNS）
 			// 陈旧写回检查与写档各是一次出口存储调用（各有各的宽限）；检查要记的日志等结论定下之后再记。
 			var notes exitNotes
@@ -1016,6 +1028,16 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		}
 		sc := graphHookScope("OnGraphEnd", graphPhaseNS)
 		endCtx := withSignalScope(withHookPhase(ctx, sc, scopedOf(outerAcc, sc)), endHookSignals)
+		if runErr == nil {
+			// 图已经成功跑完：OnGraphEnd 是观测钩子，它 panic 不把这次成功报成失败——就地兜住、带栈记一条 ERROR。转成错误的话
+			// 存档已经按成功清掉，调用方一重试（或外层节点失败续跑）整张图从头再跑、副作用重放（实测）。失败时照旧交给 Run
+			// 入口那道兜底并进错误里。
+			defer func() {
+				if r := recover(); r != nil {
+					panicerr.Log(ctx, slog.LevelError, "compose_v2: OnGraphEnd 钩子 panic（图已经成功跑完，结果不变）", panicerr.New(r))
+				}
+			}()
+		}
 		_ = cfg.hooks.OnGraphEnd(endCtx, cm.Channels(), runErr)
 	}()
 
@@ -1154,7 +1176,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		"注意档很可能还在，只是本次不捡它"
 	if cfg.resumeFrom == nil && !cfg.freshRun && !IsFreshRunCtx(ctx) &&
 		cfg.checkpointer != nil && cfg.sessionID != "" {
-		// Phase 2 Sub-3: opt-in cp.load event fire (走 cfg.hooks.OnNodeEvent)
+		// opt-in 的 cp.load 事件（经 deliverCpEvent，钩子 panic 就地兜住、只记日志）
 		loadStart := time.Now()
 		rootCp, loadErr := cfg.checkpointer.LoadNS(ctx, cfg.sessionID, cfg.graphNS)
 		// 比对基线（WithStaleWriteGuard）——**两个分支都要设**：
@@ -1327,7 +1349,11 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 
 	// 计算初始 frontier：Resume 路径从 cp.CurrentFrontier 起；正常路径从 StartNode 起。
 	var frontier []FrontierMember
+	// judgeStart：入口边界要不要过断点。新开路径恒要；续跑时只有「恢复出来的这一超步还没开始执行、
+	// 上次也不是停在它的断点上」才要（软取消 / ctx 取消停在边界、崩溃恢复）——见 breakpointStop。
+	judgeStart := false
 	if cfg.resumeFrom != nil {
+		judgeStart = !cfg.resumeFrom.FrontierStarted && !hasBreakpointStop(cfg.resumeFrom.PendingInterrupts)
 		// audit follow-up: 显式 WithResumeFrom 路径 fire cp.load event (Source=explicit)
 		// 之前只 auto-load 路径 fire, 业务统计 "Resume 次数" 时漏算显式路径.
 		if cfg.emitCpEvent && cfg.hooks != nil {
@@ -1422,6 +1448,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		// 不再抛 InterruptError; 若仍漏答案重新抛新 Interrupt 走原流程.
 		cm.clearInterrupts()
 	} else {
+		judgeStart = true
 		// 新开路径：import baseline 已在 OnGraphStart 之前摆好；这里只剩种子写入。
 		// **只有这条路径**才 apply 种子写入——续跑那半刻意不做（见 WithInitialWrites）。
 		if len(cfg.initialWrites) > 0 {
@@ -1536,6 +1563,15 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		}()
 	}
 
+	// 入口那一批也过断点（见 judgeStart）。停在这里的断点没法续：嵌在别的节点里跑、又没有 checkpointer
+	// 的图，续跑时从头再跑、又停在同一个断点（见 breakpointStop 的 unresumable）。
+	unresumableBreakpoint := enteredFromNodeBody && (cfg.checkpointer == nil || cfg.sessionID == "")
+	if judgeStart {
+		if err := breakpointStop(cm, cfg.graphNS, breakBefore, breakAfter, frontier, nil, unresumableBreakpoint); err != nil {
+			return err
+		}
+	}
+
 	visits := make(map[NodeID]int)
 	for {
 		// **关键不变量 #2**：done 已在上一次 iteration 末尾判过——这里只查 ctx
@@ -1584,7 +1620,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			}
 		}
 
-		// 执行当前 frontier（per-branch delta + hook 集成）
+		// 执行当前 frontier（per-branch delta + hook 集成）。先记下「这一超步开始执行了」：之后在这个超步里
+		// 中断 / 失败留下的档，续跑时不再判它的 before 断点（见 judgeStart）
+		cm.markFrontierStarted()
 		res := executeFrontier(ctx, g, frontier, cm, cfg.hooks)
 
 		// **单写入者冲突：在任何提交之前拦下。**
@@ -1691,6 +1729,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			nextFrontier []FrontierMember
 			isEnd        bool
 			dirWrites    []ChannelWrite
+			// completedEarlier：部分失败续跑时，这个超步先前已成功的成员（after 断点要算上它们）
+			completedEarlier []FrontierMember
 		)
 		if res.FirstErr == nil {
 			// PA-H1：读取上次部分失败超步的成功成员及其**当时就算好的出边目标**。
@@ -1699,7 +1739,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			// 就随它的执行算完了（算不出来的话它当时根本不算成功）。重算的话读到的是**它跑完
 			// 之后**的状态（含兄弟与重跑成员的产出），跟它自己当时看到的不是一份东西。
 			// audit² H1：peek 非破坏性读——本超步后续失败时记录原样留 cm 进 cp。
-			_, deferredSends, completedTargets := cm.peekCompletedSiblings()
+			var deferredSends []SendDirective
+			var completedTargets []NodeID
+			completedEarlier, deferredSends, completedTargets = cm.peekCompletedSiblings()
 
 			nextFrontier, isEnd = assembleFrontier(append(append([]NodeID{}, res.Targets...), completedTargets...))
 
@@ -1862,6 +1904,14 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			return nil
 		}
 		frontier = nextFrontier
+
+		// 新算出的边界先过断点：after 看刚整体提交的这个超步（含部分失败时先成功的兄弟），before 看下一
+		// 超步要执行的。**排在 durability 中途写档与下一轮循环顶的软取消 / ctx 检查之前**——那些停止先落档
+		// 的话，续跑恢复出这个边界时不再判 after，after 断点就被越过去；before 会重判，但要先多停一次。
+		if err := breakpointStop(cm, cfg.graphNS, breakBefore, breakAfter, frontier,
+			append(completedEarlier, res.SucceededBranches...), unresumableBreakpoint); err != nil {
+			return err
+		}
 
 		// durability：每超步边界持久化。本超步 writes 已 apply + 下一 frontier 已算出，
 		// 写的 cp = "崩这里则从 nextFrontier Resume"。Exit 档不写（走 Run-defer）；
@@ -2199,7 +2249,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 				FirstErr:       fmt.Errorf("node %q not registered", id),
 			}
 		}
-		ws, directives, consumed, signals, err := runNodeWithHooks(ctx, id, fn, g.nodeComponents[id], chs, hooks, cm, frontier[0].InstanceID)
+		ws, directives, consumed, signals, err := runNodeWithHooks(ctx, id, fn, g.nodeComponents[id], g.nodePolicies[id], chs, hooks, cm, frontier[0].InstanceID)
 		var targets []NodeID
 		if err == nil {
 			// 出边算在**提交之前**、且算在这个成员名下——失败即本成员失败。
@@ -2325,7 +2375,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 						m.NodeID, GetGraphNS(ctx), m.InstanceID)}
 				}
 			}()
-			ws, directives, consumed, signals, err := runNodeWithHooks(ctx, m.NodeID, fn, g.nodeComponents[m.NodeID], chs, hooks, cm, m.InstanceID)
+			ws, directives, consumed, signals, err := runNodeWithHooks(ctx, m.NodeID, fn, g.nodeComponents[m.NodeID], g.nodePolicies[m.NodeID], chs, hooks, cm, m.InstanceID)
 			var targets []NodeID
 			if err == nil {
 				// **每个实例各算各的出边**，视图只含它自己的写入——兄弟实例的写入看不见。
@@ -2549,6 +2599,17 @@ func validateInterrupt(ctx context.Context, id NodeID, err error, ie *InterruptE
 	return nil
 }
 
+// notifyNodeEnd 在节点体成功之后调 OnNodeEnd：它 panic 时就地兜住、带栈记一条 ERROR，这次执行照旧算成功（理由见
+// runNodeWithHooks 的调用点）。
+func notifyNodeEnd(logCtx context.Context, hooks OrchestrationHooks, hookCtx context.Context, id NodeID, chs Channels) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicerr.Log(logCtx, slog.LevelError, "compose_v2: OnNodeEnd 钩子 panic（节点体已经成功，结果与写入照常提交）", panicerr.New(r), "node", id)
+		}
+	}()
+	_ = hooks.OnNodeEnd(hookCtx, id, chs, nil)
+}
+
 // runNodeWithHooks 是单节点执行的 hook 集成 helper：
 //  1. OnNodeStart 失败 → 跳过 NodeFunc + 调 OnNodeEnd 配对
 //  2. ctx 注入 EventSink + sendSink + node interrupt counter + visit + 实例身份
@@ -2561,12 +2622,13 @@ func validateInterrupt(ctx context.Context, id NodeID, err error, ie *InterruptE
 // instanceID：本次执行的实例身份（caller 从 FrontierMember 取，ISSUE-96）——
 // SendFrom 同 Target 投递多次时每个并发 worker 拿到各自的 token，业务工具算
 // InterruptID 时编入此维度防串台；静态边节点恒空串（它们本就单实例）。
-func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind string, chs Channels, hooks OrchestrationHooks, cm *ChannelManager, instanceID string) (writes []ChannelWrite, directives []SendDirective, consumed []string, signals []SignalRecord, err error) {
+func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind string, policy nodePolicy, chs Channels, hooks OrchestrationHooks, cm *ChannelManager, instanceID string) (writes []ChannelWrite, directives []SendDirective, consumed []string, signals []SignalRecord, err error) {
 	// audit² 修 (B-HIGH-3 + C-HIGH-2): 整函数 defer recover 兜底 hook panic. 跨
 	// goroutine (fan-out frontier N>=2 时 executeFrontier 内 spawn worker
 	// goroutine 调本函数) 不能依赖 compose_v2.Run 入口 outer recover (cross-
-	// goroutine 不 cover). hook 调用 (OnNodeStart / OnNodeEnd / nodeEventSink.Send)
-	// 都在本函数内 — 一处 recover 兜全部.
+	// goroutine 不 cover). 这道兜节点体失败时的 OnNodeEnd（OnNodeStart 另有 inner recover
+	// 转 startErr、走配对）；节点体成功之后的 OnNodeEnd（notifyNodeEnd）与 nodeEventSink.Send
+	// 只作观测，各自就地兜住、只记日志，到不了这里.
 	//
 	// **第三支：`runtime.Goexit`**（`bodyReturned` 是 testing.tRunner 的 `finished`
 	// 同款——旗必须由**正常控制流的普通语句**置位，不能放 defer 里置，Goexit 也跑
@@ -2601,7 +2663,7 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 		if r := recover(); r != nil {
 			pe := panicerr.New(r)
 			err = panicerr.Wrap(fmt.Sprintf("node %q hook/run panic recovered", id), pe)
-			panicerr.Log(ctx, slog.LevelError, "compose_v2: 节点钩子（成功路径的 OnNodeEnd / 事件投递）panic，已转成错误", pe, panicerr.KeyError, err.Error())
+			panicerr.Log(ctx, slog.LevelError, "compose_v2: 节点钩子（节点体失败时的 OnNodeEnd）panic，已转成错误", pe, panicerr.KeyError, err.Error())
 			return
 		}
 		if bodyReturned {
@@ -2753,8 +2815,6 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 		nodeID:  id,
 		graphNS: GetGraphNS(ctx),
 	})
-	sink := &sendSink{}
-	nodeCtx = withSendSink(nodeCtx, sink)
 	// per-node interrupt counter + nodeID + visit——业务工具算稳定 ID 用（实例身份
 	// 已在更早处注入，见 WithNodeInstanceID 调用点）：防多节点 / 多次访问串台
 	nodeCtx = withNodeInterruptCounter(nodeCtx, id, visit)
@@ -2763,17 +2823,25 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 	// 不给「读按一套算、写按另一套算」留缝。绑 cm ⟹ 只落本层 cp，不向上冒泡。
 	nodeCtx = withNodeStateAccessor(nodeCtx, cm, id, instanceID, visit)
 
-	writes, err = safeNodeRun(nodeCtx, id, fn, chs)
-	// **普通语句置旗，不能放 defer**：NodeFunc 里 Goexit 时 safeNodeRun 永不返回、
-	// 这一行执行不到 ⟹ 旗保持 false ⟹ 函数头 defer 第三支接手；panic 则被
+	// 节点函数本身：按节点声明的超时 / 重试跑（见 node_policy.go；没声明时就是一次调用）。SendFrom
+	// 收集器每次尝试一个，拿回来的是成功那次的。
+	var sink *sendSink
+	writes, sink, err = runNodeBody(nodeCtx, id, fn, chs, policy)
+	// **普通语句置旗，不能放 defer**：NodeFunc 里 Goexit 时 runNodeBody（里面的 safeNodeRun）
+	// 永不返回、这一行执行不到 ⟹ 旗保持 false ⟹ 函数头 defer 第三支接手；panic 则被
 	// safeNodeRun 转成 err 正常返回到这里 ⟹ 旗置位 ⟹ 不误判。
 	bodyReturned = true
-	// **audit³ 决策**: OnNodeEnd 成功路径不加 inner recover — audit² 已立 fail-fast
-	// spec (hook panic = 业务 bug, framework outer recover 转 wrapped err 返业务,
-	// 见 TestHooks_PanicInOnNodeEnd_NotCrashGraph). 损 writes/err 可接受 — 业务必须
-	// 修 hook bug 才能继续. inner recover 只用在"配对承诺"路径 (OnNodeStart panic
-	// 让 OnNodeEnd 配对调, 早退 OnNodeEnd panic 不阻止 return) 不污染 fail-fast.
-	_ = hooks.OnNodeEnd(hookPhase(ctx, "OnNodeEnd"), id, chs, err)
+	// 节点体成功时，OnNodeEnd 是观测钩子（返回值不往后流、不影响执行）：它 panic 不让这次执行作废——就地兜住、带栈记一条
+	// ERROR，结果与写入照常提交（见 notifyNodeEnd）。节点体失败时照旧：panic 交给函数头那道兜底、转成这个节点的错误。
+	//
+	// 曾经成功路径也转成错误（「钩子 bug 要让业务看见，损 writes 可接受」）：失败档会被续跑与重试捡起（auto-load 按内容
+	// 判、RunWithRetry 默认判据认它可重试），已经做完的节点体重跑、副作用重放——实测同一个节点体跑 3～4 次。看得见靠那条
+	// ERROR 日志。
+	if err == nil {
+		notifyNodeEnd(ctx, hooks, hookPhase(ctx, "OnNodeEnd"), id, chs)
+	} else {
+		_ = hooks.OnNodeEnd(hookPhase(ctx, "OnNodeEnd"), id, chs, err)
+	}
 
 	if err != nil {
 		// 业务抛的中断先过一道形状校验（没有 query / Query 与 Queries 同时填 /
@@ -2902,9 +2970,14 @@ func warnUnmatchedAnswerIDs(ctx context.Context, resumeFrom *Checkpoint, answers
 		return
 	}
 	pendingIDs := make(map[string]bool, len(resumeFrom.PendingInterrupts))
+	// 断点停下的那一条不需要答案（续跑就是放行）：给它答了算配上（方向 1 不报），没答也不算「未答」（方向 2 不报）
+	breakpointIDs := map[string]bool{}
 	for _, q := range resumeFrom.PendingInterrupts {
 		if q != nil {
 			pendingIDs[q.InterruptID] = true
+			if q.Breakpoint != nil {
+				breakpointIDs[q.InterruptID] = true
+			}
 		}
 	}
 
@@ -2929,7 +3002,7 @@ func warnUnmatchedAnswerIDs(ctx context.Context, resumeFrom *Checkpoint, answers
 	if len(answers) > 0 {
 		var missing []string
 		for id := range pendingIDs {
-			if _, ok := answers[id]; !ok {
+			if _, ok := answers[id]; !ok && !breakpointIDs[id] {
 				missing = append(missing, id)
 			}
 		}

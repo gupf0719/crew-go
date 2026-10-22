@@ -9,7 +9,7 @@
 
 ## 目录
 
-1. [HITL 是什么 + 三类触发场景](#1-hitl-是什么--三类触发场景)
+1. [HITL 是什么 + 四类触发场景](#1-hitl-是什么--四类触发场景)
 2. [InterruptError 完整协议](#2-interrupterror-完整协议)
 3. [AskQuery + InterruptID 稳定寻址](#3-askquery--interruptid-稳定寻址)
 4. [ResumeContext + 取答案的业务侧 API](#4-resumecontext--取答案的业务侧-api)
@@ -25,20 +25,21 @@
 
 ---
 
-## 1. HITL 是什么 + 三类触发场景
+## 1. HITL 是什么 + 四类触发场景
 
 HITL 全称 **Human-In-The-Loop**——agent 跑到某一步需要 user 决策才能继续，挂起 +
 持久化 + 等用户答复 + 续跑。
 
-### 1.1 三类触发场景
+### 1.1 四类触发场景
 
 | 场景 | 谁抛 InterruptError | 典型用途 |
 |---|---|---|
 | **A. 业务工具 ask_user** | `agent_v2.NewAskUserTool()` 内置工具（业务从 toolkit 调用）| LLM 主动问用户：要不要继续 / 选 A 还是 B / 输入参数 |
 | **B. Hook 主动暂停** | 业务自定义 Hook（`OnAgentStart` + `OnModelEnd` 双触发；**顶层 agent 靠 OnModelEnd 产 cp**——OnAgentStart 在 graph 启动前抛不产 cp，此时对该 sid `Resume` 会返 `errors.Is(err, compose_v2.ErrNoPendingCheckpoint)`（R33 GA-M2 fail-fast，旧行为是误导性内部错/垃圾 final），详 §11.1/§11.3）| 用户暂停按钮 / 配额耗尽 / 政策审查 |
 | **C. ctx 超时被动** | ctx.DeadlineExceeded（不是真 HITL，但走类似 cp 路径）| 长任务被外部 cancel，希望 Resume 时续跑而非重做 |
+| **D. 声明式断点** | 引擎在超步边界上停（`GraphBuilder.WithInterruptBefore/After`、RunOption、GraphAgent `WithGraphInterruptBefore/After`），Reason=`breakpoint`、`AskQuery.Breakpoint` 写停在哪 | 调试 / 逐步执行 / 「到这儿先停一下」的位置闸门；续跑（带不带答案都行）就是放行，详见 [execution-control.md](execution-control.md) §1 |
 
-A/B 是真 HITL（user 提供答案），C 是被动恢复（无 user 答案）。
+A/B 是真 HITL（user 提供答案），C 是被动恢复（无 user 答案），D 是位置闸门（不带问题，续跑即放行）。
 
 ### 1.2 完整 HITL 时序
 
@@ -233,6 +234,7 @@ type AskQuery struct {
                                                           // (MergeInterrupts 聚合 N 个 ie 时透传 ie.Reason → query.Reason)
     ToolCallID  string   `json:"tool_call_id,omitempty"` // 可选：这条挂起指向哪次工具调用
     ToolName    string   `json:"tool_name,omitempty"`    // （空 = 纯问答，不指向任何待执行动作）
+    Breakpoint  *Breakpoint `json:"breakpoint,omitempty"` // 非 nil = 声明式断点停下的（框架填，Ask 会清掉业务填的）
 }
 ```
 
@@ -680,8 +682,9 @@ toolsNode := func(ctx context.Context, chs Channels) ([]ChannelWrite, error) {
     `route_to`，或工具里经 `RunSubAgent` 调的 agent 做出的）原样交出
   - tc_2 拿 user 答案返 tool_result（二阶段语义）
   - tc_3 没跑到 → 执行
-- `OnToolStart/End` hook 对全部 tool_call 仍各 fire 一次（它们在 memo 外层、看不到命中）——观测口径的
-  重复计数是既有行为，memo 只消掉「工具函数被重复调用」这一半
+- `OnToolStart/End` hook 对这一批没处理完的 tool_call 仍各 fire 一次（这一批中断之后续跑，命中 memo 的也 fire：
+  OnToolEnd 还没处理过它们）——观测口径的重复计数是既有行为，memo 只消掉「工具函数被重复调用」这一半。这一批处理完
+  之后才作废的不再 fire（§6.5）
 - 进不进 memo 的判据是「这次调用的副作用能不能重放」（`shouldMemoize` = 做出了上行信号 **或** 不是框架元工具）：
   没做出信号的框架元工具刻意不进、靠函数体重跑补回那半（`tool_search` 的解锁写 channel 那一步在工具体里，
   跳过函数体就没人写——理由见 `tool_memo.go` godoc，动名单前先看 `tool_search_resume_test.go`）；审批记录
@@ -728,7 +731,9 @@ Run 2 Resume: askUserToolFunc 入口 → GetResumeAnswer(stableID) hit → 直�
 ### 6.5 关键不变量
 
 - ✨ toolsNode 任一 tool_call 失败/中断 → 整节点失败，channel writes 全部作废；**已成功 tool_call 的产出在节点 memo 里不丢**（随 cp 走）
-- ✨ Resume 重跑 toolsNode → memo 命中的**不调函数体**、重放产出（含当时做出的转交 / 路由决定）；未命中的执行；`OnToolStart/End` 仍全部 fire
+- ✨ Resume 重跑 toolsNode → memo 命中的**不调函数体**、重放产出（含当时做出的转交 / 路由决定）；未命中的执行；`OnToolStart/End` 照常 fire（这一批处理完之后才作废的除外，见下一条）
+- ✨ 这一批处理完（`OnToolEnd`、批内裁决、按大小处理）之后结果**定下**：这次执行之后在提交之前作废（节点成功之后的钩子 Goexit、提交出错）时，续跑**不再处理**这几个调用——工具不执行，`OnToolStart` / `OnToolEnd` 都不触发，交出定下的结果与钩子当时做出的转交 / 路由决定。再交给钩子的只能是处理完的那份（转存说明、钩子改写过的结果），不幂等的钩子在它上面报错或叠加改写，续跑就过不去或结论跟着变（审计实测）；两个钩子一起不触发，钩子开的 span 也不落单。被批内裁决换掉的那几条定下的是替换后的失败结果（续跑时它按失败判、决定作废，生效的仍是首跑那个）；没处理完就停下的照常重新处理、改写照常生效（`agent_v2/tool_memo.go` 的 `finalizeToolMemo` / `fixedToolResults`，哨兵 `tool_memo_fixed_test.go` 六条）
+- ✨ model 节点同一条规矩（`agent_v2/model_call_record.go`）：这一轮处理完（`OnModelEnd` 之后）定下，之后作废续跑时不再处理——不调模型，`OnModelStart` / `OnModelEnd` 都不触发，不重记会话历史。模型答复之后、处理完之前停下的看原因：因为等人或被叫停（中断、取消）停下的，续跑沿用这次调用的答复、不再调模型（钩子问过人的，用户答的就是这一份），也不再带用量（一次调用只报一次）——这一遍 `ModelInput.Extra` / `ModelOutput.Extra` 标着 `hook.ModelResponseReusedKey`，观测不再记一次模型调用、agui 适配层不再把答复发一遍（哨兵 `TestModelResponseReused_RecordedOnce` / `TestHandler_ReusedModelResponse_NotResent`）；钩子报错拒掉、把答复置空、panic 的续跑重新调模型换一份——内容触发的钩子 panic 留着原样的话续跑永远过不去；重新调模型时推进 `OnModelEnd` 那一格的重做代际（模型钩子各在自己的相位里跑，`compose_v2.AdvanceRerunGeneration`，同条件边否决那一格）：对新答复的提问换新 ID，累积传的旧批准不会兑付给新的一份；那一格里与答复无关的普通记录（扣费这类嵌套调用）照常拿回、不重做；`OnModelStart` 问的是输入、它那一格不推进，答过的不再问（哨兵 `TestModelCall_RegeneratedAfter*_AsksAgain` / `TestModelCall_RegeneratedAfterVoid_NormalNestedCallRecalled` / `TestModelCall_Regenerated_StartQuestionNotReasked`）。沿用标记只对排在会停下的钩子前面的钩子成立，按调用计数、往外发的钩子要排在前面。作为编排成员时，重放那一轮照首跑那样登记成「这次调用里记过」，边界补记不替它再记一份（`TestHistory_MemberModelVoidedAfterProcessing_FinalRecordedOnce`）。tools 节点这一批已记过会话历史的，重放时不再记（哨兵 `history_voided_window_test.go`）
 - ✨ ask_user 二阶段语义自动幂等（GetResumeAnswer 命中即返）
 - ✨ 同节点多次 ask_user 用 `NextInterruptIndex` 自管 idx（业务工具）
 

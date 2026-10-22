@@ -62,7 +62,7 @@ func runFanoutInputProbe(t *testing.T, seq int) int {
 	if _, err := par.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("用户原话")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: conv})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: conv})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestHistory_LoopSameSlot_InputNotReRecorded(t *testing.T) {
 	if _, err := seq.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("用户原话")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-loop-slot"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-loop-slot"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestHistory_PrevOutputAsInput_NotRecordedAcrossCopy(t *testing.T) {
 	if _, err := seq.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("用户原话")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-prevout"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-prevout"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestHistory_ExecutorReusesMessageObject_AllRoundsRecorded(t *testing.T) {
 	if got := body.rounds.Load(); got != 3 {
 		t.Fatalf("body 只跑了 %d 轮，测试无效", got)
 	}
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-constmsg"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-constmsg"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}

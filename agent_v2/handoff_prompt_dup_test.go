@@ -94,7 +94,7 @@ func TestHandoff_SharedHistory_InputNotDuplicatedInPrompt(t *testing.T) {
 			"\n  完整 prompt 见上方 log；注意 store 里是对的，所以按 store 断言的测试抓不到", n)
 	}
 
-	stored, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "acme", ConvID: "conv-dup"})
+	stored, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "acme", ConvID: "conv-dup"})
 	sn := 0
 	for _, m := range stored {
 		if m.Role == schema.RoleUser && strings.Contains(m.Content, "我要退款") {

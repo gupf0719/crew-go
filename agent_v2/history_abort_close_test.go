@@ -73,7 +73,7 @@ func TestHistory_AbortClosesUnansweredToolCalls(t *testing.T) {
 			t.Fatalf("该抛审批中断，got %v", err)
 		}
 		key := agent_v2.HistoryKey{Owner: "tenant1", ConvID: conv}
-		before, _ := hs.Load(ctx, key)
+		before, _ := agent_v2.LoadAllHistory(ctx, hs, key)
 		if danglingCount(before) == 0 {
 			t.Fatalf("fixture 没搭对：中断后本该留下悬空 tool_call，实际 0 个（%d 条消息）"+
 				"——测不出「补没补」", len(before))
@@ -84,7 +84,7 @@ func TestHistory_AbortClosesUnansweredToolCalls(t *testing.T) {
 			agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); aerr != nil {
 			t.Fatalf("Abort: %v", aerr)
 		}
-		after, _ := hs.Load(ctx, key)
+		after, _ := agent_v2.LoadAllHistory(ctx, hs, key)
 		if n := danglingCount(after); n != 0 {
 			t.Errorf("Abort 之后历史里还有 %d 个悬空 tool_call（%d 条消息）——"+
 				"append-only，这条残缺会永久留着", n, len(after))

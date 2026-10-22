@@ -102,8 +102,9 @@ func (s *abnormalNodeExitSlot) take() error {
 //
 // # 按层看：谁接谁
 //
-// 本包非测试代码共 **18 处 `recover()`**，散在 7 个文件（2026-10-20 核对；之前写的「16 处、5 个文件」漏了出口
-// 记账的 `exitStorageOp` 与只作观测的 `recoverObserver`）。下面按「出事时谁先接到」分层，**不写行号**（行号本身就是最容易漂的东西，按函数名找）。
+// 本包非测试代码共 **21 处 `recover()`**，散在 8 个文件（2026-10-22 核对；之前写的「16 处、5 个文件」漏了出口
+// 记账的 `exitStorageOp`、只作观测的 `recoverObserver`、async worker 的 loop、`ApplyPendingSendsAndClear` 几道，后来又加了
+// 成功路径观测钩子的几道）。下面按「出事时谁先接到」分层，**不写行号**（行号本身就是最容易漂的东西，按函数名找）。
 //
 // ## 第 1 层：单个成员的执行内部
 //
@@ -113,14 +114,18 @@ func (s *abnormalNodeExitSlot) take() error {
 //     好让 `OnNodeEnd` 仍被配对调用。前缀 `OnNodeStart panic: `。
 //   - `OnNodeEnd` **早退路径**的 inner defer —— ⚠️ **只打 WARN 日志，返回值里一个字都没有**。
 //     早退时错误已定（`startErr`），这道只保证 hook 的 panic 不把它顶掉。
-//   - `runNodeWithHooks` 整函数 defer —— 兜上面三道**之外**剩下的，实际主要是**成功路径的
-//     `OnNodeEnd`** 与 `nodeEventSink.Send`。前缀 `node %q hook/run panic recovered: `。
+//   - `notifyNodeEnd` —— **节点体成功之后**的 `OnNodeEnd`：就地兜住、带栈记一条 ERROR，**不进错误**，
+//     节点结果与写入照常提交（转成错误的话失败档被续跑或重试捡起，已经做完的节点体重跑、副作用重放）。
+//     触发：节点成功、OnNodeEnd panic ⟹ Run 返 nil，日志里一条「OnNodeEnd 钩子 panic（节点体已经成功…）」。
+//   - `nodeEventSink.Send` —— 节点里发事件时的 `OnNodeEvent`：同样就地兜住、只记 ERROR，Send 照常返回。
+//   - `runNodeWithHooks` 整函数 defer —— 兜上面几道**之外**剩下的，实际主要是**节点体失败时的
+//     `OnNodeEnd`**。前缀 `node %q hook/run panic recovered: `。
 //     它跑在每个成员自己的 goroutine 里，所以跨 goroutine 也覆盖。
 //     **它还有第三支**：`bodyReturned` 旗（testing.tRunner 的 `finished` 同款，由正常
 //     控制流的普通语句置位——defer 里置位没用，Goexit 也跑 defer）。NodeFunc / OnNodeStart
 //     hook 里 `Goexit` 时旗保持 false ⟹ 这一支给 OnNodeEnd 配对（带合成错误，否则每个
-//     被掐断的节点漏一个不闭合的 span）+ 往本次 Run 的 `abnormalNodeExitSlot` 记一笔带
-//     身份的错（本文件里那个类型）。成功路径 OnNodeEnd 自己 Goexit 不落这支——由第 3 层
+//     被掐断的节点漏一个不闭合的 span；这次配对调用另有一道 inner defer，只打 WARN）+ 往本次 Run 的
+//     `abnormalNodeExitSlot` 记一笔带身份的错（本文件里那个类型）。成功路径 OnNodeEnd 自己 Goexit 不落这支——由第 3 层
 //     的 `bodyReached` 兜住存档，只是错误正文没有节点身份。
 //
 // **别把这一层写成「整函数 defer 收 NodeFunc 与全部节点 hook」**——那是曾经写错过的说法，
@@ -170,10 +175,13 @@ func (s *abnormalNodeExitSlot) take() error {
 //     从 `abnormalNodeExitSlot` 取带身份的错（节点层记的），没有就给通用错。这一格是
 //     **完整**的：图主体里任何位置（NodeFunc / hook / cond / 框架自身）的 Goexit 都落
 //     在这儿，不必逐个调用点设防——节点层那道只是让错误带上身份、让 span 配对。
-//   - **入口那道**（注册最早 ⟹ 最后跑）—— 收 **defer 链自身**抛的 panic，实际主要是业务 `OnGraphEnd`
+//   - **入口那道**（注册最早 ⟹ 最后跑）—— 收 **defer 链自身**抛的 panic，实际主要是**图失败时**的业务 `OnGraphEnd`
 //     hook。出口记账的存储调用（写档、清档、清档前的检查）由 `exitStorageOp` 自己兜，cp 事件的钩子与出口
 //     日志由 `recoverObserver` 兜（见第 4 层），都不落这道。
 //     前缀 `compose_v2.Run panic recovered: `。
+//   - **`OnGraphEnd` 成功路径那道** —— 图成功跑完时 `OnGraphEnd` 的 panic 就地兜住、带栈记一条 ERROR，
+//     **不进错误**（理由同 `notifyNodeEnd`：它跑在出口记账之前，转成错误的话成功收尾时档已清掉，重试从头
+//     再跑一遍）。
 //
 // `OnGraphStart` 另有自己的 inner defer（前缀 `OnGraphStart panic: `），同样是为了让
 // `OnGraphEnd` 的配对承诺不被跳过。
@@ -182,7 +190,7 @@ func (s *abnormalNodeExitSlot) take() error {
 //
 //   - `asyncCpWriter.writeOne`（`durability.go`）—— **`durability=async` 时 `SaveNS` 的
 //     panic 落这儿**，不落第 3 层的入口那道：worker 跑在独立 goroutine，Run 出口那两道够不着。
-//     前缀 `async durability writer panic: `。
+//     前缀 `async durability writer panic: `。它外面的 `loop` 还有一道（理论上到不了，防 writeOne 被改坏）。
 //     ⚠️ 中途写档三个档三个归属：`async` 落这儿，`sync` 的写在主体里、归第 3 层**出口**那道；Run 出口那次
 //     写（三个档都有）归 `exitStorageOp`。别只记一个。
 //   - `exitStorageOp`（`exit_checkpoint.go`）—— Run 出口记账的每一次存储调用（写档、清档、清档前的陈旧写回
@@ -191,8 +199,8 @@ func (s *abnormalNodeExitSlot) take() error {
 //   - `recoverObserver`（`cp_event.go`）—— 只作观测的代码：cp 事件的钩子（`deliverCpEvent`、`EmitCpEvent`）与
 //     Run 出口结论定下之后的日志（`flushNote`、`reportCpPurge`）。panic 只记一条带栈的日志、**不进任何错误**
 //     ——结论已经定了，成功收尾时档也已清掉，报错只会引来从头重跑、副作用重放。怎么触发：`WithEmitCpEvent(true)`
-//     + 在 cp 事件上 panic 的编排钩子（哨兵见 checkpoint_not_persisted_audit_test.go）。
-//   - `ChannelManager.ApplyAll` —— 业务 reducer 在归并时 panic，由它自己接住转 error，
+//     + 在 cp 事件上 panic 的编排钩子（哨兵见 checkpoint_not_persisted_audit_test.go 与 observer_hook_panic_test.go）。
+//   - `ChannelManager.ApplyAll` / `ApplyPendingSendsAndClear` —— 业务 reducer 在归并时 panic，由它自己接住转 error，
 //     不走上面任何一道。**没有回滚**：归并跑在局部 staged 上、一个字节都不写回 cm，
 //     写回是归并之后一次做完的纯赋值 ⟹ 掐断时压根没有半应用。
 //   - `Restore`（`serialization.go`）—— 反序列化时 panic，回滚已改的字段再转 error。
@@ -216,10 +224,12 @@ func (s *abnormalNodeExitSlot) take() error {
 //
 // # 两个前缀刻意不同
 //
-// 业务据此区分两件处置相反的事：
+// 业务据此区分是哪一段炸的：
 //
 //   - `graph body panic recovered` —— 图主体炸了，**存档已正确存成 failed**，可 Resume
-//   - `Run panic recovered` —— 存档写 / hook 炸了，**存档可能压根没落盘**
+//   - `Run panic recovered` —— 收尾段（图失败时的 OnGraphEnd 钩子）炸了。出口的存档读写不在这里
+//     兜（出口存储调用那道单独兜，结论按存储调用的结果定：写档 panic 报 `ErrCheckpointNotPersisted`），存档
+//     状态以错误链上的结论为准
 //
 // 这两个前缀曾被一次无边界的字符串替换抹平，而**全套测试照常全绿**——没有任何用例断言过
 // 它们可区分。现在有了（out_edge_panic_test.go 里那条），改前缀时它会红。

@@ -210,6 +210,10 @@ type HistoryKey struct {
 }
 ```
 
+> 2026-10 起 `Load` 改成 `Load(ctx, key, HistoryQuery) (HistoryPage, error)`：分页从末尾往前读（`Before` / `Limit`），
+> 按消息 ID / 任务章 / 归属过滤（`MessageID` / `Task` / `Agent`）——长会话每次 Run 不再整场拉一遍，去重直接问后端。
+> 见 [usage-guide.md 会话历史节](../v2/usage-guide.md)。本节保留当时的设计。
+
 **`Owner` 无默认值**的理由来自 MAF 的还债：它的 `AgentSessionStore` 签名是
 `(agent, conversationId)`，类 doc 自己承认 conversationId「来自 wire，是续接标识符不是授权
 令牌」「猜中别人的就能拉到别人的完整历史」，后来在 Foundry.Hosting 补了带 `userId` 的版本，

@@ -17,12 +17,16 @@ import (
 // taskExecutionCtxKeys 是 agent_v2 的执行状态：每个都实现 compose_v2.ExecutionStateKey（DetachExecution /
 // DetachTask 剥掉、CallHook 采纳时取框架那份）。
 var taskExecutionCtxKeys = []any{
-	sessionKey{}, taskScopeKey{}, callApprovalKey{}, finalRoundKey{}, toolsUsedKey{}, foAttemptsKey{}, revealedChKey{},
+	sessionKey{}, taskScopeKey{}, callApprovalKey{}, finalRoundKey{}, compactionMemoKey{}, toolsUsedKey{}, foAttemptsKey{}, revealedChKey{},
 	revealTurnKey{}, repeatTurnKey{},
 	runOverridesCtxKey{}, offloadDedupKey{}, subAgentStoreScopeKey{},
 	historyCtxKey{}, historySlotCtxKey{}, historyReceiptCtxKey{},
 	handoffHopsCtxKey{}, handoffDestKey{}, handoffHistoryModeKey{}, routeDestKey{},
-	endErrCtxKey{}, resumePhaseCtxKey{}, toolResultPosKey{}, toolBatchSignalsKey{}, nodeGrantsKey{},
+	endErrCtxKey{}, resumePhaseCtxKey{}, toolResultPosKey{}, toolBatchKey{}, nodeGrantsKey{},
+	backgroundScopeKey{},
+	inboxCtxKey{},
+	interjectionLedgerCtxKey{},
+	callerHistoryKey{},
 }
 
 // taskEnvironmentCtxKeys 是 agent_v2 的环境：每个都实现 compose_v2.EnvironmentKey（DetachTask 留下；采纳

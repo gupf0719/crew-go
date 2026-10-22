@@ -472,29 +472,36 @@ func TestHooks_NilHooks_NoCrash(t *testing.T) {
 
 // ── hook panic 收口 ──
 
+// TestHooks_PanicInOnNodeEnd_NotCrashGraph：OnNodeEnd panic 不让 Run 的 goroutine 崩掉。节点体成功时它不改变结果（Run 成功、
+// panic 记成一条 ERROR，见 observer_hook_panic_test.go）；节点体失败时照旧转成这个节点的错误，错误里带着 panic。
 func TestHooks_PanicInOnNodeEnd_NotCrashGraph(t *testing.T) {
-	hooks := &recordingHooks{panicOnNodeEnd: true}
-	g, err := compose_v2.NewBuilder().
-		AddNode("a", func(_ context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
-			return nil, nil
-		}).
-		AddEdge(compose_v2.StartNode, "a").
-		AddEdge("a", compose_v2.EndNode).
-		Compile()
-	if err != nil {
-		t.Fatalf("compile: %v", err)
-	}
-
-	cm := compose_v2.NewChannelManager()
-	// audit² 改 (跟 eino 对齐): hook panic 由 framework outer recover 转 wrapped err 返业务,
-	// 不让 Run goroutine crash. 业务拿到 err 可观测 — 不再 silent isolate (eino 哲学:
-	// hook panic = 业务 bug fail-fast).
-	err = compose_v2.Run(context.Background(), g, cm, compose_v2.WithHooks(hooks))
-	if err == nil {
-		t.Fatal("hook panic 后 Run 应返 wrapped err (不能 silent isolate)")
-	}
-	if !strings.Contains(err.Error(), "panic") {
-		t.Fatalf("Run 应返 panic-wrapped err, got %v", err)
+	for _, nodeFails := range []bool{false, true} {
+		t.Run(map[bool]string{false: "节点体成功", true: "节点体失败"}[nodeFails], func(t *testing.T) {
+			hooks := &recordingHooks{panicOnNodeEnd: true}
+			g, err := compose_v2.NewBuilder().
+				AddNode("a", func(_ context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+					if nodeFails {
+						return nil, errors.New("业务错")
+					}
+					return nil, nil
+				}).
+				AddEdge(compose_v2.StartNode, "a").
+				AddEdge("a", compose_v2.EndNode).
+				Compile()
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			err = compose_v2.Run(context.Background(), g, compose_v2.NewChannelManager(), compose_v2.WithHooks(hooks))
+			if !nodeFails {
+				if err != nil {
+					t.Fatalf("节点体成功时 OnNodeEnd panic 不该让 Run 失败，got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "panic") {
+				t.Fatalf("节点体失败时 Run 应返回带 panic 的错误，got %v", err)
+			}
+		})
 	}
 }
 

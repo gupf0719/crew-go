@@ -16,6 +16,10 @@ type RemoteTool struct {
 	sourceName  string
 	description string
 	schema      map[string]any
+	annotations *ToolAnnotations
+	// trustAnnotations：调用方显式信任这个 server 的自述（WithTrustedAnnotations / WithTrustedClient），只有这时才认
+	// 它的只读声明，见 ReadOnly。
+	trustAnnotations bool
 }
 
 // NewRemoteTool 构造一个直接绑在 client 上的 RemoteTool（名字用 CanonicalName）。一般由 Hub 自动创建，
@@ -42,8 +46,28 @@ func newRemoteTool(s *server, name string, spec ToolSpec) *RemoteTool {
 		sourceName:  spec.Name,
 		description: spec.Description,
 		schema:      schema,
+		annotations: spec.Annotations.clone(),
+		// 信任与否是 server 的配置（WithTrustedAnnotations），NewRemoteTool 直接建的不信任
+		trustAnnotations: s.cfg.trustAnnotations,
 	}
 }
+
+// ReadOnly 实现 tool.ReadOnlyDeclarer：**只有**调用方显式信任这个 server（[WithTrustedAnnotations]）、
+// server 声明了 readOnlyHint=true、且没有同时声明 destructiveHint=true 时才返回 true。
+//
+// 默认不认：MCP 规范明说工具注解是提示、不能凭不受信任的 server 的注解做决定——认了的话，一个 server
+// 给写操作标上只读，就绕过了审批的只读放行档。两个声明自相矛盾（只读又有破坏性）时按有副作用处理。
+func (t *RemoteTool) ReadOnly() bool {
+	a := t.annotations
+	if !t.trustAnnotations || a == nil || a.ReadOnlyHint == nil || !*a.ReadOnlyHint {
+		return false
+	}
+	return a.DestructiveHint == nil || !*a.DestructiveHint
+}
+
+// Annotations 返回 server 对这个工具的自述（副本；server 没给时为 nil）。业务的审批启发式可以拿它做
+// 自己的判断——它是提示、不保证如实，见 [ToolAnnotations]。
+func (t *RemoteTool) Annotations() *ToolAnnotations { return t.annotations.clone() }
 
 func (t *RemoteTool) Name() string                { return t.canonical }
 func (t *RemoteTool) Description() string         { return t.description }

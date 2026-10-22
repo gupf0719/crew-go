@@ -280,7 +280,7 @@ func TestHistory_NestedSubAgent_ReadsSameStreamItWrites(t *testing.T) {
 	}
 
 	// 写：一条流，都在父的 key 下，各自标着归属。
-	inParent, _ := parentHS.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-PARENT", ConvID: "conv-1"})
+	inParent, _ := agent_v2.LoadAllHistory(ctx, parentHS, agent_v2.HistoryKey{Owner: "tenant-PARENT", ConvID: "conv-1"})
 	var childMsgs int
 	for _, m := range inParent {
 		if owner, _ := m.Annotations[agent_v2.HistoryAgentAnnotation].(string); owner == "child" {
@@ -298,7 +298,7 @@ func TestHistory_NestedSubAgent_ReadsSameStreamItWrites(t *testing.T) {
 		t.Errorf("子 agent 名下 %d 条, want 4（父两轮 × 每轮「input + 产出」）——"+
 			"多了疑似写入器被重复挂载，少了是漏记", childMsgs)
 	}
-	if inChild, _ := childHS.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-CHILD", ConvID: "conv-1"}); len(inChild) != 0 {
+	if inChild, _ := agent_v2.LoadAllHistory(ctx, childHS, agent_v2.HistoryKey{Owner: "tenant-CHILD", ConvID: "conv-1"}); len(inChild) != 0 {
 		t.Errorf("子自己的 store 里有 %d 条——嵌套时子的 WithHistory 不该生效", len(inChild))
 	}
 
@@ -345,7 +345,7 @@ func TestHistory_HandoffSharedView_InputRecordedOnce(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-handoff-once"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-handoff-once"})
 	var n int
 	for _, m := range got {
 		if m != nil && strings.Contains(m.Content, "USER_ASK_MARK") {
@@ -401,7 +401,7 @@ func TestHistory_NestedHandoff_InputRecordedOnce(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-nested"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-nested"})
 	var n int
 	for _, m := range got {
 		if m != nil && strings.Contains(m.Content, "USER_ASK_MARK") {
@@ -467,7 +467,7 @@ func TestHistory_Handoff_XProcResume_NoDupInput(t *testing.T) {
 		t.Fatalf("Resume: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, key)
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, key)
 	var n int
 	for _, m := range got {
 		if m != nil && strings.Contains(m.Content, "USER_MARK") {
@@ -505,7 +505,7 @@ func TestHistory_Handoff_RealRepeatNotDeduped(t *testing.T) {
 			t.Fatalf("Run %d: %v", i, err)
 		}
 	}
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-rep"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-rep"})
 	var n int
 	for _, m := range got {
 		if m != nil && m.Role == schema.RoleUser && m.Content == "继续" {
@@ -544,7 +544,7 @@ func TestHistory_Handoff_RawView_InputRecordedOnce(t *testing.T) {
 	if _, err := ho.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("RAW_MARK")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-raw"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-raw"})
 	var n int
 	for _, m := range got {
 		if m != nil && strings.Contains(m.Content, "RAW_MARK") {
@@ -564,8 +564,8 @@ type loadFailHistoryStore struct {
 func (s *loadFailHistoryStore) Append(ctx context.Context, k agent_v2.HistoryKey, m []*schema.Message) error {
 	return s.inner.Append(ctx, k, m)
 }
-func (s *loadFailHistoryStore) Load(context.Context, agent_v2.HistoryKey) ([]*schema.Message, error) {
-	return nil, errFakeLoad
+func (s *loadFailHistoryStore) Load(context.Context, agent_v2.HistoryKey, agent_v2.HistoryQuery) (agent_v2.HistoryPage, error) {
+	return agent_v2.HistoryPage{}, errFakeLoad
 }
 
 var errFakeLoad = errors.New("模拟后端读失败")
@@ -598,7 +598,7 @@ func TestHistory_Handoff_LoadFailFallback_InputNotLost(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	// 绕过报错的 Load，直接数实际 Append 进去的。
-	got, _ := backend.inner.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-loadfail"})
+	got, _ := agent_v2.LoadAllHistory(ctx, backend.inner, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-loadfail"})
 	var n int
 	for _, m := range got {
 		if m != nil && strings.Contains(m.Content, "MARK_LF") {
@@ -639,7 +639,7 @@ func TestHistory_Handoff_SessionReuse_SecondRunRecorded(t *testing.T) {
 	if _, err := newHo().Run(ctx, sess, schema.UserMessage("第二轮问题")); err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-reuse"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-reuse"})
 	// 上下界都要验：只验"存在"的话，去重反向失效（第二轮记 3 份）照样绿——而本测试的
 	// 主题恰恰就是去重。
 	var n2 int
@@ -697,7 +697,7 @@ func TestHistory_Handoff_LossyCompactor_NoDupInput(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, key)
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, key)
 	var n int
 	for _, m := range got {
 		if m != nil && strings.Contains(m.Content, "USER_MARK") {

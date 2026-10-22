@@ -157,10 +157,17 @@ type Graph struct {
 	// node span operation.name 标对应 kind (GraphAgent 显式编排路径让组件调用在 trace 区分).
 	// 无声明的 node 不在 map 内 (读返 "" → 默认 workflow node kind).
 	nodeComponents map[NodeID]string
-	adj            map[NodeID][]edge // node 出边
-	channels       []anyChannel      // 编译期注册的所有 channel
-	maxVisit       int
-	maxWidth       int
+	// nodePolicies 节点声明的超时 / 重试（WithNodeTimeout / WithNodeRetry），没声明的不在 map 内。
+	nodePolicies map[NodeID]nodePolicy
+	adj          map[NodeID][]edge // node 出边
+	channels     []anyChannel      // 编译期注册的所有 channel
+	maxVisit     int
+	maxWidth     int
+
+	// breakBefore / breakAfter 是编译期声明的断点（GraphBuilder.WithInterruptBefore / After），
+	// Run 时与运行期的取并集。
+	breakBefore breakpointSet
+	breakAfter  breakpointSet
 
 	// ── ISSUE-50 P0 防串台：Graph 身份字段（Phase 5.1.b 引入） ──
 	name     string // 业务可选 WithName 设置，空时 ID() 走 fingerprint 兜底
@@ -220,6 +227,18 @@ func (g *Graph) ID() string {
 	return g.cachedID
 }
 
+// HasNode 报 id 是不是这张图注册过的节点（起止节点不算）。
+func (g *Graph) HasNode(id NodeID) bool {
+	_, ok := g.nodes[id]
+	return ok
+}
+
+// HasBreakpoints 报这张图有没有编译期声明的断点（[GraphBuilder.WithInterruptBefore] /
+// [GraphBuilder.WithInterruptAfter]）。只看这一层，不看子图。
+func (g *Graph) HasBreakpoints() bool {
+	return !g.breakBefore.empty() || !g.breakAfter.empty()
+}
+
 // Compile 把 builder 编译为不可变 Graph。
 func (b *GraphBuilder) Compile() (*Graph, error) {
 	if err := b.validate(); err != nil {
@@ -228,10 +247,13 @@ func (b *GraphBuilder) Compile() (*Graph, error) {
 	g := &Graph{
 		nodes:          make(map[NodeID]NodeFunc, len(b.nodes)),
 		nodeComponents: make(map[NodeID]string, len(b.nodeComponents)),
+		nodePolicies:   make(map[NodeID]nodePolicy, len(b.nodePolicies)),
 		adj:            make(map[NodeID][]edge, len(b.nodes)+1),
 		channels:       append([]anyChannel(nil), b.channels...),
 		maxVisit:       b.maxVisit,
 		maxWidth:       b.maxWidth,
+		breakBefore:    breakpointSet{}.with(b.interruptBefore),
+		breakAfter:     breakpointSet{}.with(b.interruptAfter),
 		name:           b.name, // ISSUE-50 P0 防串台
 	}
 	if g.maxVisit <= 0 {
@@ -245,6 +267,9 @@ func (b *GraphBuilder) Compile() (*Graph, error) {
 	}
 	for id, comp := range b.nodeComponents {
 		g.nodeComponents[id] = comp
+	}
+	for id, p := range b.nodePolicies {
+		g.nodePolicies[id] = p
 	}
 	for _, e := range b.edges {
 		g.adj[e.from] = append(g.adj[e.from], e)
@@ -263,12 +288,16 @@ func (b *GraphBuilder) Compile() (*Graph, error) {
 // GraphBuilder 构造 Graph。
 type GraphBuilder struct {
 	nodes          map[NodeID]NodeFunc
-	nodeComponents map[NodeID]string // Phase 2: node→组件类型声明 (见 Graph.nodeComponents)
+	nodeComponents map[NodeID]string     // Phase 2: node→组件类型声明 (见 Graph.nodeComponents)
+	nodePolicies   map[NodeID]nodePolicy // 节点的超时 / 重试声明（见 Graph.nodePolicies）
 	edges          []edge
 	channels       []anyChannel
 	maxVisit       int
 	maxWidth       int
 	name           string // ISSUE-50 P0：业务可选 WithName 显式声明 graph 身份
+	// interruptBefore / interruptAfter 见 WithInterruptBefore / WithInterruptAfter（编译期断点）。
+	interruptBefore []NodeID
+	interruptAfter  []NodeID
 }
 
 // NewBuilder 创建空 GraphBuilder。
@@ -276,14 +305,17 @@ func NewBuilder() *GraphBuilder {
 	return &GraphBuilder{
 		nodes:          make(map[NodeID]NodeFunc),
 		nodeComponents: make(map[NodeID]string),
+		nodePolicies:   make(map[NodeID]nodePolicy),
 	}
 }
 
-// NodeOption 配置 AddNode 注册的节点 (Phase 2: 组件类型标注).
+// NodeOption 配置 AddNode 注册的节点：组件类型（[WithNodeComponent]）、超时（[WithNodeTimeout]）、
+// 重试（[WithNodeRetry]）。
 type NodeOption func(*nodeConfig)
 
 type nodeConfig struct {
 	component string
+	policy    nodePolicy
 }
 
 // WithNodeComponent 声明该 node 的组件类型 (retrieval/embedding/guardrail),
@@ -298,7 +330,8 @@ func WithNodeComponent(kind string) NodeOption {
 	return func(c *nodeConfig) { c.component = kind }
 }
 
-// AddNode 注册节点。可选 NodeOption 声明组件类型 (WithNodeComponent).
+// AddNode 注册节点。可选 NodeOption 声明组件类型（WithNodeComponent）、超时（WithNodeTimeout）、
+// 重试（WithNodeRetry）。
 //
 // **audit⁷ HIGH-2 fix (audit¹² 补漏 — audit⁷ commit 23eebe4 谎报 5 处实改 3 处)**:
 // isFrameworkNil 检 typed nil func (协议七复证). 业务 `var fn NodeFunc; AddNode(id, fn)`
@@ -308,16 +341,28 @@ func (b *GraphBuilder) AddNode(id NodeID, fn NodeFunc, opts ...NodeOption) *Grap
 		panic("GraphBuilder.AddNode: nil fn (含 Go typed nil func 陷阱)")
 	}
 	b.nodes[id] = fn
-	if len(opts) > 0 {
-		var cfg nodeConfig
-		for _, o := range opts {
+	b.applyNodeOptions(id, opts)
+	return b
+}
+
+// applyNodeOptions 把节点选项记到 id 名下。AddNode 与 AddSubgraphNode（经
+// [WithSubgraphNodeOptions]）共用这一处。
+func (b *GraphBuilder) applyNodeOptions(id NodeID, opts []NodeOption) {
+	if len(opts) == 0 {
+		return
+	}
+	var cfg nodeConfig
+	for _, o := range opts {
+		if o != nil {
 			o(&cfg)
 		}
-		if cfg.component != "" {
-			b.nodeComponents[id] = cfg.component
-		}
 	}
-	return b
+	if cfg.component != "" {
+		b.nodeComponents[id] = cfg.component
+	}
+	if cfg.policy.active() {
+		b.nodePolicies[id] = cfg.policy
+	}
 }
 
 // AddEdge 加静态边 from → to。
@@ -455,6 +500,15 @@ func (b *GraphBuilder) validate() error {
 		if id == StartNode || id == EndNode {
 			return fmt.Errorf("invalid node ID %q: it is the graph's start or end node", id)
 		}
+		if id == AllNodes {
+			return fmt.Errorf("invalid node ID %q: it is the breakpoint wildcard (compose_v2.AllNodes)", id)
+		}
+	}
+	if err := checkBreakpointNodes(b.nodes, "before", b.interruptBefore); err != nil {
+		return err
+	}
+	if err := checkBreakpointNodes(b.nodes, "after", b.interruptAfter); err != nil {
+		return err
 	}
 	hasStart := false
 	for _, e := range b.edges {

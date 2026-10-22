@@ -6,6 +6,7 @@ import (
 	"crew-go/hook"
 	"crew-go/schema"
 	"fmt"
+	"sync"
 )
 
 // ParallelAgent 并发跑 N 个 sub-agent 链——所有 branch 同 input、结果合并。
@@ -15,11 +16,11 @@ import (
 // 共享 session：所有 sub-agent.Run 最终 events 都进父 session（caller 看完整流水）。
 //
 // **branch 间 events 物理隔离**（ISSUE-80 修，lane events 模型）：N
-// branch 并发跑时每个用 `parentSession.ForkLane()` 拿独立 lane child sess——branch
-// 内 AddEvent 写 lane 私有 slice（R33 后 lane.mu 保护，见 session.go），sibling
-// branch 物理不可见。branch 完成时 `CommitLaneEvents(parent, lane)` 把 lane events
-// 按 **branch 完成顺序整段 append** 合并回父（不跨 branch 按 TS 重排——单 branch
-// 内时序保持，跨 branch 顺序 = 完成顺序，见 session.go CommitLaneEvents godoc）。
+// branch 并发跑时每个在开始时拿一条独立 lane child sess（siblingEvents.fork：上文是此刻
+// 父 session 的事件，去掉兄弟分支提交上来的）——branch 内 AddEvent 写 lane 私有 slice
+// （R33 后 lane.mu 保护，见 session.go），sibling branch 物理不可见。branch 完成时
+// siblingEvents.commit 把 lane events 按 **branch 完成顺序整段 append** 合并回父（不跨
+// branch 按 TS 重排——单 branch 内时序保持，跨 branch 顺序 = 完成顺序）。
 //
 // **同一个 agent 实例可以挂多个分支**（best-of-N 采样就是这个形状）。这条能力经历过
 // 两次收窄再放开：R31 曾用 FinalMessageByAgent name filter 临时缓解 events 串台，要求
@@ -35,8 +36,8 @@ import (
 //
 // **嵌套场景**：`AgentAsTool(ParallelAgent)` 时 ParallelAgent 收到的 child sess
 // (来自 NewSharedChildSession) 与父 sess events 独立，但 N branch 之间通过 lane
-// 模型物理隔离。多层嵌套 fan-out (ParallelAgent 内嵌 ParallelAgent) 时 lane.Parent
-// 链自动建立。
+// 模型物理隔离。多层嵌套 fan-out (ParallelAgent 内嵌 ParallelAgent) 时内层分支 lane 从外层分支
+// lane 派生、提交进外层分支 lane，外层分支再往上提交。
 //
 // 嵌套 cp：每 branch 通过 ctx push graphNS 让子 cp 写 (parentSID, parentNS/branchName)。
 //
@@ -272,7 +273,7 @@ func (p *ParallelAgent) Run(ctx context.Context, session *RunSession, input *sch
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "ParallelAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: msgs})
+		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: msgs}, retErr)
 	}()
 
 	// 「这是不是新任务」已在钩子之前判定（enterRunTask），下面那个 input 事件判断读的是同一个信号。
@@ -360,7 +361,7 @@ func (p *ParallelAgent) Resume(ctx context.Context, sessionID string, opts ...Re
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "ParallelAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: msgs})
+		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: msgs}, retErr)
 	}()
 
 	cm := compose_v2.NewChannelManager()
@@ -465,16 +466,22 @@ func (p *ParallelAgent) buildComposeGraph(
 	}
 
 	retryCfg := p.retryCfg
+	siblings := &siblingEvents{set: make(map[*AgentEvent]struct{})}
 	for _, br := range p.branches {
 		br := br
 		branchFn := func(ctx context.Context, input *schema.Message) (*schema.Message, error) {
 			// **ISSUE-80 修**：fork lane child sess——branch 内 events 写到 lane 私有
-			// slice (lock-free)，与 sibling branch 物理隔离。完成后 CommitLaneEvents
-			// 按 TS 排序合并回 parentSession。彻底解决 R31 视角 D HIGH-1 串台根因 + 删 R31 临时
+			// slice，与 sibling branch 物理隔离。完成后 siblings.commit
+			// 按原有顺序合并回 parentSession（见 siblingEvents）。彻底解决 R31 视角 D HIGH-1 串台根因 + 删 R31 临时
 			// FinalMessageByAgent name filter 限制（业务可同 sub-agent 实例作多 branch）。
-			// **这是 7 编排里唯一不共享父 session 的一处**——扇出分支之间必须互不可见。
-			laneSess := parentSession.ForkLane()
-			result, runErr := runMember(ctx, memberGrants{}, memberSpec{
+			// **这是 7 编排里唯一让成员看不到兄弟成员事件的一处**——扇出分支之间必须互不可见。
+			// 分支成员每次尝试的暂存 lane 再从这条分支 lane 派生（见 attemptLanes）。
+			laneSess := siblings.fork(parentSession)
+			// 无论成功失败都要 commit lane events 到 parent——失败 (含 InterruptError)
+			// 时业务 / Resume 路径需要看 lane 内已写的 events（如 OutputEvent 中间步骤）；
+			// panic 越过分支往上走时同样（defer 不 recover，panic 现场的栈归引擎的节点兜底）。
+			defer siblings.commit(parentSession, laneSess)
+			return runMember(ctx, memberGrants{}, memberSpec{
 				agent: br.Agent,
 				sess:  laneSess,
 				input: input,
@@ -483,10 +490,6 @@ func (p *ParallelAgent) buildComposeGraph(
 				historySlot: br.Name,
 				retryCfg:    retryCfg,
 			})
-			// 无论成功失败都要 commit lane events 到 parent——失败 (含 InterruptError)
-			// 时业务 / Resume 路径需要看 lane 内已写的 events（如 OutputEvent 中间步骤）
-			CommitLaneEvents(parentSession, laneSess)
-			return result, runErr
 		}
 		bld = bld.AddBranch(br.Name, branchFn)
 	}
@@ -494,3 +497,42 @@ func (p *ParallelAgent) buildComposeGraph(
 }
 
 var _ Agent = (*ParallelAgent)(nil)
+
+// siblingEvents 记下同一次并行里各分支提交进编排会话的事件，让分支开始时派生的 lane 看不到兄弟。
+//
+// 分支的上文 = 它开始执行那一刻编排会话的事件，去掉兄弟分支提交上来的。两条都要：
+//   - 兄弟的不能看到——分支之间互不可见（同名 agent 会把兄弟的问答当成自己的上文）。只在建图时取一次快照
+//     挡得住兄弟，但分支开始之前编排钩子写进会话的事件（OnGraphStart、分支节点的 OnNodeStart）也一起挡掉了，
+//     跟 Sequential 的成员不一致（审计实测）。
+//   - 其余的照常看到——跟 Sequential 的成员一样，开始之前写进会话的都在上文里。
+//
+// 按事件指针认兄弟：提交是把 lane 里的事件指针追加到编排会话，同一批指针。只有经分支 lane 提交上来的才算兄弟的：
+// 钩子直接写进编排会话的（哪怕是兄弟分支节点的 OnNodeEnd 写的）算会话自己的，开始得晚的分支看得到。fork 的「取上文 + 过滤」与 commit 的
+// 「提交 + 记下」在同一把锁里，兄弟不会插在中间——不然取到了它的事件、却还没记下是它的。
+type siblingEvents struct {
+	mu  sync.Mutex
+	set map[*AgentEvent]struct{}
+}
+
+// fork 从 parent 派生一条分支 lane：上文是此刻 parent 的事件去掉兄弟提交上来的。
+func (s *siblingEvents) fork(parent *RunSession) *RunSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	view := parent.Events()
+	base := make([]*AgentEvent, 0, len(view))
+	for _, ev := range view {
+		if _, ok := s.set[ev]; !ok {
+			base = append(base, ev)
+		}
+	}
+	return parent.forkLaneFrom(base)
+}
+
+// commit 把分支 lane 提交进 parent，记下提交了哪些事件。
+func (s *siblingEvents) commit(parent, lane *RunSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ev := range commitLane(parent, lane) {
+		s.set[ev] = struct{}{}
+	}
+}

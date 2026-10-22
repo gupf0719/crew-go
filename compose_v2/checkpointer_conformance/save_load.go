@@ -3,6 +3,7 @@ package checkpointer_conformance
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
 
 	"crew-go/compose_v2"
@@ -155,6 +156,9 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 			CreatedAt: 12345,
 			// ISSUE-96: 成员身份**内联**。空 InstanceID 表达「该成员是静态边节点」，
 			// 不是「没值」——两者语义不同，都要 round-trip（backend 别把空串这条整个丢掉）
+			// 这一超步已开始执行（中断 / 失败之后的档）：漏了不报错，只是续跑时把开始过的超步当成没开始，
+			// 运行期 before 断点在它前面多停一次
+			FrontierStarted: true,
 			CurrentFrontier: []compose_v2.FrontierMember{
 				{NodeID: "node_a"},
 				{NodeID: "node_b", InstanceID: "i7"},
@@ -172,6 +176,12 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 				{InterruptID: "q1", Question: "Q1?", Reason: "因为用户操作",
 					ToolCallID: "tc_abc", ToolName: "transfer"},
 				{InterruptID: "q2", Question: "Q2?", Options: []string{"yes", "no"}, Reason: "需要确认"},
+				// 声明式断点停下的挂起：Breakpoint 漏序列化不报错，但引擎靠它判「上次是不是停在断点上」——
+				// 漏了的话，停在 before 断点上的档每次续跑都被重判、在同一个边界再停，图永远过不去（after 断点
+				// 那种续跑照常放行）；调用方也从存档里分不出「这是断点、续跑即放行」与「节点在等答案」。
+				{InterruptID: "q3", Question: "已在断点处暂停", Reason: compose_v2.BreakpointInterruptReason,
+					Breakpoint: &compose_v2.Breakpoint{Before: []compose_v2.NodeID{"nb"},
+						After: []compose_v2.NodeID{"na1", "na2"}, NS: "outer/sub"}},
 			},
 			// PA-H1: 部分失败超步成功成员 + 其 SendDirectives wire 形态——漏序列化
 			// 任一字段时发散 fan-out HITL Resume 后成功分支后继静默丢失 graph 假成功
@@ -248,6 +258,10 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 		}
 		if loaded.CreatedAt != 12345 {
 			t.Errorf("CreatedAt: expected %d, got %d", 12345, loaded.CreatedAt)
+		}
+
+		if !loaded.FrontierStarted {
+			t.Error("FrontierStarted round-trip lost: want true（业务 backend 漏 frontier_started 字段）")
 		}
 
 		// CurrentFrontier 顺序敏感 + 成员身份内联（ISSUE-96）
@@ -408,8 +422,17 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 
 		// PendingInterrupts slice + InterruptID 是 HITL Resume 关键 — 漏序列化
 		// 直接导致 ask_user 答案配对失败 (CLAUDE.md 5 维稳定 ID).
-		if len(loaded.PendingInterrupts) != 2 {
-			t.Fatalf("PendingInterrupts len: expected 2, got %d", len(loaded.PendingInterrupts))
+		if len(loaded.PendingInterrupts) != 3 {
+			t.Fatalf("PendingInterrupts len: expected 3, got %d", len(loaded.PendingInterrupts))
+		}
+		// q3：断点信息三个字段都要回来，问答型的 q1 / q2 上必须仍是 nil
+		if bp := loaded.PendingInterrupts[2].Breakpoint; bp == nil ||
+			!slices.Equal(bp.Before, []compose_v2.NodeID{"nb"}) ||
+			!slices.Equal(bp.After, []compose_v2.NodeID{"na1", "na2"}) || bp.NS != "outer/sub" {
+			t.Errorf("PendingInterrupts[2].Breakpoint 没有原样回来（业务 backend 漏 breakpoint 字段），got %+v", bp)
+		}
+		if loaded.PendingInterrupts[0].Breakpoint != nil || loaded.PendingInterrupts[1].Breakpoint != nil {
+			t.Error("问答型挂起的 Breakpoint 应为 nil——非 nil 说明 backend 把别处的值串了过来")
 		}
 
 		// q1: InterruptID + Question + Reason 必 round-trip

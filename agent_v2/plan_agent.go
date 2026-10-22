@@ -131,6 +131,7 @@ type PlanAgent struct {
 	executor         Agent           // 默认执行器（SubAgentName 空 + TmpSubAgent 空 时用）
 	planModel        model.ChatModel // 共享 model，TmpSubAgent 构造 BasicAgent 用
 	planToolkit      *tool.Toolkit   // 共享 toolkit，TmpSubAgent.ToolNames 按名筛子集
+	tmpSubAgentOpts  []Option        // 给每个 TmpSubAgent 的额外选项（审批档等），见 WithPlanTmpSubAgentOptions
 	execInputBuilder ExecInputBuilder
 	maxSteps         int
 	retryCfg         compose_v2.RetryConfig // 每步 sub-agent.Run 的重试策略
@@ -260,6 +261,16 @@ func WithPlanModel(m model.ChatModel) PlanOption {
 // 步骤未使用 TmpSubAgent 时此 option 不生效。
 func WithPlanToolkit(tk *tool.Toolkit) PlanOption {
 	return func(p *PlanAgent) { p.planToolkit = tk }
+}
+
+// WithPlanTmpSubAgentOptions 给 PlanAgent 现造的每个执行体（PlanStep.TmpSubAgent）加上 BasicAgent 选项——
+// 典型是审批档：TmpSubAgent 拿的是 WithPlanToolkit 工具池的子集，不配的话它们执行前不问任何人。
+//
+//	agent_v2.WithPlanTmpSubAgentOptions(agent_v2.WithApprovalMode(agent_v2.ApprovalAskWrites))
+//
+// 排在框架给的名字 / 模型 / 系统提示 / 工具子集之后，同类选项以这里的为准。可调用多次，依次追加。
+func WithPlanTmpSubAgentOptions(opts ...Option) PlanOption {
+	return func(p *PlanAgent) { p.tmpSubAgentOpts = append(p.tmpSubAgentOpts, opts...) }
 }
 
 // WithPlanHooks 设业务 hook 实例——PlanAgent 整体生命周期 OnAgentEnd 在 Run/Resume
@@ -447,7 +458,7 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "PlanAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = p.hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: finalMessagesRef})
+		fireAgentEnd(ctxOut, p.hooks, info, &hook.AgentOutput{Messages: finalMessagesRef}, retErr)
 	}()
 
 	// 消费 hook 改写: 业务清空 Messages 时退化空字符串 (与 BasicAgent 同), 业务
@@ -554,7 +565,7 @@ func (p *PlanAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "PlanAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = p.hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: finalMessagesRef})
+		fireAgentEnd(ctxOut, p.hooks, info, &hook.AgentOutput{Messages: finalMessagesRef}, retErr)
 	}()
 
 	cm := compose_v2.NewChannelManager()
@@ -743,7 +754,7 @@ func (p *PlanAgent) buildPlanGraph(ctx context.Context, session *RunSession, gra
 		// 子 agent，那条链就会经过历史层。
 		//
 		// 注意只摘这一处：下面 exec 节点跑的 sub-agent 是**真活**，产出该进历史。
-		remaining, finalAnswer, err := p.planner(WithoutHistoryCtx(nodeCtx), session, original, executed)
+		remaining, finalAnswer, err := p.planner(decisionCtx(nodeCtx), session, original, executed)
 		if err != nil {
 			return nil, fmt.Errorf("plan: planner: %w", err)
 		}
@@ -990,6 +1001,7 @@ func (p *PlanAgent) makeTmpSubAgent(cfg *TmpSubAgentConfig, stepDesc string) (Ag
 			opts = append(opts, WithToolkit(filtered))
 		}
 	}
+	opts = append(opts, p.tmpSubAgentOpts...)
 	return NewBasicAgent(opts...), nil
 }
 

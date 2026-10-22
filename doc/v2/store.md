@@ -799,13 +799,13 @@ type InMemoryStore struct {
 - `Batch` 顺序执行 ops —— **per-Op 错误隔离**（失败 Op `Result.Err` 非 nil，其他 Op 仍执行）。**区别于 LangGraph InMemoryStore**（任一 Op 异常整 batch 抛异常退出）——crew-go 选择更宽容的部分失败语义，对幂等批量场景（多条 actionID 标记完成）更友好。best-effort 是所有后端唯一合法的语义；Store 契约不提供事务；需要原子性只能绕开 Store 直接操作底层数据库
 - `Batch` **非原子**：Op 间隙其他 goroutine 可见中间态（每 Op 各自抢锁，区别于 LangGraph 整 batch 单锁）。业务想要 snapshot 语义得自己加锁，Store 契约不提供
 - `Search` filter 解析走纯 Go 递归 map 比较（无外部依赖）
-- **Get / Search 返 copy**：outer field（Namespace / Key / Value 字段替换）不影响 store。**Namespace 额外深 copy**（`[]string` 便宜）——防业务 `got.Namespace[i]=x` 元素写穿透污染 store（N2 修复；原 shallow copy 只复制 slice header 不防元素写）。**Value 仍浅持有**——`any` 深拷成本高不做，**不防** Value 内部 map/slice 篡改，业务约定把返回的 Value 视为不可变（PR 1 audit 视角 1 HIGH-1 文档化）
+- **Get / Search 返 copy**：outer field（Namespace / Key / Value 字段替换）不影响 store。**Namespace 额外深 copy**（`[]string` 便宜）——防业务 `got.Namespace[i]=x` 元素写穿透污染 store（N2 修复；原 shallow copy 只复制 slice header 不防元素写）。**Value 不拷贝**：它是 `Put` 时归一化出来的那份（值的 JSON 形状，见 `store.NormalizeValue`），不是业务传进来的对象——业务 Put 之后再改自己的对象碰不到它；Get / Search 每次返回它，就地改返回值会改到存储里，当只读用
 
 **已知限制**（PoC 接受）：
 - 大量 key（10K+ 同 namespace）下 Search 线性扫描慢 → 业务用更细 namespace 切分
 - 无持久化 —— 进程重启丢失 → 生产用 Redis/PG 后端
 - 无并发版本控制 —— 并发写同 key last-write-wins → 业务自加版本字段
-- Value 浅持有 —— 业务 Put 后再 mutate value 内 map/slice 改 store 状态，业务自负
+- Get / Search 返回的 Value 是存储里那份 —— 就地改它会改到存储里，当只读用（Put 之后改业务自己的对象不受影响）
 
 ## 9. 第一版 PoC vs 后续版本
 
@@ -1036,7 +1036,7 @@ st.Put(ctx, store.NS("users", uid, "prefs"), "theme", nil)
 1. **LangGraph 用户迁移友好**：[`langgraph BaseStore.put`](../../../langgraph/libs/checkpoint/langgraph/store/base/__init__.py) 同款语义
 2. **Batch 操作便利**：`Op` 单元只用 `PutOp{value: nil}` 表达"upsert + 删除"两种语义，不引入额外 `DeleteOp`
 
-**InMemoryStore 实现真删除**（不留 tombstone）；业务自实现后端**必须遵守 interface 契约**——`Put(nil)` 后 `Get` 必须返 `(nil, nil)`（同 `Delete` 后行为）。业务后端内部可选 hard delete 或 soft delete + tombstone，但 `Get` 对外行为不变（违反契约会让 helper 假设错位）。
+**InMemoryStore 实现真删除**（不留 tombstone）；业务自实现后端**必须遵守 interface 契约**——`Put(nil)` 后 `Get` 必须返 `(nil, nil)`（同 `Delete` 后行为）。这里的 nil 是无类型的 nil：typed nil 指针 / slice / map、`json.RawMessage("null")`、`MarshalJSON` 返回 null 的值编成 JSON 是 null，是一个值——存一条 Value 为 nil 的记录，覆盖写时记录还在（判删除要用业务传进来的原值、在归一化之前判，conformance `Put_Value_Encoding_To_JSON_Null_Stores_Null`）。业务后端内部可选 hard delete 或 soft delete + tombstone，但 `Get` 对外行为不变（违反契约会让 helper 假设错位）。
 
 详见 [§3.3 Store 接口](#33-store-接口) 的 `Put` godoc。
 

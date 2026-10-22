@@ -74,7 +74,8 @@ orch := obs.OrchHooks(sseOrchHooks)                // 编排级
 
 - **记改写之后的值**：开始一侧 observability 先开 span（父子关系要它），输入消息、工具名与参数、token 模态等
   里面的钩子跑完再记；结束一侧里面的钩子先跑。业务在钩子里改写 [消费] 字段（PII 过滤输入、脱敏或改判工具结果）
-  时，span 记的是改写之后、真正交下去 / 被框架用上的那份。里面的结束钩子报错时由随后的 `OnError` 以失败收尾。
+  时，span 记的是改写之后、真正交下去 / 被框架用上的那份。里面的结束钩子报错、等人或被叫停时，模型 / 工具调用本身已经
+  完成，照样按这次调用自己的结局收尾（模型调用的用量只在这一遍交来）。
 - **外来 ctx**：里面的钩子返回外来的 ctx（缓存下来的、`Background`）属于违约（框架会告警），observability 仍把
   自己的句柄与当前 span 挂回去，span 照常收尾。
 
@@ -159,7 +160,7 @@ invoke_agent assistant
 | 工作流（`OnGraphStart`） | `gen_ai.workflow.name`、`crew.run.id`、`gen_ai.conversation.id`、`crew.graph.ns`（非顶层时） |
 | node | `crew.node.id`、`crew.graph.ns`、`crew.node.instance`（扇出实例）、`crew.node.component`；有流式片段时 `crew.stream.chunks`、`crew.stream.first_chunk_seconds` |
 | chat | `gen_ai.agent.name`、`crew.agent.round`、`gen_ai.request.model` / `.temperature` / `.max_tokens` / `.top_p`（有才记）、`gen_ai.request.stream`（流式时为 true，非流式不记）、`gen_ai.conversation.id`；结束时 `gen_ai.provider.name`、`gen_ai.response.model`、`gen_ai.response.finish_reasons`、`gen_ai.usage.input_tokens` / `.output_tokens`（有用量就记，含 0；输出含推理 token）、`gen_ai.usage.cache_read.input_tokens` / `.cache_write.input_tokens` / `.reasoning.output_tokens`（大于 0 才记）、`gen_ai.response.time_to_first_chunk`（流式） |
-| execute_tool | `gen_ai.tool.name`、`gen_ai.tool.type`（`function`）、`gen_ai.tool.call.id`、`gen_ai.agent.name`、`gen_ai.conversation.id`、`crew.tool.category`（`retrieval` / `embedding` / `guardrail` / `skill`）、`gen_ai.skill.name`（`activate_skill` 调用） |
+| execute_tool | `gen_ai.tool.name`、`gen_ai.tool.type`（`function`）、`gen_ai.tool.call.id`、`gen_ai.agent.name`、`gen_ai.conversation.id`、`crew.tool.category`（`retrieval` / `embedding` / `guardrail` / `skill`）、`gen_ai.skill.name`（`activate_skill` 调用）、`crew.tool.outcome`（`denied`：被审批拒绝）、`crew.tool.replayed`（续跑时从工具账重放） |
 | A2A client | `gen_ai.provider.name`=`a2a`、`gen_ai.agent.name`、`crew.a2a.method`、`crew.a2a.transport`、`gen_ai.conversation.id`（A2A contextId）、`crew.a2a.task_id` |
 | A2A server | `crew.a2a.operation`、`gen_ai.conversation.id`、`crew.a2a.task_id` |
 
@@ -180,7 +181,7 @@ span status 只有 Unset / Error 两档有用，而「用户点了停止」「�
 | `error` | 失败 | Error，带 `error.type` 与 `exception` 事件 |
 | `timeout` | 超时 | Error，`error.type`=`timeout` |
 | `cancelled` | 取消、`compose_v2.ErrSoftCanceled` | Unset |
-| `blocked` | 中断，等人答复（`compose_v2.InterruptError`） | Unset |
+| `blocked` | 中断，等人答复（`compose_v2.InterruptError`）；工具调用被审批拒绝（另带 `crew.tool.outcome=denied`） | Unset |
 
 判定（所有 span 同一个口径）：调用方 ctx 已结束时按 ctx 判——到期是 timeout，取消是 cancelled；ctx 还活着时看
 错误：陈旧写回（`compose_v2.ErrCheckpointStale`，`error.type`=`checkpoint_stale`）先于中断判——它可能跟中断绑在
@@ -216,6 +217,17 @@ A2A client span 按发请求用的 ctx 判（`A2AClientSpan.End(ctx, err)`），
 成功的话记 `error` / `_OTHER`；这些叶子不记时长样本。`OnError` 报到 agent / 节点 / 工作流上的错误不在那里记——
 错误要是被处理掉了（重试成功、分支失败被兜住），按 OTel 的 recording-errors 指引不该记；没被处理的话，那个 span
 结束时自己以失败收尾。
+
+**一次调用只按它自己的结局记一次**：
+
+- BasicAgent 的一轮在 `OnModelEnd` 里因为等人或被叫停停下时，续跑沿用那次的答复、不再调模型，模型钩子再走一遍
+  （`ModelInput.Extra` / `ModelOutput.Extra` 带 `hook.ModelResponseReusedKey`）。那次调用在停下的那一遍已经收尾，
+  沿用的那一遍不再开 `chat` span、不记耗时与用量。
+- 一批工具调用没整体成功时（同批有调用中断或硬失败），已经有结局的调用照样各自触发 `OnToolEnd`
+  （`Extra` 带 `agent_v2.ToolBatchFailedExtraKey`），按自己的结局收尾。续跑时它们从工具账重放、`OnToolEnd` 再触发一次
+  （`Extra` 带 `agent_v2.ToolReplayedExtraKey`）：span 标 `crew.tool.replayed`，不记时长样本、不计入 agent 的调用次数。
+- 被审批拒绝的调用没有执行：`OnToolEnd` 的 `Extra` 带 `agent_v2.ToolOutcomeDenied`，span 记 `blocked`、不标 Error、
+  带 `crew.tool.outcome=denied`，时长样本带同一个属性——跟执行成功的分得开。
 
 ### 2.5 span 事件
 
@@ -267,7 +279,7 @@ trace。
 | `gen_ai.invoke_agent.inference_calls` | 直方图 / {inference_call} | `gen_ai.agent.name` |
 | `gen_ai.invoke_agent.tool_calls` | 直方图 / {tool_call} | `gen_ai.agent.name` |
 | `gen_ai.invoke_workflow.duration` | 直方图 / s | `gen_ai.workflow.name`；失败时 `error.type` |
-| `gen_ai.execute_tool.duration` | 直方图 / s | `gen_ai.tool.name`、`gen_ai.tool.type`、`gen_ai.agent.name`；失败时 `error.type` |
+| `gen_ai.execute_tool.duration` | 直方图 / s | `gen_ai.tool.name`、`gen_ai.tool.type`、`gen_ai.agent.name`；失败时 `error.type`，被审批拒绝时 `crew.tool.outcome=denied`；从工具账重放的不记 |
 
 - token 计数只在模型调用成功（`OnModelEnd`）时记，数量为 0 的不记。
 - 口径照约定：输入 token 含缓存读写（cache_read / cache_write 是它的子集）；输出 token 含推理 token（约定要求推理计入

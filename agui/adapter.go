@@ -74,6 +74,11 @@ func newSSEAdapter(w *SSEWriter, runID string) *sseAdapter {
 //     本轮 run_id 不在 openMsgs——最终答案在此**补发完整 TextMessage**（Start+Content+End），
 //     否则纯文本答复会丢（真流式 provider 掩盖此路径，mock / 非流式 model 会暴露）。
 func (a *sseAdapter) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, output *schema.ModelOutput) (context.Context, error) {
+	// 沿用原样续跑（见 hook.ModelResponseReusedKey）：这条答复上一次 run 已经交给前端（流式的 chunk，或那次在这里补发的
+	// 完整 message），这一遍再发就是同一个 messageId 的第二条。
+	if output != nil && hook.IsModelResponseReused(output.Extra) {
+		return ctx, nil
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	// 本轮 message 的 id = output 的 run_id（与流式 chunk 的 run_id 同一 UUID）；缺省兜底 runID。
@@ -121,7 +126,15 @@ func (a *sseAdapter) OnToolStart(ctx context.Context, _ *hook.AgentInfo, in *sch
 
 // OnToolEnd 把工具执行结果映射为 ToolCallResult。out.CallId 与 OnToolStart 的
 // in.CallId 配对。失败时 content 取错误码（前端看得到工具失败）。
+//
+// 这一批 tool_call 没整体成功时（有调用挂起等人回答、或者硬失败）框架照样给已经有结局的调用触发 OnToolEnd，带
+// agent_v2.ToolBatchFailedExtraKey：那个结果不进历史，续跑时这个调用从工具账重放或重新执行，那一次才发——这里发的话
+// 同一个 toolCallId 在一个 thread 里会有两条结果（前端按 toolCallId 一个调用一条 tool 消息），硬失败后重跑成功的还会
+// 一条报错、一条成功。
 func (a *sseAdapter) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ToolOutput) (context.Context, error) {
+	if failed, _ := out.Extra[agent_v2.ToolBatchFailedExtraKey].(bool); failed {
+		return ctx, nil
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	content := ""

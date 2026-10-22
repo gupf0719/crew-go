@@ -244,6 +244,14 @@ type Checkpoint struct {
 	// 见 `FrontierMember` 类型 godoc。
 	CurrentFrontier []FrontierMember `json:"current_frontier,omitempty"`
 
+	// FrontierStarted 报 CurrentFrontier 这一超步是不是已经开始执行了（有成员跑过：成员中断 / 失败之后的
+	// 档为真；停在超步边界上的档——软取消、ctx 取消、断点、durability 中途写——为假）。续跑恢复出一个还没
+	// 开始执行的边界时照常判 before 断点（[WithInterruptBefore]，编译期 ∪ 运行期）。漏序列化不报错：读回
+	// 恒为 false 时，开始过的超步续跑时被再判一次，before 断点多停一次，那次续跑带的答案没被兑付、下次续跑
+	// 同一个问题以同一个 ID 再问；读回恒为 true 时，软取消停在边界上之后、续跑时新加的 before 断点在那个
+	// 边界上不停。
+	FrontierStarted bool `json:"frontier_started,omitempty"`
+
 	// NodeVisits 跟踪每个节点的成功完成次数（audit Round 3 Bug #1 修复）。
 	// 跨 Run/Resume 持久化让 InterruptID 编入 visit 维度——同节点 ReAct 多轮 /
 	// LoopAgent 重访 / PlanAgent 循环时不同访问的 ask_user 算不同 ID 不串台。

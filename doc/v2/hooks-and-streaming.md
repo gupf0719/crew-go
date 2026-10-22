@@ -169,7 +169,7 @@ func myNode(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelW
 
 > **框架自动注入 `graph_ns`** (`compose_v2/hooks.go::nodeEventSink.Send`): 节点 `Send` 的每个 Event, framework 在投递前**浅拷贝 `ev.Metadata` 并注入 `graph_ns`** (= 当前 graphNS, 业务自填 `graph_ns` 时不覆盖). 所以 OrchHooks.OnNodeEvent 收到的 Metadata 永远比业务 `Send` 时多一个 `graph_ns` key (类比 LangGraph `stream(subgraphs=True)` 的 namespace tuple, 前端可按 ns 分通道展示父子嵌套). 下文及各 doc 写 chunk/reset_stream 的 `Metadata: {run_id, agent, ...}` 都是**业务 Send 时的源 map**, 实际下游还带 `graph_ns`.
 
-**Send 是 fire-and-forget** (`compose_v2/hooks.go::nodeEventSink.Send`): nil sink / nil hooks 早返; 不在 Send 内做 per-hook panic 隔离 (audit² 删 `safeOnNodeEvent` wrapper 跟 eino 对齐). 业务 OrchHook impl panic 冒泡到 NodeFunc 的 `safeNodeRun` + `runNodeWithHooks` 整函数 defer recover 转 err — 该节点失败但不 crash 进程. 例外是 cp 事件（框架发的 cp.load / cp.save / cp.cleanup 与节点里经 `EmitCpEvent` 发的）：只作观测，钩子 panic 在发事件那一处兜住、只记带栈日志，不进错误、不让节点或 Run 失败.
+**Send 是 fire-and-forget** (`compose_v2/hooks.go::nodeEventSink.Send`): nil sink / nil hooks 早返; OnNodeEvent 只作观测: 业务 OrchHook impl 在这里 panic 时 Send 就地兜住、带栈记一条 ERROR, Send 照常返回、节点照常往下跑 (转成节点错误的话失败档被续跑或重试捡起, Send 之前做过的副作用重放, 实测). 框架自己发的 cp 事件 (cp.load / cp.save / cp.cleanup, 见 `deliverCpEvent`) 同样只作观测, 钩子 panic 不进错误.
 
 ## 6. Streaming chunk 实时投递协议
 
@@ -244,8 +244,10 @@ agent_v2.WithHooks(hooks)
 - 单 hook panic = 业务 bug **fail-fast 中断剩余 chain handler** (audit² 删 per-handler
   isolation — 跟 eino `internal/callbacks/inject.go` 同款哲学: 业务 hook panic 应业务
   自己修, framework 不 silent isolate)
-- panic 冒泡到 framework 4 层 outer defer recover 兜底转 **wrapped err 返业务**, 不让
-  Run goroutine crash 进程:
+- panic 冒泡到调用这条链的地方兜住, 不让 Run goroutine crash 进程。多数转 **wrapped err 返业务**;
+  跑在工作之后、只作观测的那几处 (节点体成功之后的 OnNodeEnd、图成功之后的 OnGraphEnd、任何时候的
+  OnNodeEvent、调用成功之后的 OnAgentEnd) 就地兜住、带栈记一条 ERROR, 结果照常提交 (逐道分工见
+  `compose_v2/panic_recovery.go`)。转成错误的那几层:
   1. `compose_v2.Run` 入口 outer recover (`graph_loop.go::Run`)
   2. `runNodeWithHooks` 整函数 defer recover (覆盖 fan-out 跨 goroutine)
   3. `agent_v2.BasicAgent.Run` + 其他 8 编排 Run/Resume 各 outer recover (`agent_v2/*.go`)
@@ -301,7 +303,7 @@ session.AddEvent(NewChunkEvent(...))  // 错: chunk 污染审计流
 
 `hook.NewChainHooks(...)` 提供 nil/typed-nil 过滤 + 多 hook 链式串联，**不提供 panic 隔离**——一个 hook panic 仍 fail-fast 中断链内剩余 hook（audit² 删了 per-hook recover）。
 
-hook panic **不会崩 Run goroutine**：framework 4 层 outer recover 兜底转 err（见 §8），与是否用 ChainHooks 无关。想 per-hook panic-safe 自己在 hook 内 `defer recover()`.
+hook panic **不会崩 Run goroutine**：框架兜住，多数转 err、成功之后的观测钩子只记 ERROR（见 §8），与是否用 ChainHooks 无关。想 per-hook panic-safe 自己在 hook 内 `defer recover()`.
 
 ### ❌ fan-out 场景 OrchHook 内写共享 slice 无锁
 

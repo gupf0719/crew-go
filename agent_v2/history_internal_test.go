@@ -46,14 +46,14 @@ func (s *recordingHistoryStore) Append(_ context.Context, key HistoryKey, msgs [
 	return s.err
 }
 
-func (s *recordingHistoryStore) Load(_ context.Context, _ HistoryKey) ([]*schema.Message, error) {
+func (s *recordingHistoryStore) Load(_ context.Context, _ HistoryKey, _ HistoryQuery) (HistoryPage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*schema.Message
 	for _, b := range s.batches {
 		out = append(out, b...)
 	}
-	return out, nil
+	return HistoryPage{Messages: out}, nil
 }
 
 func (s *recordingHistoryStore) flat() []string {
@@ -481,9 +481,9 @@ func TestHistoryPrior_ThreeViews(t *testing.T) {
 	st := NewInMemoryHistoryStore()
 	key := HistoryKey{Owner: "tenant-a", ConvID: "conv-1"}
 	seed := []*schema.Message{
-		stampHistoryAgent(schema.UserMessage("用户的问题"), "alice", "alice"),
-		stampHistoryAgent(schema.AssistantMessage("alice 说的话"), "alice", "alice"),
-		stampHistoryAgent(schema.AssistantMessage("bob 说的话"), "bob", "bob"),
+		stampHistoryAgent(schema.UserMessage("用户的问题"), "alice", "alice", ""),
+		stampHistoryAgent(schema.AssistantMessage("alice 说的话"), "alice", "alice", ""),
+		stampHistoryAgent(schema.AssistantMessage("bob 说的话"), "bob", "bob", ""),
 	}
 	if err := st.Append(context.Background(), key, seed); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -493,7 +493,7 @@ func TestHistoryPrior_ThreeViews(t *testing.T) {
 
 	// 以 bob 的视角看这条流。
 	t.Run("SelfOnly——别人的一概不看", func(t *testing.T) {
-		got, ok := historyPrior(ctx, hc, "bob", HandoffHistorySelfOnly)
+		got, ok := historyPrior(ctx, hc, "bob", HandoffHistorySelfOnly, 0)
 		if !ok {
 			t.Fatal("historyPrior 报 false")
 		}
@@ -503,7 +503,7 @@ func TestHistoryPrior_ThreeViews(t *testing.T) {
 	})
 
 	t.Run("Raw——全看，别人的标出处", func(t *testing.T) {
-		got, ok := historyPrior(ctx, hc, "bob", HandoffHistoryRaw)
+		got, ok := historyPrior(ctx, hc, "bob", HandoffHistoryRaw, 0)
 		if !ok {
 			t.Fatal("historyPrior 报 false")
 		}
@@ -529,7 +529,7 @@ func TestHistoryPrior_ThreeViews(t *testing.T) {
 	})
 
 	t.Run("Rewrite——别人的转述成旁白", func(t *testing.T) {
-		got, ok := historyPrior(ctx, hc, "bob", HandoffHistoryRewrite)
+		got, ok := historyPrior(ctx, hc, "bob", HandoffHistoryRewrite, 0)
 		if !ok {
 			t.Fatal("historyPrior 报 false")
 		}
@@ -570,8 +570,8 @@ func (suicidalHistoryStore) Append(context.Context, HistoryKey, []*schema.Messag
 	runtime.Goexit()
 	return nil
 }
-func (suicidalHistoryStore) Load(context.Context, HistoryKey) ([]*schema.Message, error) {
-	return nil, nil
+func (suicidalHistoryStore) Load(context.Context, HistoryKey, HistoryQuery) (HistoryPage, error) {
+	return HistoryPage{}, nil
 }
 
 // TestHistoryWriter_DeathIsAnnounced：worker 非正常退出时必须留下诊断信号。
@@ -628,9 +628,9 @@ type suppressedHistoryStore struct{ loaded bool }
 func (s *suppressedHistoryStore) Append(context.Context, HistoryKey, []*schema.Message) error {
 	return nil
 }
-func (s *suppressedHistoryStore) Load(context.Context, HistoryKey) ([]*schema.Message, error) {
+func (s *suppressedHistoryStore) Load(context.Context, HistoryKey, HistoryQuery) (HistoryPage, error) {
 	s.loaded = true
-	return nil, nil
+	return HistoryPage{}, nil
 }
 
 // TestLoadHistory_SuppressedFallsBackToEvents：摘除的分支读写两侧都不走历史层。
@@ -646,7 +646,7 @@ func TestLoadHistory_SuppressedFallsBackToEvents(t *testing.T) {
 	ctx := compose_v2.WithThreadIDCtx(context.Background(), "conv-1")
 	ctx = WithoutHistoryCtx(ctx)
 
-	msgs, ok := loadHistory(ctx, hc)
+	msgs, ok := historyPrior(ctx, hc, "a", HandoffHistorySelfOnly, 0)
 	if ok {
 		t.Error("摘除的分支报了「历史层接管了这次读」——调用方会因此不回落 events，" +
 			"而写侧已被摘掉、这个 store 永远是空的，等于让它什么上文都看不到")
@@ -827,8 +827,8 @@ func (s *blockedHistoryStore) Append(context.Context, HistoryKey, []*schema.Mess
 	<-s.release
 	return nil
 }
-func (s *blockedHistoryStore) Load(context.Context, HistoryKey) ([]*schema.Message, error) {
-	return nil, nil
+func (s *blockedHistoryStore) Load(context.Context, HistoryKey, HistoryQuery) (HistoryPage, error) {
+	return HistoryPage{}, nil
 }
 
 // TestHistoryWriter_WaitDrained_CtxCancelUnblocks：ctx 取消后，等待方必须放行。
@@ -897,8 +897,8 @@ func (s *gatedThenSuicidalStore) Append(context.Context, HistoryKey, []*schema.M
 	runtime.Goexit()
 	return nil
 }
-func (s *gatedThenSuicidalStore) Load(context.Context, HistoryKey) ([]*schema.Message, error) {
-	return nil, nil
+func (s *gatedThenSuicidalStore) Load(context.Context, HistoryKey, HistoryQuery) (HistoryPage, error) {
+	return HistoryPage{}, nil
 }
 
 // TestHistoryWriter_DeathDuringDrain_IsAnnounced：收摊排空的窗口里猝死，同样要有信号。
@@ -990,5 +990,21 @@ func TestHistoryWriter_NormalShutdown_NoDeathWarning(t *testing.T) {
 	}
 	if got := len(st.flat()); got != 5 {
 		t.Fatalf("落盘 %d 条, want 5", got)
+	}
+}
+
+// agent 的记录不带前文标注：它只由写前文那一处盖，带着的话这条记录会被读成调用方的前文——不按归属过滤、被挪到最前。
+func TestStampHistoryAgent_StripsCallerAnnotation(t *testing.T) {
+	src := schema.UserMessage("转手的前文")
+	src.Annotations = map[string]any{CallerHistoryAnnotation: true, "biz": "keep"}
+	got := stampHistoryAgent(src, "alice", "alice", "")
+	if isCallerHistory(got) {
+		t.Errorf("agent 的记录被标成了调用方的前文：%v", got.Annotations)
+	}
+	if got.Annotations["biz"] != "keep" {
+		t.Errorf("业务标注丢了：%v", got.Annotations)
+	}
+	if !isCallerHistory(src) {
+		t.Errorf("改到了原消息的标注")
 	}
 }

@@ -181,6 +181,8 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 归属位置：name（业务在自己的图里保证唯一）。**不用子 ns**——子 ns 带身份哈希、每次调用
 	// 都不同，拿它当归属会让同一个 sub-agent 每次归属不同、跨轮读不回自己的历史。
 	subCtx = WithHistorySlot(subCtx, name)
+	// 被当成工具 / 嵌套调用的子 agent 不取用户的运行中插话：用户是在跟调用它的那个 agent 说话（见 Inbox）
+	subCtx = withoutInbox(subCtx)
 	// ⚠️ **AgentAsTool 传的 name 是 `t.agent.Name()`**（见 agent_tool.go），所以那条路径上
 	// 子 agent 的位置就是它自己的名字。未命名的 agent 自动名每次构造都不同，位置跟着变、
 	// 跨 Run 读不回自己的历史——这是 warnUnnamedAgentInHistory 要提醒的两档后果里更重的

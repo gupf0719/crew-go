@@ -284,7 +284,7 @@ const asyncCpWriterBuffer = 8
 // **并发**：submit 与 closeAndJoin 都只在 Run goroutine 调（超步循环 + 出口 defer 时序串行，
 // 无 send-on-closed-channel race）；唯一跨 goroutine 是与 worker——cp 不可变（snapshot 已序列化
 // 解耦 cm）+ firstErr 加锁，-race clean。**注意**：emitCpEvent 开时 worker 从后台 goroutine 调
-// cfg.hooks.OnNodeEvent（cp.save event），业务 OnNodeEvent 实现需 thread-safe（async 特有）。
+// OnNodeEvent（cp.save event），业务 OnNodeEvent 实现需 thread-safe（async 特有）。
 type asyncCpWriter struct {
 	tasks    chan *Checkpoint
 	ctx      context.Context // Run 的 ctx（worker SaveNS + event 用）——join 在 Run 返回前，ctx 仍有效

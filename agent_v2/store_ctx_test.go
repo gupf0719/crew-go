@@ -483,10 +483,8 @@ func TestBasicAgent_WithStoreMemory_PreambleInjectsHistory(t *testing.T) {
 	ns := store.NS("users", "alice", "memories")
 	ctx := context.Background()
 
-	// 预 Put 历史 message——业务在前面 Run 后留下的（实际生产由 BasicAgent
-	// commitFinal 写，测试场景手动预填）
-	historyMsg := schema.AssistantMessage("user previously said: I like dark theme")
-	if err := myStore.Put(ctx, ns, "history_1", historyMsg); err != nil {
+	// 预 Put 一条记忆——形状同 BasicAgent commitFinal 写的（答复文本），测试场景手动预填
+	if err := myStore.Put(ctx, ns, "history_1", "user previously said: I like dark theme"); err != nil {
 		t.Fatalf("Put history: %v", err)
 	}
 
@@ -565,23 +563,15 @@ func TestBasicAgent_WithStoreMemory_PostambleSavesAssistant(t *testing.T) {
 		t.Fatal("PR 3.3 regression: store 应含 Run 后写入的 assistant message" +
 			"（commitFinal 内 store.Put 漏调？）")
 	}
-	// 验值是 *schema.Message 含正确 content
+	// 验值是这次的答复文本
 	var found bool
 	for _, it := range items {
 		// 框架存的是**答复文本**（2026-09-07 起），不是整条 *schema.Message——
 		// 存消息时六个后端读回来的类型不一致（in-memory 给 Message、持久后端给 map），
 		// 喂给 LLM 的东西也跟着分叉。
-		if txt, ok := it.Value.(string); ok {
-			if txt == "final response from agent" {
-				found = true
-			}
-			continue
-		}
-		if msg, ok := it.Value.(*schema.Message); ok && msg != nil {
-			if msg.Content == "final response from agent" {
-				found = true
-				break
-			}
+		if txt, ok := it.Value.(string); ok && txt == "final response from agent" {
+			found = true
+			break
 		}
 	}
 	if !found {

@@ -176,10 +176,10 @@ func TestApprovalDecisionOf_WithoutRecordFns(t *testing.T) {
 		}
 		return ApprovalDecisionAllow
 	}}
-	if d, on, _ := approvalDecisionOf(context.Background(), cfg, "t", nil); d != ApprovalDecisionAsk || !on {
+	if d, on, _ := approvalDecisionOf(context.Background(), cfg, "t", nil, false); d != ApprovalDecisionAsk || !on {
 		t.Fatalf("第一次应得 Ask，实际 %v / %v", d, on)
 	}
-	if d, _, _ := approvalDecisionOf(context.Background(), cfg, "t", nil); d != ApprovalDecisionAllow || calls != 2 {
+	if d, _, _ := approvalDecisionOf(context.Background(), cfg, "t", nil, false); d != ApprovalDecisionAllow || calls != 2 {
 		t.Fatalf("没注入记录回调时每次现算：第二次应得 Allow 且启发式被调 2 次，实际 %v / %d 次", d, calls)
 	}
 
@@ -195,7 +195,7 @@ func TestApprovalDecisionOf_WithoutRecordFns(t *testing.T) {
 		decide: func(d ApprovalDecision) { recorded = &d },
 	})
 	for i := 0; i < 3; i++ {
-		if d, _, _ := approvalDecisionOf(ctx, cfg, "t", nil); d != ApprovalDecisionAsk {
+		if d, _, _ := approvalDecisionOf(ctx, cfg, "t", nil, false); d != ApprovalDecisionAsk {
 			t.Fatalf("第 %d 次应重放第一次的 Ask，实际 %v", i+1, d)
 		}
 	}
@@ -203,19 +203,19 @@ func TestApprovalDecisionOf_WithoutRecordFns(t *testing.T) {
 		t.Fatalf("注入记录回调后启发式应只被调 1 次，实际 %d 次", calls)
 	}
 	// 记下的结论不看现在的配置：审批关掉了照样重放
-	if d, on, _ := approvalDecisionOf(ctx, &Config{}, "t", nil); d != ApprovalDecisionAsk || !on {
+	if d, on, _ := approvalDecisionOf(ctx, &Config{}, "t", nil, false); d != ApprovalDecisionAsk || !on {
 		t.Fatalf("已经形成的结论在审批关掉后应照样重放，实际 %v / %v", d, on)
 	}
 
 	// 没配启发式的 ApprovalAsk 也记：结论是 mode 默认
 	recorded = nil
-	if d, on, _ := approvalDecisionOf(ctx, &Config{ApprovalMode: ApprovalAsk}, "t", nil); d != ApprovalDecisionAsk || !on || recorded == nil || *recorded != ApprovalDecisionAsk {
+	if d, on, _ := approvalDecisionOf(ctx, &Config{ApprovalMode: ApprovalAsk}, "t", nil, false); d != ApprovalDecisionAsk || !on || recorded == nil || *recorded != ApprovalDecisionAsk {
 		t.Fatalf("ApprovalAsk 无启发式应得 Ask 并记下，实际 %v / %v / recorded=%v", d, on, recorded)
 	}
 
 	// 审批不生效、也没有记下的结论：不生效、不写记录
 	recorded = nil
-	if _, on, _ := approvalDecisionOf(ctx, &Config{}, "t", nil); on || recorded != nil {
+	if _, on, _ := approvalDecisionOf(ctx, &Config{}, "t", nil, false); on || recorded != nil {
 		t.Fatalf("审批不生效时应报不生效、且不写记录，实际 on=%v / recorded=%v", on, recorded)
 	}
 }

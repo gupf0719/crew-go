@@ -2,6 +2,7 @@ package compose_v2_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -240,8 +241,18 @@ func TestPanicRecovery_TwoPrefixesStayDistinct(t *testing.T) {
 		t.Errorf("图主体 panic 应带 `graph body panic recovered` 前缀，实际 %v", bodyErr)
 	}
 
-	// ② defer 链自身 panic（业务 OnGraphEnd hook）—— 归入口那道
-	hookErr := compose_v2.Run(context.Background(), mk(false), compose_v2.NewChannelManager(),
+	// ② defer 链自身 panic（图失败时的业务 OnGraphEnd hook；图成功时它的 panic 就地兜住、只记日志）—— 归入口那道
+	fb := compose_v2.NewBuilder().WithName("prefix_distinct_fail")
+	fb.AddNode("n", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		return nil, errors.New("业务错")
+	})
+	fb.AddEdge(compose_v2.StartNode, "n")
+	fb.AddEdge("n", compose_v2.EndNode)
+	failing, err := fb.Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hookErr := compose_v2.Run(context.Background(), failing, compose_v2.NewChannelManager(),
 		compose_v2.WithHooks(panicAtGraphEnd{}))
 	if hookErr == nil || !strings.Contains(hookErr.Error(), "compose_v2.Run panic recovered") {
 		t.Errorf("defer 链自身的 panic 应带 `compose_v2.Run panic recovered` 前缀，实际 %v", hookErr)

@@ -50,7 +50,7 @@ func TestHistory_NoTreeTraversalForConfig(t *testing.T) {
 		if _, err := rt.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("x")); err != nil {
 			t.Fatalf("环形结构不该让 Run 失败：%v", err)
 		}
-		if msgs, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "cyc"}); len(msgs) == 0 {
+		if msgs, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "cyc"}); len(msgs) == 0 {
 			t.Error("历史是空的——直接子里就有配置源，不该找不到")
 		}
 	})
@@ -82,7 +82,7 @@ func TestHistory_NoTreeTraversalForConfig(t *testing.T) {
 		if el := time.Since(t0); el > 2*time.Second {
 			t.Errorf("深度 %d 的共享 DAG 跑了 %v——有人把树遍历写回来了", depth, el)
 		}
-		if msgs, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "dag"}); len(msgs) == 0 {
+		if msgs, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "dag"}); len(msgs) == 0 {
 			t.Error("历史是空的——运行入口声明没生效")
 		}
 	})
@@ -153,7 +153,7 @@ func TestHistory_CtxDeclaredConfig_SingleWriter(t *testing.T) {
 		if _, err := ho.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("原话")); err != nil {
 			t.Fatalf("Run: %v", err)
 		}
-		msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: conv})
+		msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: conv})
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}

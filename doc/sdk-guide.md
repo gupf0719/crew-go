@@ -29,7 +29,7 @@
 |---|---|---|
 | **FuncTool**（函数包成工具）| `example/orchestration/basic_chat`（get_weather）| [quickstart §2](quickstart.md) |
 | **StreamableTool**（流式工具）| — | `tool` 包 godoc（`StreamableTool` 接口）|
-| **MCP 集成**（stdio / HTTP Server）| — | `mcp` 包 godoc（`Hub` / `StdioClient` / `StreamableHTTPClient`）|
+| **MCP 集成**（stdio / HTTP Server；按 server 降级、掉线后台重连）| `example/mcp/mcp_demo`（聚合；降级见 `mcp/degrade_test.go`）| [v2/mcp.md](v2/mcp.md)、`mcp` 包 godoc（`Hub` / `StdioClient` / `StreamableHTTPClient`）|
 | **Categorizer**（tool span 标 retrieval/embedding/...）| — | [observability.md §2.3](v2/observability.md) |
 
 ## 横切能力

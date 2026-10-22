@@ -5,7 +5,7 @@
 
 ## 项目画像
 
-crew-go 是一个 **Go 原生 LLM Agent 编排框架**——用最少抽象把"单个 ReAct Agent"和"多 Agent 协作"统一在 channel-based BSP 图执行引擎里。参考 LangGraph Pregel + eino adk + agentdock-spec 设计，不做跨语言 codegen，面向 Go 生态保持简洁。
+crew-go 是一个 **Go 原生 LLM Agent 编排框架**——用最少抽象把"单个 ReAct Agent"和"多 Agent 协作"统一在 channel-based BSP 图执行引擎里。参考 LangGraph Pregel + eino adk 设计（早期另参考公司 spec，现已不再依赖），不做跨语言 codegen，面向 Go 生态保持简洁。
 
 **核心设计选择**：
 - 所有编排（BasicAgent ReAct + Sequential / Parallel / Loop / Plan / Reflect / Routing / Handoff / GraphAgent）**编译为同一个 channel-based Graph** 执行
@@ -96,7 +96,7 @@ crew-go 是一个 **Go 原生 LLM Agent 编排框架**——用最少抽象把"�
 | **tool** | `tool/tool.go` | `Tool`, `Toolkit`, `FuncTool`, `StreamableTool` | go doc |
 | **hook** | `hook/hooks.go` | `Hooks` 接口（8 callback）+ `NoOpHooks` + `ChainHooks` | go doc |
 | **skill** | `skill/skillbox.go` | `SkillBox` 接口，`DefaultSkillBox` 关键词匹配实现；`SkillDescriptor.DisableModelInvocation/UserInvocable` 二维 frontmatter 控制（V2 P2.A）；`SkillDescriptor.Context/Agent/Model` fork 模式 + per-skill model 切换（V2 P2.C+B）| go doc |
-| **mcp** | `mcp/client.go` / `hub.go` | `Client` 接口（StdioClient/StreamableHTTPClient）+ `Hub` 聚合 | go doc |
+| **mcp** | `mcp/client.go` / `hub.go` / `server.go` | `Client` 接口（StdioClient/StreamableHTTPClient）+ `Hub` 聚合（工具集 Start 时定下不变、调用失败交给模型、按 server 降级与后台重连） | [v2/mcp.md](../v2/mcp.md) |
 | **compose_v2** | `compose_v2/graph.go` | `GraphBuilder`, `Graph`, `NodeFunc`, `Channel[T]`, `Run`, `Checkpointer` | [v2/migration-history.md §核心类型速查](../v2/migration-history.md) |
 | **agent_v2** | `agent_v2/agent.go` | `Agent`, `BasicAgent`, 8 编排 + `RunSession` + 4 层压缩 + `WithStore` / `WithStoreMemory`（第 4 层走 `store.Store` 接口）| 同上 |
 | **a2a** | `a2a/remote_agent.go` | `RemoteAgent`（`NewRemoteAgent`/`NewRemoteAgentTool` 消费远程 A2A agent；`WithHumanGate` HITL 骑 host cp；`WithHooks` 观测）+ `NewRemoteAgentFromService` 发现 glue | go doc（remote_tool.go 包 godoc 含业内对照）|

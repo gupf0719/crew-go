@@ -188,7 +188,7 @@ func testMessageFields(t *testing.T, factory HistoryStoreFactory) {
 	// thinking 类模型的 wire 协议要求把上一轮 assistant 的 reasoning 原样回传，
 	// 不回传第 2 轮直接 400——所以它跟 Content 一样是必须落库的字段。
 	toolCall.ReasoningContent = "先查库存再决定是否补货"
-	toolResult := schema.ToolResultMessage("call-1", "查库存", "库存只剩 3 件")
+	toolResult := schema.ToolResultMessage("call-1", "库存只剩 3 件")
 
 	mustAppend(t, hs, convA, toolCall, toolResult)
 
@@ -398,7 +398,7 @@ func testAppendNoMutation(t *testing.T, factory HistoryStoreFactory) {
 		Function: schema.FunctionCall{Name: "查库存", Arguments: `{"sku":"A"}`},
 	}})
 	call.Annotations = map[string]any{agent_v2.HistoryAgentAnnotation: "clerk"}
-	result := schema.ToolResultMessage("call-1", "查库存", "库存只剩 3 件")
+	result := schema.ToolResultMessage("call-1", "库存只剩 3 件")
 
 	batch := []*schema.Message{call, result}
 

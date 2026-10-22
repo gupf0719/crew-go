@@ -233,8 +233,8 @@ output tool 是 **end-tool 不是"强制"**：`tool_choice=ToolChoiceRequired`(�
 **这是"不照抄"的核心。** Pydantic/LangChain 在 model turn 内追加 retry 消息重发;但 crew-go 的 **ReAct 循环(tool 失败 → tool_result → model 重生成)天生就是这个回炉**,且 tool_call↔tool_result 配对由引擎自动保证。框架重核发现的 **H4**(必须保留失败轮 + retry 消息配对原 tool_call_id,否则悬空 422——Pydantic `openai.py:1547`/LangChain `factory.py:1238` 都手动保证)**在我们架构里引擎免费满足、根本不存在**。
 
 **路径 2(output tool 模式)——校验在 tools 节点的 `final_output` handler**：
-- 校验 Arguments：**通过** → 产 `tool_result(ok)` + 置 return-direct → 短路 postamble,从该 tool_call 的 Arguments 取结构化结果;**失败** → 产 `schema.ToolResultMessage(failedCallID, "", 错误)`(role=tool,配对 `final_output` 的 tool_call_id)、**不**置 return-direct → tools→model 边 → model 重生成(看到错误 tool_result 再调 final_output)。
-- **回炉 = 既有 ReAct 循环**:失败 assistant(含 tool_call)留 channel 历史 + tool_result 引擎自动配对 → **H4 零成本满足、零 422 风险**(`schema.ToolResultMessage(callID, _, content)` 是现成构造器,`schema/message.go:81`)。错误文案抄 LangChain 极简模板 `"Error: {error}\n Please fix your mistakes."`。
+- 校验 Arguments：**通过** → 产 `tool_result(ok)` + 置 return-direct → 短路 postamble,从该 tool_call 的 Arguments 取结构化结果;**失败** → 产 `schema.ToolResultMessage(failedCallID, 错误)`(role=tool,配对 `final_output` 的 tool_call_id)、**不**置 return-direct → tools→model 边 → model 重生成(看到错误 tool_result 再调 final_output)。
+- **回炉 = 既有 ReAct 循环**:失败 assistant(含 tool_call)留 channel 历史 + tool_result 引擎自动配对 → **H4 零成本满足、零 422 风险**(`schema.ToolResultMessage(callID, content)` 是现成构造器,`schema/message.go:85`)。错误文案抄 LangChain 极简模板 `"Error: {error}\n Please fix your mistakes."`。
 - **预算(A4 解,学 LangChain 隐式,不建独立 counter)**:重试预算 = **数对话历史里 `final_output` 的 error tool_result 条数**(已在 cp 的 messages 里 → 跨 Resume 累积不重置,**无可丢弃 counter → H1 跨超步可见性 + H2 toolsNode 失败丢 write 两个洞一起消失**)。≥ `WithMaxValidationRetries`(默认 1)→ 抛 `StructuredOutputError`。**H7 边界(显式定义)**:模型在 required 下调了**业务 tool 但没调 final_output** → 不算校验失败、不消耗预算(正常 ReAct 轮,只受 maxRounds);只有"调了 final_output 但 Arguments 不合格"才计入(数那条 error tool_result)。
 
 **路径 1(response_format / json_object 模式)——校验在 model 节点**(无 tool_call):

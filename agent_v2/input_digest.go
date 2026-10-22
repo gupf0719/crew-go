@@ -1,6 +1,7 @@
 package agent_v2
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding"
 	"encoding/hex"
@@ -161,6 +162,10 @@ func (w digestWriter) block(b *schema.ContentBlock) {
 		w.str("toolresult.type", string(b.Toolresult.Type))
 		w.str("toolresult.call_id", b.Toolresult.ToolCallId)
 		w.str("toolresult.content", b.Toolresult.Content)
+		// 失败标记只在置上时写入：加这个字段之前的存档（都是 false）算出的摘要不变
+		if b.Toolresult.IsError {
+			w.str("toolresult.is_error", "true")
+		}
 	}
 	w.present("data", b.Data != nil)
 	if b.Data != nil {
@@ -232,16 +237,77 @@ func digestValue(v any) (canonical []byte, bad []string) {
 	}
 	n := &digestNormalizer{bad: map[string]string{}}
 	tree := n.walk(reflect.ValueOf(v))
-	out, err := json.Marshal(tree)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := encodeTree(&buf, tree); err != nil {
 		// 走过一遍之后树里只剩往返过的值，不会走到这里；万一走到，整个值记成一个坏叶子
 		return []byte("null"), []string{"\x00root\x00unencodable"}
 	}
+	out := buf.Bytes()
 	for p, why := range n.bad {
 		bad = append(bad, p+"\x00"+why)
 	}
 	sort.Strings(bad)
 	return out, bad
+}
+
+// encodeTree 按 json.Marshal 的规则编码 walk 产出的树（map 键按字节序排、键与标量交给 json.Marshal，
+// 输出与 json.Marshal 逐字相同），但不受嵌套深度限制。
+//
+// 不能直接 json.Marshal 这棵树：Go 1.27 起它拒绝编码嵌套超过一万层的值（1.26 只在解码时拒），而超深
+// 嵌套正是走到逐叶子这条路的原因之一——用它编码，整份值就落进「根上一个坏叶子」，只在别的叶子上不同的
+// 两份输入算出同一个身份。树里只有 nil / bool / float64 / string / map[string]any / []any（walk 与
+// leaf 的产物），深度来自业务值本身的结构，递归在 Go 的可增长栈上走得下去（walk 本身也是递归）。
+func encodeTree(buf *bytes.Buffer, v any) error {
+	switch t := v.(type) {
+	case map[string]any:
+		if t == nil {
+			buf.WriteString("null")
+			return nil
+		}
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		buf.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			kb, err := json.Marshal(k)
+			if err != nil {
+				return err
+			}
+			buf.Write(kb)
+			buf.WriteByte(':')
+			if err := encodeTree(buf, t[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+	case []any:
+		if t == nil {
+			buf.WriteString("null")
+			return nil
+		}
+		buf.WriteByte('[')
+		for i, e := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := encodeTree(buf, e); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return err
+		}
+		buf.Write(b)
+	}
+	return nil
 }
 
 // jsonRoundTrip 按存档的方式往返一次 v；序列化出错、panic 或解不回来都返回 false。

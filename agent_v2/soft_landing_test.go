@@ -2,104 +2,312 @@ package agent_v2_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/hook"
 	"crew-go/model"
+	"crew-go/model/openai"
 	"crew-go/schema"
 	"crew-go/tool"
 )
 
-// greedyModel 每轮都调工具，永不主动收尾——除非工具被摘掉。
-type greedyModel struct {
-	mu       sync.Mutex
-	rounds   int
-	sawTools []bool // 每轮 LLM 是否拿到了工具
+func isNone(c *schema.ToolChoice) bool { return c != nil && *c == schema.ToolChoiceNone }
+
+// landingModel 记每轮绑到的工具名与收到的 tool_choice。手上有 noop 就一直调它、永不主动收尾；收到 tool_choice=none
+// 时以文本收尾——跟强制执行 none 的 provider 一样。hardCall 非空时不认收尾要求：收到 none（或手上没有 noop）也照调
+// 这个工具——不强制执行 none 的 provider、业务自己写的不认 tool_choice 的 ChatModel。
+type landingModel struct {
+	hardCall string
+
+	mu      sync.Mutex
+	bound   []string
+	rounds  [][]string
+	choices []*schema.ToolChoice
 }
 
-func (g *greedyModel) Generate(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.Message, error) {
-	g.mu.Lock()
-	g.rounds++
-	g.sawTools = append(g.sawTools, false) // 无 WithTools 调用 ⟹ 没拿到工具
-	n := g.rounds
-	g.mu.Unlock()
-	return schema.AssistantMessage("第 " + string(rune('0'+n)) + " 轮的收尾答复"), nil
+func (m *landingModel) Generate(_ context.Context, _ []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+	choice := model.Apply(opts...).ToolChoice
+	m.mu.Lock()
+	names := m.bound
+	m.bound = nil
+	m.rounds = append(m.rounds, names)
+	m.choices = append(m.choices, choice)
+	m.mu.Unlock()
+	switch {
+	case !isNone(choice) && slices.Contains(names, "noop"):
+		return callMsg(tcall("tc", "noop", "{}")), nil
+	case m.hardCall != "":
+		return callMsg(tcall("tc", m.hardCall, "{}")), nil
+	default:
+		return schema.AssistantMessage("收尾答复"), nil
+	}
 }
 
-func (g *greedyModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+func (m *landingModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
 	return nil, model.ErrStreamUnsupported
 }
 
-func (g *greedyModel) WithTools(tools []*schema.ToolInfo) (model.ChatModel, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return &greedyBound{parent: g}, nil
+func (m *landingModel) WithTools(tools []*schema.ToolInfo) (model.ChatModel, error) {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if t != nil {
+			names = append(names, t.Name)
+		}
+	}
+	m.mu.Lock()
+	m.bound = names
+	m.mu.Unlock()
+	return m, nil
 }
 
-// greedyBound 是「拿到了工具」的那个分支——它每轮都调工具。
-type greedyBound struct{ parent *greedyModel }
-
-func (b *greedyBound) Generate(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.Message, error) {
-	b.parent.mu.Lock()
-	b.parent.rounds++
-	b.parent.sawTools = append(b.parent.sawTools, true)
-	b.parent.mu.Unlock()
-	return schema.AssistantToolCallMessage([]schema.ToolCall{{
-		ID: "tc1", Function: schema.FunctionCall{Name: "noop", Arguments: "{}"},
-	}}), nil
+func (m *landingModel) seen() ([][]string, []*schema.ToolChoice) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.rounds), slices.Clone(m.choices)
 }
-func (b *greedyBound) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-	return nil, model.ErrStreamUnsupported
-}
-func (b *greedyBound) WithTools(t []*schema.ToolInfo) (model.ChatModel, error) { return b, nil }
 
-// TestSoftLanding_LastRoundHasNoTools 钉住**轮次耗尽时模型得到一次收尾机会**。
+// TestSoftLanding_LastRoundKeepsToolsSendsNone 钉住**轮次耗尽时模型得到一次收尾机会，且那一轮的工具集不变**。
 //
-// ⚠️ 承重的量有两个，缺一不可：
-//   - **最后一轮 LLM 有没有拿到工具**——软降落的机制就是摘掉它们。断言「有没有产出答案」
-//     不够：一个什么都没改的退化下模型照样可能碰巧不调工具。
+// 没配结构化输出时，最后一轮绑的工具跟前几轮同一套、tool_choice=none——不是摘掉工具：工具集是 Anthropic 给 thinking
+// 块签名时绑定的前缀之一，摘掉就让之前的 thinking 全部作废（见 withFinalRound）。
+//
+// ⚠️ 承重的量有三个，缺一不可：
+//   - **最后一轮的工具集与前一轮相同**——摘掉工具同样能逼模型收尾，只断言「有没有产出答案」分不出两种机制。
+//   - **只有最后一轮带 tool_choice=none**——它是这一轮唯一的收尾机制；提前带上等于砍掉预算。
 //   - **err 照返**——`maxRounds` 既可能是保险丝也可能是预算，框架不替产品决定。
 //     err 消失了才是「静默截断」，那比原来的问题更糟。
-func TestSoftLanding_LastRoundHasNoTools(t *testing.T) {
-	g := &greedyModel{}
-	kit := tool.NewToolkit()
-	kit.Register(tool.NewFuncTool("noop", "什么都不做",
-		map[string]any{"type": "object", "properties": map[string]any{}},
-		func(ctx context.Context, args map[string]any) (*tool.Result, error) {
-			return tool.Success("ok"), nil
-		}))
+func TestSoftLanding_LastRoundKeepsToolsSendsNone(t *testing.T) {
+	var n atomic.Int32
+	m := &landingModel{}
 	ag := agent_v2.NewBasicAgent(
-		agent_v2.WithName("sl"), agent_v2.WithModel(g),
-		agent_v2.WithToolkit(kit), agent_v2.WithMaxRounds(3))
+		agent_v2.WithName("sl"), agent_v2.WithModel(m),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(3))
 
 	events, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
 
-	g.mu.Lock()
-	saw := append([]bool(nil), g.sawTools...)
-	g.mu.Unlock()
-	if len(saw) == 0 {
-		t.Fatal("fixture 没搭对：模型一次都没被调")
+	rounds, choices := m.seen()
+	if len(rounds) != 4 {
+		t.Fatalf("fixture 没搭对：maxRounds=3 应调模型 4 次（3 个工具轮 + 软降落轮），实际 %d 次", len(rounds))
 	}
-	if saw[len(saw)-1] {
-		t.Errorf("最后一轮 LLM **拿到了工具** %v——软降落没生效，模型没有收尾机会", saw)
+	last := len(rounds) - 1
+	if len(rounds[last]) == 0 || !slices.Equal(rounds[last], rounds[last-1]) {
+		t.Errorf("最后一轮的工具集应跟前一轮相同（摘掉工具会让之前的 thinking 作废），实际前一轮 %v、最后一轮 %v",
+			rounds[last-1], rounds[last])
 	}
-	for i := 0; i < len(saw)-1; i++ {
-		if !saw[i] {
-			t.Errorf("第 %d 轮就摘了工具 %v——只有最后一轮该摘，提前摘等于砍掉预算", i, saw)
+	for i, c := range choices {
+		if isNone(c) != (i == last) {
+			t.Errorf("tool_choice=none 只该出现在最后一轮，实际每轮 %v", choiceNames(choices))
+			break
 		}
 	}
-
+	if got := n.Load(); got != 3 {
+		t.Errorf("noop 应执行 3 次（每个工具轮一次），实际 %d 次", got)
+	}
 	var mie *compose_v2.MaxIterationsError
 	if !errors.As(err, &mie) {
 		t.Errorf("err 该照返 MaxIterationsError——maxRounds 当保险丝用的调用方靠它；"+
 			"err 消失就是静默截断，比原问题更糟。实际 %v", err)
 	}
-	if fm := agent_v2.FinalMessage(events); fm == nil || !strings.Contains(fm.Content, "收尾") {
+	if fm := agent_v2.FinalMessage(events); fm == nil || fm.Content != "收尾答复" {
 		t.Errorf("events 里该有那条收尾答复——当预算用的调用方 errors.As 之后要能取到它。实际 %v", fm)
+	}
+}
+
+// TestSoftLanding_HardToolCallNotExecuted：最后一轮发了 tool_choice=none，模型照样调工具（provider 不强制执行 none、
+// 业务自己的 ChatModel 不认它）——框架不执行，以失败结果交回。执行的话就是在轮次预算之外多跑一批副作用，而结果再
+// 没有一轮可以消化。
+//
+// 承重的量是**工具实际执行了几次**：断言「有没有报错」抓不到，执行与否都以 MaxIterationsError 收尾。
+func TestSoftLanding_HardToolCallNotExecuted(t *testing.T) {
+	var n atomic.Int32
+	m := &landingModel{hardCall: "noop"}
+	h := &toolEndRecorder{}
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("sl"), agent_v2.WithModel(m), agent_v2.WithHooks(h),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(2))
+
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+
+	if rounds, _ := m.seen(); len(rounds) != 3 {
+		t.Fatalf("fixture 没搭对：maxRounds=2 应调模型 3 次，实际 %d 次", len(rounds))
+	}
+	if got := n.Load(); got != 2 {
+		t.Errorf("软降落轮模型硬调的 noop 不该执行：应只在前两个工具轮各执行 1 次，实际执行 %d 次", got)
+	}
+	if res := h.snapshot(); len(res) != 3 || res[2].Success || res[2].ErrorCode != "round_budget_exhausted" {
+		t.Errorf("软降落轮那次调用应以失败结果（round_budget_exhausted）交回，实际每次的结果 %+v", res)
+	}
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(err, &mie) {
+		t.Errorf("应以 MaxIterationsError 收尾，实际 %v", err)
+	}
+}
+
+// askOnToolsRound 在 tools 节点第 round 轮那一批的 OnToolStart 里问一次用户：首跑停在中断，续跑拿到答复放行。
+type askOnToolsRound struct {
+	hook.NoOpHooks
+	round int32
+}
+
+func (h askOnToolsRound) OnToolStart(ctx context.Context, info *hook.AgentInfo, _ *schema.ToolInput) (context.Context, error) {
+	if info == nil || info.Round != h.round {
+		return ctx, nil
+	}
+	if _, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "继续？"}); err != nil {
+		return ctx, err
+	}
+	return ctx, nil
+}
+
+// TestSoftLanding_HardToolCallNotExecutedAfterResume：软降落轮那一批停在中断（这里是 OnToolStart 里问用户），续跑直接
+// 进 tools 节点——产出这批调用的那次模型调用不再重跑，「是不是软降落轮」要从存档里读回来，硬调的工具照样不执行。这个
+// 标记只放在内存里的话，续跑时读到的是零值，那次调用就被执行了。
+func TestSoftLanding_HardToolCallNotExecutedAfterResume(t *testing.T) {
+	var n atomic.Int32
+	// maxRounds=1：第 1 轮调 noop（tools 节点 Round=1），第 2 轮是软降落轮、硬调 noop（tools 节点 Round=2）。
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("slr"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithHooks(askOnToolsRound{round: 2}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(1))
+	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
+	sess := agent_v2.NewRunSession()
+
+	_, err := ag.Run(ctx, sess, schema.UserMessage("干活"))
+	ie, ok := compose_v2.IsInterrupt(err)
+	if !ok {
+		t.Fatalf("fixture 没搭对：软降落轮那一批应停在 OnToolStart 的提问上，实际 %v", err)
+	}
+	if got := n.Load(); got != 1 {
+		t.Fatalf("fixture 没搭对：中断前 noop 应只在第 1 轮执行过 1 次，实际 %d 次", got)
+	}
+	_, rerr := ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess),
+		agent_v2.WithResumeUserInputs(map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("继续")}))
+	if got := n.Load(); got != 1 {
+		t.Errorf("续跑后软降落轮硬调的 noop 不该执行，实际 noop 一共执行了 %d 次", got)
+	}
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(rerr, &mie) {
+		t.Errorf("续跑应以 MaxIterationsError 收尾，实际 %v", rerr)
+	}
+}
+
+// TestSoftLanding_AtMostOnePerTaskAcrossResume：每个任务至多一个软降落轮。不认 none 的 provider 在软降落轮硬调工具、
+// 被执行闸拦下之后，续跑不再调模型。续跑时引擎的访问计数从 0 数、round 却接着数，不挡的话越过预算之后每一轮都被判成
+// 软降落轮，模型被白调到本次续跑的访问上限（maxRounds=3 时续跑白调 4 次、没有收尾答复，审计实测；改动前摘工具，同样的
+// 续跑调 1 次就收尾）。
+//
+// 承重的量是续跑时模型被调了几次。
+func TestSoftLanding_AtMostOnePerTaskAcrossResume(t *testing.T) {
+	var n atomic.Int32
+	m := &landingModel{hardCall: "noop"}
+	// maxRounds=3：第 3 个工具批（最后一个正常工具轮，tools 节点 Round=3）停在 OnToolStart 的提问上。
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("sl"), agent_v2.WithModel(m), agent_v2.WithHooks(askOnToolsRound{round: 3}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(3))
+	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
+	sess := agent_v2.NewRunSession()
+
+	_, err := ag.Run(ctx, sess, schema.UserMessage("干活"))
+	ie, ok := compose_v2.IsInterrupt(err)
+	if !ok {
+		t.Fatalf("fixture 没搭对：第 3 个工具批应停在 OnToolStart 的提问上，实际 %v", err)
+	}
+	before, _ := m.seen()
+	_, rerr := ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess),
+		agent_v2.WithResumeUserInputs(map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("继续")}))
+	after, choices := m.seen()
+	if got := len(after) - len(before); got != 1 {
+		t.Errorf("续跑应只调 1 次模型（那一次就是软降落轮），实际调了 %d 次，每次的 tool_choice %v",
+			got, choiceNames(choices[len(before):]))
+	}
+	if got := n.Load(); got != 3 {
+		t.Errorf("noop 应只在 3 个工具轮各执行 1 次，实际执行 %d 次", got)
+	}
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(rerr, &mie) {
+		t.Errorf("续跑应以 MaxIterationsError 收尾，实际 %v", rerr)
+	}
+}
+
+// TestSoftLanding_RaisedBudgetOnResumeLandsAgain：撞上「每个任务至多一个软降落轮」之后存档照留，续跑把预算调大，新预算的
+// 最后一轮另算、照常软降落。这里调到正好等于已用的轮数——下一次调用就是新预算的最后一轮（边界：闸判的是「越过」预算，
+// 不是「到达」）。
+func TestSoftLanding_RaisedBudgetOnResumeLandsAgain(t *testing.T) {
+	var n atomic.Int32
+	m := &landingModel{hardCall: "noop"}
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("sl"), agent_v2.WithModel(m), agent_v2.WithHooks(askOnToolsRound{round: 3}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(3))
+	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
+	sess := agent_v2.NewRunSession()
+
+	_, err := ag.Run(ctx, sess, schema.UserMessage("干活"))
+	ie, ok := compose_v2.IsInterrupt(err)
+	if !ok {
+		t.Fatalf("fixture 没搭对：第 3 个工具批应停在 OnToolStart 的提问上，实际 %v", err)
+	}
+	// 第一次续跑：软降落轮（round 3）硬调被拦，回到 model 节点时 round 4 越过预算 3 ⟹ 撞闸。
+	_, rerr := ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess),
+		agent_v2.WithResumeUserInputs(map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("继续")}))
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(rerr, &mie) {
+		t.Fatalf("fixture 没搭对：第一次续跑应撞上闸、报 MaxIterationsError，实际 %v", rerr)
+	}
+	before, _ := m.seen()
+	// 第二次续跑：预算调到 4（正好等于已用的轮数）⟹ 下一次调用是新预算的最后一轮。
+	_, rerr = ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess), agent_v2.WithResumeMaxRounds(4))
+	after, choices := m.seen()
+	if got := len(after) - len(before); got != 1 || !isNone(choices[len(choices)-1]) {
+		t.Errorf("调大预算的续跑应调 1 次模型、那一次是新预算的软降落轮（tool_choice=none），实际调了 %d 次，每次的 tool_choice %v（err %v）",
+			got, choiceNames(choices[len(before):]), rerr)
+	}
+}
+
+// TestSoftLanding_ShrunkBudgetOnResumeStillLands：续跑时把预算调得比已用的轮数还小（WithResumeMaxRounds），续跑的第一次
+// 模型调用就是软降落轮——照常给一次收尾机会。「每个任务至多一个软降落轮」那道闸只在软降落轮之后才拦；只看「round 越过
+// 预算」的话，这里一次都不调就报错，正文还说「软降落轮也已用过」（审计实测）。
+//
+// 承重的量是续跑时模型被调了几次、那一次的 tool_choice。
+func TestSoftLanding_ShrunkBudgetOnResumeStillLands(t *testing.T) {
+	var n atomic.Int32
+	m := &landingModel{}
+	// maxRounds=5：第 3 个工具批（tools 节点 Round=3）停在 OnToolStart 的提问上；续跑把预算缩到 1。
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("sl"), agent_v2.WithModel(m), agent_v2.WithHooks(askOnToolsRound{round: 3}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(5))
+	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
+	sess := agent_v2.NewRunSession()
+
+	_, err := ag.Run(ctx, sess, schema.UserMessage("干活"))
+	ie, ok := compose_v2.IsInterrupt(err)
+	if !ok {
+		t.Fatalf("fixture 没搭对：第 3 个工具批应停在 OnToolStart 的提问上，实际 %v", err)
+	}
+	before, _ := m.seen()
+	events, rerr := ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess), agent_v2.WithResumeMaxRounds(1),
+		agent_v2.WithResumeUserInputs(map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("继续")}))
+	after, choices := m.seen()
+	if got := len(after) - len(before); got != 1 || !isNone(choices[len(choices)-1]) {
+		t.Fatalf("缩了预算的续跑应调 1 次模型、那一次是软降落轮（tool_choice=none），实际调了 %d 次，每次的 tool_choice %v（err %v）",
+			got, choiceNames(choices[len(before):]), rerr)
+	}
+	if fm := agent_v2.FinalMessage(events); fm == nil || fm.Content != "收尾答复" {
+		t.Errorf("软降落轮的收尾答复应在 events 里，实际 %v", fm)
+	}
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(rerr, &mie) {
+		t.Errorf("跑到软降落轮，续跑仍应报 MaxIterationsError，实际 %v", rerr)
 	}
 }
 
@@ -195,21 +403,85 @@ func (r *toolNameRecorder) WithTools(tools []*schema.ToolInfo) (model.ChatModel,
 	return r, nil
 }
 
-// interruptOnceModel 第一轮抛中断，之后跟 greedyModel 一样一直调工具。
+// structuredLandingModel 手上有 noop 就一直调它；软降落轮只剩 final_output 时，同一条答复里硬调 noop（那一轮没绑它）、
+// 再经 final_output 交合法答复。
+type structuredLandingModel struct {
+	mu     sync.Mutex
+	bound  []string
+	rounds [][]string
+}
+
+func (m *structuredLandingModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	m.mu.Lock()
+	names := m.bound
+	m.bound = nil
+	m.rounds = append(m.rounds, names)
+	m.mu.Unlock()
+	if slices.Contains(names, "noop") {
+		return callMsg(tcall("tc", "noop", "{}")), nil
+	}
+	return callMsg(tcall("hard", "noop", "{}"), tcall("fo", agent_v2.FinalOutputToolName, `{"answer":"结构化"}`)), nil
+}
+
+func (m *structuredLandingModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	return nil, model.ErrStreamUnsupported
+}
+
+func (m *structuredLandingModel) WithTools(tools []*schema.ToolInfo) (model.ChatModel, error) {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if t != nil {
+			names = append(names, t.Name)
+		}
+	}
+	m.mu.Lock()
+	m.bound = names
+	m.mu.Unlock()
+	return m, nil
+}
+
+// TestSoftLanding_StructuredOutputFinalRoundDelivers：配了结构化输出时，软降落轮经 final_output 交的答复照常生效——
+// 那一轮模型硬调的工具不执行，放行的只有框架那件 final_output（结构化答复的唯一投递通道）。同一条答复里硬调的 noop
+// 不执行。
+//
+// 承重的量有两个：**最终答复是不是 final_output 校验过的 JSON**（放行坏了的话 final_output 也被拦下、没有答复）；
+// **noop 执行了几次**（闸坏了的话软降落轮那次 noop 照样执行）。
+func TestSoftLanding_StructuredOutputFinalRoundDelivers(t *testing.T) {
+	var n atomic.Int32
+	m := &structuredLandingModel{}
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("so"), agent_v2.WithModel(m),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(2),
+		agent_v2.WithOutputSchema("A", answerSchema()))
+
+	events, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+
+	m.mu.Lock()
+	rounds := slices.Clone(m.rounds)
+	m.mu.Unlock()
+	if len(rounds) != 3 || !slices.Equal(rounds[2], []string{agent_v2.FinalOutputToolName}) {
+		t.Fatalf("fixture 没搭对：应调模型 3 次、最后一轮只绑着 final_output，实际每轮的工具 %v", rounds)
+	}
+	if got := n.Load(); got != 2 {
+		t.Errorf("软降落轮硬调的 noop 不该执行：应只在前两个工具轮各执行 1 次，实际执行 %d 次", got)
+	}
+	if fm := agent_v2.FinalMessage(events); fm == nil || fm.Content != `{"answer":"结构化"}` {
+		t.Errorf("软降落轮经 final_output 交的答复应照常生效，实际 %+v（err %v）", fm, err)
+	}
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(err, &mie) {
+		t.Errorf("跑到了软降落轮，仍应报 MaxIterationsError，实际 %v", err)
+	}
+}
+
+// interruptOnceModel 第一次拿到工具时抛中断，之后跟 landingModel 一样：一直调 noop，收到 tool_choice=none 时以文本收尾。
 type interruptOnceModel struct {
-	mu       sync.Mutex
-	fired    bool
-	rounds   int
-	sawTools []bool
+	mu    sync.Mutex
+	fired bool
 }
 
 func (m *interruptOnceModel) Generate(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.Message, error) {
-	m.mu.Lock()
-	m.rounds++
-	m.sawTools = append(m.sawTools, false)
-	n := m.rounds
-	m.mu.Unlock()
-	return schema.AssistantMessage("第 " + string(rune('0'+n)) + " 轮的收尾答复"), nil
+	return schema.AssistantMessage("收尾答复"), nil
 }
 func (m *interruptOnceModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
 	return nil, model.ErrStreamUnsupported
@@ -224,12 +496,13 @@ func (b *interruptOnceBound) Generate(ctx context.Context, in []*schema.Message,
 	b.p.mu.Lock()
 	first := !b.p.fired
 	b.p.fired = true
-	b.p.rounds++
-	b.p.sawTools = append(b.p.sawTools, true)
 	b.p.mu.Unlock()
 	if first {
 		return nil, &compose_v2.InterruptError{Reason: "hitl", Query: &compose_v2.AskQuery{
 			InterruptID: "q-sl", Question: "继续吗"}}
+	}
+	if isNone(model.Apply(opts...).ToolChoice) {
+		return schema.AssistantMessage("收尾答复"), nil
 	}
 	return schema.AssistantToolCallMessage([]schema.ToolCall{{
 		ID: "tc", Function: schema.FunctionCall{Name: "noop", Arguments: "{}"},
@@ -285,103 +558,145 @@ func TestSoftLanding_ResumePathAlsoReportsExhaustion(t *testing.T) {
 	}
 }
 
-// TestSoftLanding_BusinessFinalOutputWithoutSchemaIsRemoved：没配 WithOutputSchema 时 final_output 这个名字
-// 是业务工具，软降落轮跟别的业务工具一起摘掉——只有框架那件（结构化输出的投递通道）才留。曾经按名字留：
+// TestSoftLanding_BusinessFinalOutputWithoutSchemaNotExempt：没配 WithOutputSchema 时 final_output 这个名字是业务工具，
+// 软降落轮跟别的业务工具同等对待——照旧绑着、tool_choice=none，模型硬调了也不执行。放行的只有框架那件（结构化输出的
+// 投递通道），按实例认、不按名字：按名字放行的话业务那件在最后一轮照样执行。摘工具那会儿踩过同一个坑：按名字留，
 // 业务那件在最后一轮照样绑着，模型调了它就跑满轮次、报原始的超限错误、拿不到收尾答复（审计实测）。
 //
-// 承重的量同上一条：最后一轮 LLM 手上还剩哪些工具。
-func TestSoftLanding_BusinessFinalOutputWithoutSchemaIsRemoved(t *testing.T) {
-	g := &toolNameRecorder{}
-	kit := tool.NewToolkit()
-	for _, name := range []string{"noop", agent_v2.FinalOutputToolName} {
-		kit.Register(tool.NewFuncTool(name, "业务工具",
-			map[string]any{"type": "object", "properties": map[string]any{}},
-			func(ctx context.Context, args map[string]any) (*tool.Result, error) {
-				return tool.Success("ok"), nil
-			}))
-	}
+// 承重的量是业务那件 final_output 在软降落轮执行了没有。
+func TestSoftLanding_BusinessFinalOutputWithoutSchemaNotExempt(t *testing.T) {
+	var noop, fo atomic.Int32
+	m := &landingModel{hardCall: agent_v2.FinalOutputToolName}
 	ag := agent_v2.NewBasicAgent(
-		agent_v2.WithName("sl"), agent_v2.WithModel(g),
-		agent_v2.WithToolkit(kit), agent_v2.WithMaxRounds(2))
+		agent_v2.WithName("sl"), agent_v2.WithModel(m),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &noop, "ok"), namedBizTool(agent_v2.FinalOutputToolName, &fo, "业务答复"))),
+		agent_v2.WithMaxRounds(2))
 	_, _ = ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
 
-	g.mu.Lock()
-	rounds := append([][]string(nil), g.perRound...)
-	g.mu.Unlock()
-	if len(rounds) < 2 {
-		t.Fatalf("fixture 没搭对：模型只被调了 %d 次，走不到软降落轮", len(rounds))
+	rounds, choices := m.seen()
+	if len(rounds) != 3 {
+		t.Fatalf("fixture 没搭对：maxRounds=2 应调模型 3 次，实际 %d 次", len(rounds))
 	}
-	if last := rounds[len(rounds)-1]; len(last) != 0 {
-		t.Errorf("没配结构化输出时软降落轮该摘掉全部业务工具、同名的 final_output 也不例外，那轮手上的工具=%v", last)
+	if !slices.Contains(rounds[2], agent_v2.FinalOutputToolName) || !isNone(choices[2]) {
+		t.Errorf("没配结构化输出时业务那件 final_output 跟别的业务工具一样照旧绑着、tool_choice=none，"+
+			"实际那轮工具=%v tool_choice=%v", rounds[2], choiceNames(choices[2:]))
+	}
+	if got := fo.Load(); got != 0 {
+		t.Errorf("软降落轮硬调的业务 final_output 不该执行（它不是框架那件），实际执行 %d 次", got)
 	}
 }
 
-// toolChoiceRecorder 记每轮 LLM 手上的工具名与收到的 tool_choice；拿到工具时一直调 noop。
-type toolChoiceRecorder struct {
-	mu      sync.Mutex
-	bound   []string
-	rounds  [][]string
-	choices []*schema.ToolChoice
-}
-
-func (r *toolChoiceRecorder) Generate(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.Message, error) {
-	r.mu.Lock()
-	names := append([]string(nil), r.bound...)
-	r.rounds = append(r.rounds, names)
-	r.choices = append(r.choices, model.Apply(opts...).ToolChoice)
-	r.bound = nil
-	r.mu.Unlock()
-	if len(names) > 0 {
-		return schema.AssistantToolCallMessage([]schema.ToolCall{{
-			ID: "tc", Function: schema.FunctionCall{Name: "noop", Arguments: "{}"},
-		}}), nil
-	}
-	return schema.AssistantMessage("收尾答复"), nil
-}
-func (r *toolChoiceRecorder) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-	return nil, model.ErrStreamUnsupported
-}
-func (r *toolChoiceRecorder) WithTools(tools []*schema.ToolInfo) (model.ChatModel, error) {
-	names := make([]string, 0, len(tools))
-	for _, t := range tools {
-		if t != nil {
-			names = append(names, t.Name)
-		}
-	}
-	r.mu.Lock()
-	r.bound = names
-	r.mu.Unlock()
-	return r, nil
-}
-
-// TestSoftLanding_ForcedToolChoiceDroppedWithTools：业务经 WithRunModelOptions 强制了 tool_choice=required——
-// 软降落轮把工具摘光时 tool_choice 一并摘掉（「必须调工具」配「没有工具」provider 返 400），前面有工具的轮次照常
-// 带着它。曾经照发，软降落那一轮的请求必然被拒。
-func TestSoftLanding_ForcedToolChoiceDroppedWithTools(t *testing.T) {
-	g := &toolChoiceRecorder{}
-	kit := tool.NewToolkit()
-	kit.Register(tool.NewFuncTool("noop", "什么都不做",
-		map[string]any{"type": "object", "properties": map[string]any{}},
-		func(ctx context.Context, args map[string]any) (*tool.Result, error) {
-			return tool.Success("ok"), nil
-		}))
+// TestSoftLanding_ForcedToolChoiceOverriddenToNone：业务经 WithRunModelOptions 强制了 tool_choice=required——软降落轮
+// 工具照旧绑着、tool_choice 换成 none（排在业务那份之后、盖掉它）。照发 required 的话模型被逼着调工具，而这一轮调的
+// 工具不执行，收尾机会白白浪费。之前的轮次照常：第 1 轮 required，调过工具之后复位（见 WithRunModelOptions）。
+func TestSoftLanding_ForcedToolChoiceOverriddenToNone(t *testing.T) {
+	var n atomic.Int32
+	m := &landingModel{}
 	ag := agent_v2.NewBasicAgent(
-		agent_v2.WithName("sl"), agent_v2.WithModel(g),
-		agent_v2.WithToolkit(kit), agent_v2.WithMaxRounds(2))
+		agent_v2.WithName("sl"), agent_v2.WithModel(m),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(2))
 	_, _ = ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"),
 		agent_v2.WithRunModelOptions(model.WithToolChoice(schema.ToolChoiceRequired)))
 
-	g.mu.Lock()
-	rounds, choices := g.rounds, g.choices
-	g.mu.Unlock()
-	if len(rounds) < 2 {
-		t.Fatalf("fixture 没搭对：模型只被调了 %d 次，走不到软降落轮", len(rounds))
+	rounds, choices := m.seen()
+	if len(rounds) != 3 {
+		t.Fatalf("fixture 没搭对：maxRounds=2 应调模型 3 次，实际 %d 次", len(rounds))
 	}
-	if c := choices[0]; c == nil || *c != schema.ToolChoiceRequired {
-		t.Errorf("有工具的轮次应照常带着业务强制的 required，实际 %v", c)
+	if !isRequired(choices[0]) || choices[1] != nil || !isNone(choices[2]) {
+		t.Errorf("每轮的 tool_choice 应为 [required nil none]（软降落轮盖掉业务强制的那份），实际 %v", choiceNames(choices))
 	}
-	last := len(rounds) - 1
-	if len(rounds[last]) != 0 || choices[last] != nil {
-		t.Errorf("软降落轮摘光了工具，业务强制的 tool_choice 也该摘掉：那轮工具=%v tool_choice=%v", rounds[last], choices[last])
+	if len(rounds[2]) == 0 || !slices.Equal(rounds[2], rounds[1]) {
+		t.Errorf("软降落轮的工具集应跟前一轮相同，实际前一轮 %v、最后一轮 %v", rounds[1], rounds[2])
+	}
+}
+
+// TestSoftLanding_NoToolsBoundSendsNoToolChoice：软降落轮 toolkit 这条路一件工具都没绑上（这里是 ToolFilter 在拿到工具
+// 结果之后把业务工具滤光）时不设 none——没有工具可关，而有的 provider 对没有 tools 的 tool_choice 直接拒绝。
+func TestSoftLanding_NoToolsBoundSendsNoToolChoice(t *testing.T) {
+	var n atomic.Int32
+	m := &landingModel{}
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("sl"), agent_v2.WithModel(m),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(1),
+		agent_v2.WithToolFilter(func(_ context.Context, in *schema.Message) []string {
+			if in != nil && in.Role == schema.RoleTool {
+				return []string{}
+			}
+			return nil
+		}))
+	_, _ = ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+
+	rounds, choices := m.seen()
+	if len(rounds) != 2 || len(rounds[0]) == 0 || len(rounds[1]) != 0 {
+		t.Fatalf("fixture 没搭对：应调模型 2 次、第 1 轮绑着 noop、第 2 轮（软降落轮）一件工具都没有，实际每轮的工具 %v", rounds)
+	}
+	if choices[0] != nil || choices[1] != nil {
+		t.Errorf("没绑上工具的软降落轮不该带 tool_choice，实际每轮 %v", choiceNames(choices))
+	}
+}
+
+// TestSoftLanding_OpenAIWireKeepsToolsSendsNone：端到端走真的 openai client——软降落轮发出去的请求里工具跟前一轮
+// 同一套、tool_choice 是 "none"，之前的轮次不带 tool_choice。mock 模型读的是框架交给它的选项；这条读的是线上的
+// 请求体（client 自己还要按「请求里有没有工具」决定发不发 tool_choice）。
+func TestSoftLanding_OpenAIWireKeepsToolsSendsNone(t *testing.T) {
+	type wireReq struct {
+		tools  []string
+		choice any
+	}
+	var mu sync.Mutex
+	var reqs []wireReq
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Tools []struct {
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
+			ToolChoice any `json:"tool_choice"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("解析请求体: %v", err)
+		}
+		names := make([]string, 0, len(body.Tools))
+		for _, tl := range body.Tools {
+			names = append(names, tl.Function.Name)
+		}
+		mu.Lock()
+		reqs = append(reqs, wireReq{tools: names, choice: body.ToolChoice})
+		mu.Unlock()
+		msg, finish := `{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function",`+
+			`"function":{"name":"noop","arguments":"{}"}}]}`, "tool_calls"
+		if body.ToolChoice == "none" {
+			msg, finish = `{"role":"assistant","content":"收尾答复"}`, "stop"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"x","object":"chat.completion","created":0,"model":"m","choices":[{"index":0,`+
+			`"message":`+msg+`,"finish_reason":"`+finish+`"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer srv.Close()
+
+	var n atomic.Int32
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("wire"),
+		agent_v2.WithModel(openai.NewClient("k", "m", openai.WithBaseURL(srv.URL), openai.WithStreamUnsupported())),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(2))
+	events, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+
+	mu.Lock()
+	got := slices.Clone(reqs)
+	mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("fixture 没搭对：maxRounds=2 应发 3 次请求，实际 %d 次（err %v）", len(got), err)
+	}
+	if len(got[2].tools) == 0 || !slices.Equal(got[2].tools, got[1].tools) || got[2].choice != "none" {
+		t.Errorf("软降落轮的请求应带着跟前一轮同一套工具、tool_choice 为 \"none\"，实际前一轮工具 %v、最后一轮工具 %v tool_choice %v",
+			got[1].tools, got[2].tools, got[2].choice)
+	}
+	if got[0].choice != nil || got[1].choice != nil {
+		t.Errorf("之前的轮次不该带 tool_choice，实际 %v / %v", got[0].choice, got[1].choice)
+	}
+	var mie *compose_v2.MaxIterationsError
+	if fm := agent_v2.FinalMessage(events); fm == nil || fm.Content != "收尾答复" || !errors.As(err, &mie) {
+		t.Errorf("应以收尾答复 + MaxIterationsError 结束，实际答复 %+v err %v", fm, err)
 	}
 }

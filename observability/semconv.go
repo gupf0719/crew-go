@@ -22,6 +22,7 @@ const (
 	AttrUsageInputTokens      = attribute.Key("gen_ai.usage.input_tokens")
 	AttrUsageOutputTokens     = attribute.Key("gen_ai.usage.output_tokens")
 	AttrUsageCacheReadTokens  = attribute.Key("gen_ai.usage.cache_read.input_tokens")
+	AttrUsageCacheWriteTokens = attribute.Key("gen_ai.usage.cache_write.input_tokens")
 	AttrUsageReasoningTokens  = attribute.Key("gen_ai.usage.reasoning.output_tokens")
 	AttrTokenModality         = attribute.Key("gen_ai.token.modality")
 	AttrConversationID        = attribute.Key("gen_ai.conversation.id")
@@ -95,6 +96,7 @@ const (
 	MetricUsageInputTokens       = "gen_ai.client.inference.usage.input_tokens"
 	MetricUsageOutputTokens      = "gen_ai.client.inference.usage.output_tokens"
 	MetricUsageCacheReadTokens   = "gen_ai.client.inference.usage.cache_read.input_tokens"
+	MetricUsageCacheWriteTokens  = "gen_ai.client.inference.usage.cache_write.input_tokens"
 	MetricUsageReasoningTokens   = "gen_ai.client.inference.usage.reasoning.output_tokens"
 	MetricInvokeAgentDuration    = "gen_ai.invoke_agent.duration"
 	MetricInvokeAgentInferences  = "gen_ai.invoke_agent.inference_calls"

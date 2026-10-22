@@ -357,8 +357,8 @@ func (c *Client) buildRequest(messages []*schema.Message, o *model.Options, stre
 		req.extraBody = eb
 	}
 
-	// tool_choice 只在这次请求真有工具时发：没有工具时 provider 拒绝（required 配零工具返 400）。框架自己就会
-	// 合法地产生没有工具的一轮（软降落），AllowedTools 也可能把工具滤光——省掉，不报错。「有没有工具」看的是
+	// tool_choice 只在这次请求真有工具时发：没有工具时 provider 拒绝（required 配零工具返 400）。AllowedTools
+	// 可能把工具滤光，调用方也可能带着 tool_choice 调一个没绑工具的 client——省掉，不报错。「有没有工具」看的是
 	// 最终请求体：ExtraBody 带了 tools 时合并会整个替换绑定的工具（provider 内置工具常走这条），以它为准。
 	if o.ToolChoice != nil && wireHasTools(req) {
 		req.ToolChoice = string(*o.ToolChoice)

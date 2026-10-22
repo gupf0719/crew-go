@@ -205,7 +205,7 @@ func dtBuilderHost(t *testing.T, name string, replies []*schema.Message, tk *too
 				return nil, err
 			}
 			s, _ := res.Output.(string)
-			out = append(out, schema.ToolResultMessage(tc.ID, tc.Function.Name, s))
+			out = append(out, schema.ToolResultMessage(tc.ID, s))
 		}
 		return out, nil
 	}

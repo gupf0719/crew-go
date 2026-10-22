@@ -98,7 +98,7 @@ func TestAgentHooks_FullReActLifecycle(t *testing.T) {
 		var out []*schema.Message
 		for _, tc := range tcs {
 			r, _ := mockTool(ctx, tc.Function.Name, tc.Function.Arguments)
-			out = append(out, schema.ToolResultMessage(tc.ID, tc.Function.Name, r))
+			out = append(out, schema.ToolResultMessage(tc.ID, r))
 		}
 		return out, nil
 	}
@@ -225,7 +225,7 @@ func TestAgentHooks_OnToolStartConsumesArgRewrite(t *testing.T) {
 	tools := func(_ context.Context, tcs []schema.ToolCall, _ []context.Context) ([]*schema.Message, error) {
 		capturedName = tcs[0].Function.Name
 		capturedArgs = tcs[0].Function.Arguments
-		return []*schema.Message{schema.ToolResultMessage(tcs[0].ID, tcs[0].Function.Name, "raw")}, nil
+		return []*schema.Message{schema.ToolResultMessage(tcs[0].ID, "raw")}, nil
 	}
 
 	g, _ := agent_v2.NewBasicAgentBuilder(model, tools).WithAgentHooks(&toolStartRewriteHooks{}).Compile()
@@ -279,7 +279,7 @@ func TestAgentHooks_OnToolEndConsumesResultRewrite(t *testing.T) {
 		return schema.AssistantMessage("done"), nil
 	}
 	tools := func(_ context.Context, tcs []schema.ToolCall, _ []context.Context) ([]*schema.Message, error) {
-		return []*schema.Message{schema.ToolResultMessage(tcs[0].ID, tcs[0].Function.Name, "secret_data")}, nil
+		return []*schema.Message{schema.ToolResultMessage(tcs[0].ID, "secret_data")}, nil
 	}
 
 	g, _ := agent_v2.NewBasicAgentBuilder(model, tools).WithAgentHooks(&toolEndRewriteHooks{}).Compile()

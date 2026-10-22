@@ -64,7 +64,7 @@ func TestAudit5_HIGH1_MicroCompact_EmitsBeforeAfter(t *testing.T) {
 		callID := fmt.Sprintf("tc_%d", i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read", Arguments: `{"path":"/x"}`}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", "long content..."))
+		msgs = append(msgs, schema.ToolResultMessage(callID, "long content..."))
 	}
 
 	sink := &capturingSink{}
@@ -97,7 +97,7 @@ func TestMicroCompact_NoSinkSafe(t *testing.T) {
 		callID := fmt.Sprintf("tc_%d", i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read"}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", "x"))
+		msgs = append(msgs, schema.ToolResultMessage(callID, "x"))
 	}
 	// 无 sink ctx(context.Background 未 push EventSink）
 	out := agent_v2.MicroCompactRun(context.Background(), msgs, cfg)

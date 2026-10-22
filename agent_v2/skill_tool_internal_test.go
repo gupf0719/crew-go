@@ -298,7 +298,7 @@ func (b *mockSkillBox) ActivateSkill(_ context.Context, name string) (*skill.Act
 	return nil, errors.New("not impl")
 }
 func (b *mockSkillBox) RunSkillAction(_ context.Context, _, _ string, _ map[string]any) (*skill.SkillExecutionResult, error) {
-	return nil, skill.ErrActionNotImplemented
+	return nil, skill.ErrSkillActionNotFound
 }
 
 var _ skill.SkillBox = (*mockSkillBox)(nil)

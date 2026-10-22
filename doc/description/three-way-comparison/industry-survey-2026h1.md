@@ -130,7 +130,7 @@
 
 **新增 token / request 属性（`docs/registry/attributes/gen-ai.md`）**：
 - `gen_ai.usage.reasoning.output_tokens`（output 子集）
-- `gen_ai.usage.cache_read.input_tokens` + `gen_ai.usage.cache_creation.input_tokens`（input 子集）
+- `gen_ai.usage.cache_read.input_tokens` + `gen_ai.usage.cache_creation.input_tokens`（input 子集；约定后来把后者改名为 `gen_ai.usage.cache_write.input_tokens`，observability 按新名记）
 - `gen_ai.request.reasoning.level`（low/medium/high，#258，2026-06-18 刚加）
 
 > **网络调查期被反驳、未采信的声明**（记录以防被重新断言）：① 「Google ADK 每次 tool call 自动 checkpoint」（3 票全反驳；ADK 实为 `DatabaseSessionService` 显式持久化 + webhook resume）；② 「Anthropic long-running agent = initializer+coding 双 agent 架构」（证据不足，1-2 反驳）。

@@ -75,7 +75,8 @@ func WithMaxValidationRetries(n int) OutputOption {
 // ⚠️ 软降落轮（轮次预算最后一轮，见 [withFinalRound]）工具集**只剩框架这件 `final_output`**。
 // 一度连它也摘，后果实测有三层：请求体畸形（`required` 配零工具、
 // provider 返 400）、熔断信号被 `StructuredOutputError` 替换（业务再也检测不到预算耗尽）、
-// 诊断正文写「已尝试 0 次」把排查方向指反。
+// 诊断正文写「已尝试 0 次」把排查方向指反。对 Claude 原生接入（`model/anthropic`）这一轮是一次
+// 工具集变化，之前的 thinking 块全部作废（没配结构化输出时那一轮工具集照旧、不受影响）。
 func WithOutputSchema(name string, s map[string]any, opts ...OutputOption) Option {
 	return func(c *Config) {
 		oc := &outputConfig{name: name, maxRetries: 1}

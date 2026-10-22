@@ -80,7 +80,7 @@ func TestMicroCompact_TriggersOnExcessToolResults(t *testing.T) {
 		callID := fmt.Sprintf("tc_%d", i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "Read", Arguments: `{"path":"/tmp/x"}`}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "Read", "原始大文件内容 row 1\nrow 2\n... 很长"))
+		msgs = append(msgs, schema.ToolResultMessage(callID, "原始大文件内容 row 1\nrow 2\n... 很长"))
 	}
 
 	out := agent_v2.MicroCompactRun(context.Background(), msgs, cfg)
@@ -108,7 +108,7 @@ func TestMicroCompact_NoTriggerForNonWhitelist(t *testing.T) {
 		callID := fmt.Sprintf("tc_%d", i)
 		tc := schema.ToolCall{ID: callID, Function: schema.FunctionCall{Name: "ask_user", Arguments: `{}`}}
 		msgs = append(msgs, schema.AssistantToolCallMessage([]schema.ToolCall{tc}))
-		msgs = append(msgs, schema.ToolResultMessage(callID, "ask_user", "user said yes"))
+		msgs = append(msgs, schema.ToolResultMessage(callID, "user said yes"))
 	}
 	out := agent_v2.MicroCompactRun(context.Background(), msgs, cfg)
 	for _, m := range out {
@@ -352,7 +352,7 @@ func TestAutoCompact_PreservesSkillBodyGroups(t *testing.T) {
 	//  组 2: user("翻译") → asst(tool_call=activate_skill) → tool_result(SKILL_BODY) ← skill body
 	//  组 3: user("最新提问") → ... ← tail 保留
 	bigPayload := strings.Repeat("超长内容 abcdefgh ", 50)
-	skillBodyResult := schema.ToolResultMessage("tc_skill", "activate_skill", "SKILL_BODY_翻译指南")
+	skillBodyResult := schema.ToolResultMessage("tc_skill", "SKILL_BODY_翻译指南")
 	skillBodyResult.Annotations = map[string]any{
 		agent_v2.SkillBodyAnnotation: true,
 	}
@@ -364,7 +364,7 @@ func TestAutoCompact_PreservesSkillBodyGroups(t *testing.T) {
 			ID: "tc_weather", Type: "function",
 			Function: schema.FunctionCall{Name: "get_weather", Arguments: `{}`},
 		}}),
-		schema.ToolResultMessage("tc_weather", "get_weather", "晴 12°C"),
+		schema.ToolResultMessage("tc_weather", "晴 12°C"),
 		// 组 2: skill 激活（应整组保留）
 		schema.UserMessage("翻译这段：" + bigPayload),
 		schema.AssistantToolCallMessage([]schema.ToolCall{{
@@ -449,7 +449,7 @@ func TestAutoCompact_SkillBodyAnnotationNoMarker_NotPreserved(t *testing.T) {
 		schema.AssistantToolCallMessage([]schema.ToolCall{{
 			ID: "tc1", Function: schema.FunctionCall{Name: "activate_skill"},
 		}}),
-		schema.ToolResultMessage("tc1", "activate_skill", "FAKE_BODY_未打 marker"),
+		schema.ToolResultMessage("tc1", "FAKE_BODY_未打 marker"),
 		schema.UserMessage("Q2: " + bigPayload),
 		schema.AssistantMessage("answer 2"),
 		schema.UserMessage("最新提问"),
@@ -489,7 +489,7 @@ func TestReactiveCompact_ProtectsSkillBodyGroups(t *testing.T) {
 		Enabled:     true,
 		MaxAttempts: 3,
 	}
-	skillBodyResult := schema.ToolResultMessage("tc_skill", "activate_skill", "SKILL_BODY_保鲜")
+	skillBodyResult := schema.ToolResultMessage("tc_skill", "SKILL_BODY_保鲜")
 	skillBodyResult.Annotations = map[string]any{
 		agent_v2.SkillBodyAnnotation: true,
 	}

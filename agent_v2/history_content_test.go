@@ -67,7 +67,7 @@ func TestHistory_Truncation_CutPointKeepsRealResult(t *testing.T) {
 			ID: "T1", Type: "function",
 			Function: schema.FunctionCall{Name: "查库存", Arguments: `{"sku":"A"}`},
 		}})),
-		stampOwner("clerk", schema.ToolResultMessage("T1", "查库存", "REAL_RESULT_MARK")),
+		stampOwner("clerk", schema.ToolResultMessage("T1", "REAL_RESULT_MARK")),
 		stampOwner("clerk", schema.AssistantMessage("跟进答复")),
 		stampOwner("clerk", schema.UserMessage("较新问题")),
 		stampOwner("clerk", schema.AssistantMessage("较新答复")),
@@ -123,9 +123,9 @@ func TestHistory_MarkerHoist_KeepsSiblingRealResult(t *testing.T) {
 		{ID: "biz-2", Type: "function",
 			Function: schema.FunctionCall{Name: "查库存", Arguments: `{"sku":"A"}`}},
 	})
-	body := schema.ToolResultMessage("skill-1", "activate_skill", "SKILL_BODY_MARK")
+	body := schema.ToolResultMessage("skill-1", "SKILL_BODY_MARK")
 	body.Annotations = map[string]any{agent_v2.SkillBodyAnnotation: true}
-	biz := schema.ToolResultMessage("biz-2", "查库存", "BIZ_RESULT_MARK")
+	biz := schema.ToolResultMessage("biz-2", "BIZ_RESULT_MARK")
 
 	var seed []*schema.Message
 	// 算式（改动请一并核）：3 对更旧(6) + marker 轮(3) + 2 对较新(4) = 13 条；

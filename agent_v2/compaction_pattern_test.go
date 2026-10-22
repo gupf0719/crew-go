@@ -77,7 +77,7 @@ func TestCompactionPattern_AutoCompactWrap(t *testing.T) {
 		var out []*schema.Message
 		for _, tc := range tcs {
 			r, _ := mockTool(ctx, tc.Function.Name, tc.Function.Arguments)
-			out = append(out, schema.ToolResultMessage(tc.ID, tc.Function.Name, r))
+			out = append(out, schema.ToolResultMessage(tc.ID, r))
 		}
 		return out, nil
 	}

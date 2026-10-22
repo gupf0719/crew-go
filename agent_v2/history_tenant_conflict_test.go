@@ -61,7 +61,7 @@ func TestHistory_SameTenantConfig_Runs(t *testing.T) {
 	if _, err := ho.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("原话")); err != nil {
 		t.Fatalf("同一套配置不该报错：%v", err)
 	}
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-same"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-same"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestHistory_SuppressedMemberIsConfigSource(t *testing.T) {
 	if _, err := rt.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("原话")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-suppressed"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-suppressed"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}

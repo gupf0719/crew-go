@@ -112,9 +112,8 @@ func bindJSON(b []byte) string { return string(b) }
 //	    id, _ := num.Int64()  // 大整数保留精度
 //	}
 //
-// **跨 backend 行为对齐**: InMemoryStore 不序列化 (value 原 interface{} 保留),
-// sql backend JSON 序列化用 UseNumber 让业务感知"数字需 type-assert 转换".
-// 业务用 ParseStoreValue helper 跨 backend 一致 (Phase 2 加).
+// **跨 backend 行为对齐**: 读回的形状就是 store.NormalizeValue 的结果——每个后端存的、读回的都是值的 JSON
+// 形状（数字是 json.Number），业务按同一套类型分支读。
 func unmarshalValue(data []byte) (any, error) {
 	if len(data) == 0 {
 		return nil, nil

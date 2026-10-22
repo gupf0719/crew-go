@@ -67,10 +67,12 @@ type AgentOutput struct {
 //
 // **业务无 ctx mutation 需求时**: 直接 `return ctx, nil` 一行即可.
 //
-// ─── panic 语义 (audit² 改) ───
-// 业务 hook panic = 业务 bug, framework **不做 per-hook isolation**. agent_v2.Run /
-// compose_v2.Run 入口已有 outer defer recover 兜底转 err 返业务. 业务想 panic-safe
-// 自己在 hook 内 defer recover().
+// ─── panic 语义 ───
+// 业务 hook panic = 业务 bug, framework **不做 per-hook isolation**（链里排在它后面的不再调）。框架在调用
+// 钩子的地方兜住、不让 goroutine 崩：OnAgentStart / OnModel* / OnTool*（跑在工作之前或改得了结果）与
+// OnError（调用已经失败）panic 转成这次调用的错误；OnAgentEnd 跑在工作之后、只作观测，调用成功时它 panic 就地兜住、
+// 带栈记一条 ERROR，结果不变（转成错误的话调用方的重试 / 续跑会把已经做完的再做一次），调用失败时并到
+// 那个错误上。业务想 panic-safe 自己在 hook 内 defer recover().
 //
 // ─── 消费语义（按字段分档，不是"所有 hook 一律可改"）───
 // hook 入参是指针，但**改了是否生效取决于框架是否在该 hook 后消费该字段**。
@@ -81,12 +83,20 @@ type AgentOutput struct {
 //	OnAgentStart                input.Messages —— 整个调用的原始输入（可做 PII filter / 模板包装；Resume 时为空）
 //	OnModelStart                input.Preamble —— agent 前言（system prompt / 提示词模板渲染结果，含 skill 正文）；改内容 / 删条 / 整段换都生效
 //	OnModelStart                input.Messages —— 被上下文压缩处置的那条对话流（⚠️ 它不是最终发出去的那份：四层压缩在本 hook 之后才跑）
-//	OnModelEnd                  output.Message —— 替换本轮输出（写 channel + 前端 reset_stream event）
+//	OnModelEnd                  output.Message —— 替换本轮输出（写 channel + 前端 reset_stream event）。改写在这一轮第一次
+//	                            处理完时定下：之后这次执行在提交之前作废（节点成功之后的钩子 Goexit、提交出错）、续跑时这一轮
+//	                            不再处理——不调模型，OnModelStart / OnModelEnd 都不触发，交出定下的答复与它当时做出的决定。
+//	                            模型答复之后、这一轮处理完之前停下的看原因：因为等人或被叫停（中断、取消）停下的，续跑沿用这次
+//	                            调用的答复（不再调模型、不再带用量）把这一轮处理完——这一遍 ModelInput.Extra / ModelOutput.Extra
+//	                            标着 ModelResponseReusedKey，按调用计数、计时、计费的钩子据此不再记一次（它们要排在会停下的
+//	                            钩子前面）；钩子报错拒掉、把答复置空、panic 的，续跑重新调模型换一份，OnModelEnd 里对新答复的
+//	                            提问换新 ID（见 agent_v2 的 modelCallRecord）
 //	OnModelEndStream            返回值 reader  —— 以返回的 reader 替换流（不得为 nil：返回 nil 或报错都让这次模型调用失败）
 //	OnToolStart                 input.Name / input.ArgumentsJSON —— 改写后喂业务工具调用（参数注入 / 工具重定向）；
 //	                            只在这一批调用第一次交给工具执行时生效：之后的执行（中断续跑、失败续跑）沿用那一次定下的内容，
-//	                            这两个字段的改写对它们不生效——用户答过的、审批批过的、已经执行过的都是那一份（钩子照样每次
-//	                            触发，返回的 ctx、错误与中断照常算数）；定下的内容随中断档、失败档落盘，每次执行都要新取的值
+//	                            这两个字段的改写对它们不生效——用户答过的、审批批过的、已经执行过的都是那一份（钩子照样
+//	                            触发，返回的 ctx、错误与中断照常算数；这一批处理完之后才作废的调用续跑时不再处理、钩子不触发，
+//	                            见 OnToolEnd）；定下的内容随中断档、失败档落盘，每次执行都要新取的值
 //	                            走钩子返回的 ctx 或工具中间件（见 OnToolStart 方法注释）
 //	OnToolEnd                   output.Result.* —— 改写后写回 LLM 历史（结果脱敏 / 注入缓存），in-place 改 content 保留 message Annotations marker；
 //	                            Success 同样算数：改成失败，这次调用做出的转交 / 路由决定作废、框架那件控制工具（transfer_to_agent /
@@ -94,10 +104,19 @@ type AgentOutput struct {
 //	                            一律是失败格式（没给 Error 就拿 Output 当说明；给了 Error 时内容按 (ErrorCode, Error) 渲染，只改 Output
 //	                            不生效——要改失败结果给模型看的说明，比如脱敏，就改 Error）——⚠️ 整体替换
 //	                            `out.Result = &schema.ToolCallResult{...}` 时记得填 Success：零值 false 按失败处理。final_output
-//	                            被改成失败等同校验失败：回炉、计入 WithOutputSchema 的重试预算
+//	                            被改成失败等同校验失败：回炉、计入 WithOutputSchema 的重试预算。改写在这一批第一次处理完时
+//	                            定下：之后这次执行在提交之前作废（节点成功之后的钩子 Goexit、提交出错）、续跑时这几个调用不再
+//	                            处理——工具不执行，OnToolStart / OnToolEnd 都不触发，交出定下的结果与钩子当时做出的决定；这一批
+//	                            没处理完就停下的（同批别的调用中断、钩子报错），续跑时照常交给钩子处理
 //	                            （BasicAgent 的 tools 节点在全部 OnToolEnd 之后才定这批调用的决定。同一批里决定被排在前面的调用盖掉的那几个，
 //	                            结果在那时被换成一条「没有生效」的失败结果——钩子看到的不是最终进历史的那一条。钩子自己在 OnToolEnd 里做出的
 //	                            转交 / 路由决定排在这批调用的决定之后：它是看过结果才做的，后者为准）
+//	                            一批 tool_call 没整体成功（有调用中断或硬失败，或者某个调用的 OnToolEnd 钩子报错 / 中断）时，已经有
+//	                            结局、还没收尾的调用照样各自触发，Extra 带 agent_v2.ToolBatchFailedExtraKey：跑完的交它的结果，硬失败的
+//	                            交框架合成的失败结果（agent_v2.ToolCallErrCode）；挂起的（等人回答、等审批）不触发。这时这批的结果整体
+//	                            作废，改写不被消费，钩子的错误与 panic 只记日志——给用户展示结果的钩子据这个标记跳过、等续跑那一次。续跑时
+//	                            跑完的那几个从工具账重放、再触发一次，Extra 带 agent_v2.ToolReplayedExtraKey（改写照常消费）——按调用计数
+//	                            或计时的钩子据它跳过
 //
 // [只读] 观测 / 统计 / 配对锚点字段，框架不消费，改写不生效（by design；tool/model 层是 observation-only）：
 //
@@ -167,6 +186,7 @@ type Hooks interface {
 	// ⚠️ 改写只在这一批调用第一次交给工具执行时生效（BasicAgent 的 tools 节点，见 Hooks 接口 godoc 的
 	// 消费表）：续跑时钩子照样触发、收到的是模型给的原样，但对 `Name` / `ArgumentsJSON` 的改写不生效，执行的
 	// 是第一次那份——用户答过的问题、批过的审批、交给嵌套 agent（`agent_v2.AgentAsTool`）的输入续跑都不变。
+	// 这一批处理完（OnToolEnd 之后）才作废的调用续跑时不再处理，本钩子也不触发。
 	//
 	// 改写就是改这次调用的内容：定下的那份随中断档、失败档落盘（续跑要按它执行）。所以**每次执行都要新取的值**
 	// （凭证、短时令牌、trace_id）别写进参数——写进去会落盘，短时令牌还会被冻在第一次的值上。放钩子返回的 ctx
@@ -226,8 +246,7 @@ func (NoOpHooks) OnError(ctx context.Context, _ *AgentInfo, _ *schema.CommError)
 // **ctx propagation**: hook 链式串 — 每个 hook 返的 ctx 给下一个 hook 用. 业务在
 // hook A 内 push 的 span 让 hook B 拿到.
 //
-// **panic 语义** (audit² 改): 一个 hook panic = 业务 bug, fail-fast
-// 中断剩余 hook. framework Run 入口 outer defer recover 兜底转 err 返业务.
+// **panic 语义**: 一个 hook panic = 业务 bug, 中断剩余 hook; 处置见包文档「panic 语义」.
 //
 // **错误路径的 ctx 语义**（8 个方法一致）: 链上任一 hook 返 err 时,
 // ChainHooks 回**入参** ctx 而不是那个 hook 返的 newCtx. 理由: hook 返 err 即

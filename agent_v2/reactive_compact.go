@@ -227,12 +227,22 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 
 	// 按原顺序保留未被 drop 的组
 	keptGroups := make([][]*schema.Message, 0, len(groups)-dropCount)
+	var dropped []*schema.Message
 	for i, g := range groups {
 		if !toDrop[i] {
 			keptGroups = append(keptGroups, g)
+		} else {
+			dropped = append(dropped, g...)
 		}
 	}
 	kept := dropOrphanToolResults(compose_v2.FlattenGroups(keptGroups))
+	// 丢掉的组里带取回 id 的（转存过的工具结果、摘要附的索引）：全文还在 store 里，补一条索引放在最前，模型照样取得回
+	// （见 tool_spill.go 的 spillIndex）。它是 user 角色，保留部分以 assistant 开头时也就不用再补占位了。
+	if idx := spillIndex(dropped); len(idx) > 0 {
+		indexMsg := schema.UserMessage(spillIndexText(idx))
+		indexMsg.Annotations = map[string]any{spillIndexAnnotation: strings.Join(idx, "\n")}
+		kept = append([]*schema.Message{indexMsg}, kept...)
+	}
 
 	// 删后首条是 assistant → 前补 user marker（API 要求 user-first，system 之后）
 	if len(kept) > 0 && kept[0].Role == schema.RoleAssistant {

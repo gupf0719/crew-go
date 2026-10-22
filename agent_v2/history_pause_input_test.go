@@ -51,7 +51,7 @@ func (a *pausingExternalAgent) Description() string { return "会中断的外部
 
 func pauseHist(t *testing.T, hs agent_v2.HistoryStore, ctx context.Context, conv string) []*schema.Message {
 	t.Helper()
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: conv})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: conv})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}

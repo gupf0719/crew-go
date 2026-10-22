@@ -45,13 +45,13 @@ WHEN instr(CAST(NEW.payload AS TEXT), 'boom') > 0 BEGIN SELECT RAISE(ABORT, 'boo
 	if err == nil {
 		t.Fatal("第二条插入失败时 Append 应报错")
 	}
-	if got, err := h.Load(ctx, key); err != nil || len(got) != 0 {
+	if got, err := agent_v2.LoadAllHistory(ctx, h, key); err != nil || len(got) != 0 {
 		t.Fatalf("失败的一批应整批不留，Load 返 %d 条（err=%v）", len(got), err)
 	}
 	if err := h.Append(ctx, key, []*schema.Message{schema.UserMessage("q2")}); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := h.Load(ctx, key); len(got) != 1 || got[0].Content != "q2" {
+	if got, _ := agent_v2.LoadAllHistory(ctx, h, key); len(got) != 1 || got[0].Content != "q2" {
 		t.Fatalf("回滚之后的写入应正常：%v", got)
 	}
 }
@@ -66,7 +66,7 @@ func TestSQLiteHistoryStore_UnencodableMessageWritesNothing(t *testing.T) {
 	if err := h.Append(ctx, key, []*schema.Message{schema.UserMessage("q"), bad}); err == nil {
 		t.Fatal("消息编码失败时 Append 应报错")
 	}
-	if got, _ := h.Load(ctx, key); len(got) != 0 {
+	if got, _ := agent_v2.LoadAllHistory(ctx, h, key); len(got) != 0 {
 		t.Fatalf("编码失败的一批应整批不写，Load 返 %d 条", len(got))
 	}
 }
@@ -96,7 +96,7 @@ func TestSQLiteHistoryStore_SurvivesReopen(t *testing.T) {
 			Toolcall: &schema.ToolcallContentBlock{Id: "toolu_1", Name: "clock__now", Arguments: `{"tz":"Asia/Shanghai","n":12345678901234567890}`},
 		}},
 		Annotations: map[string]any{
-			"anthropic.assistant_content": `{"v":1,"content":[{"type":"thinking","thinking":"嗯","signature":"EqQBCkgIBh+/="}]}`,
+			"anthropic.assistant_content":   `{"v":1,"content":[{"type":"thinking","thinking":"嗯","signature":"EqQBCkgIBh+/="}]}`,
 			agent_v2.HistoryAgentAnnotation: "deskbot",
 		},
 	}
@@ -111,7 +111,7 @@ func TestSQLiteHistoryStore_SurvivesReopen(t *testing.T) {
 	}
 	h2, db2 := open()
 	defer db2.Close()
-	got, err := h2.Load(ctx, key)
+	got, err := agent_v2.LoadAllHistory(ctx, h2, key)
 	if err != nil {
 		t.Fatal(err)
 	}

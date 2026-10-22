@@ -125,10 +125,10 @@ func TestAudit5_HIGH1_AutoCompact_EmitsBeforeGenerateAfter(t *testing.T) {
 		Enabled: true,
 		Model:   &alwaysSummaryModel{},
 		// threshold = ModelContextWindow - SummaryMaxTokens - SummaryBufferTokens
-		// 设 200/10/50 → threshold=140 token. estimateToken = (len+3)/4. 测试 msgs
-		// 总长 > 560 chars 触发.
-		ModelContextWindow:  200,
-		SummaryMaxTokens:    10,
+		// 设 220/30/50 → threshold=140 token. estimateToken = (len+3)/4. 测试 msgs
+		// 总长 > 560 chars 触发. SummaryMaxTokens 也是摘要的上限，要放得下桩模型的摘要。
+		ModelContextWindow:  220,
+		SummaryMaxTokens:    30,
 		SummaryBufferTokens: 50,
 		// 微缩配置（阈值仅 ~140 token）——按同比例关掉可压缩区尺寸守卫，
 		// 否则 early 达不到 MinCompactableTokens 默认 5000 会被静默跳过。

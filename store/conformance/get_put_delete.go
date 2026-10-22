@@ -2,8 +2,10 @@ package conformance
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -196,8 +198,8 @@ func testGetPutDelete(t *testing.T, factory StoreFactory) {
 		//    JSON 不转换, crew-go 协议要求保留
 		// 2) numeric (int/float) — 用 fmt.Sprintf 比较, 业务 JSON unmarshal 可能
 		//    全转 float64 (json.Number 默认行为), 字符串化对比兼容
-		// 3) 复合 (slice/map) — **当前只验非 nil**(没验 len>0, 更没验内容), 业务 backend
-		//    类型转换自由。收严这一格见 `doc/code/todo.md`「conformance 有三格假绿」
+		// 3) 复合 (slice/map/struct) — 读回的是值的 JSON 形状（store.NormalizeValue）：按 store.ValueEqual
+		//    比内容，struct 读回是以 JSON 字段名为键的 map[string]any
 		t.Run("Primitive_StrictEqual", func(t *testing.T) {
 			primitives := map[string]any{
 				"string":       "hello",
@@ -253,22 +255,133 @@ func testGetPutDelete(t *testing.T, factory StoreFactory) {
 				}
 			}
 		})
-		t.Run("Composite_NonNil", func(t *testing.T) {
+		t.Run("Composite_ContentEqual", func(t *testing.T) {
 			composites := map[string]any{
-				"slice": []any{1, 2, 3},
-				"map":   map[string]any{"a": 1, "b": "two"},
+				"slice":      []any{1, 2, 3},
+				"map":        map[string]any{"a": 1, "b": "two"},
+				"map_string": map[string]string{"z": "1"},
+				"nested":     map[string]any{"tags": []string{"x", "y"}, "meta": map[string]any{"n": 2.5}},
 			}
 			for key, val := range composites {
 				if err := st.Put(ctx, ns, key, val); err != nil {
 					t.Errorf("Put(%s): %v", key, err)
 					continue
 				}
-				item, _ := st.Get(ctx, ns, key)
-				if item == nil {
-					t.Errorf("Get(%s): nil", key)
+				item, err := st.Get(ctx, ns, key)
+				if err != nil || item == nil {
+					t.Errorf("Get(%s): item=%v err=%v", key, item, err)
+					continue
+				}
+				want, err := store.NormalizeValue(val)
+				if err != nil {
+					t.Fatalf("NormalizeValue(%s): %v", key, err)
+				}
+				if !store.ValueEqual(item.Value, want) {
+					t.Errorf("Get(%s): 读回 %v（%T），want 它的 JSON 形状 %v", key, item.Value, item.Value, want)
 				}
 			}
 		})
+		// struct 是业务写长期记忆最自然的形状之一：读回是以 JSON 字段名为键的 map[string]any（跟持久后端读回的一样）。
+		// 曾经内存后端原样存 struct、读回还是 struct，同一份数据换后端读回的类型就变了。
+		t.Run("Struct_ReadBackAsJSONObject", func(t *testing.T) {
+			type memo struct {
+				Kind  string   `json:"kind"`
+				Count int      `json:"count"`
+				Tags  []string `json:"tags"`
+				Note  string   // 没有 tag：键是字段名
+			}
+			if err := st.Put(ctx, ns, "struct", memo{Kind: "pref", Count: 3, Tags: []string{"a"}, Note: "n"}); err != nil {
+				t.Fatalf("Put struct: %v", err)
+			}
+			item, err := st.Get(ctx, ns, "struct")
+			if err != nil || item == nil {
+				t.Fatalf("Get struct: item=%v err=%v", item, err)
+			}
+			obj, ok := item.Value.(map[string]any)
+			if !ok {
+				t.Fatalf("struct 读回应是 map[string]any，got %T", item.Value)
+			}
+			want := map[string]any{"kind": "pref", "count": 3, "tags": []any{"a"}, "Note": "n"}
+			if !store.ValueEqual(obj, want) {
+				t.Errorf("struct 读回 %v，want %v", obj, want)
+			}
+		})
+
+		// 不合法的 UTF-8 字节编成 JSON 时换成 U+FFFD，读回的是换过的那份——持久后端经 JSON 落盘本来如此，内存后端
+		// 归一化时同样换（合法字符串的往返是恒等、可以跳过编解码，不合法的不行）。
+		t.Run("String_InvalidUTF8_ReadBackReplaced", func(t *testing.T) {
+			if err := st.Put(ctx, ns, "bad_utf8", "a\xffb"); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+			item, err := st.Get(ctx, ns, "bad_utf8")
+			if err != nil || item == nil {
+				t.Fatalf("Get: item=%v err=%v", item, err)
+			}
+			if got, want := item.Value, "a�b"; got != want {
+				t.Errorf("读回 %q，want %q", got, want)
+			}
+		})
+	})
+
+	// 只有无类型的 nil 等于 Delete。编成 JSON 是 null 的值（typed nil 指针 / slice / map、json.RawMessage("null")、
+	// MarshalJSON 返回 null 的）是一个值：存一条 Value 为 nil 的记录，覆盖写时旧值换成它、记录还在。曾经示例后端先
+	// 归一化再判 nil，把它们当成 Delete、覆盖写时删掉了旧记录（别的后端存一条 nil 记录），两边 `err == nil`。
+	t.Run("Put_Value_Encoding_To_JSON_Null_Stores_Null", func(t *testing.T) {
+		st := factory()
+		ctx := context.Background()
+		ns := store.NS("jsonnull")
+		for _, c := range []struct {
+			key string
+			val any
+		}{
+			{"typed_nil_ptr", (*int)(nil)},
+			{"nil_slice", []int(nil)},
+			{"nil_map", map[string]int(nil)},
+			{"raw_null", json.RawMessage("null")},
+			{"marshaler_null", nullMarshaler{}},
+		} {
+			if err := st.Put(ctx, ns, c.key, "v1"); err != nil {
+				t.Fatalf("Put %s v1: %v", c.key, err)
+			}
+			if err := st.Put(ctx, ns, c.key, c.val); err != nil {
+				t.Fatalf("Put %s: %v", c.key, err)
+			}
+			item, err := st.Get(ctx, ns, c.key)
+			if err != nil {
+				t.Fatalf("Get %s: %v", c.key, err)
+			}
+			if item == nil {
+				t.Errorf("%s：覆盖写之后记录没了（被当成了 Delete）", c.key)
+				continue
+			}
+			if item.Value != nil {
+				t.Errorf("%s：Value 应读回 nil（JSON null），got %#v", c.key, item.Value)
+			}
+		}
+	})
+
+	// 「Value 必须能编成 JSON」在每个后端上都强制：编不成的值 Put 报错、什么都不存。曾经内存后端照收，换到持久后端
+	// 才失败。
+	t.Run("Put_Unencodable_Value_Rejected", func(t *testing.T) {
+		st := factory()
+		ctx := context.Background()
+		ns := store.NS("unencodable")
+		for _, c := range []struct {
+			key string
+			val any
+		}{
+			{"nan", math.NaN()},
+			{"inf", math.Inf(1)},
+			{"chan", map[string]any{"c": make(chan int)}},
+			{"func", map[string]any{"f": func() {}}},
+		} {
+			if err := st.Put(ctx, ns, c.key, c.val); err == nil {
+				t.Errorf("Put(%s) 应报错（编不成 JSON），got nil", c.key)
+			}
+			if item, err := st.Get(ctx, ns, c.key); err != nil || item != nil {
+				t.Errorf("Put(%s) 失败后不该存下任何东西，Get 得 item=%v err=%v", c.key, item, err)
+			}
+		}
 	})
 
 	// key 的**可移植长度**是 255 字符——见 [store.Store] 的 Put godoc：最窄的后端是 sql 的
@@ -370,3 +483,8 @@ func testGetPutDelete(t *testing.T, factory StoreFactory) {
 		}
 	})
 }
+
+// nullMarshaler 的 JSON 编码是 null。
+type nullMarshaler struct{}
+
+func (nullMarshaler) MarshalJSON() ([]byte, error) { return []byte("null"), nil }

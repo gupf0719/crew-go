@@ -65,8 +65,8 @@ type MicroCompactConfig struct {
 	// 看到预览 + 业务可通过 store.Get(NS, key) 取回做审计/重读.
 	//
 	// ⚠️ **取回来的不一定是「全文」**: 开了 `Config.ToolResultMaxBytes` 时闸在工具结果进
-	// 消息流之前就截过了, 存进去的就是截断版; 且持久后端(redis/sql)读回来是
-	// `map[string]any`(JSON 往返), 不是 `*schema.Message`, 要自己 decode.
+	// 消息流之前就截过了, 存进去的就是截断版; 且读回来是 `map[string]any`(store 按值的 JSON 形状存,
+	// 每个后端都一样, 见 store.Item), 不是 `*schema.Message`, 要自己 decode.
 	//
 	// 默认 false——纯替占位符行为不变 (跟 OffloadEnabled=false / store 未注入 时
 	// 等价). true 时:
@@ -106,8 +106,8 @@ const MicroCompactOffloadedAnnotation = "microcompact_offloaded"
 
 // MicroCompactOffloadKeyAnnotation 存 offload store key. 业务读 placeholder message
 // Annotations 拿 key 后 store.Get(ctx, cfg.OffloadNamespace(ctx), key) 取回。
-// ⚠️ **取回的不一定是 `*schema.Message`**：持久后端（redis / sql）存 JSON、读回是
-// `map[string]any`，类型断言会失败；只有 in-memory 原样持有 Go 值。
+// ⚠️ **取回的不是 `*schema.Message`**：store 按值的 JSON 形状存（见 store.Item），每个后端读回都是
+// `map[string]any`，要消息就 json.Marshal 再 json.Unmarshal 进 schema.Message。
 // **用 cfg.OffloadNamespace(ctx) 拿 NS，别用裸 cfg.OffloadNS**——默认档 cfg.OffloadNS 空 ≠
 // 实际写入 NS（按 sid 派生），裸用恢复会 miss（audit MED fix）。
 const MicroCompactOffloadKeyAnnotation = "microcompact_offload_key"
@@ -134,8 +134,8 @@ var defaultMicroCompactOffloadNS = store.NS("_micro_offload")
 //
 // **业务取回 offloaded 内容**：占位符 message 的 Annotations[MicroCompactOffloadKeyAnnotation]
 // 存 key；业务注册的 read_offloaded_result 类工具内 store.Get(ctx, cfg.OffloadNamespace(ctx), key)
-// 取回——NS 走本方法，不必知道内部 "_micro_offload"/sid 派生规则。⚠️ 持久后端读回是
-// `map[string]any` 不是 `*schema.Message`（存的是 JSON），业务别写死类型断言。
+// 取回——NS 走本方法，不必知道内部 "_micro_offload"/sid 派生规则。⚠️ 读回是 `map[string]any`
+// 不是 `*schema.Message`（store 按值的 JSON 形状存），业务别写死类型断言。
 func (cfg *MicroCompactConfig) OffloadNamespace(ctx context.Context) store.Namespace {
 	if len(cfg.OffloadNS) > 0 {
 		return cfg.OffloadNS
@@ -166,6 +166,48 @@ const defaultMicroCompactPlaceholder = "[Old tool result content cleared by micr
 //
 // 用 annotation 而非字符串匹配，保证用户自定义 Placeholder 时识别仍可靠。
 const MicroCompactClearedAnnotation = "microcompact_cleared"
+
+// microCompactToClear 是 MicroCompact 要清的那些 tool_result（按 tool_use_id）：白名单里的每个工具保留最近 KeepRecent
+// 个，更早的都清。纯计算——MicroCompactRun 按它清，AutoCompact 的文件重注入按它跳过（在原始消息流上挑文件时，
+// MicroCompact 会清掉的那些不再注回原文，见 autocompact.go）。同一个判据只有这一份。
+func microCompactToClear(messages []*schema.Message, cfg *MicroCompactConfig) map[string]bool {
+	keep := cfg.KeepRecent
+	if keep <= 0 {
+		keep = 5
+	}
+	whitelist := make(map[string]bool, len(cfg.CompactableTools))
+	for _, t := range cfg.CompactableTools {
+		whitelist[t] = true
+	}
+	if len(whitelist) == 0 {
+		for _, t := range DefaultCompactableTools {
+			whitelist[t] = true
+		}
+	}
+	// 收集白名单 tool 的 tool_use_id（按 tool name 分组，按出现顺序）
+	perToolIDs := map[string][]string{}
+	for _, m := range messages {
+		if m == nil {
+			continue
+		}
+		for _, tc := range schema.GetToolCalls(m) {
+			if whitelist[tc.Function.Name] {
+				perToolIDs[tc.Function.Name] = append(perToolIDs[tc.Function.Name], tc.ID)
+			}
+		}
+	}
+	// 每个 tool 保留最近 keep 个
+	toClear := map[string]bool{}
+	for _, ids := range perToolIDs {
+		if len(ids) <= keep {
+			continue
+		}
+		for _, id := range ids[:len(ids)-keep] {
+			toClear[id] = true
+		}
+	}
+	return toClear
+}
 
 // MicroCompactRun 应用 MicroCompact 算法到 messages。
 //
@@ -207,47 +249,12 @@ func MicroCompactRun(ctx context.Context, messages []*schema.Message, cfg *Micro
 			},
 		})
 	}
-	keep := cfg.KeepRecent
-	if keep <= 0 {
-		keep = 5
-	}
 	placeholder := cfg.Placeholder
 	if placeholder == "" {
 		placeholder = defaultMicroCompactPlaceholder
 	}
-	whitelist := make(map[string]bool, len(cfg.CompactableTools))
-	for _, t := range cfg.CompactableTools {
-		whitelist[t] = true
-	}
-	if len(whitelist) == 0 {
-		for _, t := range DefaultCompactableTools {
-			whitelist[t] = true
-		}
-	}
-
-	// Step 1：收集白名单 tool 的 tool_use_id（按 tool name 分组，按出现顺序）
-	perToolIDs := map[string][]string{}
-	for _, m := range messages {
-		if m == nil {
-			continue
-		}
-		for _, tc := range schema.GetToolCalls(m) {
-			if whitelist[tc.Function.Name] {
-				perToolIDs[tc.Function.Name] = append(perToolIDs[tc.Function.Name], tc.ID)
-			}
-		}
-	}
-
-	// Step 2：计算"待清除"的 tool_use_id 集合（每个 tool 保留最近 keep 个）
-	toClear := map[string]bool{}
-	for _, ids := range perToolIDs {
-		if len(ids) <= keep {
-			continue
-		}
-		for _, id := range ids[:len(ids)-keep] {
-			toClear[id] = true
-		}
-	}
+	// Step 1 + 2：挑出要清的 tool_use_id（见 microCompactToClear）
+	toClear := microCompactToClear(messages, cfg)
 	if len(toClear) == 0 {
 		// 无 tool_result 待清——后处理 noop, After event Dropped=0/Kept=len(messages)
 		if hasSink {
@@ -318,6 +325,13 @@ func MicroCompactRun(ctx context.Context, messages []*schema.Message, cfg *Micro
 						out[i] = m
 						continue
 					}
+				}
+				// 产生时就转存过的（见 tool_spill.go）：全文已在 store 里，这里只清掉预览、留下取回方式——
+				// 再卸载一次就是把「转存说明」本身又存一份，模型得先读回说明才能拿到 id（两跳）。
+				if sid, ok := m.Annotations[ToolResultSpillAnnotation].(string); ok && sid != "" {
+					out[i] = cloneToolResultWithPlaceholder(m, fmt.Sprintf(
+						"[较早的工具输出已清理；全文仍可用 %s 取回，id=%q]", ReadToolOutputToolName, sid))
+					continue
 				}
 				// HIGH-2: offload path — store.Put 成功后用 offloaded 占位符 +
 				// MicroCompactOffloadedAnnotation marker; 失败 / 未启用 / 无 store →

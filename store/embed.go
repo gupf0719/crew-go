@@ -32,7 +32,8 @@ func (f EmbedderFunc) Embed(ctx context.Context, texts []string) ([][]float32, e
 // # Fields：哪些内容参与检索
 //
 // 决定从一条记录里抽出什么文本去 embed。空 = 用默认抽取（见 [TextExtractor]）。
-// 给了字段名时，只对 `map[string]any` 形态的 value 生效，按名取值再转文本；一条记录
+// 给了字段名时，对编成 JSON 是对象的 value 生效（struct、`map[string]string` 按它读回的
+// `map[string]any` 取，跟 filter 按字段命中是同一个形状），按名取值再转文本；一条记录
 // 可以产出多段文本，各自 embed，检索时取**分最高的那段**代表这条记录。
 //
 // # 代价
@@ -43,9 +44,10 @@ func (f EmbedderFunc) Embed(ctx context.Context, texts []string) ([][]float32, e
 type IndexConfig struct {
 	// Embedder 是必填的——[IndexConfig] 的全部意义就是它。
 	Embedder Embedder
-	// Fields 限定 map 形态 value 的哪些字段参与检索。空 = 默认抽取。
+	// Fields 限定对象形态 value 的哪些字段参与检索。空 = 默认抽取。
 	Fields []string
-	// Extractor 覆盖默认的「从 value 抽文本」规则。空 = [DefaultTextExtractor]。
+	// Extractor 覆盖默认的「从 value 抽文本」规则。空 = [DefaultTextExtractor]。它收到的是业务 Put 进来的原值
+	// （按业务自己的类型写）；默认抽取器收到的是 value 的 JSON 形状（实现了 GetContent 的值除外，那一档要原值）。
 	Extractor TextExtractor
 }
 

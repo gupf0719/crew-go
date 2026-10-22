@@ -25,6 +25,8 @@ type serverConfig struct {
 	hasSnapshot bool
 	callTimeout time.Duration
 	serial      bool
+	// trustAnnotations：信任这个 server 对工具行为的自述，见 WithTrustedAnnotations。
+	trustAnnotations bool
 }
 
 // WithToolSnapshot 给这个 server 一份工具清单快照（通常是上次连上时 ServerStatus.Tools 存下来的那份）。
@@ -35,6 +37,15 @@ type serverConfig struct {
 func WithToolSnapshot(specs []ToolSpec) ServerOption {
 	cp := cloneSpecs(specs)
 	return func(c *serverConfig) { c.snapshot, c.hasSnapshot = cp, true }
+}
+
+// WithTrustedAnnotations 信任这个 server 对工具行为的自述（MCP tool annotations）：它声明只读（readOnlyHint=true）的
+// 工具算只读工具（tool.IsReadOnly 为真），在审批的只读放行档（agent_v2.ApprovalAskWrites）下不问人直接执行。
+//
+// 只对你自己掌控、确信它如实标注的 server 用。不信任的 server 注解照样解析（可经 [RemoteTool.Annotations] 读到），
+// 但不影响审批。[WithTrustedClient] 是 WithClient 加上它的简写；可重建连接的 server 在 WithClientFactory 里传它。
+func WithTrustedAnnotations() ServerOption {
+	return func(c *serverConfig) { c.trustAnnotations = true }
 }
 
 // WithCallTimeout 给这个 server 的每次工具调用一个时限（d <= 0 = 不设，默认）。超过时限返回失败结果
@@ -550,24 +561,10 @@ func cloneSpecs(specs []ToolSpec) []ToolSpec {
 			Description:  sp.Description,
 			InputSchema:  cloneMap(sp.InputSchema),
 			OutputSchema: cloneMap(sp.OutputSchema),
-			Annotations:  cloneAnnotations(sp.Annotations),
+			Annotations:  sp.Annotations.clone(),
 		}
 	}
 	return out
-}
-
-func cloneAnnotations(a *ToolAnnotations) *ToolAnnotations {
-	if a == nil {
-		return nil
-	}
-	cp := *a
-	for _, p := range []**bool{&cp.ReadOnlyHint, &cp.DestructiveHint, &cp.IdempotentHint, &cp.OpenWorldHint} {
-		if *p != nil {
-			v := **p
-			*p = &v
-		}
-	}
-	return &cp
 }
 
 func cloneMap(m map[string]any) map[string]any {

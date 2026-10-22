@@ -112,10 +112,8 @@ func adaptHooks(h OrchestrationHooks) compose_v2.OrchestrationHooks {
 // 缺 helper 业务自管 chain 易漏 nil 过滤. 本 helper 过滤 nil/typed-nil 后复用底层
 // compose_v2.ChainOrchHooks.
 //
-// **panic 语义**（audit² 已删 per-hook 隔离，本注释同步纠正）：chain 内 hook 是 raw
-// 调用，单 hook panic 冒泡由 framework outer defer recover 兜底转 err（compose_v2.Run
-// / runNodeWithHooks / agent_v2 9 编排 Run/Resume 多层覆盖）——业务 hook panic =
-// 业务 bug fail-fast。例外是框架发的 cp 事件：它只作观测，钩子 panic 当场兜住、只记带栈日志，不进错误。
+// **panic 语义**：chain 内 hook 直接调、不逐个隔离——单 hook panic 中断剩余链，由调用这条链的地方处置
+// （转成错误还是就地兜住记日志，见 compose_v2.OrchestrationHooks「panic 语义」）。
 //
 // 用法:
 //

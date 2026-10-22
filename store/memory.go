@@ -105,9 +105,9 @@ func (s *InMemoryStore) Get(_ context.Context, namespace Namespace, key string) 
 	// 底层数组污染 store（N2 修复；原 shallow copy 只复制 slice header 不防元素写，注释却
 	// 说"防 outer field 篡改"暗示 Namespace 受保护，实际漏了元素写这条路径）。
 	//
-	// **Value 业务自负**：Value 字段是 any 持业务原始引用——业务 `got.Value.(map[string]
-	// any)["k"] = "v"` 仍会改 store 内部 Value（any deep copy 成本高不做，PR 1 audit 视角
-	// 1 HIGH-1 确认）。业务约定：把 Get 返的 Value 视为不可变；要改业务自己 deep copy 后改。
+	// **Value 不拷贝**：它是 Put 时归一化出来的那份（store 自己的，不是业务传进来的对象），每次 Get 都返回它——
+	// 业务 `got.Value.(map[string]any)["k"] = "v"` 会改到 store 里存的那份。把 Get 返的 Value 视为只读，要改先
+	// 自己拷一份。
 	itCopy := *it
 	itCopy.Namespace = append(Namespace(nil), it.Namespace...)
 	return &itCopy, nil
@@ -126,12 +126,21 @@ func (s *InMemoryStore) Put(ctx context.Context, namespace Namespace, key string
 		// InMemoryStore 不实现 TTLAware；业务想用 TTL 用 Redis 后端（sql/PG 暂不支持，待 Phase 2）。
 		return ErrTTLNotSupported
 	}
+	// 存的是值的 JSON 形状（见 NormalizeValue），跟持久后端读回的一样；编不成 JSON 的值在这里报错
+	stored := value
+	if value != nil {
+		norm, err := NormalizeValue(value)
+		if err != nil {
+			return fmt.Errorf("store put: value is not JSON-encodable: %w", err)
+		}
+		stored = norm
+	}
 
 	// **embed 在加锁之前**——它是网络往返，持锁做会让整个 store 卡在一次 RPC 上。
 	// 失败不让 Put 失败（见 IndexConfig godoc）：记录照常存，只是不参与语义检索。
 	var vecs [][]float32
 	if s.idx != nil && value != nil {
-		vecs = s.embedValue(ctx, value)
+		vecs = s.embedValue(ctx, value, stored)
 	}
 
 	s.mu.Lock()
@@ -155,21 +164,19 @@ func (s *InMemoryStore) Put(ctx context.Context, namespace Namespace, key string
 	now := time.Now().UTC() // audit iter-3 视角 3 H2: 强制 UTC 防跨 dev/prod TZ 偏移
 	existing, exists := bucket[key]
 	if exists {
-		// 覆盖：保留 CreatedAt 仅更新 Value + UpdatedAt。
-		// Value 浅持有业务指针——业务 Put 后再 mutate value 内 map/slice 会改 store
-		// 状态（PR 1 audit 视角 1 HIGH-2 确认）。业务约定：Put 后不再 mutate。
-		existing.Value = value
+		// 覆盖：保留 CreatedAt 仅更新 Value + UpdatedAt。存的是归一化出来的那份，业务 Put 之后再改自己的对象
+		// 碰不到它。
+		existing.Value = stored
 		existing.UpdatedAt = now
 		return nil
 	}
-	// 新建：namespace 深 copy 防业务后续改 slice 影响 store；
-	// Value 浅持有同覆盖路径——业务自负。
+	// 新建：namespace 深 copy 防业务后续改 slice 影响 store。
 	nsCopy := make(Namespace, len(namespace))
 	copy(nsCopy, namespace)
 	bucket[key] = &Item{
 		Namespace: nsCopy,
 		Key:       key,
-		Value:     value,
+		Value:     stored,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -248,7 +255,7 @@ func (s *InMemoryStore) Search(ctx context.Context, namespacePrefix Namespace, o
 			if !ok {
 				continue
 			}
-			// copy 同 Get——Namespace 深 copy 防元素写污染 store，Value 浅持有业务自负（详见 Get 注释）
+			// copy 同 Get——Namespace 深 copy 防元素写污染 store，Value 不拷贝（详见 Get 注释）
 			itCopy := *it
 			itCopy.Namespace = append(Namespace(nil), it.Namespace...)
 			matched = append(matched, &SearchItem{Item: itCopy})
@@ -472,8 +479,18 @@ var _ Store = (*InMemoryStore)(nil)
 // embedValue 把一条 value 抽成文本再 embed。不持锁调用（含网络往返）。
 //
 // 任何一步失败都返回 nil——这条记录不参与语义检索，但 Put 照常成功。
-func (s *InMemoryStore) embedValue(ctx context.Context, value any) [][]float32 {
-	texts := s.idx.extractor()(value, s.idx.Fields)
+//
+// 抽文本用哪个值：业务配的抽取器（IndexConfig.Extractor）拿业务传进来的原值——它是按业务自己的类型写的；默认抽取器
+// 对实现了 GetContent 的值用原值（读回的形状里没有这个方法），其余用存下的 JSON 形状——struct、`map[string]string`
+// 读回是 `map[string]any`，Fields 按字段名取值跟 filter 按字段命中是同一个形状。
+func (s *InMemoryStore) embedValue(ctx context.Context, value, stored any) [][]float32 {
+	in := value
+	if s.idx.Extractor == nil {
+		if _, ok := value.(interface{ GetContent() string }); !ok {
+			in = stored
+		}
+	}
+	texts := s.idx.extractor()(in, s.idx.Fields)
 	if len(texts) == 0 {
 		return nil
 	}

@@ -500,9 +500,8 @@ func TestR33_NestedFanOut_LaneParentNoRace(t *testing.T) {
 // eino runctx.go:334 显式 `Events: parentRunCtx.Session.Events` 共享父 events——
 // crew-go 漏对齐。
 //
-// **修法**：ForkLane child.events = parent.events (slice 共享指针) +
-// child.eventsMuRef = &parent.eventsMu (锁共享指针) → effectiveEventsMu() 返父锁
-// → child Events() 走父锁读父 slice race-free。
+// **修法**：ForkLane 时 child.events 拿到父的事件（当时是共享父切片 + 父锁指针；2026-10-21
+// 起改成派生那一刻的快照，见 ForkLane godoc）→ child Events() 读得到父历史。
 func TestR33_LaneInternal_SeesParentCommittedHistory(t *testing.T) {
 	parent := agent_v2.NewRunSession()
 	parent.AddEvent(agent_v2.NewOutputEvent("parent_step1", schema.UserMessage("u1")))
@@ -528,7 +527,7 @@ func TestR33_LaneInternal_SeesParentCommittedHistory(t *testing.T) {
 	if len(parent.Events()) != parentLen {
 		t.Errorf("lane 内 AddEvent 不应进父 events; 父长度应仍 %d，实际 %d", parentLen, len(parent.Events()))
 	}
-	// 但 lane 自己 Events() 视图应见父 + lane 链
+	// 但 lane 自己 Events() 视图应见父 + lane 自己写的
 	if len(laneSess.Events()) != parentLen+1 {
 		t.Errorf("lane Events() 应见父 + lane (%d 条); 实际 %d 条", parentLen+1, len(laneSess.Events()))
 	}

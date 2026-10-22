@@ -422,7 +422,7 @@ memo 命中 → 渐进披露 gate → 审批 → [ 中间件链 ] → 工具
 > 工具执行单位**外面**，拿不到 memo / `approve_always` / 批量合并。
 >
 > ⚠️ **`OnToolStart` 改参数，就是改这次调用的内容**：第一次执行时定下、随中断档 / 失败档落盘，续跑沿用（续跑时
-> 钩子照样触发，但改写不生效）。所以**每次执行都要新取的值**（凭证、短时令牌、trace_id）别在这里写进参数——写进去
+> 钩子照样触发，但改写不生效；这一批处理完之后才作废的调用续跑时不再处理、钩子不触发）。所以**每次执行都要新取的值**（凭证、短时令牌、trace_id）别在这里写进参数——写进去
 > 会落盘，短时令牌还会被冻在第一次的值上。放钩子返回的 ctx（只用于这次执行、不落盘），或用 `WithToolMiddleware`
 > 在每次执行时注入（也不落盘，但它改的参数不经审批）。代价：改写让这次调用出错时，修好钩子再续跑也不生效——这一批
 > 按第一次的内容执行，恢复办法是放弃这个任务、`sess.NextTask()` 重开。
@@ -455,6 +455,9 @@ ag.Run(ctx, sess, schema.UserMessage("A 还有货吗"))
 ag.Run(ctx, sess, schema.UserMessage("那给我留一件"))  // 第二轮看得到第一轮的全过程
 ```
 
+配置也可以在运行入口声明：`ctx = agent_v2.WithHistoryCtx(ctx, hs, "tenant-a")`——BasicAgent、编排、GraphAgent 都认，
+两者都在时以 ctx 为准。agent 构造一次、每个请求各带配置时用它（GraphAgent 只能用它）。
+
 **开不开，差在模型第二轮看到什么。** 不开时喂给模型的「上一轮」读自 `RunSession.Events`，
 而 events 只记首尾：
 
@@ -480,13 +483,83 @@ ag.Run(ctx, sess, schema.UserMessage("那给我留一件"))  // 第二轮看得�
 
 **归属**：一场会话里所有 agent 的消息在同一条流上，每条盖 `HistoryAgentAnnotation`
 （值 = 该 agent 在编排树里的**位置**——分支名 / 步骤名 / 转交目标名，顶层回落 agent 名；另有 `HistoryAgentDisplayAnnotation` 存 agent 名供展示）。嵌套子 agent 沿用父的写入器——一场会话只该有一条流。**内部决策 LLM
-不进历史**：routing 分类器 / reflect 评估器与反馈教练 / plan 规划器产出的是给框架看的控制信号，
-框架已自动摘除，`NewPlanAgent` 的 planner 参数与 `WithRouteDecider` 挂的决策方同样；业务自己的
-Router（`WithRouter`）、Reflector（`WithReflector`）、评估函数（`WithEvalFunc`）、循环退出条件
-（`WithLoopExitCondition`）等内部跑子 agent 时，要自己在子 ctx 上调一次
-`agent_v2.WithoutHistoryCtx(ctx)`——框架直接调用的业务回调都一样。
+不进历史**：内部决策产出的是给框架看的判定。框架调这些决策方时都已经摘掉了（连同用户的插话一起）：
+routing 分类器、reflect 评估器与反馈教练、`NewPlanAgent` 的 planner、`WithRouter` 的路由函数与
+`WithRouteDecider` 的决策方、`WithReflector` / `WithEvalFunc`、`WithLoopExitCondition` 的退出判断、
+`WithTurnGate` 的闸门——它们里面再起的子 agent 继承这条禁止。框架不认识的决策点（GraphAgent 节点里自己
+写的判断、Parallel 的 Merger / Aggregator 里拿 agent 当裁判）要自己在子 ctx 上调一次
+`agent_v2.WithoutHistoryCtx(ctx)`。
 
-**自研 backend**：实现 `Append` / `Load` 两个方法，跑 conformance 验语义——
+**调用方手里的前文**（`WithCallerHistoryCtx`）：有的调用方每次请求都带着整场对话（AG-UI 前端就是这样，`agui`
+已自动接上）。把这一轮之前的轮次推进 ctx：
+
+```go
+ctx = agent_v2.WithCallerHistoryCtx(ctx, earlierTurns) // 这一轮之前的轮次，不含这一轮的输入
+ag.Run(ctx, sess, schema.UserMessage("这一轮的问题"))
+```
+
+**一次运行只认一个来源**——前文与历史层描述的是同一段对话，客户端会裁、会改、会重新生成，历史层又有客户端看不到的
+工具往返，两份放在一起没有可靠的对法：
+
+| 情形 | 读历史的 agent 看到什么 |
+|---|---|
+| 这次运行有拥有这场对话的写入器，建写入器时读得出记录 | **以服务端为准**：历史层的记录（逐字、带工具往返），按各自的视图模式投影。这场对话在历史层里一条记录都没有时（服务端第一次见到它），写入器建好时先把前文写进去（标 `CallerHistoryAnnotation`、不带归属、ID 按位置与内容确定性派生），排在这次运行的一切记录之前，每种视图都原样看到；此后前文不再看、不再写 |
+| 其余：没配历史层；配了历史层的 agent 是在钩子、节点、工具里被调起的（它的写入器只记自己那段子对话）；建写入器时读历史层失败或前文没写进去；某个 agent 读历史时读失败 | **以客户端为准**：前文排在 session events 之前，历史层这次不读 |
+
+拥有者是建写入器时还不在任何正在执行的任务里的那一个，也就是这次运行最外层的 agent。编排从自己的整棵静态子树借历史
+配置（嵌套的编排也算），树里只要有成员配了 `WithHistory`，写入器就由最外层的编排拥有；两处配得不一样直接报错。GraphAgent
+没有静态子列表，要以服务端为准就在运行入口用 `WithHistoryCtx` 声明。
+
+以服务端为准的三个后果，接 AG-UI 前端时要知道：
+
+- 前端「编辑前面的消息」「重新生成答复」不会改写服务端的记录，模型照旧看到服务端那份。要这类功能，让前端拥有历史（不配
+  历史层）。
+- 同一场对话各轮要用同一套配置：某几轮由没配历史层的 agent 接，那几轮进不了服务端的记录，以服务端为准的轮看不到它们。
+- 前文只在服务端第一次见到这场对话时写一次；那一次读或写失败，这次运行照样以客户端为准、看得到前文，但之后那几轮不在
+  服务端的记录里。
+
+只取 user / assistant 的文本：system / developer、工具调用与结果、多模态块都不取——客户端能伪造历史，指令只认 agent
+自己的前言，伪造的文本最多做到提示词注入，碰不到审批、转交、存档这些服务端的控制决定。内部决策 LLM 与 `DetachTask`
+开的独立任务看不到它；AgentAsTool 的全历史输入不带它（子 agent 读历史时已经看得到）。续跑时也要推，推 Run 时那一份：
+续跑里才开始跑的成员（Sequential 的后一步之类）同样要看到前文，跟先跑的成员看到的一样（`agui` 把它存在会话条目里，不按
+续跑请求重算）。
+
+**读多少：只读尾部、按条件读。** 每次 Run 从会话末尾往前一页一页读（`HistoryQuery{Before, Limit}`），凑够这次要用的
+就停；去重按条件直接问后端（`HistoryQuery` 的 `MessageID` / `Task` / `Agent`）。读的量与会话长度无关：
+
+- **prompt 的 prior**：凑够 `MaxHistoryPairs*2` 条，并确认第 0 层截断的切点落在读到的这一段里（切点往前对齐
+  tool_call 配对之后仍在段内、段里没有找不到声明者的 tool_result、带 skill 正文的那一对都在段内）。在这一段上截
+  与在整场上截逐条相同。「只看自己」的视图（`HandoffHistorySelfOnly`，非转交场景的默认）按归属读，只读自己的记录——
+  自己发言少的 agent 进一个长会话时不用把别人的话翻一遍。唯一的语义变化：比这一段更早激活的 skill 正文不再进 prior
+  （原先整场会话里激活过的都保下，随激活次数无上限增长）。配了 `WithHistoryCompactor` 时照旧给它整个视图。
+- **「这个任务里记过这条没有」类的去重**（续跑重跑到同一步、转交的下一跳、边界补记）按消息 ID + 任务章查；「这条产出
+  是不是已经在别的归属下记过」按消息 ID 查，只认本任务与从本任务脱离出去的独立任务写下的（别的任务复用同一个消息
+  对象时那是它自己的回复，不算透传）；放弃时补悬空 tool_call 按任务章读这个任务写下的记录。每条记录
+  盖任务章 `HistoryTaskAnnotation`（值是 RunID），业务回看时也能拿它把一场会话按任务分段。判断只依赖后端里的记录，
+  不依赖 session 对象——无状态服务按 RunID 重建 session、session 传 nil 由框架补，都判得对。
+
+实测（后端按 JSON 存取、消息 ID / 任务章 / 归属另存成可筛的列，只算反序列化）：1000 轮的会话，单 agent 一次 Run 从读
+4008 条 / 8MB / 43ms 降到 80 条 / 0.2MB / 0.8ms，三步顺序编排从 30071 条 / 72MB / 352ms 降到 240 条 / 0.6MB / 3.1ms；
+模型看到的 prompt 不变。会话里有 1200 条别的任务的记录时，续跑一个 6 步的任务，去重一共读回 1 条。
+
+**压缩边界：靠摘要控制上下文的会话也只读尾部。** 开了 AutoCompact 的 agent（不论 `MaxHistoryPairs`）某一轮真摘要了
+一次时，模型节点往历史追加一条**压缩边界**（盖 `HistoryCompactionAnnotation`，正文是那次
+的摘要），带着那一刻的完整替代历史；下一次 Run 往前读到本 agent、同视图的最新一条边界就停：prior = 替代历史 +
+边界之后的记录，不再把整场原文读一遍、再在第一轮把它整个摘要一遍（1000 轮时原先每次 Run 读 4008 条、摘要两次、
+每次摘要输入 3.8MB；现在约 190 条、不重新摘要）。关掉轮数截断（`WithMaxHistoryPairs(0)`）、靠摘要控制上下文的会话受益
+最大；开着轮数截断时 prior 同样从边界读起，摘要作为受保护消息留在截断之后。原始记录一条不动，业务回看时可以按这个标注跳过边界或把它当作
+「此前的摘要」展示。机制见 [context-compaction.md](context-compaction.md)「压缩结果的复用」。
+
+**自研 backend**：实现 `Append` / `Load` 两个方法。`Load(ctx, key, HistoryQuery) (HistoryPage, error)` 先按过滤条件
+（`MessageID` / `Task` / `Agent`，非空的都要满足；任务章与归属在 `Annotations[HistoryTaskAnnotation]` /
+`Annotations[HistoryAgentAnnotation]` 里，写入时抽成带索引的列）筛，再按写入顺序返回 `Before` 之前最近的 `Limit` 条，
+`More` 按满足条件的算（零值 query 读整场，会话不存在、没有命中都返空页不报错）；在进程里过滤的用
+`HistoryQuery.Matches` 判，跟框架的判据一致。游标 `HistoryCursor` 由后端铸、对框架不透明，同一场会话里按写入顺序严格
+递增、追加不改变已有游标。业务回看整场用 `agent_v2.LoadAllHistory`。没实现过滤条件的后端（只认 `Before` / `Limit`）
+结果照旧正确——框架逐条核对返回的记录——但按条件查退化成往前翻整场会话，并告警一次。跑 conformance 验语义
+（19 个子测试，其中 5 条管分页：Limit 取最近的、逐页往前不漏不重、往前翻页时别人追加游标不漂、Limit 超过总数、越过
+第一条是空页；4 条管按条件读：同一个 ID 的每一份都返回、条件之间是「且」、带条件翻页不漏不重且最早一页 More 为
+false、没有命中是空页）——
 
 ```go
 import "crew-go/agent_v2/history_conformance"
@@ -612,8 +685,8 @@ func (m *MyStore) Search(ctx context.Context, ns store.Namespace, opts ...store.
 | 编排 | child sess 行为 | store.Search 看到 | store.Put `IsSubAgentStoreScope` |
 |---|---|---|---|
 | `BasicAgent`（顶层） | 主 sess | 顶层 sess 完整 events | `false` (顶层入口) |
-| `SequentialAgent` / `LoopAgent` / `RoutingAgent` / `ReflectAgent` / `HandoffAgent` / `PlanAgent` | 直接传 parentSession | 全量父历史 + 自动写父 events | `true` (ISSUE-84 audit HIGH-1 修后) |
-| `ParallelAgent` | `ForkLane` lane child sess | 共享父读视图 + 写隔离 (lane events 物理隔离 ISSUE-80) | `true` (ISSUE-84 audit HIGH-1 修后) |
+| `SequentialAgent` / `LoopAgent` / `RoutingAgent` / `ReflectAgent` / `HandoffAgent` / `PlanAgent` | 每次尝试一条从 parentSession 派生的暂存 lane（`ForkLane`） | 全量父历史 + 这次尝试自己写的；尝试有了结局才提交进父 events，被下一次从头再跑的尝试取代时丢掉（见 [channel-engine.md §11.4](channel-engine.md)） | `true` (ISSUE-84 audit HIGH-1 修后) |
+| `ParallelAgent` | 每个分支一条 lane，分支成员每次尝试再从它派生一条 | 分支开始执行那一刻的父历史，去掉兄弟分支提交上来的（兄弟之间互不可见，其余照常可见）+ 写隔离 (lane events 物理隔离 ISSUE-80) | `true` (ISSUE-84 audit HIGH-1 修后) |
 | `AgentAsTool` / `SkillTool fork` | `NewSharedChildSession` 半共享 | events 完全独立 + parentSess 反向指针 (业务 store.Search 用 RootSession 上追) | `true` (ISSUE-79 实施时已修) |
 
 **同一 sub-agent 实例放在不同编排里 sess 行为分裂**——业务自定义 Store 实现按

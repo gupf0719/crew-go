@@ -20,6 +20,7 @@ crew-go 借鉴 LangGraph + eino 设计但不完全照抄——做架构决策时
 | NS / Address 寻址模型 | `address-routing.md` |
 | Skill 加载 / 激活 / 子 agent 隔离 | `skill-system.md` |
 | 可观测性 trace + metrics 集成 (OpenTelemetry) | `observability-trace-spec.md`（对照 OTel GenAI 语义约定）+ `observability-callback.md`（钩子协议决策）+ `observability-langgraph.md` / `observability-eino.md` (⚠️ 风格特例: 拆 2 文档单方面深度调研, 不是单文档三方对照; crew-go 决策综合见 `observability-eino.md` §8) |
+| 声明式断点 / 节点超时与重试 / 审批分档与审批方式进提示词 / 运行中插话与回合结束闸门 | `execution-control.md`（插话与闸门的业内对照在 `industry-survey-2026q3.md` §二、§三）|
 
 读文档时重点看：
 1. **三方对照表**：当前问题三方各怎么做，哪个有 corner case 是我们没考虑的

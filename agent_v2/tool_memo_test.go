@@ -123,7 +123,7 @@ func TestToolMemo_HistoryNoDoubleRecord(t *testing.T) {
 		t.Fatalf("Resume: %v", err)
 	}
 
-	msgs, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "c_memo"})
+	msgs, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "c_memo"})
 	n := 0
 	for _, m := range msgs {
 		if m.Role == schema.RoleTool && strings.Contains(m.Content, "已扣款") {

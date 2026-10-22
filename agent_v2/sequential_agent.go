@@ -240,7 +240,7 @@ func (s *SequentialAgent) Run(ctx context.Context, session *RunSession, input *s
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "SequentialAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: finalMessagesRef})
+		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: finalMessagesRef}, retErr)
 	}()
 
 	// 注入 user input 到 sess.Events 作审计
@@ -333,7 +333,7 @@ func (s *SequentialAgent) Resume(ctx context.Context, sessionID string, opts ...
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "SequentialAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: finalMessagesRef})
+		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: finalMessagesRef}, retErr)
 	}()
 
 	cm := compose_v2.NewChannelManager()
@@ -465,7 +465,8 @@ func (s *SequentialAgent) buildComposeGraph(
 		// 包装 sub-agent.Run 成 SequentialStepFn——加 retry 包装：失败 IsRetryable 时
 		// 按 retryCfg 重试，InterruptError / ctx cancel 永不重试。
 		stepFn := func(ctx context.Context, input *schema.Message) (*schema.Message, error) {
-			// 共享父 session：sub-agent 写 events 到父 session，step1→step2 互相看得到。
+			// 共享父 session：sub-agent 每次尝试的 events 经暂存 lane 提交到父 session（见
+			// attemptLanes），step1→step2 互相看得到。
 			return runMember(ctx, grants, memberSpec{
 				agent: step.Agent,
 				sess:  parentSession,

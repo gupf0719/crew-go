@@ -190,14 +190,27 @@ func NewBasicAgent(opts ...Option) *BasicAgent {
 	cfg.approvalOwner = newUUID()
 	validateOutputSchemaConfig(&cfg)
 	warnAskUserOverride(&cfg)
+	warnReadToolOutputOverride(&cfg)
 	validateHistoryConfig(&cfg)
+	validateBackgroundTasksConfig(&cfg)
 	return &BasicAgent{config: cfg}
 }
 
-// Name 返回 agent 名。
 // historyCfgForOrchestration 让编排能提前建历史写入器（见 startHistoryForOrchestration）。
 func (a *BasicAgent) historyCfgForOrchestration() *historyConfig { return a.config.History }
 
+// historyCfgFor 是这次调用用的会话历史配置：运行入口用 [WithHistoryCtx] 声明了就以它为准，否则用自己的
+// [WithHistory]——同编排（见 startHistoryForOrchestration）。只看自己的配置时，只在 ctx 上声明历史的调用一条
+// 不写，两者都配时写进自己的那个，跟 WithHistoryCtx 的约定相反；DetachTask 开的独立任务里跑没配 WithHistory
+// 的 BasicAgent 也一条不写。
+func (a *BasicAgent) historyCfgFor(ctx context.Context) *historyConfig {
+	if hc := historyCfgFromCtx(ctx); hc != nil {
+		return hc
+	}
+	return a.config.History
+}
+
+// Name 返回 agent 名。
 func (a *BasicAgent) Name() string { return a.config.Name }
 
 // Description 返回 agent 职责描述。
@@ -244,7 +257,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	ctx = withRunOverrides(ctx, cfg.overrides())
 	// 会话历史（opt-in）：起写入器 + 出口 drain。ctx 里已有写入器时（嵌套在另一个
 	// 开了历史的 agent 下）沿用父的，不另起——同一场会话只该有一条流。
-	ctx, stopHistory := startHistory(ctx, a.config.History, a.config.Name)
+	ctx, stopHistory := startHistory(ctx, a.historyCfgFor(ctx), a.config.Name)
 	warnUnnamedAgentInHistory(ctx, &a.config)
 	defer stopHistory()
 	startOffset := len(session.Events())
@@ -256,6 +269,9 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	info := &hook.AgentInfo{Name: a.config.Name, Type: "base", Round: 0}
 	var finalMessagesRef []*schema.Message
 	agentIn := &hook.AgentInput{Messages: []*schema.Message{input}}
+	// 后台任务只在顶层（不在另一个正在执行的任务里）生效，判在盖任务章之前（见 withBackgroundScope）
+	_, nested := enclosingTask(ctx)
+	ctx = withBackgroundScope(ctx, &a.config, !nested)
 	// 「这是不是新任务」判在钩子之前：钩子里就可能发起调用（见 enterRunTask）
 	ctx = enterRunTask(ctx, session)
 	var startErr error
@@ -285,7 +301,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 		// 顶部 recoverToErr 后跑时 panic 已消费 → no-op. recover() 必须闭包内直接调(传 helper 实参).
 		recoverPanicToErr(ctx, "BasicAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = a.config.Hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: finalMessagesRef})
+		fireAgentEnd(ctxOut, a.config.Hooks, info, &hook.AgentOutput{Messages: finalMessagesRef}, retErr)
 	}()
 
 	// **ISSUE-74 修**：buildInitialMessages 不再在 Run 入口同步调用——已重构成
@@ -380,7 +396,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	ctx = withRunOverrides(ctx, rcfg.overrides())
 	// 会话历史（opt-in）：Resume 同款起写入器——续跑产生的轮次照样进历史（HITL 答完
 	// 之后的对话跟答之前是同一场）。
-	ctx, stopHistory := startHistory(ctx, a.config.History, a.config.Name)
+	ctx, stopHistory := startHistory(ctx, a.historyCfgFor(ctx), a.config.Name)
 	warnUnnamedAgentInHistory(ctx, &a.config)
 	defer stopHistory()
 
@@ -392,6 +408,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	// AgentIn.Messages 退化 nil (Resume 没有新 input — 走 cp 重建), 业务 hook 若依赖
 	// messages 可从 sess.Events 取 ResumeContext.UserInputs.
 	agentInResume := &hook.AgentInput{}
+	ctx = withBackgroundScope(ctx, &a.config, true) // Resume 只在顶层调（见 commonResumePrep）
 	ctx = enterResumeTask(ctx, session)
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
@@ -414,7 +431,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 		// 顶部 recoverToErr 后跑时 panic 已消费 → no-op. recover() 必须闭包内直接调(传 helper 实参).
 		recoverPanicToErr(ctx, "BasicAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = a.config.Hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: finalMessagesRef})
+		fireAgentEnd(ctxOut, a.config.Hooks, info, &hook.AgentOutput{Messages: finalMessagesRef}, retErr)
 	}()
 
 	cm := compose_v2.NewChannelManager()
@@ -462,7 +479,10 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 		runOpts = append(runOpts, compose_v2.WithEmitCpEvent(true))
 	}
 
+	// 这次续跑取走的插话记一本账，续不了时还回收件箱（见 Inbox「取走之后」）
+	ctx, ledger := withInterjectionLedger(ctx)
 	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
+	settleInterjections(ctx, ledger, cper, runErr)
 	finalMsgs, _ := compose_v2.Get(cm.Channels(), basicMessagesChan)
 	finalMessagesRef = finalMsgs
 	// Sub-5 audit HIGH-1 fix: Resume 路径同步 update info.Round 让 OnAgentEnd defer
@@ -502,7 +522,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 //
 // 嵌套场景（AgentAsTool 把本 BasicAgent 包成 tool
 // 让父 BasicAgent 调用）下，子 BasicAgent 的存档必须同时满足：
-//  1. 落在父 sid 下——sid 取 session.RunID（任务的身份）：嵌套成员拿父 session 本身、并行分支拿 ForkLane 派生的、嵌套调用的被调方拿框架给的（RunID = 所在任务），RunID 都等于父 sid，所以子存档落在父 sid 下；业务在嵌套位置传了别的任务的 session，入口直接拒（见 resolveRunSession）
+//  1. 落在父 sid 下——sid 取 session.RunID（任务的身份）：编排成员与并行分支拿 ForkLane 派生的、嵌套调用的被调方拿框架给的（RunID = 所在任务），RunID 都等于父 sid，所以子存档落在父 sid 下；业务在嵌套位置传了别的任务的 session，入口直接拒（见 resolveRunSession）
 //  2. 落在父推下来的 graphNS 里（AgentAsTool.Call 经嵌套调用执行器 push 了由调用身份派生的子 ns）
 //     ——子 cp 写到 (parentSID, childNS) 物理分离，避免与父 cp (parentSID, "") 互覆盖
 //
@@ -602,7 +622,10 @@ func (a *BasicAgent) runGraph(ctx context.Context, runCfg *runConfig, session *R
 	if compose_v2.IsFreshRunCtx(ctx) {
 		runOpts = append(runOpts, compose_v2.WithFreshRun())
 	}
+	// 这次 Run 取走的插话记一本账，续不了时（没配存档、终局失败）还回收件箱（见 Inbox「取走之后」）
+	ctx, ledger := withInterjectionLedger(ctx)
 	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
+	settleInterjections(ctx, ledger, cper, runErr)
 	finalMsgs, _ := compose_v2.Get(cm.Channels(), basicMessagesChan)
 	lastRound := GetBasicAgentRound(cm)
 	return finalMsgs, lastRound, runErr
@@ -730,6 +753,14 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 			}
 		}
 	}
+	// 审批生效时把当前审批方式写进前言：模型事先知道哪些调用会停下来等人、被拒了怎么办（见 approvalPrompt）
+	if seg := approvalPrompt(&a.config); seg != "" {
+		if sysPrompt == "" {
+			sysPrompt = seg
+		} else {
+			sysPrompt = sysPrompt + "\n\n" + seg
+		}
+	}
 	if sysPrompt != "" {
 		sysPreamble = append(sysPreamble, schema.SystemMessage(sysPrompt))
 	}
@@ -794,80 +825,33 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 				"agent", a.config.Name, "ns", a.config.StoreMemoryNS.String(), "err", err)
 		}
 		{
-			// SearchItem → *schema.Message 转换。⚠️ **框架自己写进来的是答复文本**
-			// （postamble 的 `st.Put` 存 `last.Content`，见下方分支注释），这里的
-			// `*schema.Message` 分支只服务业务自己塞的消息。业务自定义 Value
-			// 类型 fallback 优先 json.Marshal 让 LLM 收到语义化 JSON；marshal 失败再
-			// fmt.Sprint（**round audit fix 2 视角 3 A4**：旧 fmt.Sprintf %v 输出 Go
-			// 内部表示 "map[mode:dark]"，业务 mem0 后端存 map 时 LLM 几乎不可读）。
-			//
-			// clone *Message 后再标 marker——store 内部 Get/Search 返 shallow copy 但
-			// Value 内 map/slice 仍共享业务原始指针，多并发 Run 同时 mutate Annotations
-			// 会触发 -race（参 store.md §8 "Get / Search 返 shallow copy" 约定）。
+			// SearchItem → 注入的 system 消息。值是 store 往返契约下的 JSON 形状（见 store.Item）：框架自己写进来的是答复
+			// 文本（postamble 的 `st.Put` 存 `last.Content`），走 `case string` 原样注入；业务塞进同一个 namespace 的别的
+			// 形状（对象、数组、数字……）注入它的 JSON 文本，在每个后端上都一样。曾经 in-memory 原样存业务的
+			// `*schema.Message`、这里按真消息注入，而持久后端读回的是 map、注入的是 JSON 文本：同一份记忆在两类后端上
+			// 喂给模型的东西不一样，两边都 `err == nil`。store 改成按 JSON 形状存之后那条分支没有后端能走到，已删。
 			cloned := make([]*schema.Message, 0, len(items))
 			for _, it := range items {
 				if it == nil {
 					continue
 				}
-				// ⚠️ **框架自己写进来的恒是文本**（见 commitFinal 的 st.Put），走下面的
-				// `case string`——这条 `*schema.Message` 分支只服务**业务自己塞进同一个
-				// namespace 的消息**。
-				//
-				// 它此前也承载框架自己的数据，而那时它只在 in-memory 上命中、持久后端恒
-				// 失败走 fallback ⟹ 同一份框架记忆在两类后端上喂给 LLM 的东西不一样
-				// （一边真消息、一边整条消息的 JSON 文本），两边都 err == nil。写入侧改存
-				// 文本后那个分歧从源头消失。
-				//
-				// 业务塞消息时这条分支仍只在 in-memory 上命中——那是业务自己的数据与选择，
-				// 保留它至少让 in-memory 用法不退化；跨后端一致性由业务自负（见 store.md）。
 				var msg *schema.Message
-				if v, ok := it.Value.(*schema.Message); ok && v != nil {
-					c := *v // shallow clone *schema.Message
-					msg = &c
-				} else {
-					// 业务自定义 Value 类型 fallback：
-					// - `string` 直传不 JSON-quote 化（**语义变化**：旧路径
-					//   `fmt.Sprintf("%v", "hello")` 出 `hello`，但 R32 follow-up audit
-					//   把 fallback 切到 json.Marshal 时会变 `"hello"` 带引号——
-					//   c40bc71 audit Agent MED-1 fix：string 走 case 分支保留 raw 输出）
-					// - 其他类型用 json.Encoder + SetEscapeHTML(false) 输出语义化 JSON
-					//   （关 HTML 转义让 `<` `>` `&` 不被 \uXXXX 化——commit 33466ee
-					//   audit Agent 2 MED-1 fix：默认 json.Marshal 会 HTML escape 让
-					//   LLM 读到的 token 增加且可读性差）
-					// - marshal 失败（如含 chan/func 不可序列化）退化 fmt.Sprint
-					switch v := it.Value.(type) {
-					case string:
-						msg = schema.SystemMessage(v)
-					default:
-						var buf bytes.Buffer
-						enc := json.NewEncoder(&buf)
-						enc.SetEscapeHTML(false)
-						if err := enc.Encode(v); err == nil {
-							// Encoder.Encode 会末尾加 '\n'——去掉避免 prompt 末尾多余换行
-							s := buf.String()
-							s = strings.TrimRight(s, "\n")
-							msg = schema.SystemMessage(s)
-						} else {
-							msg = schema.SystemMessage(fmt.Sprintf("%v", v))
-						}
+				switch v := it.Value.(type) {
+				case string:
+					msg = schema.SystemMessage(v)
+				default:
+					// json.Encoder + SetEscapeHTML(false)：`<` `>` `&` 不被 \uXXXX 化（默认 json.Marshal 会，模型读到的
+					// token 变多、可读性差）；Encode 末尾的换行去掉。编不成 JSON 时（不守往返契约的自研后端）退化 fmt.Sprint
+					var buf bytes.Buffer
+					enc := json.NewEncoder(&buf)
+					enc.SetEscapeHTML(false)
+					if err := enc.Encode(v); err == nil {
+						msg = schema.SystemMessage(strings.TrimRight(buf.String(), "\n"))
+					} else {
+						msg = schema.SystemMessage(fmt.Sprintf("%v", v))
 					}
 				}
-				// Annotations 深拷贝 + 剥业务持有的 framework 内部 marker
-				if msg.Annotations != nil {
-					annot := make(map[string]any, len(msg.Annotations)+1)
-					for k, v := range msg.Annotations {
-						// R21 audit HIGH-3 fix 协议保留：业务 Value 内若含 framework
-						// marker 必剥避免 AutoCompact splitProtectedGroups 错位
-						if k == SkillBodyAnnotation {
-							continue
-						}
-						annot[k] = v
-					}
-					msg.Annotations = annot
-				} else {
-					msg.Annotations = make(map[string]any, 1)
-				}
-				msg.Annotations[StoreInjectedAnnotation] = true
+				msg.Annotations = map[string]any{StoreInjectedAnnotation: true}
 				cloned = append(cloned, msg)
 			}
 			msgs = append(msgs, cloned...)
@@ -884,8 +868,15 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	//   - 没开 → 回落到 session events。events 只记首尾，于是模型看到的是
 	//     「user 问 → assistant 说还有 3 件」——结论在、来源没了，它无从判断这个数字是
 	//     刚查的还是编的，也就无从判断该不该重查。**这是有意的降级**，见 WithHistory godoc。
+	//
+	// **开了会话历史时只读最近一段**：第 0 层截断留的是最近 MaxHistoryPairs 对，更早的读回来也是扔
+	// （见 history_read.go 的实测）。配了 HistoryCompactor 时留多少由它决定，照旧给它整个视图。
 	mode := GetHandoffHistoryMode(ctx)
-	prior, fromHistory := historyPrior(ctx, a.config.History, historyOwner(ctx, a.config.Name), mode)
+	need := 0
+	if a.config.HistoryCompactor == nil && a.config.MaxHistoryPairs > 0 {
+		need = a.config.MaxHistoryPairs * 2
+	}
+	prior, fromHistory := historyPrior(ctx, a.historyCfgFor(ctx), historyOwner(ctx, a.config.Name), mode, need)
 	if !fromHistory {
 		switch mode {
 		case HandoffHistoryRaw:
@@ -895,6 +886,10 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 		default: // HandoffHistorySelfOnly（含非 handoff 场景缺省）——只自己，零回归
 			prior = session.SelfHistoryCompacted(a.config.Name)
 		}
+		// 调用方提供的前文排在最前：events 只有这个进程里发生的，更早的轮次在调用方手里（见 caller_history.go）
+		if turns := callerHistory(ctx); len(turns) > 0 {
+			prior = append(turns, prior...)
+		}
 	}
 
 	// **留一份未削减的给去重判据用**。下面的截断/压缩是「这轮喂给模型多少」的有损投影，
@@ -903,6 +898,9 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	// 而历史 append-only，这份重复永久留存，下一轮模型会看到用户把同一句话说了两遍。
 	// 触发不需要业务写错代码——有损的 HistoryCompactor（那正是它被文档定位的用途）
 	// 或默认开启的 MaxHistoryPairs 攒够量，都会削到它。
+	//
+	// 这一份是读回来的那一段（只读最近一段之后它也不是整场会话了）；比它更早、但属于本任务的记录由
+	// claimSharedRootInput 按消息 ID 与任务章再查一遍（见 findHistory）。
 	priorForDedup := prior
 
 	// 第 0 层兜底：HistoryCompactor / MaxHistoryPairs 截断 prior（防多轮累积爆 ctx）。
@@ -1113,7 +1111,7 @@ func truncatePriorPreservingMarkers(prior []*schema.Message, limit int) []*schem
 			protected = append(protected, m)
 			continue
 		}
-		if m != nil && m.Role != schema.RoleTool && hasSkillMarker(m) {
+		if m != nil && m.Role != schema.RoleTool && isPriorProtected(m) {
 			protected = append(protected, m)
 			continue
 		}
@@ -1134,6 +1132,13 @@ func truncatePriorPreservingMarkers(prior []*schema.Message, limit int) []*schem
 	out = append(out, protected...)
 	out = append(out, rest...)
 	return out
+}
+
+// isPriorProtected 报第 0 层截断要不要保下这条（非 tool 角色的）消息：skill 正文，以及 AutoCompact 的
+// 摘要——后者只会经压缩边界的替代历史进 prior（见 compaction_boundary.go），它代表边界之前的全部对话，
+// 按条数截掉它等于把那段对话整个丢了。
+func isPriorProtected(m *schema.Message) bool {
+	return hasSkillMarker(m) || isCompactSummary(m)
 }
 
 // hasSkillMarker 报这条消息是否带 skill body 跨层 marker——第 0 层截断据此保护它不被
@@ -1809,12 +1814,12 @@ func (a *BasicAgent) gatherMemoryCandidates(ctx context.Context, st store.Store,
 
 // memoryItemText 从一条记忆里抽出用于打分的文本。
 //
-// 三种形态都要认——它们都是**框架自己文档里教过的**写法，漏掉哪种，那种记忆就永远
-// 参与不了打分、永远注入不进去，而且不报错：
+// store 读回的是值的 JSON 形状（`store.NormalizeValue`），所以只有两种形态——漏掉哪种，那种记忆就永远参与不了
+// 打分、永远注入不进去，而且不报错：
 //
 //   - `string`：**框架 commitFinal 写进去的答复文本**（2026-09-07 起），以及业务 seed 的纯文本
-//   - `GetContent() string`：业务自己塞进来的消息对象（框架已不走这条）
-//   - `map[string]any`：业务结构化写入（`doc/v2/store.md` 的示例就是这个形状）
+//   - `map[string]any`：业务结构化写入（`doc/v2/store.md` 的示例就是这个形状），业务塞进来的 struct、消息对象
+//     读回也是它
 //
 // map 取全部 string 值拼起来，**按 key 排序**——map 迭代顺序随机，不排的话同一条记录
 // 每次算出的文本不同、分数跟着抖。
@@ -1822,8 +1827,6 @@ func memoryItemText(v any) string {
 	switch x := v.(type) {
 	case string:
 		return x
-	case interface{ GetContent() string }:
-		return x.GetContent()
 	case map[string]any:
 		keys := make([]string, 0, len(x))
 		for k, val := range x {
@@ -1989,14 +1992,15 @@ func (a *BasicAgent) commitFinal(ctx context.Context, session *RunSession, in *B
 		//
 		// # 为什么
 		//
-		// 这条路的 value 过业务提供的 store：in-memory 原样持有 Go 值，而 redis / sql 三方言
-		// 存的是 JSON、读回来是 `map[string]any`。于是同一份记忆在两类后端上**两个轴同时
+		// 这条路的 value 过业务提供的 store。曾经 in-memory 原样持有 Go 值，而 redis / sql 三方言
+		// 存的是 JSON、读回来是 `map[string]any`，于是同一份记忆在两类后端上**两个轴同时
 		// 相反**（实测）：类型断言一边成功一边失败 ⟹ 喂给 LLM 的一边是真 assistant 消息、
 		// 另一边是**整条消息的 JSON 文本**；`WithFilter{role:...}` 一边 0 命中一边 1 命中。
 		// 两边都 `err == nil`。
 		//
 		// 存文本让六个后端逐字相同——`string` 过 JSON 往返还是 `string`，不需要类型信封、
-		// 不需要注册表、不需要保留 namespace、不需要按字段猜。
+		// 不需要注册表、不需要保留 namespace、不需要按字段猜。（store 现在按值的 JSON 形状存、每个
+		// 后端读回都是 map，存整条消息也一致了；但注入时还得解回消息、按字段取内容，文本仍是最直接的形状。）
 		//
 		// 顺带修掉 embedding 的输入：`store.DefaultTextExtractor` 对 `map[string]any` 取**所有
 		// 顶层 string 值**，所以持久后端此前 embed 进去的是「内容 + 消息 ID + 推理过程 +
@@ -2072,6 +2076,15 @@ func (a *BasicAgent) commitFinal(ctx context.Context, session *RunSession, in *B
 					"agent", a.config.Name, "session", session.RunID,
 					"ns", memNS.String(), "writer", a.storeMemoryWriterID(ctx), "err", err)
 			}
+		}
+	}
+	// 这个任务里接进来的运行中插话进会话事件，排在它回应的那条答复之前：那是用户的原话，没开会话历史时
+	// 下一个任务的上文（从事件读）和转交的下一个接手者只能从这里看到它——不记，上文里就剩一条在回应
+	// 一句不存在的话的答复。跟 ExitEvent 放在同一处、同样在 StoreMemory 块之后：Put 抛中断时这里不跑，
+	// Resume 重跑 postamble 时只记一次。
+	for _, m := range in.Interjections {
+		if m != nil {
+			session.AddEvent(NewOutputEvent(a.config.Name, m))
 		}
 	}
 	// **ExitEvent 恒在这里发**——Put 成功 / 业务错被吞 / Content 为空跳过写入 / 根本没配
@@ -2173,7 +2186,7 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	if !a.config.RouteToolOptIn {
 		grants.route = nil
 	}
-	dispatchToolkit := a.composeDispatchToolkit(grants)
+	dispatchToolkit := a.composeDispatchToolkit(grants, backgroundScopeFrom(ctx) != nil)
 	modelFn := a.makeModelFn(grants)
 	toolsFn := a.makeToolsFn(grants, dispatchToolkit)
 
@@ -2189,6 +2202,21 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	bld = bld.WithModelConfig(func(ctx context.Context) *schema.ModelConfig {
 		return model.RequestConfig(resolveModel(ctx, a.config.Model), resolveModelOpts(ctx)...)
 	})
+	if a.config.BackgroundTasks != nil {
+		bld.backgroundNotes = backgroundNotes // 后台任务的结束通知（见 background_task.go）
+	}
+	if a.config.ToolResultSpill != nil {
+		// OnToolEnd 之后按大小处理（转存 / 截断，见 renderToolContent）
+		cfg := a.config
+		bld.finishToolResult = func(ctx context.Context, toolName string, msg *schema.Message, failed bool, code string) {
+			finishPendingToolResult(ctx, &cfg, toolName, msg, failed, code)
+		}
+	}
+	// 这一批处理完之后把结果定进工具账（见 finalizeToolMemo）——跟配没配转存无关。
+	bld.finalizeToolMemo = finalizeToolMemo
+	if len(a.config.TurnGates) > 0 {
+		bld = bld.WithTurnGates(a.config.TurnGates, a.config.TurnGateMaxVetoes)
+	}
 	g, err := bld.Compile()
 	return g, dispatchToolkit, err
 }
@@ -2203,6 +2231,11 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 // 必须支持多次调用同结果（典型实现走 ResumeContext 区分首次/续跑）。详见
 // `BasicAgentPostambleFn` godoc。
 func (a *BasicAgent) postambleFn(ctx context.Context, in *BasicAgentPostambleInput) error {
+	// 最后一轮送进来的后台任务通知随那一轮提交了，之后不会再有模型节点看到它，在这里记下送达（见 background_task.go；
+	// return-direct 收尾也经过这里）
+	if in != nil {
+		backgroundSeen(ctx, in.Messages)
+	}
 	session := GetSession(ctx)
 	if session == nil {
 		// fallback：理论不会发生（Run 入口已 WithSession 注入）；保守路径不 panic
@@ -2433,14 +2466,15 @@ func resetRequiredToolChoice(o *model.Options) {
 }
 
 // withFrameworkTools 返回挂上框架 opt-in 工具（[WithAskUser] 的 ask_user、[WithOutputSchema] 的
-// final_output）之后的工具表；两样都没配时原样返回 tk。绑定侧（modelFn）与派发侧（toolsFn）各调一次，
-// 两边看到的是同一组工具。
+// final_output、[WithToolResultSpill] 的 read_tool_output）之后的工具表；都没配时原样返回 tk。绑定侧
+// （modelFn）与派发侧（toolsFn）各调一次，两边看到的是同一组工具。
 //
 // 不往 cfg.Toolkit 里注册：那是业务传进来的对象，可能被几个 agent 共用——写进去的话没配这些能力的
 // agent 也拿到了（实测：没配结构化输出的 agent 拿别的 agent 的 schema JSON 当最终答复收尾，`err == nil`）。
 // 要加时拷一份；业务的同名工具在这份里被框架那件顶掉（构造期已告警）。
-func withFrameworkTools(cfg *Config, tk *tool.Toolkit) *tool.Toolkit {
-	if !cfg.AskUserOptIn && cfg.OutputSchema == nil {
+func withFrameworkTools(cfg *Config, tk *tool.Toolkit, background bool) *tool.Toolkit {
+	background = background && cfg.BackgroundTasks != nil
+	if !cfg.AskUserOptIn && cfg.OutputSchema == nil && cfg.ToolResultSpill == nil && !background {
 		return tk
 	}
 	out := tool.NewToolkit()
@@ -2454,6 +2488,12 @@ func withFrameworkTools(cfg *Config, tk *tool.Toolkit) *tool.Toolkit {
 	}
 	if cfg.OutputSchema != nil {
 		out.Register(cfg.OutputSchema.tool)
+	}
+	if cfg.ToolResultSpill != nil {
+		out.Register(newReadToolOutputTool(cfg.ToolResultSpill))
+	}
+	if background {
+		out.Register(newBackgroundTaskTool())
 	}
 	return out
 }
@@ -2584,6 +2624,16 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			}
 		}
 
+		// 这一轮之前的摘要结果（单次 Run 内复用，见 compaction_memo.go）：消息流的前 Upto 条换成那次的压缩
+		// 形态，后面两层只处理之后新增的部分。排在 MicroCompact 之前——备忘的锚点按原始消息流记，
+		// MicroCompact 会把旧工具结果换成占位符的克隆，在它之后校验会对不上。
+		memoCtx := compactionMemoFrom(ctx)
+		origMsgs := msgs
+		memoUpto, memoHead := 0, 0
+		if memoCtx != nil && cfg.AutoCompact != nil && cfg.AutoCompact.Enabled {
+			msgs, memoUpto, memoHead = memoCtx.in.apply(msgs)
+		}
+
 		// 第 1 层 MicroCompact——清白名单 tool 旧 tool_result 内容（保结构）
 		if cfg.MicroCompact != nil && cfg.MicroCompact.Enabled {
 			msgs = MicroCompactRun(ctx, msgs, cfg.MicroCompact)
@@ -2591,7 +2641,19 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 
 		// 第 2 层 AutoCompact——超阈值时调 LLM 摘要
 		if cfg.AutoCompact != nil && cfg.AutoCompact.Enabled {
-			compacted, ccErr := AutoCompactRun(ctx, cfg.AutoCompact, msgs)
+			inputLen := len(msgs)
+			// 套用了上一次的结果时告诉压缩 Head 在哪、原始消息流是哪份（见 compactCut）。原始流没经过 MicroCompact：
+			// 它会清掉的那些由同一个判据算出来交过去，文件重注入跳过它们。
+			cut := &compactCut{headLen: memoHead, original: origMsgs, tailLen: -1}
+			if cfg.MicroCompact != nil && cfg.MicroCompact.Enabled && cfg.AutoCompact.reinjectRecentFiles() {
+				cut.cleared = microCompactToClear(origMsgs, cfg.MicroCompact)
+			}
+			compacted, ccErr := autoCompactRun(ctx, cfg.AutoCompact, msgs, cut)
+			// 真摘要了一次 ⟹ 记成新的备忘，模型节点成功后写回 channel，下一轮从这里接着（同一轮里
+			// 模型调用失败 / 中断时这份结果随节点作废，续跑重做——跟消息流同生共死）。
+			if ccErr == nil && cut.tailLen >= 0 && memoCtx != nil {
+				memoCtx.out = nextCompactionMemo(origMsgs, memoUpto, memoHead, inputLen, compacted, cut.tailLen)
+			}
 			// **R23 audit HIGH-1 fix**：control flow err 必须 propagate——业务自定义
 			// cfg.AutoCompact.Model 抛 InterruptError / ctx.Err() 时 AutoCompactRun
 			// 已 propagate（不 wrap），caller 这里也必须直接返。原 `_` 吞掉破坏 HITL。
@@ -2634,7 +2696,7 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 
 		// Skill 集成：仅 toolCall 模式注入 activate_skill 工具——adaptive / pre_match
 		// 模式由 buildInitialMessages 已预激活 skill 进 sysPrompt，无需再让 LLM 调工具。
-		toolkit := withFrameworkTools(&cfg, cfg.Toolkit)
+		toolkit := withFrameworkTools(&cfg, cfg.Toolkit, backgroundScopeFrom(ctx) != nil)
 		if cfg.Skill != nil && cfg.Skill.SkillBox != nil && skillActivationMode(cfg.Skill) == skill.SkillActivationModeToolCall {
 			// P2.B/C: 注入 fork 模式 resolver + parent model fallback
 			actTool := newSkillTool(cfg.Skill.SkillBox).
@@ -2731,9 +2793,11 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 				// 前接那条 transfer tool_call assistant、被洗成记账文本。业务这个回调的典型
 				// 用法是「按用户这轮说了什么裁工具」，拿到框架记账等于拿不到信息。
 				// 见 IsUnresolvedCallsRecord：凡是框架**挑一条消息代表某件事**的地方都要跳。
+				// 框架以 user 角色追加的提示同理（后台任务通知、重复调用提醒、inline skill 正文，见 IsFrameworkNote）：
+				// 它们排在用户输入或工具结果之后，通知最常落在下一次 Run 的第一轮——恰好是这个回调唯一看得到用户原话的那一轮。
 				var lastInput *schema.Message
 				for i := len(msgs) - 1; i >= 0; i-- {
-					if msgs[i] != nil && !IsUnresolvedCallsRecord(msgs[i]) {
+					if msgs[i] != nil && !IsUnresolvedCallsRecord(msgs[i]) && !IsFrameworkNote(msgs[i]) {
 						lastInput = msgs[i]
 						break
 					}
@@ -2925,7 +2989,7 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 // + skill / tool_search 这些框架工具 + 按授予挂的转交 / 路由（没被授予时挂软失败桩）。绑定侧（makeModelFn）
 // 每轮另拼一份，两份注册同一组框架工具。类型标注（pushToolCategorizerCtx）也按这一份查——那是实际会被
 // 派发的实例。
-func (a *BasicAgent) composeDispatchToolkit(grants memberGrants) *tool.Toolkit {
+func (a *BasicAgent) composeDispatchToolkit(grants memberGrants, background bool) *tool.Toolkit {
 	cfg := a.config
 	// 只要有用户 toolkit 或 toolCall 模式 skill 集成，就需要 toolsFn。
 	// adaptive / pre_match 不注 activate_skill 工具，纯靠用户 toolkit 决定是否需要 toolsFn。
@@ -2941,7 +3005,7 @@ func (a *BasicAgent) composeDispatchToolkit(grants memberGrants) *tool.Toolkit {
 	// 图拓扑不受影响：tools 节点本来就恒存在，nil 只在**运行到**它时才报错。
 	// 内置 skill 工具的 lazy 初始化——modelFn 内 toolkit 是 clone 的，toolsFn
 	// 这里独立维护一份 dispatch 用 toolkit。adaptive / pre_match 不注 activate_skill。
-	dispatchToolkit := withFrameworkTools(&cfg, cfg.Toolkit)
+	dispatchToolkit := withFrameworkTools(&cfg, cfg.Toolkit, background)
 	if skillNeedsTool {
 		// 综合 audit H3 fix: 检测业务自带同名工具，warn 提示被框架版覆盖
 		// （toolsFn 构造期一次性 warn——modelFn 已 per-Run warn 过同样信号，但这里
@@ -3085,6 +3149,8 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			// 作废看 OnToolEnd 改写之后的结果，见 tool_batch_signals.go。
 			signals compose_v2.Signals
 			err     error
+			// replayed：产出是从工具账重放的（这一批上次没整体成功，这个调用当时已经跑完）。
+			replayed bool
 		}
 
 		// ── 已跑成功的 tool_call 不重跑（节点私有中断态，见 compose_v2/node_state.go）──
@@ -3100,7 +3166,10 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 		// ⚠️ **hook 行为不变**：`OnToolStart/End` 仍对全部 tc 各 fire 一次（它们在
 		// basic_builder.go 的 toolsFn 外层、看不到 memo）。Resume 时 hook 重复 fire 是
 		// **既有行为**（今天所有 tc 都重跑、hook 也都重 fire），memo 只把「工具函数被重
-		// 调用」这半消掉。观测口径的重复计数是另一件事，不在本次范围。
+		// 调用」这半消掉。重放的那几个在 OnToolEnd 的 `ToolOutput.Extra` 上标
+		// [ToolReplayedExtraKey]（经 toolBatch.ends 交给 tools 节点）：它们在上一次没整体成功
+		// 的那一批里已经收过尾（见 endSettledToolCalls），按调用计数或计时的钩子据它跳过。这一批处理完之后定下的
+		// 那几个（见 finalizeToolMemo）例外：续跑时不再处理，钩子也不触发（见 fixedToolResults）。
 		//
 		// ⚠️ **判据是「这次调用的副作用能不能重放」，不是工具名字**（见 shouldMemoize）：
 		// memo 的契约原本是「重放产出、不重放副作用」，可有些工具的产出**不止 tool_result**
@@ -3138,20 +3207,17 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 		//     仍进键，让「A 的产出不被当成 B 的返回值贴回去」不依赖那份记录——改写曾经在续跑时
 		//     生效，那时这一维是唯一的防线（命中就把 A 的产出贴给 B，带上名字后退化成**不命中**、
 		//     重跑，错在安全侧）。现在它是冗余的第二道：固定内容之下走不到，没有测试覆盖。
-		memoKey := func(callID string, idx int, toolName string) string {
-			return callID + "#" + strconv.Itoa(idx) + "#" + toolName
-		}
+		memoKey := toolMemoKey
 		// fanout 下 N 个 goroutine 并发写 memo——map 写必须串行（cm 那侧自己有锁，
 		// 这里保护的是 map 本身 + 「改完立刻存」这两步的原子性）。
 		//
 		// ⚠️ **它实际保护的范围比「这张 map」大**：持锁期间会 `json.Marshal(memo)`
 		// （SaveNodeState 内），而那会遍历**整棵对象图**。于是有一条隐式不变量——
-		// **凡是被 memo 引用的 *schema.Message，都不许在 memoMu 之外被改**。
-		// 今天成立（entry 构造后没有任何一处原地改它的字段），但 `hit.ToolMsg` 是被
-		// **原样交出去**的（下面命中分支 → outcomes[i] → 下游），安全只因下游都在
-		// wg.Wait() 之后。哪天有人在 fanout 窗口内给 tool_result 补个 annotation
-		// （markToolFailure / ReturnDirectAnnotation / SkillBodyAnnotation 都是这种形状），
-		// 就是一条真 race。
+		// **凡是被 memo 引用的 *schema.Message，都不许在 fanout 窗口里、memoMu 之外被改**。
+		// memo 引用的就是交出去的那条（下面命中分支 → outcomes[i] → 下游），tools 节点在这一批都返回之后会
+		// 就地改它（钩子改写、按大小处理，见 basic_builder.go）——那时 fanout 已经结束、没有并发的
+		// SaveNodeState，存下的字节也是改之前当场序列化的。哪天有人在 fanout 窗口内给 tool_result 补个
+		// annotation（markToolFailure / ReturnDirectAnnotation / SkillBodyAnnotation 都是这种形状），就是一条真 race。
 		var memoMu sync.Mutex
 		rememberDone := func(tc schema.ToolCall, idx int, oc outcome) {
 			// tc.ID 为空（有的 provider 不回 tool_call ID）照样记：memoKey 带批内下标，同一批两个
@@ -3196,7 +3262,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			if hit != nil && hit.ToolMsg != nil {
 				// 函数体被跳过 ⟹ 它当时做出的决定也不会再做一次，这里原样交出。
 				compose_v2.EmitSignals(callCtx, hit.Signals)
-				return outcome{toolMsg: hit.ToolMsg, bodyMsg: hit.BodyMsg}
+				return outcome{toolMsg: hit.ToolMsg, bodyMsg: hit.BodyMsg, replayed: true}
 			}
 			// review-v6 H-02 fix: 业务 Tool.Call panic 转 outcome.err 不冒泡——
 			// ISSUE-81 N>=2 fanout 路径下 goroutine 内未 recover 的 panic 让 Go runtime
@@ -3313,7 +3379,9 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 					}
 				},
 			})
-			if ar := checkToolApproval(callCtx, &cfg, tc, args, minted); ar.err != nil {
+			// 只读放行档要知道这次派发的那件工具有没有声明只读——按实例认（tool.IsReadOnly），不按名字
+			readOnly := tool.IsReadOnly(dispatchToolkit.Get(tc.Function.Name))
+			if ar := checkToolApproval(callCtx, &cfg, tc, args, minted, readOnly); ar.err != nil {
 				return outcome{err: ar.err}
 			} else if !ar.proceed {
 				return outcome{toolMsg: ar.denyMsg}
@@ -3323,103 +3391,94 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			// 不依赖那份记录，跟工具账（memoKey 带名字）同一个理由。改写曾经在续跑时生效，那时新工具
 			// 读到旧工具记的「做过了」，事没做（实测）。现在同样是冗余的第二道，没有测试覆盖。
 			callCtx = compose_v2.WithNodeStateSealed(callCtx, "tool\x00"+tc.Function.Name)
-			// **工具级超时**：把 deadline 交给工具，超时后**照样等它返回**，只在它返回时
-			// 说一句「你超了」。理由见 [WithToolTimeout]——不假装能掐断一个不看 ctx 的工具。
-			// ⚠️ **留住派生前那个 ctx**：超时判定要区分「工具自己的 deadline 到了」和
-			// 「调用方的 ctx 死了」，而派生 ctx 的 `Err()` 两种情况下都非 nil
-			// （派生 ctx 继承父的 deadline）。手上没有父 ctx 就分不出来。
-			parentCtx := callCtx
-			if cfg.ToolTimeout > 0 && !minted {
-				var cancel context.CancelFunc
-				callCtx, cancel = context.WithTimeout(callCtx, cfg.ToolTimeout)
-				defer cancel()
-			}
-			// 中间件链在这儿——memo / 渐进披露 / 审批**之内**，工具**之外**（理由见
-			// ToolMiddleware godoc「顺序」）。框架自带工具不过链：它们的真产出不在
-			// tool_result 里，短路掉是静默失败（同 memo 的判定，别改回去）。
-			callTool := ToolEndpoint(func(ctx context.Context, name string, a map[string]any) (*tool.Result, error) {
-				return dispatchToolkit.Call(ctx, name, a)
-			})
-			var res *tool.Result
-			var err error
-			if len(cfg.ToolMiddlewares) > 0 && !minted {
+			// invoke 跑这次调用：中间件链 + 工具。中间件链在这儿——memo / 渐进披露 / 审批**之内**，工具**之外**（理由见
+			// ToolMiddleware godoc「顺序」）。框架自带工具不过链：它们的真产出不在 tool_result 里，短路掉是静默失败
+			// （同 memo 的判定，别改回去）。
+			//
+			// c 是交给工具的 ctx；guard 是判「中间件吞掉的错能不能吞」用的调用方 ctx（见 guardControlFlow）——同步执行
+			// 时是工具超时派生之前那个，别把框架自己设的 deadline 当成调用方喊停；后台执行时就是后台任务自己的 ctx。
+			invoke := func(c, guard context.Context) (*tool.Result, error) {
+				callTool := ToolEndpoint(func(ctx context.Context, name string, a map[string]any) (*tool.Result, error) {
+					return dispatchToolkit.Call(ctx, name, a)
+				})
+				if len(cfg.ToolMiddlewares) == 0 || minted {
+					return callTool(c, tc.Function.Name, args)
+				}
 				// 中间件交给 next 的 ctx 跟钩子返回的 ctx 一样采纳（compose_v2.EnterHook，规则同 CallHook）：
 				// 交过来的是存下来的 ctx 时，工具体照样在这次调用的位置上跑。曾经原样交给工具体：中间件为了
 				// 挂 span 沿用第一次存下的 ctx，工具里的提问每次续跑都换一个 ID、永远答不完（实测）。
-				mwCtx, adopt := compose_v2.EnterHook(callCtx)
+				mwCtx, adopt := compose_v2.EnterHook(c)
 				adopting := ToolEndpoint(func(ctx context.Context, name string, a map[string]any) (*tool.Result, error) {
 					return callTool(adopt(ctx), name, a)
 				})
-				// parentCtx：工具超时派生之前的调用方 ctx——guard 判「能不能吞」按它，
-				// 别把框架自己设的 deadline 当成调用方喊停（见 guardControlFlow godoc）。
-				guarded, check := guardControlFlow(parentCtx, adopting)
-				res, err = check(chainToolMiddlewares(cfg.ToolMiddlewares, guarded)(mwCtx, tc.Function.Name, args))
-			} else {
-				res, err = callTool(callCtx, tc.Function.Name, args)
+				guarded, check := guardControlFlow(guard, adopting)
+				return check(chainToolMiddlewares(cfg.ToolMiddlewares, guarded)(mwCtx, tc.Function.Name, args))
 			}
-			// **框架自己设的 deadline 到期 ⟹ 框架自己收尾**，不指望工具返对东西。
-			//
-			// 本仓契约是「工具返 error = 硬失败（整节点挂）、返 tool.Failure = 给模型看」。
-			// 而超时是**这次工具调用**的失败、不是整轮的失败——该让模型看见并换条路。
-			// 响应 ctx 的工具会返 `context.DeadlineExceeded`（那是 error 档，会挂整轮），
-			// 不响应的会返一个迟到的成功。**两种都不是我们要的**，所以在这儿统一改写。
-			if toolDeadlineExceeded(parentCtx, callCtx, cfg.ToolTimeout, err) {
-				if err == nil && res != nil && res.Success {
-					// 超了 deadline 还返回成功 ⟹ 这个工具没看 ctx。出声——**一个不生效
-					// 又不出声的超时比没有超时更坏**，业务会以为有保护。
-					slog.WarnContext(ctx, "agent_v2: 工具超过 WithToolTimeout 仍返回成功——"+
-						"它没有响应 ctx 取消，这次调用实际没有被超时打断（结果已按超时丢弃）",
-						"tool", tc.Function.Name, "timeout", cfg.ToolTimeout, "tool_call_id", tc.ID)
+			var res *tool.Result
+			var err error
+			ran := false
+			// **可后台的调用**（见 background_task.go）：在后台 goroutine 里跑，YieldAfter 之内返回就跟同步执行一样往下走；
+			// 到点了还没返回就转入后台，这次的 tool_result 换成任务 id。
+			if sc := backgroundScopeFrom(callCtx); backgroundEligible(sc, minted, dispatchToolkit.Get(tc.Function.Name)) {
+				// 后台任务结束时没有 OnToolEnd 这一步，当场按大小处理（deferSize=false）
+				render := func(c context.Context, r *tool.Result) bgRendered {
+					rc := renderToolContent(c, &cfg, false, tc.Function.Name, r, false)
+					return bgRendered{content: rc.content, spillID: rc.spillID, spillInfo: rc.spillInfo}
 				}
-				// **标失败**：超时是这次工具调用的失败，不标的话 `OnToolEnd` 收到
-				// `Success=true`、`gen_ai.tool.error.total` 不计这一类、span 标成功——
-				// 最需要被观测到的工具失败反而是唯一不可见的（合成入口收敛见
-				// failedToolResult godoc）。
-				return outcome{toolMsg: failedToolResult(tc.ID, "tool_timeout",
-					fmt.Sprintf("工具调用超时（超过 %s 未返回），本次调用已放弃", cfg.ToolTimeout))}
+				bo, started := sc.cfg.Manager.call(callCtx, sc, tc, cfg.ToolTimeout, invoke, render)
+				if started {
+					ran = true
+					if bo.task != nil {
+						return outcome{toolMsg: backgroundHandleMessage(tc, bo.task, sc.cfg.yieldAfter())}
+					}
+					if bo.timedOut > 0 {
+						return outcome{toolMsg: failedToolResult(tc.ID, ToolTimeoutErrCode,
+							fmt.Sprintf("工具调用超时（超过 %s 未返回），本次调用已放弃", bo.timedOut))}
+					}
+					res, err = bo.res, bo.err
+				}
+			}
+			if !ran {
+				// **工具级超时**：把 deadline 交给工具，超时后**照样等它返回**，只在它返回时
+				// 说一句「你超了」。理由见 [WithToolTimeout]——不假装能掐断一个不看 ctx 的工具。
+				// ⚠️ **留住派生前那个 ctx**：超时判定要区分「工具自己的 deadline 到了」和
+				// 「调用方的 ctx 死了」，而派生 ctx 的 `Err()` 两种情况下都非 nil
+				// （派生 ctx 继承父的 deadline）。手上没有父 ctx 就分不出来。
+				parentCtx := callCtx
+				if cfg.ToolTimeout > 0 && !minted {
+					var cancel context.CancelFunc
+					callCtx, cancel = context.WithTimeout(callCtx, cfg.ToolTimeout)
+					defer cancel()
+				}
+				res, err = invoke(callCtx, parentCtx)
+				// **框架自己设的 deadline 到期 ⟹ 框架自己收尾**，不指望工具返对东西。
+				//
+				// 本仓契约是「工具返 error = 硬失败（整节点挂）、返 tool.Failure = 给模型看」。
+				// 而超时是**这次工具调用**的失败、不是整轮的失败——该让模型看见并换条路。
+				// 响应 ctx 的工具会返 `context.DeadlineExceeded`（那是 error 档，会挂整轮），
+				// 不响应的会返一个迟到的成功。**两种都不是我们要的**，所以在这儿统一改写。
+				if toolDeadlineExceeded(parentCtx, callCtx, cfg.ToolTimeout, err) {
+					if err == nil && res != nil && res.Success {
+						// 超了 deadline 还返回成功 ⟹ 这个工具没看 ctx。出声——**一个不生效
+						// 又不出声的超时比没有超时更坏**，业务会以为有保护。
+						slog.WarnContext(ctx, "agent_v2: 工具超过 WithToolTimeout 仍返回成功——"+
+							"它没有响应 ctx 取消，这次调用实际没有被超时打断（结果已按超时丢弃）",
+							"tool", tc.Function.Name, "timeout", cfg.ToolTimeout, "tool_call_id", tc.ID)
+					}
+					// **标失败**：超时是这次工具调用的失败，不标的话 `OnToolEnd` 收到
+					// `Success=true`、工具 span 记成 success、`gen_ai.execute_tool.duration` 不带 `error.type`——
+					// 最需要被观测到的工具失败反而是唯一不可见的（合成入口收敛见
+					// failedToolResult godoc）。
+					return outcome{toolMsg: failedToolResult(tc.ID, ToolTimeoutErrCode,
+						fmt.Sprintf("工具调用超时（超过 %s 未返回），本次调用已放弃", cfg.ToolTimeout))}
+				}
 			}
 			if err != nil {
 				return outcome{err: err}
 			}
-			content := ""
-			// origBytes 记「截断之前正文有多少字节」——0 表示没截过。它要一路带到消息的
-			// annotation 上，因为**下一刀（紧急压缩兜底）手上的 len 是这一刀之后的残长**。
-			origBytes := 0
-			var toolErr *tool.Error // 业务工具声明的失败（tool.Failure）——见下方 markToolFailure
-			if res != nil {
-				// **单条工具结果的字节上限**——超了从中间挖空。堵在源头，压缩层就极少再遇到
-				// 「受保护的组自己就超预算、只能整丢或整留」那个死局。见 Config.ToolResultMaxBytes。
-				//
-				// ⚠️ **位置是承重的：必须在 content 拼装之前、作用在 res 的内容字段上。**
-				// 晚半步（在拼好的 content 上截）有两个后果，都实测过：
-				//   - **失败路径上截断被完全撤销**：`toolErr` 抓的是 `res.Error` 的引用，
-				//     下游 `basic_builder.go` 按 `(ErrorCode, Error)` **无条件重算** content
-				//     覆盖回去 ⟹ 模型实收 40027 字节一个字节没少，**而框架已经打了一条
-				//     `kept_bytes=2000` 的 WARN**——比静默更糟：业务照日志建监控会以为保护生效。
-				//   - **看不出这条结果的去向**：`res.Metadata` 那时还没读，而「能不能截」恰恰
-				//     取决于它是「给模型的输入」还是「给调用方的答案」。
-				trunc := truncMaxBytesFor(cfg, minted, res)
-				if res.Error != nil {
-					msg := res.Error.Message
-					if trunc > 0 && len(msg) > trunc {
-						msg = truncateMiddle(msg, trunc)
-						logToolResultTruncated(callCtx, cfg.Name, tc.Function.Name, len(res.Error.Message), len(msg), trunc)
-					}
-					content = toolErrorContent(res.Error.Code, msg)
-					if len(msg) < len(res.Error.Message) {
-						origBytes = len(res.Error.Message)
-					}
-					// **不改业务那份 res.Error**——另铸一个，免得业务持有的对象被我们写穿。
-					toolErr = &tool.Error{Code: res.Error.Code, Message: msg}
-				} else {
-					content = fmt.Sprintf("%v", res.Output)
-					if trunc > 0 && len(content) > trunc {
-						origBytes = len(content)
-						content = truncateMiddle(content, trunc)
-						logToolResultTruncated(callCtx, cfg.Name, tc.Function.Name, origBytes, len(content), trunc)
-					}
-				}
-			}
+			// 开了转存时按大小处理留到 OnToolEnd 之后（deferSize=true，见 renderToolContent）：转存的要是钩子改写之后的那份
+			rendered := renderToolContent(callCtx, &cfg, minted, tc.Function.Name, res, true)
+			content, toolErr := rendered.content, rendered.toolErr
 
 			// **P2.D inline body 协议**：仅 framework activate_skill 成功 + InlineSkillBody 启用时
 			_, isSkillTool := dispatchToolkit.Get(tc.Function.Name).(*skillTool) // 按实例认：派发的是框架那件 activate_skill
@@ -3452,8 +3511,12 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			}
 
 			toolMsg := schema.ToolResultMessage(tc.ID, content)
-			if origBytes > 0 {
-				toolMsg.Annotations = map[string]any{TruncatedOriginalBytesAnnotation: origBytes}
+			annotateSizedToolResult(toolMsg, sizedToolContent{origBytes: rendered.origBytes, spillID: rendered.spillID, spillInfo: rendered.spillInfo})
+			if rendered.pending {
+				if toolMsg.Annotations == nil {
+					toolMsg.Annotations = map[string]any{}
+				}
+				toolMsg.Annotations[toolResultSizePendingAnnotation] = true
 			}
 			// issue-95 finding 3: 业务工具声明的失败经 annotation 跨层带到 toolsNode 的
 			// hook fire 层——否则 OnToolEnd 恒收到 Success=true，工具 span 永远不会记成失败。
@@ -3498,8 +3561,8 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 		// 结果是失败的（超时、工具声明的 tool.Failure、中间件改成失败）也照收、不在这里作废：模型最后
 		// 看到的是 OnToolEnd 改写之后的结果，作废按那个判（钩子把失败改成成功，决定就算数），见
 		// tool_batch_signals.go。超时也不例外——工具调用是同步的，走到超时收尾时工具已经返回，这次
-		// 调用期间做出的决定已经收全。记账里记的也是这一份原始的，续跑命中时钩子照样 fire、按同一套
-		// 规则重判。
+		// 调用期间做出的决定已经收全。记账里记的也是这一份原始的：这一批没处理完就停下、续跑命中时钩子
+		// 照样 fire、按同一套规则重判；处理完之后定下的不再交给钩子（见 fixedToolResults）。
 		runCall := func(callCtx context.Context, tc schema.ToolCall, idx int) outcome {
 			var oc outcome
 			sigs, _ := compose_v2.CaptureSignals(callCtx, func(c context.Context) error {
@@ -3631,6 +3694,14 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 		// 挂着 ErrCheckpointStale 就整轮判 stale，兄弟那条干净中断被一起判死、pending entry 一并清掉。
 		// 这是有意的 fail-closed。子 agent 出口档没写成（`ErrCheckpointNotPersisted`）不靠这个：
 		// PickFanoutError 给它单独一档，排在中断之前。
+		// 各调用的结局交给 tools 节点（成不成都交）：没整体成功时它据此给已经有结局的调用收尾（OnToolEnd），整体成功时
+		// 据此给重放的调用打标记（见 toolBatch.ends）
+		if b := toolBatchFrom(ctx); b != nil {
+			b.ends = make([]toolCallEnd, len(outcomes))
+			for i, oc := range outcomes {
+				b.ends[i] = toolCallEnd{msg: oc.toolMsg, err: oc.err, replayed: oc.replayed}
+			}
+		}
 		if err := compose_v2.PickFanoutError(toolErrs); err != nil {
 			return nil, err
 		}
@@ -3642,7 +3713,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 		for i, oc := range outcomes {
 			perCall[i] = oc.signals
 		}
-		if b := toolBatchSignalsFrom(ctx); b != nil {
+		if b := toolBatchFrom(ctx); b != nil {
 			b.perCall, b.filled = perCall, true
 		} else {
 			failed := make([]bool, len(toolCalls))

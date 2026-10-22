@@ -78,8 +78,9 @@ type Config struct {
 	// **PR 3.3+ 真消费**：BasicAgent.buildInitialMessages 子步调
 	// `store.Search(ctx, StoreMemoryNS, ...)` 注入历史 + commitFinal 内
 	// 调 `store.Put(ctx, StoreMemoryNS, key, last.Content)` 保存最终答复的**文本**
-	// （2026-09-07 起：存整条 message 时 in-memory 与持久后端读回来的类型不一致，
-	// 喂给 LLM 的东西也跟着分叉；存文本让六个后端逐字相同。Content 为空则跳过）
+	// （2026-09-07 起存文本：那时存整条 message 时 in-memory 与持久后端读回来的类型不一致，
+	// 喂给 LLM 的东西也跟着分叉；store 按值的 JSON 形状存之后类型已经一致，文本仍是注入时最直接的
+	// 形状。Content 为空则跳过）
 	// （写入者维在 ns 上防成员之间撞键，见 StoreMemoryConfig.WriterID）。
 	//
 	// nil StoreMemory = 不启用 helper。
@@ -147,6 +148,15 @@ type Config struct {
 	// `final_output` 装的就是最终答案本身，截它等于把答案改坏。
 	ToolResultMaxBytes int
 
+	// ToolResultSpill 是超大工具输出转存配置（nil = 关闭）——超过阈值的业务工具结果全文存进 store，消息流里
+	// 只留说明 + 头尾预览 + 取回 id，并注入 read_tool_output。经 [WithToolResultSpill] 设，见 tool_spill.go。
+	ToolResultSpill *ToolResultSpillConfig
+
+	// BackgroundTasks 是长时间运行工具的后台执行配置（nil = 关闭）——点名的工具一次调用跑过 YieldAfter 还没返回
+	// 就转入后台、先给模型一个任务 id，结束后作为通知送进对话，并注入 background_task。经 [WithBackgroundTasks]
+	// 设，只在顶层生效，见 background_task.go。
+	BackgroundTasks *BackgroundTasksConfig
+
 	// SkillModelResolver 是 P2.B 解析 skill frontmatter `model: <name>` 字段为
 	// `model.ChatModel` 实例的回调（业务实现）。
 	//
@@ -196,7 +206,8 @@ type Config struct {
 	// 那道要的正是摘掉它们。用同一个 helper 表达两者曾让软降落的白名单一行没生效，故各有各的载体。
 	// input 是本轮发给 LLM 的最后一条**真实**消息（首轮通常是 user 输入，round 2+ 通常是
 	// tool_result）——框架合成的记账文本（见 UnresolvedCallsRecordAnnotation）会被跳过，
-	// 否则 Handoff 共享视图下它恰好排在末尾、业务拿到的是框架记账而不是对话内容；
+	// 否则 Handoff 共享视图下它恰好排在末尾、业务拿到的是框架记账而不是对话内容；框架以 user
+	// 角色追加的提示（后台任务通知、重复调用提醒、inline skill 正文，见 IsFrameworkNote）同样跳过；
 	// 每轮都跑（含 Resume 后的轮）。用于"分类后裁工具"等场景（RoutingAgent classifier 分类 →
 	// filter 返子集是典型用法）。与 ToolSearch（LLM 主动搜解锁）正交可叠加。
 	ToolFilter func(ctx context.Context, input *schema.Message) []string
@@ -234,6 +245,12 @@ type Config struct {
 	// ApprovalScope 把一次工具调用归一化成「这算哪件事」的指纹（可选，nil = 参数原文精确匹配）。
 	// 决定 approve_always 这条规则覆盖多大范围。见 WithApprovalScope。
 	ApprovalScope ApprovalScope
+	// ApprovalPrompt 替换写进系统提示的审批说明（nil = 默认文案，指向空串 = 不写）。见 WithApprovalPrompt。
+	ApprovalPrompt *string
+	// TurnGates 回合结束闸门（空 = 不设，图里没有闸门节点）。见 WithTurnGate。
+	TurnGates []TurnGateFunc
+	// TurnGateMaxVetoes 一个任务里闸门最多否决几次（<= 0 用 DefaultTurnGateMaxVetoes）。见 WithTurnGateMaxVetoes。
+	TurnGateMaxVetoes int
 	// approvalOwner 是这个 agent 实例在 approve_always 规则里的身份，构造时铸（见 NewBasicAgent，在选项之后）。规则只对
 	// 答应它的那个 agent 生效：工具名只在一个 agent 的工具表里唯一，别的 agent 同名的可能是另一个工具（见
 	// approvalRuleKey）。
@@ -463,8 +480,8 @@ func WithPromptTemplate(tmpl *prompt.Template, varsFn func(ctx context.Context, 
 //     入口检 typed nil 防 framework 内部调用 deref. 见 `agent_v2/basic_builder.go::Compile`
 //   - 两层数字不同是 by-design (不同语义层独立检查), 不是 stale.
 //
-// **panic 语义** (audit² 改): hook panic 由 framework Run 入口 outer
-// defer recover 兜底转 err 返业务 — 不在每个调用点 wrap (统一在执行入口兜底).
+// **panic 语义**: hook panic 由框架兜住、不让 goroutine 崩——多数转成这次调用的错误，调用成功之后的
+// OnAgentEnd 只作观测、panic 就地兜住记一条 ERROR（见 hook 包文档「panic 语义」）.
 func WithHooks(h hook.Hooks) Option {
 	return func(c *Config) {
 		if isFrameworkNil(h) {

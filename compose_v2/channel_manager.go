@@ -41,6 +41,11 @@ type ChannelManager struct {
 	// 仅 Run 在 graphLoop 内更新；外部不该直接 set。
 	frontierAtExit []FrontierMember
 
+	// frontierStarted：frontierAtExit 这一超步是不是已经开始执行了（成员跑过）。超步开始执行前置位、
+	// 整体推进到新边界时清掉，随存档走。续跑恢复出一个还没开始执行的边界（软取消 / ctx 取消停在边界上、
+	// 崩溃恢复）时照常判 before 断点，开始过的（中断 / 失败之后续跑）不再判——见 breakpointStop。
+	frontierStarted bool
+
 	// cpEpochBaseline 是本 Run 的"世代基线"——**我最后一次看到或写入的那一代 cp**。
 	//
 	// 载入 cp 时设为它的 Epoch；本 Run 每次成功写 cp 后更新为刚写的那一代。
@@ -551,6 +556,13 @@ func (cm *ChannelManager) updateFrontier(frontier []FrontierMember) {
 	cm.updateFrontierLocked(frontier)
 }
 
+// markFrontierStarted 记下当前超步开始执行了（见 frontierStarted）。
+func (cm *ChannelManager) markFrontierStarted() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.frontierStarted = true
+}
+
 // updateFrontierLocked 是 updateFrontier 的实现——**调用方须已持写锁**。
 func (cm *ChannelManager) updateFrontierLocked(frontier []FrontierMember) {
 	if len(frontier) == 0 {
@@ -689,6 +701,7 @@ func (cm *ChannelManager) commitSuperstepAdvance(
 	cm.completedFrontier, cm.deferredSends, cm.completedTargets = nil, nil, nil
 	cm.completedSignals = nil
 	cm.updateFrontierLocked(nextFrontier)
+	cm.frontierStarted = false // 新边界，还没开始执行
 	if len(dirWrites) > 0 {
 		cm.pendingSendWrites = append([]ChannelWrite(nil), dirWrites...)
 		if err := cm.applyAllLocked(dirWrites); err != nil {
@@ -895,12 +908,8 @@ func (cm *ChannelManager) PendingInterrupts() []*AskQuery {
 		if q == nil {
 			continue
 		}
-		// 深拷贝 *AskQuery + Options slice（map 引用类型也需深拷贝避免污染）
-		qc := *q
-		if q.Options != nil {
-			qc.Options = append([]string(nil), q.Options...)
-		}
-		out = append(out, &qc)
+		// 深拷贝 *AskQuery（Options、断点信息也各拷一份，见 AskQuery.clone）
+		out = append(out, q.clone())
 	}
 	return out
 }

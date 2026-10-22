@@ -43,6 +43,9 @@ type GraphAgent struct {
 	inputWriter  GraphInputWriter
 	outputReader GraphOutputReader
 	hooks        hook.Hooks
+	// interruptBefore / interruptAfter 见 WithGraphInterruptBefore / WithGraphInterruptAfter。
+	interruptBefore []compose_v2.NodeID
+	interruptAfter  []compose_v2.NodeID
 }
 
 // GraphInputWriter 把 input message 翻译成 graph 初始 channel writes。
@@ -83,7 +86,75 @@ func NewGraphAgent(graph *compose_v2.Graph, opts ...GraphAgentOption) *GraphAgen
 	if g.name == "" {
 		panic("NewGraphAgent: WithGraphAgentName required")
 	}
+	if g.graph != nil {
+		for _, bp := range []struct {
+			opt string
+			ids []compose_v2.NodeID
+		}{{"WithGraphInterruptBefore", g.interruptBefore}, {"WithGraphInterruptAfter", g.interruptAfter}} {
+			for _, id := range bp.ids {
+				if id != compose_v2.AllNodes && !g.graph.HasNode(id) {
+					panic(fmt.Sprintf("NewGraphAgent: %s 里的节点 %q 不在这张图里", bp.opt, id))
+				}
+			}
+		}
+	}
 	return g
+}
+
+// WithGraphInterruptBefore 给这个 GraphAgent 加 before 断点：图执行到 nodes 中的节点
+// （compose_v2.AllNodes = 每一个节点）之前停下，不用改节点代码——调试、逐步执行、「到这儿先让人看一眼」
+// 的闸门。语义同 compose_v2.GraphBuilder.WithInterruptBefore：停下时 Run / Resume 返回
+// Reason 为 compose_v2.BreakpointInterruptReason 的中断（Query.Breakpoint 写着停在哪），Resume（带不带
+// 答案都行）就是放行，恰好越过这一个超步边界；要拦下不走就不 Resume，或 Resume 时
+// WithResumeAction(ResumeActionAbort)。
+//
+// Run 与每次 Resume 都带上这组断点（逐步执行时每次 Resume 停在下一个边界）。只作用于这张图自己的节点：
+// 节点里调起的 agent、子图里的节点不受影响（子图的断点在子图的 builder 上设）。节点名不在图里时构造期 panic。
+func WithGraphInterruptBefore(nodes ...compose_v2.NodeID) GraphAgentOption {
+	return func(g *GraphAgent) { g.interruptBefore = append(g.interruptBefore, nodes...) }
+}
+
+// WithGraphInterruptAfter 给这个 GraphAgent 加 after 断点：nodes 中的节点所在的超步整体提交之后停下。
+// 其余同 [WithGraphInterruptBefore]；语义见 compose_v2.GraphBuilder.WithInterruptAfter。
+func WithGraphInterruptAfter(nodes ...compose_v2.NodeID) GraphAgentOption {
+	return func(g *GraphAgent) { g.interruptAfter = append(g.interruptAfter, nodes...) }
+}
+
+// errBreakpointNeedsCheckpointer 是 GraphAgent 配了断点、ctx 上却没有 checkpointer。实现
+// [compose_v2.NonRetryable]：配置错重跑必然一样；不用 [compose_v2.ErrRunAborted]——它抛在图开始执行之前，
+// 也没有存档可清。
+type errBreakpointNeedsCheckpointer struct{ name string }
+
+func (e *errBreakpointNeedsCheckpointer) Error() string {
+	return fmt.Sprintf("agent_v2: GraphAgent %q 配了断点，但 ctx 上没有 checkpointer：停在断点上要靠存档续跑，"+
+		"没有存档时 Resume 续不了、重跑又停在同一个断点。用 compose_v2.WithCheckpointerCtx 配上 checkpointer", e.name)
+}
+
+// NonRetryable 实现 [compose_v2.NonRetryable]。
+func (e *errBreakpointNeedsCheckpointer) NonRetryable() {}
+
+// checkBreakpointsResumable：配了断点（GraphAgent 自己的，或者图编译期声明的）就得有 checkpointer。停在断点
+// 上只能经 Resume 续（Resume 要存档），没有存档时这个任务每次都停在第一个断点、永远过不去——Run 入口就拒。
+func (g *GraphAgent) checkBreakpointsResumable(ctx context.Context) error {
+	if len(g.interruptBefore)+len(g.interruptAfter) == 0 && !g.graph.HasBreakpoints() {
+		return nil
+	}
+	if compose_v2.GetCheckpointer(ctx) != nil {
+		return nil
+	}
+	return &errBreakpointNeedsCheckpointer{name: g.Name()}
+}
+
+// breakpointOptions 把这个 GraphAgent 的断点转成引擎选项（Run 与 Resume 都带）。
+func (g *GraphAgent) breakpointOptions() []compose_v2.RunOption {
+	var opts []compose_v2.RunOption
+	if len(g.interruptBefore) > 0 {
+		opts = append(opts, compose_v2.WithInterruptBefore(g.interruptBefore...))
+	}
+	if len(g.interruptAfter) > 0 {
+		opts = append(opts, compose_v2.WithInterruptAfter(g.interruptAfter...))
+	}
+	return opts
 }
 
 // GraphAgentOption 配置 GraphAgent。
@@ -157,6 +228,9 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 		return nil, fmt.Errorf("graph agent %q: output reader required (use WithGraphOutputReader)", g.Name())
 	}
 	if err := resolveRunSession(ctx, &session, g.Name()); err != nil {
+		return nil, err
+	}
+	if err := g.checkBreakpointsResumable(ctx); err != nil {
 		return nil, err
 	}
 	ctx = WithSession(ctx, session)
@@ -253,7 +327,7 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "GraphAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: msgs})
+		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: msgs}, retErr)
 	}()
 
 	final, err := g.runGraph(ctx, &cfg, session, input)
@@ -364,6 +438,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 		compose_v2.WithCheckpointer(cper),
 		compose_v2.WithSessionID(sessionID),
 	}
+	runOpts = append(runOpts, g.breakpointOptions()...)
 	// **R31 audit 视角 C HIGH-1 fix**：与 runGraph 路径对称——嵌套场景下 caller 持
 	// GraphAgent 引用直接 .Resume 时 ctx 中含父推 graphNS——必须 forward 让
 	// LoadNS(sid, ns) 拿到正确 ns 下子 cp，避免拿父 cp 报 channel not registered。
@@ -413,7 +488,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "GraphAgent.OnAgentEnd", recover(), &retErr)
 		ctxOut := WithEndError(ctx, retErr)
-		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: msgs})
+		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: msgs}, retErr)
 	}()
 
 	// Resume 拿不到授予：放一份空的，遮住外层放的那份。
@@ -465,6 +540,7 @@ func (g *GraphAgent) runGraph(
 	// （`withImportOverlay`，子图独家）。⚠️ 这里尤其不能靠「写 LastValue 所以幂等」来省判断
 	// ——`inputWriter` 是**业务提供的**，业务完全可以往 Append channel 写。
 	runOpts := []compose_v2.RunOption{compose_v2.WithInitialWrites(g.inputWriter(input)...)}
+	runOpts = append(runOpts, g.breakpointOptions()...)
 	if cper != nil {
 		runOpts = append(runOpts,
 			compose_v2.WithCheckpointer(cper),

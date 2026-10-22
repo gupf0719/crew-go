@@ -284,7 +284,10 @@ func (b *ReflectAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// **R30 视角A HIGH-1 + LOW-1 fix**：与 actor 路径对称（已 push round_<N>），
 		// 评估也 push round_<N> NS 让跨多轮 evaluator 嵌套 sub-agent 的 InterruptID
 		// 5 维 graphNS 维度自然隔离。
-		evalCtx := compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), fmt.Sprintf("round_%d", round)))
+		//
+		// Reflector / EvalFunc 是内部决策（同评审 agent 那一档，见 decisionCtx）：它们里面请教的 agent 不进
+		// 会话历史、不取用户的插话。
+		evalCtx := decisionCtx(compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), fmt.Sprintf("round_%d", round))))
 
 		if reflector != nil {
 			op, err := reflector(evalCtx, orig, out)

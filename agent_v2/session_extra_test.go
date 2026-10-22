@@ -92,19 +92,19 @@ func TestRunSession_AddEventConcurrent(t *testing.T) {
 // **R32+ 视角 4 audit 删**: TestRunSession_AddEventInGraph 测的 API 已删
 // (生产 0 caller, ev.NS 字段无人读, 设计被 ParallelAgent ForkLane 替代)。
 
-// TestRunSession_ForkLaneVsAddEventRace 验证 ForkLane → shareEventsFrom 读
-// parent.events slice header 期间 parent.AddEvent 并发写不触发 race。
+// TestRunSession_ForkLaneVsAddEventRace 验证 ForkLane 取父事件快照期间 parent.AddEvent
+// 并发写不触发 race。
 //
-// **背景**：session.go:362 `shareEventsFrom` 读 parent.events / parent.eventsMuRef
-// 漏锁——parent 主线 goroutine 并发 AddEvent 写 events 时 race detector 触发
-// (R34 ISSUE-87 audit 发现; PR 2 commit 990bdad 加 store ctx push 后 scheduling
-// 时序变化让原本 ~40% 命中率升到 ~66%, 根因独立于 PR 2).
+// **背景**：ForkLane 曾直接共享 parent.events 切片、读 slice header 时漏锁——parent 主线
+// goroutine 并发 AddEvent 写 events 时 race detector 触发 (R34 ISSUE-87 audit 发现; PR 2
+// commit 990bdad 加 store ctx push 后 scheduling 时序变化让原本 ~40% 命中率升到 ~66%,
+// 根因独立于 PR 2)。现在 ForkLane 经 parent.Events() 在 parent 的锁里拷一份快照。
 //
 // 用 WaitGroup 屏障让 writer / reader 真正并发 (CLAUDE.md 测试纪律: thunder-herd
 // 测试需强制并发否则 Go scheduler 自然串行化掉).
 //
-// **sanity-revert 标准**: revert shareEventsFrom 内 RLock → 跑 `go test -race` 必 fail
-// 且 fail 信息精确指向 session.go:362 + ForkLane stack。
+// **sanity-revert 标准**: 去掉 Events() 里的 RLock → 跑 `go test -race` 必 fail
+// 且 fail 信息指向 Events + ForkLane stack。
 func TestRunSession_ForkLaneVsAddEventRace(t *testing.T) {
 	parent := agent_v2.NewRunSession()
 	// 预填一些事件让 parent.events slice 不空 — slice header 读时 ptr/len/cap 都非零
@@ -127,7 +127,7 @@ func TestRunSession_ForkLaneVsAddEventRace(t *testing.T) {
 		}
 	}()
 
-	// Reader: 持续 ForkLane → shareEventsFrom 读 parent.events (无锁路径 = race 触发点)
+	// Reader: 持续 ForkLane → 读 parent.events 取快照 (漏锁时 = race 触发点)
 	done.Add(1)
 	go func() {
 		defer done.Done()

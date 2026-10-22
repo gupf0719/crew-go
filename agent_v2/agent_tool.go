@@ -240,6 +240,8 @@ func (t *agentTool) Call(ctx context.Context, args map[string]any) (*tool.Result
 		//
 		// 真要挡父的框架元信息，得在 rewrite 之前按角色/内容判，或让 HistoryFor 带 owner。
 		if parentSess := GetSession(ctx); parentSess != nil {
+			// 调用方提供的前文不放进来：子 agent 读历史时照它自己的规则已经看得到它（以客户端为准时排在它的前文最前，以
+			// 服务端为准时在写进历史层的记录里，见 caller_history.go），这里再放一份，同一次调用里子 agent 看到两遍
 			msgs := parentSess.HistoryFor("")
 			var sb strings.Builder
 			first := true

@@ -20,6 +20,7 @@ const (
 	logKeyTools   = "tools"
 	logKeyAttempt = "attempt"
 	logKeyRetryIn = "retry_in"
+	logKeyTool    = "tool"
 )
 
 // 默认值：重连退避从 1s 翻倍到 60s；每次连接尝试（建实例 + Initialize + ListTools）30s。
@@ -166,6 +167,12 @@ func WithToolNamer(fn func(server, tool string) string) HubOption {
 // Close 就是自己等自己）；Close 时还没送出的状态变化不再回调——要持久化最后的清单，Close 之前读一次 Status。
 func WithStatusHook(fn func(ServerStatus)) HubOption {
 	return func(h *Hub) { h.statusHook = fn }
+}
+
+// WithTrustedClient 同 [WithClient]，并且**信任这个 server 对工具行为的自述**（MCP tool annotations，见
+// [WithTrustedAnnotations]）。
+func WithTrustedClient(c Client, opts ...ServerOption) HubOption {
+	return WithClient(c, append(append([]ServerOption(nil), opts...), WithTrustedAnnotations())...)
 }
 
 // NewHub 构造一个空 Hub，使用 With* 选项注入 server。

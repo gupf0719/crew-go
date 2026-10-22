@@ -214,9 +214,13 @@ func TestPanicStack_HooksKeepOpaqueJudgement(t *testing.T) {
 	}
 }
 
+// TestPanicStack_OnGraphEnd：图失败时 OnGraphEnd panic 落在 Run 入口那道兜底，错误上挂着栈、只记一条日志。（图成功时它的 panic
+// 就地兜住、不改结果，见 observer_hook_panic_test.go。）
 func TestPanicStack_OnGraphEnd(t *testing.T) {
 	logs := psCaptureLogs(t)
-	err := compose_v2.Run(context.Background(), psSingleNodeGraph(t, psNoop), compose_v2.NewChannelManager(),
+	err := compose_v2.Run(context.Background(), psSingleNodeGraph(t, func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		return nil, errors.New("业务错")
+	}), compose_v2.NewChannelManager(),
 		compose_v2.WithHooks(psHooks{at: "OnGraphEnd"}))
 
 	psAssertPanicStack(t, err, "psGraphEndExplodes")

@@ -17,7 +17,7 @@ import (
 
 func slotOwners(t *testing.T, hs agent_v2.HistoryStore, conv string) map[string]int {
 	t.Helper()
-	msgs, err := hs.Load(context.Background(),
+	msgs, err := agent_v2.LoadAllHistory(context.Background(), hs,
 		agent_v2.HistoryKey{Owner: "t", ConvID: conv})
 	if err != nil {
 		t.Fatalf("Load(%s): %v", conv, err)
@@ -236,7 +236,7 @@ func TestHistorySlot_RewriteUsesDisplayName(t *testing.T) {
 	}
 
 	// 历史里两个字段都该有：归属是位置，显示名是 agent 名
-	msgs, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-display"})
+	msgs, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-display"})
 	var hasDisplay bool
 	for _, m := range msgs {
 		o, _ := m.Annotations[agent_v2.HistoryAgentAnnotation].(string)
@@ -327,7 +327,7 @@ func TestHistorySlot_PlanExecutorNoCollisionWithSubAgentName(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	msgs, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-execcollide"})
+	msgs, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-execcollide"})
 	byOwner := map[string][]string{}
 	for _, m := range msgs {
 		o, _ := m.Annotations[agent_v2.HistoryAgentAnnotation].(string)

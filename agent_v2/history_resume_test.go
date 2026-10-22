@@ -65,7 +65,7 @@ func TestHistory_HITLResume_CompleteAndNoDuplicate(t *testing.T) {
 	}
 
 	// 中断当下：工具轮整批作废（Resume 会重跑全部工具），所以历史里不该有工具结果。
-	mid, _ := hs.Load(ctx, key)
+	mid, _ := agent_v2.LoadAllHistory(ctx, hs, key)
 	dumpPrompt(t, "中断后的历史", mid)
 	if len(mid) != 2 {
 		t.Errorf("中断后历史 %d 条, want 2（用户输入 + 声明了工具调用的 assistant）——"+
@@ -81,7 +81,7 @@ func TestHistory_HITLResume_CompleteAndNoDuplicate(t *testing.T) {
 		t.Fatalf("Resume: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, key)
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, key)
 	dumpPrompt(t, "Resume 后的历史", got)
 	if len(got) != 4 {
 		t.Fatalf("Resume 后历史 %d 条, want 4（用户输入 / 声明 / 工具结果 / 最终答复）", len(got))
@@ -162,7 +162,7 @@ func TestHistory_ConcurrentRuns_SameConversation_NoLoss(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-concurrent"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-concurrent"})
 	if len(got) != n*2 {
 		t.Errorf("历史 %d 条, want %d（%d 个 Run × 输入+产出）——并发写掉了消息",
 			len(got), n*2, n)
@@ -196,12 +196,12 @@ func (s *delayedHistoryStore) Append(_ context.Context, k agent_v2.HistoryKey, m
 	return nil
 }
 
-func (s *delayedHistoryStore) Load(_ context.Context, k agent_v2.HistoryKey) ([]*schema.Message, error) {
+func (s *delayedHistoryStore) Load(_ context.Context, k agent_v2.HistoryKey, _ agent_v2.HistoryQuery) (agent_v2.HistoryPage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*schema.Message, len(s.convs[k]))
 	copy(out, s.convs[k])
-	return out, nil
+	return agent_v2.HistoryPage{Messages: out}, nil
 }
 
 var _ agent_v2.HistoryStore = (*delayedHistoryStore)(nil)

@@ -28,23 +28,37 @@ const SupersededDecisionErrCode = "decision_superseded"
 //     失败，而这批 tool_call 续跑时从工具账原样重放、必然再撞，任务永远过不去（审计实测：续跑 3 次都撞
 //     同一个冲突，批里另一个工具先问了人的话答完照样卡死）。
 //
-// 只管框架自己的 tools 节点（makeToolsFn）：它把每个调用收到的信号登记进 builder 放在 ctx 上的收集器，
+// 只管框架自己的 tools 节点（makeToolsFn）：它把每个调用收到的信号登记进 builder 放在 ctx 上的收集器（toolBatch），
 // builder 在 OnToolEnd 之后调 finishToolBatchSignals。业务自写的 toolsFn 不经收集器，工具做出的决定
 // 直接交给节点这次执行（同一段执行里先后交的，后者为准）。
-type toolBatchSignals struct {
-	// perCall 下标与 tool_call 一一对应：那个调用期间收到的上行信号（原样，作废在这里之后判）。
+
+// toolBatch 是框架的 toolsFn 交给 tools 节点的、跟这一批 tool_call 一一对应的东西（下标与 tool_call 相同）：各调用收到
+// 的上行信号，以及各调用的结局。builder 放在 ctx 上，toolsFn 返回前填；业务自写的 toolsFn 不填。
+type toolBatch struct {
+	// perCall：那个调用期间收到的上行信号（原样，作废在这里之后判）。这一批整体成功时才填。
 	perCall []compose_v2.Signals
 	filled  bool
+	// ends：各调用的结局，成不成都填。这一批整体成功时 tools 节点据它给重放的调用标上 ToolReplayedExtraKey，没整体
+	// 成功时据它给已经有结局的调用触发 OnToolEnd（见 endSettledToolCalls）。
+	ends []toolCallEnd
 }
 
-type toolBatchSignalsKey struct{}
-
-func withToolBatchSignals(ctx context.Context, b *toolBatchSignals) context.Context {
-	return context.WithValue(ctx, toolBatchSignalsKey{}, b)
+// toolCallEnd 是一个 tool_call 在这一批里的结局：msg 是它的 tool_result（这次跑完的，或者从工具账重放的——replayed
+// 为真），err 是它没产出 tool_result 时的错误（硬失败、中断、被停下）。
+type toolCallEnd struct {
+	msg      *schema.Message
+	err      error
+	replayed bool
 }
 
-func toolBatchSignalsFrom(ctx context.Context) *toolBatchSignals {
-	b, _ := ctx.Value(toolBatchSignalsKey{}).(*toolBatchSignals)
+type toolBatchKey struct{}
+
+func withToolBatch(ctx context.Context, b *toolBatch) context.Context {
+	return context.WithValue(ctx, toolBatchKey{}, b)
+}
+
+func toolBatchFrom(ctx context.Context) *toolBatch {
+	b, _ := ctx.Value(toolBatchKey{}).(*toolBatch)
 	return b
 }
 

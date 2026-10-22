@@ -85,30 +85,35 @@ func detachedFromRunning(ctx context.Context, runID string) bool {
 // 引擎这层的采纳点（OnGraphStart / OnNodeStart）也认得。新加 ctx key 时要么在这里实现它，要么实现
 // compose_v2.EnvironmentKey（调用方配的环境，见本组最后两个）——机械测试扫全包的
 // context.WithValue / Value 调用，两边都没实现就红。
-func (sessionKey) ExecutionState()            {}
-func (taskScopeKey) ExecutionState()          {}
-func (callApprovalKey) ExecutionState()       {}
-func (finalRoundKey) ExecutionState()         {}
-func (toolsUsedKey) ExecutionState()          {}
-func (foAttemptsKey) ExecutionState()         {}
-func (revealedChKey) ExecutionState()         {}
-func (revealTurnKey) ExecutionState()         {}
-func (repeatTurnKey) ExecutionState()         {}
-func (runOverridesCtxKey) ExecutionState()    {}
-func (offloadDedupKey) ExecutionState()       {}
-func (subAgentStoreScopeKey) ExecutionState() {}
-func (historyCtxKey) ExecutionState()         {}
-func (historySlotCtxKey) ExecutionState()     {}
-func (historyReceiptCtxKey) ExecutionState()  {}
-func (handoffHopsCtxKey) ExecutionState()     {}
-func (handoffDestKey) ExecutionState()        {}
-func (handoffHistoryModeKey) ExecutionState() {}
-func (routeDestKey) ExecutionState()          {}
-func (endErrCtxKey) ExecutionState()          {}
-func (resumePhaseCtxKey) ExecutionState()     {}
-func (toolResultPosKey) ExecutionState()      {}
-func (toolBatchSignalsKey) ExecutionState()   {}
-func (nodeGrantsKey) ExecutionState()         {}
+func (sessionKey) ExecutionState()               {}
+func (taskScopeKey) ExecutionState()             {}
+func (callApprovalKey) ExecutionState()          {}
+func (finalRoundKey) ExecutionState()            {}
+func (compactionMemoKey) ExecutionState()        {}
+func (toolsUsedKey) ExecutionState()             {}
+func (foAttemptsKey) ExecutionState()            {}
+func (revealedChKey) ExecutionState()            {}
+func (revealTurnKey) ExecutionState()            {}
+func (repeatTurnKey) ExecutionState()            {}
+func (runOverridesCtxKey) ExecutionState()       {}
+func (offloadDedupKey) ExecutionState()          {}
+func (subAgentStoreScopeKey) ExecutionState()    {}
+func (historyCtxKey) ExecutionState()            {}
+func (historySlotCtxKey) ExecutionState()        {}
+func (historyReceiptCtxKey) ExecutionState()     {}
+func (handoffHopsCtxKey) ExecutionState()        {}
+func (handoffDestKey) ExecutionState()           {}
+func (handoffHistoryModeKey) ExecutionState()    {}
+func (routeDestKey) ExecutionState()             {}
+func (endErrCtxKey) ExecutionState()             {}
+func (resumePhaseCtxKey) ExecutionState()        {}
+func (toolResultPosKey) ExecutionState()         {}
+func (toolBatchKey) ExecutionState()             {}
+func (nodeGrantsKey) ExecutionState()            {}
+func (backgroundScopeKey) ExecutionState()       {}
+func (inboxCtxKey) ExecutionState()              {}
+func (interjectionLedgerCtxKey) ExecutionState() {}
+func (callerHistoryKey) ExecutionState()         {}
 
 // 调用方给整个请求配的环境：脱离时留下；采纳钩子返回的 ctx 时，派生的听钩子的、外来的取框架这次的
 // （compose_v2.EnvironmentKey）。

@@ -160,6 +160,10 @@ func (h *hookAdapter) OnAgentEnd(ctx context.Context, info *hook.AgentInfo, _ *h
 }
 
 func (h *hookAdapter) OnModelStart(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
+	// 暂停之后继续：沿用暂停前那次答复，这一遍不是新的模型调用，前端已经收到过（hookAdapter 排在 intHook 前面）
+	if hook.IsModelResponseReused(in.Extra) {
+		return ctx, nil
+	}
 	h.sink.send("model_start", map[string]any{
 		"name":  info.Name,
 		"round": info.Round,
@@ -169,7 +173,7 @@ func (h *hookAdapter) OnModelStart(ctx context.Context, info *hook.AgentInfo, in
 }
 
 func (h *hookAdapter) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
-	if out == nil || out.Message == nil {
+	if out == nil || out.Message == nil || hook.IsModelResponseReused(out.Extra) {
 		return ctx, nil
 	}
 	msg := out.Message

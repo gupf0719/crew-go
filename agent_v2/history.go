@@ -31,6 +31,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -60,16 +62,32 @@ import (
 //     还在图内流转的那条消息**共享底层数据**。后端要跨 goroutine 长期持有或做异步序列
 //     化，应对整条消息做深拷贝，不能假设独占这些子结构。
 //   - Load 返回的 slice 会被调用方读（喂给模型），实现方同样应返回快照而非内部引用。
+//   - **Annotations 的值按 JSON 类型读回**：布尔还是布尔、数字还是数值（读回成 float64 也算）、数组还是数组
+//     （[]any 也算）、对象还是对象。框架有标注按布尔判（skill 正文、return-direct 结果的标记），读回成文本 "true"
+//     时判据认不出、静默退化（第 0 层截断不再保护 skill 正文）。把整条消息按 JSON 存取就满足；只存得下字符串的
+//     结构（Redis hash 字段、字符串列）要把值按 JSON 编码后再存。
 //   - 两个方法都可能被多 goroutine 并发调用（异步 worker + 主流程读），需自己保证
 //     线程安全。
+//   - **Load 要能只读尾部**（[HistoryQuery] 的 Before + Limit）：框架每次 Run 只读最近一段（见
+//     history_read.go），后端要把「取 Before 之前最近 Limit 条」下推成一次有界的读——SQL 用
+//     `WHERE seq < ? ORDER BY seq DESC LIMIT ?` 再反转、Redis 列表用 LRANGE 负下标。在内存里
+//     读出全部再切片当然也满足契约，但那正是这个接口要省掉的成本。
+//   - **Load 要能按条件读**（[HistoryQuery] 的 MessageID / Task / Agent，非空的都要满足）：框架的去重
+//     （「这个任务里记过这条没有」「这条是不是已经在别的归属下记过」）与「只看自己」的视图都按条件查。
+//     消息 ID、任务章（[HistoryTaskAnnotation]）、归属（[HistoryAgentAnnotation]）写入时抽成带索引的列，
+//     按条件读就只碰命中的记录——SQL 用 `WHERE conv = ? AND task = ? AND seq < ? ORDER BY seq DESC LIMIT ?`。
+//     在进程里过滤的用 [HistoryQuery.Matches] 判，跟框架的判据一致。More 按满足条件的算：最早一条满足条件
+//     的记录之前只剩不满足的时 More 为 false。
 //   - 业务自研 backend 跑 `agent_v2/history_conformance.RunHistoryStoreTests` 验证语义。
 type HistoryStore interface {
 	// Append 把 msgs 追加到 key 对应的会话末尾。**只追加**，见接口 godoc。
 	Append(ctx context.Context, key HistoryKey, msgs []*schema.Message) error
 
-	// Load 按写入顺序返回该会话的全部消息。会话不存在时返 (nil, nil)——
-	// 「没聊过」不是错误。
-	Load(ctx context.Context, key HistoryKey) ([]*schema.Message, error)
+	// Load 按写入顺序返回 q 圈定的那一段：满足 q 的过滤条件的记录里，q.Before 之前（空 = 会话末尾）
+	// 最近的 q.Limit 条（<= 0 不限）。**零值 q 读整场会话。** 会话不存在、没有满足条件的记录时返空页、
+	// 不报错——「没聊过」「没记过」不是错误。返回页的 Start 是第一条的位置，More 报更早还有没有满足
+	// 条件的；见 [HistoryPage]。
+	Load(ctx context.Context, key HistoryKey, q HistoryQuery) (HistoryPage, error)
 }
 
 // HistoryKey 定位一条会话。
@@ -427,6 +445,20 @@ const historyWriterBacklogWarn = 64
 type historyWriter struct {
 	store HistoryStore
 	key   HistoryKey
+	// task 是这条流写进历史的记录要盖的任务章（[HistoryTaskAnnotation]）：建写入器那一刻所在任务的
+	// RunID。嵌套位置沿用父的写入器，被调方属于调用方的任务，章也就是同一个；DetachTask 开的独立任务
+	// 剥掉了写入器、自己建新的，章是它自己的。
+	task string
+	// origin 是这个写入器所在的执行从哪些仍在执行的任务里脱离出来（[compose_v2.DetachedFrom] 的 sid，编码好的
+	// 来源章，见 encodeHistoryOrigin）：经 DetachTask 开的独立任务写下的记录盖上它（historyOriginAnnotation），
+	// 「这条产出是不是已经在别的归属下记过」据此认得出独立任务写的那份（见 finalAlreadyInOtherSlot）。不是脱离
+	// 出来的写入器为空。
+	origin string
+
+	// clientPrior 报调用方提供了前文、这次运行的读却要以它为准、不读历史层（见 caller_history.go）：写入器是嵌套的
+	// （建它时已经在一个正在执行的任务里，它只记自己那段子对话），或者建它时读历史层失败、前文没写进去。在写入器交
+	// 出去之前定下，之后只读。
+	clientPrior bool
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -501,7 +533,8 @@ type historyWriter struct {
 
 // newHistoryWriter 启动单 worker。store 非 nil、key 完整由 caller 保证。
 func newHistoryWriter(ctx context.Context, store HistoryStore, key HistoryKey) *historyWriter {
-	w := &historyWriter{store: store, key: key, ctx: ctx}
+	w := &historyWriter{store: store, key: key, task: currentHistoryTask(ctx), ctx: ctx,
+		origin: encodeHistoryOrigin(compose_v2.DetachedFrom(ctx))}
 	w.cond = sync.NewCond(&w.mu)
 	w.drained = sync.NewCond(&w.mu)
 	w.wg.Add(1)
@@ -741,15 +774,15 @@ func historySuppressed(ctx context.Context) bool {
 
 // WithoutHistoryCtx 声明**这条分支下产生的对话不进历史**。
 //
-// 给「内部决策 LLM」用：routing 的分类器、reflect 的评估器与反馈教练、plan 的规划器，它们跟
-// 用户不对话，产出是给框架看的控制信号。让这些落进会话历史，业务回看时会读到一堆
-// 自己从没说过、也不该看见的内容。框架已经在这四处自动摘掉了。
+// 给「内部决策」用：它们跟用户不对话，产出是给框架看的判定。让这些落进会话历史，业务回看时会读到
+// 一堆自己从没说过、也不该看见的内容，下一回合模型还会把评审请求当成用户说过的话。框架调这些决策方时
+// 都已经摘掉了（连同用户的插话一起，见 decisionCtx）：编排的分类器、评估器与反馈教练，`NewPlanAgent` 的
+// planner，`WithRouter` 的路由函数与 `WithRouteDecider` 的决策方，`WithReflector` / `WithEvalFunc`，
+// `WithLoopExitCondition` 的退出判断，`WithTurnGate` 的闸门——它们里面再起的子 agent 继承这条禁止，业务
+// 无需再调。
 //
-// **业务自定义的决策回调里跑子 agent 时，得自己在子 ctx 上调一次**——框架只包得住
-// 它自己调用的那一层，摘不了业务函数**内部**再起的子 agent。典型的有 `WithRouter` 的
-// 路由函数、`WithReflector` 的反思器、`WithEvalFunc` 的评估函数、`WithLoopExitCondition`
-// 的退出条件，框架直接调用的业务回调都一样。（`NewPlanAgent` 的 planner 参数与
-// `WithRouteDecider` 的决策方不在此列——框架调它们时已经摘过了，业务无需重复。）
+// **框架不认识的决策点要业务自己调一次**：GraphAgent 节点里自己写的判断、Parallel 的 Merger / Aggregator
+// 里拿 agent 当裁判（这两个回调的产出是内容，框架不替它们摘）。
 //
 // **是「禁止」不是「当前没有」**：这条分支下哪怕有 agent 自己配了 WithHistory 也不会
 // 重新开写入器——否则业务给分类器随手配一个历史就绕过了整个摘除。它是执行状态：从这里
@@ -797,101 +830,16 @@ func startHistory(ctx context.Context, hc *historyConfig, agentName string) (con
 		return ctx, noop
 	}
 	w := newHistoryWriter(ctx, hc.store, key)
+	// 调用方提供了前文时定下这次运行以谁为准（见 caller_history.go）。拥有者 = 建写入器时还不在任何正在执行的任务里：
+	// 各个 agent 入口都在盖自己的任务章之前建写入器，所以这里看到的任务只能是外面的（节点里、钩子里、嵌套调用里调起的）
+	if prior, declared := callerPrior(ctx); declared {
+		if _, nested := enclosingTask(ctx); nested {
+			w.clientPrior = true
+		} else {
+			w.clientPrior = !seedCallerPrior(ctx, w, prior)
+		}
+	}
 	return withHistoryWriter(ctx, w), w.closeAndJoin
-}
-
-// loadHistory 读回本会话此前的全部消息。
-//
-// 第二个返回值报**历史层是否接管了这次读**——false 时调用方必须回落到 session events。
-//
-// **「读成功但没内容」和「读失败」必须分开**：前者是第一轮对话的正常状态（返
-// `(nil, true)`，prior 空是对的）；后者是后端抖动，这时空 prior 意味着模型**彻底
-// 失忆**——连 events 里那份残缺历史都拿不到。两者都返 nil 而不带信号的话，调用方
-// 无从区分，只能一律当「历史就是空的」处理，于是后端一次超时就让多轮对话断片。
-//
-// **读的去处跟写的去处必须是同一个**：嵌套时写入器沿用父的（见 startHistory），所以
-// 读也优先走 ctx 里那个写入器的 (store, key)。子 agent 自己配的 `WithHistory` 在嵌套
-// 场景下不生效——写侧本来就忽略它，读侧若还认自己的配置，就会去一个**从来没人往里写过**
-// 的 store 上读，读到空、还报「读成功」压掉 events 回落，模型直接失忆。
-func loadHistory(ctx context.Context, hc *historyConfig) ([]*schema.Message, bool) {
-	// 被摘除的分支跟历史层**完全无关**，读写两侧都是。
-	//
-	// 只挡写不挡读的话，业务给分类器随手配一个 WithHistory 就会掉进一个静默降级：写侧被
-	// 摘掉、那个 store 永远是空的，读侧却报「读成功，只是没内容」——于是连 session events
-	// 都不回落了，这个内部决策 LLM 什么上文都看不到。报 false 让它跟「没配历史」表现一致。
-	if historySuppressed(ctx) {
-		return nil, false
-	}
-	if w := historyWriterFrom(ctx); w != nil {
-		// 先等自己这条流的 pending 写落盘，再读——**读的去处和写的去处一致还不够，
-		// 时机也得一致**。写是异步的：同一个 Run 里嵌套调用时（父建了写入器、子沿用），
-		// 不等就会读到父那批还没落盘的空档，然后因为「读成功只是没内容」而不回落 events。
-		w.waitDrained(ctx)
-		return loadFrom(ctx, w.store, w.key)
-	}
-	if hc == nil || hc.store == nil {
-		return nil, false
-	}
-	key, ok := historyKeyFrom(ctx, hc)
-	if !ok {
-		return nil, false
-	}
-	return loadFrom(ctx, hc.store, key)
-}
-
-// loadFrom 是 loadHistory 的实际读取，两条取 (store, key) 的路径共用。
-func loadFrom(ctx context.Context, store HistoryStore, key HistoryKey) ([]*schema.Message, bool) {
-	msgs, err := store.Load(ctx, key)
-	if err != nil {
-		// 读失败跟写失败同档：吞 + warn 不打断 Run（让一次后端抖动把整个 Run 打挂，
-		// 比让模型少看几条历史严重得多），但**必须**报 false 让调用方真的回落到
-		// events——否则这条 warn 就是在承诺一件没发生的事。
-		slog.WarnContext(ctx, "agent_v2: 读会话历史失败，本轮回落到 session events（内容残缺）",
-			"key", key.String(), "err", err)
-		return nil, false
-	}
-	return msgs, true
-}
-
-// historyPrior 从历史层取出本 agent 该看到的跨 Run 历史，投影成三种 handoff 视图之一。
-// 第二个返回值报「历史层是否接管了这次取历史」——false 时调用方回落到 session events。
-//
-// # 为什么要投影而不是原样返回
-//
-// 历史是**按会话**存的：同一场对话里所有 agent 的消息都在一条流上，靠
-// HistoryAgentAnnotation 区分谁说的。而每个 agent 该看到什么，规则跟 session events
-// 那套完全一样——自己的原样看，别人的按 handoff 模式决定隐藏 / 改写 / 保留。这里复用
-// 的正是同一组改写函数，只是把「事件的 AgentName」换成了「消息上的归属标注」。
-func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string, mode HandoffHistoryMode) ([]*schema.Message, bool) {
-	// 没开历史 / 会话身份缺失 / 后端读失败——三种情况都由 loadHistory 报 false，
-	// 调用方据此回落到 session events。**尤其是读失败那条**：拿不到历史时给一份
-	// 残缺的 events 也远好过给空的，后者是让模型在多轮对话中途彻底失忆。
-	all, ok := loadHistory(ctx, hc)
-	if !ok {
-		return nil, false
-	}
-	out := make([]*schema.Message, 0, len(all))
-	for _, m := range all {
-		if m == nil {
-			continue
-		}
-		owner, _ := m.Annotations[HistoryAgentAnnotation].(string)
-		if owner == ownerAgentName {
-			out = append(out, m)
-			continue
-		}
-		switch mode {
-		case HandoffHistoryRaw:
-			out = append(out, markFromAgent(m, historyDisplayName(m)))
-		case HandoffHistoryRewrite:
-			// 改写文案用**显示名**（agent 自己的 Name），不用位置——`[br1] said:` 模型看不懂
-			if rewritten := rewriteCrossAgentMessage(m, historyDisplayName(m)); rewritten != nil {
-				out = append(out, rewritten)
-			}
-		default: // HandoffHistorySelfOnly——别人的一概不看
-		}
-	}
-	return out, true
 }
 
 // markFromAgent 返回一份带 from_agent 标注的浅拷贝（Raw 视图用，保留原 role）。
@@ -1032,6 +980,13 @@ func claimSharedRootInput(ctx context.Context, prior []*schema.Message, input *s
 	if priorHasRootInputID(prior, rootInputID(input)) {
 		return false
 	}
+	// prior 是只读回来的最近一段；这条输入若是本任务更早记下的（转交了很多跳、每跳调了很多工具），
+	// 不在这一段里——按消息 ID 在这个任务写下的记录里查一遍。
+	if nonce := rootInputID(input); nonce != "" {
+		if hit, _ := findHistory(ctx, nil, HistoryQuery{MessageID: nonce}, true, anyHistoryRecord); hit {
+			return false
+		}
+	}
 	return w.claimRootInput(key)
 }
 
@@ -1090,7 +1045,11 @@ func recordHistory(ctx context.Context, owner, display string, msgs []*schema.Me
 		if isDerivedInput(m) {
 			continue
 		}
-		stamped = append(stamped, stampHistoryAgent(m, owner, display))
+		cp := stampHistoryAgent(m, owner, display, w.task)
+		if w.origin != "" {
+			cp.Annotations[historyOriginAnnotation] = w.origin
+		}
+		stamped = append(stamped, cp)
 	}
 	if len(stamped) == 0 {
 		return
@@ -1098,11 +1057,26 @@ func recordHistory(ctx context.Context, owner, display string, msgs []*schema.Me
 	w.submit(stamped)
 }
 
-// stampHistoryAgent 返回一份浅拷贝，Annotations 上标好归属 agent。
+// noteHistoryRecorded 把 msgs 登记成「这次调用里由我记过」，不写进历史：model 节点处理完之后在提交之前作废、续跑重放
+// 定下的那一轮时用（见 modelCallRecord）——那一轮在上一次执行里已经记过，这次不再写。
+//
+// 登记跟 recordHistory 开头那两步一样（全局登记表 + 范围回执）：编排边界补记看这两样认「成员自己记过的产出」，不登记
+// 的话它替成员再记一份（审计实测：Sequential 成员的最终答复在历史里两份，ID 与归属都相同）。边界那侧不能改成按消息
+// ID 查历史去重——同一条流里同一个对象跨轮复用时每轮都得记（见 priorHasMessageIDInOtherSlot）。
+func noteHistoryRecorded(ctx context.Context, msgs []*schema.Message) {
+	w := historyWriterFrom(ctx)
+	if w == nil || len(msgs) == 0 {
+		return
+	}
+	w.markRecorded(HistorySlot(ctx), msgs)
+	bumpHistoryReceipt(ctx)
+}
+
+// stampHistoryAgent 返回一份浅拷贝，Annotations 上标好归属 agent 与任务章（task 为空时不盖）。
 //
 // 浅拷贝够用：改的只有 Annotations 这一个 map，其余字段（ContentBlocks / ToolCalls）
 // 共享底层数据、双方都只读。
-func stampHistoryAgent(m *schema.Message, owner, display string) *schema.Message {
+func stampHistoryAgent(m *schema.Message, owner, display, task string) *schema.Message {
 	cp := *m
 	// 兜底铸造身份：产出侧有若干处直接构造 `&schema.Message{}`（model adapter 解析响应、
 	// 流聚合出口），业务也可能手搓。盖在**拷贝**上跟盖归属同一个理由——原对象可能是
@@ -1111,11 +1085,24 @@ func stampHistoryAgent(m *schema.Message, owner, display string) *schema.Message
 	if cp.ID == "" {
 		cp.ID = newUUID()
 	}
-	anns := make(map[string]any, len(m.Annotations)+2)
+	anns := make(map[string]any, len(m.Annotations)+3)
 	for k, v := range m.Annotations {
+		// 前文标注只由写前文那一处盖：agent 的记录带着它（钩子把前文原样转进了产出之类）会被读成调用方的前文——不按归属
+		// 过滤、被挪到最前
+		if k == CallerHistoryAnnotation {
+			continue
+		}
 		anns[k] = v
 	}
 	anns[HistoryAgentAnnotation] = owner
+	if task != "" {
+		anns[HistoryTaskAnnotation] = task
+	} else {
+		// 盖章前的原件可能带着别的任务的章（业务把上一个任务读回来的消息再交进来）——不清掉的话
+		// 这条记录会冒充那个任务的。
+		delete(anns, HistoryTaskAnnotation)
+	}
+	delete(anns, historyOriginAnnotation) // 同理：来源章只由写入器盖（recordHistory）
 	// 位置跟名字不同才存显示名——顶层回落时两者相同，没必要多存一份。
 	if display != "" && display != owner {
 		anns[HistoryAgentDisplayAnnotation] = display
@@ -1159,12 +1146,58 @@ func historyKeyFrom(ctx context.Context, hc *historyConfig) (HistoryKey, bool) {
 // 以及「只要单进程内多轮对话」的场景够用。**进程重启即失忆**，生产接 Redis / PG。
 type InMemoryHistoryStore struct {
 	mu    sync.RWMutex
-	convs map[HistoryKey][]*schema.Message
+	convs map[HistoryKey]*memHistoryConv
+}
+
+// memHistoryConv 是一场会话的记录，连同写入时按消息 ID、任务章、归属建的位置索引（位置升序）——按条件读时
+// 只看命中的那些位置，不扫整场会话（见 [HistoryQuery]）。
+type memHistoryConv struct {
+	msgs    []*schema.Message
+	byID    map[string][]int
+	byTask  map[string][]int
+	byAgent map[string][]int
+}
+
+func (c *memHistoryConv) index(m *schema.Message, pos int) {
+	if m == nil {
+		return
+	}
+	add := func(idx map[string][]int, k string) {
+		if k != "" {
+			idx[k] = append(idx[k], pos)
+		}
+	}
+	add(c.byID, m.ID)
+	if t, ok := m.Annotations[HistoryTaskAnnotation].(string); ok {
+		add(c.byTask, t)
+	}
+	if a, ok := m.Annotations[HistoryAgentAnnotation].(string); ok {
+		add(c.byAgent, a)
+	}
+}
+
+// candidates 返回 q 的过滤条件下要逐条核对的位置（升序）：取几个条件里命中最少的那份索引；没有过滤条件时
+// 返回 nil、all 为 true（整场会话都是候选）。
+func (c *memHistoryConv) candidates(q HistoryQuery) (pos []int, all bool) {
+	all = true
+	pick := func(idx map[string][]int, k string) {
+		if k == "" {
+			return
+		}
+		p := idx[k]
+		if all || len(p) < len(pos) {
+			pos, all = p, false
+		}
+	}
+	pick(c.byID, q.MessageID)
+	pick(c.byTask, q.Task)
+	pick(c.byAgent, q.Agent)
+	return pos, all
 }
 
 // NewInMemoryHistoryStore 建一个空的内存历史存储。
 func NewInMemoryHistoryStore() *InMemoryHistoryStore {
-	return &InMemoryHistoryStore{convs: make(map[HistoryKey][]*schema.Message)}
+	return &InMemoryHistoryStore{convs: make(map[HistoryKey]*memHistoryConv)}
 }
 
 // Append 追加到会话末尾。存的是 msgs 元素的指针快照——caller 不改写元素是接口约定。
@@ -1177,21 +1210,75 @@ func (s *InMemoryHistoryStore) Append(_ context.Context, key HistoryKey, msgs []
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.convs[key] = append(s.convs[key], msgs...)
+	c := s.convs[key]
+	if c == nil {
+		c = &memHistoryConv{byID: map[string][]int{}, byTask: map[string][]int{}, byAgent: map[string][]int{}}
+		s.convs[key] = c
+	}
+	for _, m := range msgs {
+		c.index(m, len(c.msgs))
+		c.msgs = append(c.msgs, m)
+	}
 	return nil
 }
 
-// Load 返回该会话的全部消息（slice 快照，元素仍是共享指针）。会话不存在返 (nil, nil)。
-func (s *InMemoryHistoryStore) Load(_ context.Context, key HistoryKey) ([]*schema.Message, error) {
+// Load 返回 q 圈定的那一段（slice 快照，元素仍是共享指针）。游标是消息在会话里的下标（十进制）。
+// 会话不存在返空页。
+func (s *InMemoryHistoryStore) Load(_ context.Context, key HistoryKey, q HistoryQuery) (HistoryPage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	src := s.convs[key]
-	if len(src) == 0 {
-		return nil, nil
+	c := s.convs[key]
+	var src []*schema.Message
+	if c != nil {
+		src = c.msgs
 	}
-	out := make([]*schema.Message, len(src))
-	copy(out, src)
-	return out, nil
+	end := len(src)
+	if q.Before != "" {
+		b, err := strconv.Atoi(string(q.Before))
+		if err != nil || b < 0 {
+			return HistoryPage{}, fmt.Errorf("history: invalid cursor %q", q.Before)
+		}
+		if b < end {
+			end = b
+		}
+	}
+	cand, all := []int(nil), true
+	if c != nil {
+		cand, all = c.candidates(q)
+	}
+	if all {
+		start := 0
+		if q.Limit > 0 && end-q.Limit > 0 {
+			start = end - q.Limit
+		}
+		if start >= end {
+			return HistoryPage{}, nil
+		}
+		out := make([]*schema.Message, end-start)
+		copy(out, src[start:end])
+		return HistoryPage{Messages: out, Start: HistoryCursor(strconv.Itoa(start)), More: start > 0}, nil
+	}
+	// 候选位置里 end 之前的，从新往旧逐条核对其余条件；凑够 Limit 条之后再找一条，判 More
+	var hits []int // 新 → 旧
+	more := false
+	for i := sort.SearchInts(cand, end) - 1; i >= 0; i-- {
+		if !q.Matches(src[cand[i]]) {
+			continue
+		}
+		if q.Limit > 0 && len(hits) == q.Limit {
+			more = true
+			break
+		}
+		hits = append(hits, cand[i])
+	}
+	if len(hits) == 0 {
+		return HistoryPage{}, nil
+	}
+	out := make([]*schema.Message, len(hits))
+	for i, p := range hits {
+		out[len(hits)-1-i] = src[p]
+	}
+	return HistoryPage{Messages: out, Start: HistoryCursor(strconv.Itoa(hits[len(hits)-1])), More: more}, nil
 }
 
 // validateHistoryConfig 在构造期挡住「开了会话历史却没给 agent 起名」。
@@ -1202,7 +1289,7 @@ func (s *InMemoryHistoryStore) Load(_ context.Context, key HistoryKey) ([]*schem
 // 而不给名字时框架自动生成的名字**每次构造都不一样**。于是：写进去的历史标着上个实例
 // 的名字，这个实例按自己的名字一过滤，一条都对不上——
 //
-//	prior 空 → 但 loadHistory 报 ok=true（后端确实读成功了，只是过滤后没剩下）
+//	prior 空 → 但 historyPrior 报 ok=true（后端确实读成功了，只是过滤后没剩下）
 //	     → 不回落 session events → 模型只看到当前这一句话
 //
 // **开了历史反而比不开更失忆**，且全程无报错。命中的正是历史层的主场景：agui 的

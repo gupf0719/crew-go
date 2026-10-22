@@ -206,8 +206,8 @@ func EmitCpCleanupHelper(ctx context.Context, sessionID, ns, reason string, dele
 // 注入) + EventSink 在 ctx (NodeFunc scope 内 framework 自动注 nodeEventSink).
 // 业务侧 ctx 无 flag / 无 sink 时 short-circuit return.
 //
-// **graph_loop.go Run defer 内 fire 不走本 helper**——走 cfg.hooks.OnNodeEvent 直接
-// emit（R33 后 Run-level sink 全程在 ctx，但 defer 直调 hooks 等价且不绕一层）.
+// **Run 级的存档事件（Run 入口的载入、超步写档、出口的写档与清档）不走本 helper**——走
+// deliverCpEvent 直接调 hooks，它就地兜住钩子的 panic、只记日志.
 // nodeID="" 标"非节点 framework 级 event"
 // (业务订阅 OnNodeEvent 时按 nodeID=="" + Event.Type==CpEventType 识别).
 //

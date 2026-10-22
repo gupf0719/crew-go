@@ -76,7 +76,7 @@ func TestHistory_E2E_CapturesToolRound(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	got, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
+	got, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestHistory_E2E_AcrossRuns(t *testing.T) {
 		t.Fatalf("Run 2: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
 	want := []string{"问题一", "答复一", "问题二", "答复二"}
 	if len(got) != len(want) {
 		t.Fatalf("两轮后历史 %d 条, want %d —— 多出来的多半是 preamble 把回灌的 prior "+
@@ -179,7 +179,7 @@ func TestHistory_E2E_SeparateConversations(t *testing.T) {
 	}
 
 	for _, conv := range []string{"conv-1", "conv-2"} {
-		got, _ := hs.Load(context.Background(),
+		got, _ := agent_v2.LoadAllHistory(context.Background(), hs,
 			agent_v2.HistoryKey{Owner: "tenant-a", ConvID: conv})
 		if len(got) != 2 {
 			t.Fatalf("%s 历史 %d 条, want 2\n%s", conv, len(got), dumpHist(got))
@@ -209,7 +209,7 @@ func TestHistory_E2E_NoThreadID_NoWrite(t *testing.T) {
 	if final := agent_v2.FinalMessage(events); final == nil || !strings.Contains(final.Content, "答复") {
 		t.Errorf("主链路产出不对: %v", final)
 	}
-	if got, _ := hs.Load(context.Background(),
+	if got, _ := agent_v2.LoadAllHistory(context.Background(), hs,
 		agent_v2.HistoryKey{Owner: "tenant-a", ConvID: ""}); len(got) != 0 {
 		t.Errorf("没会话身份却写了 %d 条", len(got))
 	}
@@ -228,7 +228,7 @@ func TestHistory_E2E_OptOut_ZeroCost(t *testing.T) {
 	if _, err := ag.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("问题")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"}); len(got) != 0 {
+	if got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"}); len(got) != 0 {
 		t.Errorf("没开历史却写了 %d 条", len(got))
 	}
 }
@@ -269,7 +269,7 @@ func TestHistory_E2E_RoutingClassifierExcluded(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
 	for i, m := range got {
 		if m.Annotations[agent_v2.HistoryAgentAnnotation] == "classifier" {
 			t.Errorf("[%d] 分类器的内部决策漏进了会话历史: %s: %q\n%s",
@@ -413,7 +413,7 @@ func TestHistory_E2E_PriorNoDuplication(t *testing.T) {
 		if _, err := ag.Run(ctx, sess, schema.UserMessage(q)); err != nil {
 			t.Fatalf("Run %d: %v", i+1, err)
 		}
-		got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
+		got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
 		if want := (i + 1) * 2; len(got) != want {
 			t.Fatalf("第 %d 轮后历史 %d 条, want %d —— 每轮该只增「问 + 答」两条；"+
 				"涨得更快说明读回来的 prior 又被写了一遍\n%s", i+1, len(got), want, dumpHist(got))
@@ -431,11 +431,11 @@ func (s *flakyLoadStore) Append(ctx context.Context, key agent_v2.HistoryKey, ms
 	return s.inner.Append(ctx, key, msgs)
 }
 
-func (s *flakyLoadStore) Load(ctx context.Context, key agent_v2.HistoryKey) ([]*schema.Message, error) {
+func (s *flakyLoadStore) Load(ctx context.Context, key agent_v2.HistoryKey, q agent_v2.HistoryQuery) (agent_v2.HistoryPage, error) {
 	if s.failLoad {
-		return nil, errors.New("后端读超时")
+		return agent_v2.HistoryPage{}, errors.New("后端读超时")
 	}
-	return s.inner.Load(ctx, key)
+	return s.inner.Load(ctx, key, q)
 }
 
 // TestHistory_E2E_LoadFailure_FallsBackToEvents：后端读失败时必须真的回落到 events。

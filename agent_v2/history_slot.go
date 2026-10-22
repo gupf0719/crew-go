@@ -386,6 +386,9 @@ func settleHistoryAt(ctx context.Context, slot, agentName string, gate inputGate
 // 兄弟分支先落的那份**不该**挡住我——那边走 per-slot 的 `inputAlreadyInHistorySlot`。
 // 同一个「限不限归属」的开关，两类位置的正确答案相反（实测：Handoff 跨进程 Resume 用
 // per-slot 查会把输入落成两份、扇出用 any-stream 查会让后到的分支流缺问）。
+//
+// 只在**当前任务**的记录里找（按消息 ID 与任务章查，见 [findHistory]）：要挡的是同一个任务里转交的下一跳、
+// 续跑重跑到这一步时再记一份，那些记录都是本任务写的。
 func inputAlreadyInAnyStream(ctx context.Context, input *schema.Message) bool {
 	if input == nil {
 		return false
@@ -394,16 +397,8 @@ func inputAlreadyInAnyStream(ctx context.Context, input *schema.Message) bool {
 	if nonce == "" {
 		return false
 	}
-	prior, ok := loadHistory(ctx, nil)
-	if !ok {
-		return false
-	}
-	for _, m := range prior {
-		if rootInputID(m) == nonce {
-			return true
-		}
-	}
-	return false
+	hit, _ := findHistory(ctx, nil, HistoryQuery{MessageID: nonce}, true, anyHistoryRecord)
+	return hit
 }
 
 // finalAlreadyInOtherSlot 报这条产出是不是已经**在别的归属下**落盘了。
@@ -413,17 +408,20 @@ func inputAlreadyInAnyStream(ctx context.Context, input *schema.Message) bool {
 // 产出，在 Resume 那次调用里两道守卫都「查无此记」，于是顶层出口又记一遍，同一指针两个归属
 // （实测：中断跨 Resume 的透传形状，【子产出】记 2 条，owner 分别是 n1 和图名）。
 //
-// 顺序上放在最后：前两道是内存判断、这道要读历史。读的是同一份 `loadHistory`，输入侧那条
-// 路已经读过，不是新增的一次往返。
+// 顺序上放在最后：前两道是内存判断、这道要读历史。按消息 ID 查（[findHistory] 的 own=false），只认**这个任务
+// 这一路**写下的：任务章是本任务的，或者是从本任务脱离出去的独立任务写的（节点里经 DetachTask 开的独立任务
+// 推回同一个会话、它的产出被父图透传时，那份是独立任务写的，见 historyRecordOfTask）。别的任务写下的同一个
+// ID 不算：执行体每次返回同一个消息对象时，前一个任务在 x 分支记过、这个任务在 y 分支产出它，那是 y 的回复、
+// 不是透传——按整场会话查会把它吞掉（审计实测，会话停在 y 的提问上）。
 func finalAlreadyInOtherSlot(ctx context.Context, slot string, final *schema.Message) bool {
 	if final.ID == "" {
 		return false
 	}
-	prior, ok := loadHistory(ctx, nil)
-	if !ok {
-		return false
-	}
-	return priorHasMessageIDInOtherSlot(prior, final.ID, slot)
+	task := currentWriterTask(ctx)
+	hit, _ := findHistory(ctx, nil, HistoryQuery{MessageID: final.ID}, false, func(m *schema.Message) bool {
+		return historyRecordOfTask(m, task) && priorHasMessageIDInOtherSlot([]*schema.Message{m}, final.ID, slot)
+	})
+	return hit
 }
 
 // sameMessage 报 m 是不是已经在 msgs 里——同指针或同身份都算。
@@ -451,10 +449,115 @@ type historyConfigProvider interface {
 	historyCfgForOrchestration() *historyConfig
 }
 
+// historySubsProvider 让借配置的那一趟能穿过嵌套的编排：编排交出自己的直接子执行体（见 history_subs.go）。
+type historySubsProvider interface {
+	historySubs() []Agent
+}
+
+// borrowHistoryConfig 从 subs 的整棵静态子树里借历史配置：BasicAgent 交出自己的，编排往下走自己的子执行体（嵌套的
+// 编排也一样，见 walkHistorySubs）。整棵树都没配时返回 (nil, nil)；有两处不同时返回冲突的那两处。
+//
+// 往下走是为了让最外层的编排拥有写入器：只看直接子时，`Sequential[Sequential[chat]]` 的外层借不到配置、入口不开写入器，
+// 内层在外层的节点里开——这场对话唯一的写入器成了嵌套写入器，调用方提供的前文与历史层就分不清谁说了算（见
+// caller_history.go）。GraphAgent 没有静态子列表，走不进去；它的配置只能来自 WithHistoryCtx。
+func borrowHistoryConfig(subs []Agent) (*historyConfig, *historyConflict) {
+	var chosen *historyConfig
+	var chosenBy string
+	var conflict *historyConflict
+	exhausted := walkHistorySubs(subs, func(sub Agent) bool {
+		hp, ok := sub.(historyConfigProvider)
+		if !ok {
+			return true
+		}
+		hc := hp.historyCfgForOrchestration()
+		switch {
+		case hc == nil:
+		case chosen == nil:
+			chosen, chosenBy = hc, sub.Name()
+		case !sameHistoryConfig(chosen, hc):
+			conflict = &historyConflict{names: [2]string{chosenBy, sub.Name()}, cfgs: [2]*historyConfig{chosen, hc}}
+			return false
+		}
+		return true
+	})
+	if exhausted && historyBorrowExhaustedWarned.CompareAndSwap(false, true) {
+		slog.Warn("agent_v2: 借历史配置时子执行体超过上限还没走完——组合里多半有不可比较的值类型包装成的环，"+
+			"更深处配的历史层借不到（本条每个进程只记一次）", "limit", historyBorrowMaxVisits)
+	}
+	if conflict != nil {
+		return nil, conflict
+	}
+	return chosen, nil
+}
+
+// historyBorrowMaxVisits 是借配置这一趟最多看多少个子执行体。嵌套编排的规模远到不了这个数；到了多半是不可比较的值
+// 类型包装成了环（认不出走过，分叉的环按层数算是指数级）。
+const historyBorrowMaxVisits = 1024
+
+var historyBorrowExhaustedWarned atomic.Bool
+
+// walkHistorySubs 深度优先把 subs 的整棵静态子树逐个交给 visit（visit 返回 false 时停下）：编排往下走它的子执行体
+// （historySubsProvider）。走过的不再走——同一个实例出现在几处、组合成了环（转交候选里有自己）：按接口值本身认，指针按
+// 地址、内嵌编排指针的值类型包装按值。曾经只认指针，值类型包装成环时无限递归、整个进程栈溢出（不配历史层也一样，每个
+// 编排的 Run 入口都要走这一趟）。不可比较的值认不出走过，靠总数上限停下。返回是不是因为看满上限停下的。
+func walkHistorySubs(subs []Agent, visit func(Agent) bool) (exhausted bool) {
+	visited := make(map[any]bool)
+	budget := historyBorrowMaxVisits
+	var walk func(subs []Agent) bool
+	walk = func(subs []Agent) bool {
+		for _, sub := range subs {
+			if isAgentNil(sub) {
+				continue
+			}
+			if reflect.ValueOf(sub).Comparable() {
+				if visited[sub] {
+					continue
+				}
+				visited[sub] = true
+			}
+			if budget == 0 {
+				exhausted = true
+				return false
+			}
+			budget--
+			if !visit(sub) {
+				return false
+			}
+			if sp, ok := sub.(historySubsProvider); ok && !walk(sp.historySubs()) {
+				return false
+			}
+		}
+		return true
+	}
+	walk(subs)
+	return exhausted
+}
+
+// historyConflict 是借配置时两处不一样的历史配置：哪两个 agent、各自的配置。
+type historyConflict struct {
+	names [2]string
+	cfgs  [2]*historyConfig
+}
+
+// Error 说清哪两个 agent、差在哪：owner 不同、owner 函数不是同一个、store 不是同一个。
+func (c *historyConflict) Error() string {
+	a, b := c.cfgs[0], c.cfgs[1]
+	var diff string
+	switch {
+	case a.owner != b.owner:
+		diff = fmt.Sprintf("owner %q vs %q", a.owner, b.owner)
+	case !sameOwnerFunc(a, b):
+		diff = "WithHistoryOwnerFunc 不是同一个函数（按函数值比：返回值相同的两个函数也算不同）"
+	default:
+		diff = "不是同一个 HistoryStore"
+	}
+	return fmt.Sprintf("sub-agents %q and %q declare conflicting history config (%s)", c.names[0], c.names[1], diff)
+}
+
 // startHistoryForOrchestration 让编排在自己这一层建历史写入器。
 //
-// 配置从 sub-agent 借：业务是在 BasicAgent 上配 `WithHistory` 的，编排自己没有这个
-// option。「一场会话一条流」本来就意味着同一编排下的子 agent 共用一个写入器。
+// 配置从 sub-agent 借（整棵静态子树，见 [borrowHistoryConfig]）：业务是在 BasicAgent 上配 `WithHistory` 的，编排自己
+// 没有这个 option。「一场会话一条流」本来就意味着同一编排下的子 agent 共用一个写入器。
 //
 // # 配置不一致时 fail-fast，不静默挑一个
 //
@@ -485,28 +588,12 @@ func startHistoryForOrchestration(ctx context.Context, subs []Agent, name string
 		return c, stop, nil
 	}
 
-	var chosen *historyConfig
-	for _, sub := range subs {
-		hp, ok := sub.(historyConfigProvider)
-		if !ok {
-			continue
-		}
-		hc := hp.historyCfgForOrchestration()
-		if hc == nil {
-			continue
-		}
-		if chosen == nil {
-			chosen = hc
-			continue
-		}
-		if !sameHistoryConfig(chosen, hc) {
-			// 报出冲突双方的 owner——不然业务在一堆子 agent 里找不到是哪两个。
-			// store 不同而 owner 相同时两边都显示同一个字符串，那也是有效信息
-			//（「owner 一样但 store 不是同一个」）。
-			return ctx, noop, fmt.Errorf("agent %q: sub-agents declare conflicting history config "+
-				"(owner %q vs %q, or different store) — 一场会话只能有一条流，框架无法替业务选租户；"+
-				"请让同一编排下的子 agent 用同一个 WithHistory 配置", name, chosen.owner, hc.owner)
-		}
+	chosen, conflict := borrowHistoryConfig(subs)
+	if conflict != nil {
+		// 报出冲突的是哪两个 agent、差在哪——不然业务在一棵嵌套的编排树里找不到
+		return ctx, noop, fmt.Errorf("agent %q: %s — 一场会话只能有一条流，框架无法替业务选租户；"+
+			"请让同一编排下（含嵌套的编排）的子 agent 用同一个 WithHistory 配置（同一个 store 实例、同一个 owner 或同一个 owner 函数）",
+			name, conflict.Error())
 	}
 	if chosen == nil {
 		return ctx, noop, nil
@@ -519,17 +606,18 @@ func startHistoryForOrchestration(ctx context.Context, subs []Agent, name string
 //
 // 只要有一处不同就算冲突——落错租户是静默的数据事故，宁可误报也不漏报。
 func sameHistoryConfig(a, b *historyConfig) bool {
-	if a.owner != b.owner {
-		return false
-	}
-	if (a.ownerFunc == nil) != (b.ownerFunc == nil) {
-		return false
-	}
-	if a.ownerFunc != nil &&
-		reflect.ValueOf(a.ownerFunc).Pointer() != reflect.ValueOf(b.ownerFunc).Pointer() {
+	if a.owner != b.owner || !sameOwnerFunc(a, b) {
 		return false
 	}
 	return sameHistoryStore(a.store, b.store)
+}
+
+// sameOwnerFunc 判两份配置的 owner 函数是不是同一个（按函数值比）。
+func sameOwnerFunc(a, b *historyConfig) bool {
+	if (a.ownerFunc == nil) != (b.ownerFunc == nil) {
+		return false
+	}
+	return a.ownerFunc == nil || reflect.ValueOf(a.ownerFunc).Pointer() == reflect.ValueOf(b.ownerFunc).Pointer()
 }
 
 // sameHistoryStore 判两个 store 是不是同一个。
@@ -568,13 +656,14 @@ func inputAlreadyInHistorySlot(ctx context.Context, slot string, input *schema.M
 	if nonce == "" {
 		return false
 	}
-	prior, ok := loadHistory(ctx, nil)
-	if !ok {
-		return false
-	}
 	// 按流限定：跨 Run 续接时前一个 Run 在**这条流**上的记录能挡住重记，而兄弟分支
-	// 刚写进去的那份挡不住我——每条分支流各自要完整（有问有答）。
-	return priorHasRootInputIDInSlot(prior, nonce, slot)
+	// 刚写进去的那份挡不住我——每条分支流各自要完整（有问有答）。只查当前任务的记录：
+	// 要挡的「同一个 sid 上 Run → 中断 → 再 Run」是同一个任务。归属在 match 里比——slot 为空时
+	// 比的是「没有归属」，不能当成「不按归属过滤」。
+	hit, _ := findHistory(ctx, nil, HistoryQuery{MessageID: nonce}, true, func(m *schema.Message) bool {
+		return priorHasRootInputIDInSlot([]*schema.Message{m}, nonce, slot)
+	})
+	return hit
 }
 
 // resolveHistoryConfigForAbort 解析这次调用该往哪个历史里写——ctx 声明优先，
@@ -586,21 +675,7 @@ func resolveHistoryConfigForAbort(ctx context.Context, subs []Agent) *historyCon
 	if hc := historyCfgFromCtx(ctx); hc != nil {
 		return hc
 	}
-	var chosen *historyConfig
-	for _, sub := range subs {
-		hp, ok := sub.(historyConfigProvider)
-		if !ok {
-			continue
-		}
-		hc := hp.historyCfgForOrchestration()
-		if hc == nil {
-			continue
-		}
-		if chosen != nil && !sameHistoryConfig(chosen, hc) {
-			return nil
-		}
-		chosen = hc
-	}
+	chosen, _ := borrowHistoryConfig(subs) // 冲突时 chosen 为 nil：这条路上不报错，理由见上
 	return chosen
 }
 
@@ -628,7 +703,13 @@ func resolveHistoryConfigForAbort(ctx context.Context, subs []Agent) *historyCon
 //
 // 历史是旁路：写不进去不该让「用户放弃任务」这个操作失败（cp 已经删了，返错会让调用方
 // 以为没放弃成功而重试）。
-func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, agentName string) {
+//
+// # 只补被放弃的这个任务的
+//
+// 悬空的 tool_call 是这个任务在中断那一刻留下的，只在这个任务写下的记录里找（按任务章查，task 是被放弃
+// 任务的 RunID）——任务挂着期间同一会话里别的任务写了多少都不用翻过去。补上的结果盖上声明它的那条
+// assistant 的归属与任务章：归属对上了，那个 agent 的视图里配对才是完整的。
+func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, agentName, task string) {
 	if hc == nil || hc.store == nil {
 		return
 	}
@@ -636,12 +717,18 @@ func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, age
 	if key.Owner == "" || key.ConvID == "" {
 		return
 	}
-	msgs, err := hc.store.Load(ctx, key)
-	if err != nil || len(msgs) == 0 {
-		if err != nil {
-			slog.WarnContext(ctx, "agent_v2: abort 收尾读历史失败，悬空 tool_call 未补",
-				"agent", agentName, "key", key.String(), "err", err)
-		}
+	src := historySource{store: hc.store, key: key, task: task}
+	var msgs []*schema.Message // 新 → 旧
+	err := src.scanBackward(ctx, HistoryQuery{Task: task}, historyPageMin, true, func(m *schema.Message) bool {
+		msgs = append(msgs, m)
+		return false
+	}, nil)
+	if err != nil {
+		slog.WarnContext(ctx, "agent_v2: abort 收尾读历史失败，悬空 tool_call 未补",
+			"agent", agentName, "key", key.String(), "err", err)
+		return
+	}
+	if len(msgs) == 0 {
 		return
 	}
 
@@ -652,14 +739,18 @@ func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, age
 		}
 	}
 	var closers []*schema.Message
-	for _, m := range msgs {
+	for i := len(msgs) - 1; i >= 0; i-- { // 旧 → 新：补上的结果按调用出现的顺序排
+		m := msgs[i]
 		for _, tc := range schema.GetToolCalls(m) {
 			if tc.ID == "" || answered[tc.ID] {
 				continue
 			}
 			answered[tc.ID] = true // 同一个 id 只补一次
-			closers = append(closers, schema.ToolResultMessage(tc.ID,
-				"任务已被放弃（调用方 Abort），此工具调用没有结果"))
+			closer := schema.ToolResultMessage(tc.ID,
+				"任务已被放弃（调用方 Abort），此工具调用没有结果")
+			owner, _ := m.Annotations[HistoryAgentAnnotation].(string)
+			display, _ := m.Annotations[HistoryAgentDisplayAnnotation].(string)
+			closers = append(closers, stampHistoryAgent(closer, owner, display, task))
 		}
 	}
 	if len(closers) == 0 {

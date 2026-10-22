@@ -184,6 +184,12 @@ func testMessageFields(t *testing.T, factory HistoryStoreFactory) {
 		agent_v2.HistoryAgentAnnotation:        "br1",
 		agent_v2.HistoryAgentDisplayAnnotation: "researcher",
 		"crew_custom":                          "业务自己塞的",
+		// 非字符串的值要按 JSON 类型读回：框架有标注按布尔判（skill 正文、return-direct），只存得下字符串的
+		// 后端把它们读回成文本，判据认不出、静默退化
+		"crew_custom_bool":   true,
+		"crew_custom_number": 3,
+		"crew_custom_list":   []string{"a", "b"},
+		"crew_custom_object": map[string]any{"k": "v"},
 	}
 	// thinking 类模型的 wire 协议要求把上一轮 assistant 的 reasoning 原样回传，
 	// 不回传第 2 轮直接 400——所以它跟 Content 一样是必须落库的字段。
@@ -226,6 +232,7 @@ func testMessageFields(t *testing.T, factory HistoryStoreFactory) {
 	if got[0].Annotations["crew_custom"] != "业务自己塞的" {
 		t.Errorf("业务自定义 annotation 丢了: %v", got[0].Annotations["crew_custom"])
 	}
+	checkJSONTypedAnnotations(t, got[0].Annotations)
 
 	if got[1].Role != schema.RoleTool {
 		t.Errorf("tool 结果的 Role = %s, want %s —— 角色错了 API 会 422",
@@ -248,21 +255,24 @@ func testMessageFields(t *testing.T, factory HistoryStoreFactory) {
 	}
 }
 
-// testEmptyConversation：没聊过的会话返 (nil, nil)，不是错误。
+// testEmptyConversation：没聊过的会话返空页，不是错误。
 //
 // 「没聊过」和「出错了」必须能区分——第一轮对话时历史必然是空的，那时报错整个功能
-// 就用不了。
+// 就用不了。带 Limit 读（框架每次 Run 都这么读）也一样。
 func testEmptyConversation(t *testing.T, factory HistoryStoreFactory) {
 	hs := factory()
 
-	got, err := hs.Load(context.Background(),
-		agent_v2.HistoryKey{Owner: "tenant-x", ConvID: "从没存在过"})
-	if err != nil {
-		t.Fatalf("Load 不存在的会话返错误 %v —— 应返 (nil, nil)；"+
-			"第一轮对话时历史必然为空，报错则整个功能用不了", err)
-	}
-	if len(got) != 0 {
-		t.Errorf("Load 不存在的会话返 %d 条, want 0\n%s", len(got), dump(got))
+	for _, q := range []agent_v2.HistoryQuery{{}, {Limit: 64}} {
+		got, err := hs.Load(context.Background(),
+			agent_v2.HistoryKey{Owner: "tenant-x", ConvID: "从没存在过"}, q)
+		if err != nil {
+			t.Fatalf("Load(%+v) 不存在的会话返错误 %v —— 应返空页；"+
+				"第一轮对话时历史必然为空，报错则整个功能用不了", q, err)
+		}
+		if len(got.Messages) != 0 || got.More {
+			t.Errorf("Load(%+v) 不存在的会话返 %d 条、More=%v, want 0 条、More=false\n%s",
+				q, len(got.Messages), got.More, dump(got.Messages))
+		}
 	}
 }
 
@@ -339,7 +349,7 @@ func testConcurrent(t *testing.T, factory HistoryStoreFactory) {
 			defer wg.Done()
 			key := agent_v2.HistoryKey{Owner: "tenant-a", ConvID: fmt.Sprintf("conv-%d", c)}
 			for i := 0; i < perConv; i++ {
-				if _, err := hs.Load(context.Background(), key); err != nil {
+				if _, err := agent_v2.LoadAllHistory(context.Background(), hs, key); err != nil {
 					t.Errorf("并发 Load(%s): %v", key, err)
 					return
 				}
@@ -450,5 +460,38 @@ func testAppendNoMutation(t *testing.T, factory HistoryStoreFactory) {
 				"而报错会出现在离这里很远的地方。要留存请自己（深）拷贝",
 				i, before[i], got)
 		}
+	}
+}
+
+// checkJSONTypedAnnotations 校验非字符串的标注值按 JSON 类型读回：布尔是 bool、数字是数值类型（float64 也算）、
+// 数组是 []string 或 []any、对象是 map[string]any。读回成文本（"true"、"3"、"[a b]"）的后端在这里露馅。
+func checkJSONTypedAnnotations(t *testing.T, anns map[string]any) {
+	t.Helper()
+	if v, ok := anns["crew_custom_bool"].(bool); !ok || !v {
+		t.Errorf("布尔标注读回成 %T(%v), want bool true——框架按布尔判的标注（skill 正文、return-direct）会认不出",
+			anns["crew_custom_bool"], anns["crew_custom_bool"])
+	}
+	switch v := anns["crew_custom_number"].(type) {
+	case int, int64, float64:
+		if fmt.Sprint(v) != "3" {
+			t.Errorf("数字标注读回成 %v, want 3", v)
+		}
+	default:
+		t.Errorf("数字标注读回成 %T(%v), want 数值类型（int / int64 / float64）", v, v)
+	}
+	switch v := anns["crew_custom_list"].(type) {
+	case []string:
+		if fmt.Sprint(v) != "[a b]" {
+			t.Errorf("数组标注读回成 %v, want [a b]", v)
+		}
+	case []any:
+		if fmt.Sprint(v) != "[a b]" {
+			t.Errorf("数组标注读回成 %v, want [a b]", v)
+		}
+	default:
+		t.Errorf("数组标注读回成 %T(%v), want []string 或 []any", v, v)
+	}
+	if obj, ok := anns["crew_custom_object"].(map[string]any); !ok || obj["k"] != "v" {
+		t.Errorf("对象标注读回成 %T(%v), want map[string]any{k: v}", anns["crew_custom_object"], anns["crew_custom_object"])
 	}
 }

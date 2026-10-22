@@ -53,7 +53,7 @@ func TestHistory_RunResumeEntrySymmetry(t *testing.T) {
 		t.Fatalf("Resume: %v", err)
 	}
 
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-sym"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-sym"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestHistory_ResumeDoesNotReRecordCompletedStep(t *testing.T) {
 		t.Fatalf("Resume: %v", err)
 	}
 
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-rerecord"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "conv-rerecord"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -233,7 +233,7 @@ func fanoutHistoryShape(t *testing.T, interrupt bool) string {
 		t.Fatalf("Run: %v", err)
 	}
 
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: conv})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: conv})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}

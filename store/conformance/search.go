@@ -383,6 +383,57 @@ func testSearch(t *testing.T, factory StoreFactory) {
 		}
 	})
 
+	// Put 的值是具体 Go 类型（map[string]string、struct）时，filter 按它的 JSON 形状匹配：字段照常命中，对象相等不看
+	// struct 字段的声明序。曾经内存后端原样存业务的值、只认 map[string]any，`map[string]string{"z":"1"}` 配 filter
+	// `{"z":"1"}` 在内存后端上 0 条、在 SQLite 上 1 条；struct 字段按声明序编码，SQLite 按 JSON 文本比对象时跟 filter
+	// 的 map（键排序）对不上——两种都 `err == nil`。
+	t.Run("Search_WithFilter_ConcreteGoTypes_MatchByJSONShape", func(t *testing.T) {
+		st := factory()
+		ctx := context.Background()
+		ns := store.NS("gotypes")
+		type meta struct {
+			Z int
+			A int
+		}
+		type memo struct {
+			Kind string `json:"kind"`
+			Meta meta   `json:"meta"`
+		}
+		if err := st.Put(ctx, ns, "ss", map[string]string{"z": "1"}); err != nil {
+			t.Fatalf("Put ss: %v", err)
+		}
+		if err := st.Put(ctx, ns, "st", memo{Kind: "pref", Meta: meta{Z: 1, A: 2}}); err != nil {
+			t.Fatalf("Put st: %v", err)
+		}
+		cases := []struct {
+			name   string
+			filter map[string]any
+			want   []string
+		}{
+			{"map_string_string_field", map[string]any{"z": "1"}, []string{"ss"}},
+			{"struct_tagged_field", map[string]any{"kind": "pref"}, []string{"st"}},
+			{"struct_object_equal_declaration_order_free", map[string]any{"meta": map[string]any{"$eq": map[string]any{"A": 2, "Z": 1}}}, []string{"st"}},
+			// 比较值本身是具体 Go 类型：同样按它的 JSON 形状比（曾经客户端过滤的后端 0 条、SQLite 1 条，struct
+			// 比较值按声明序编码在 SQLite 上也对不上）
+			{"operand_struct", map[string]any{"meta": map[string]any{"$eq": meta{Z: 1, A: 2}}}, []string{"st"}},
+			{"operand_map_string_int", map[string]any{"meta": map[string]any{"$eq": map[string]int{"Z": 1, "A": 2}}}, []string{"st"}},
+			{"operand_ne_struct", map[string]any{"meta": map[string]any{"$ne": meta{Z: 9, A: 9}}}, []string{"st"}},
+			{"operand_raw_string", map[string]any{"z": map[string]any{"$eq": json.RawMessage(`"1"`)}}, []string{"ss"}},
+			// 直值编成 JSON 是对象：等于这个对象（不是嵌套 filter）
+			{"direct_struct", map[string]any{"meta": meta{Z: 1, A: 2}}, []string{"st"}},
+			{"direct_map_string_int", map[string]any{"meta": map[string]int{"A": 2, "Z": 1}}, []string{"st"}},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				items, err := st.Search(ctx, ns, store.WithLimit(100), store.WithFilter(c.filter))
+				if err != nil {
+					t.Fatalf("Search %v: %v", c.filter, err)
+				}
+				assertKeys(t, items, c.want)
+			})
+		}
+	})
+
 	// 多键 AND + 同一 key 上多个 op。
 	//
 	// ⚠️ **这条是给下推型 backend 用的**：把 filter 翻成 SQL 时，参数编号（PG 的 `$N`）

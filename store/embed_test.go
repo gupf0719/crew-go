@@ -291,3 +291,31 @@ func TestIndex_StringValueIsEmbeddable(t *testing.T) {
 		t.Errorf("Score 应非零，实际 %v——value 没被 embed", got[0].Score)
 	}
 }
+
+// 配了 Fields：Put 进来的是 struct 或 `map[string]string` 也按字段取文本——它们读回是 `map[string]any`，跟 filter
+// 按字段命中是同一个形状。曾经默认抽取器只认原值本身是 `map[string]any` 的，这两种一律不 embed、score 恒为 0。
+// tag 字段故意放了另一个关键词：Fields 没生效、取了全部字段的话第二条也会被 query 命中。
+func TestIndex_FieldsApplyToJSONObjectShape(t *testing.T) {
+	st := store.NewInMemoryStore(store.WithIndex(&store.IndexConfig{Embedder: fakeEmbedder(nil), Fields: []string{"text"}}))
+	ctx := context.Background()
+	ns := store.NS("mem")
+	type note struct {
+		Text string `json:"text"`
+		Tag  string `json:"tag"`
+	}
+	if err := st.Put(ctx, ns, "ss", map[string]string{"text": "我家的猫很胖", "tag": "菜"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Put(ctx, ns, "st", note{Text: "晚饭做了菜", Tag: "猫"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ q, want string }{{"猫", "ss"}, {"菜", "st"}} {
+		got, err := st.Search(ctx, ns, store.WithQuery(c.q), store.WithLimit(2))
+		if err != nil {
+			t.Fatalf("Search %s: %v", c.q, err)
+		}
+		if len(got) != 2 || got[0].Key != c.want || got[0].Score <= 0 || got[1].Score > 0 {
+			t.Errorf("query %s：want %s 第一且只有它得分，got %v", c.q, c.want, got)
+		}
+	}
+}

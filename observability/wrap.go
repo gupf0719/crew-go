@@ -77,12 +77,15 @@ func (w *wrappedHooks) OnModelEndStream(ctx context.Context, info *hook.AgentInf
 	return w.obs.o.keepHandles(ctx1, ctx2), sr2, nil
 }
 
+// OnModelEnd 先让里面的钩子改写，再按改写之后的值收尾。里面的钩子报错（拒掉这份答复、等人、被叫停）时也收尾：模型调用
+// 本身已经完成，按它自己的结局记——用量只在这一遍交来，续跑沿用这份答复的那一遍不带用量、也不再记（见
+// hook.ModelResponseReusedKey），这里不收的话这次调用一次也记不上。
 func (w *wrappedHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
 	ret, err := w.inner.OnModelEnd(ctx, info, out)
+	_, _ = w.obs.OnModelEnd(ctx, info, out)
 	if err != nil {
 		return ctx, err
 	}
-	_, _ = w.obs.OnModelEnd(ctx, info, out)
 	return ret, nil
 }
 
@@ -98,12 +101,14 @@ func (w *wrappedHooks) OnToolStart(ctx context.Context, info *hook.AgentInfo, in
 	return o.keepHandles(ctx1, ctx2), nil
 }
 
+// OnToolEnd 同 OnModelEnd：里面的钩子报错时工具已经执行过，照样按这次调用自己的结局收尾（续跑时它从工具账重放，带
+// agent_v2.ToolReplayedExtraKey，那一次不再记）。
 func (w *wrappedHooks) OnToolEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ToolOutput) (context.Context, error) {
 	ret, err := w.inner.OnToolEnd(ctx, info, out)
+	_, _ = w.obs.OnToolEnd(ctx, info, out)
 	if err != nil {
 		return ctx, err
 	}
-	_, _ = w.obs.OnToolEnd(ctx, info, out)
 	return ret, nil
 }
 

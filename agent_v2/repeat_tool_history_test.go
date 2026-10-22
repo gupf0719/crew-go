@@ -68,7 +68,7 @@ func TestRepeatTool_ReminderStaysOutOfHistory(t *testing.T) {
 	}
 
 	// 证据一：append-only 历史里不该有它。
-	recs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
+	recs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}

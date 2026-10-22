@@ -1,6 +1,7 @@
 package agui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crew-go/agent_v2"
@@ -21,6 +23,13 @@ import (
 
 // RunAgentInput 是 AG-UI client（如 CopilotKit）POST 给 server 的运行请求。
 // 只解析 server 端需要的字段——state / tools / context 暂不消费。
+//
+// messages 按 AG-UI 1.0 视作这场对话的完整历史：最后一条 user 是这一轮的输入，它之前的 user / assistant 文本作为
+// 调用方提供的前文交给 agent（agent_v2.WithCallerHistoryCtx——一次运行只认一个来源：agent 配了历史层、由它拥有这场
+// 对话时以服务端为准，服务端第一次见到这场对话时把前文写进去一次；否则每个读历史的 agent 都看到这份前文）。续跑推 Run
+// 时那一份（存在会话条目里），不按续跑请求的 messages 重算。
+// 客户端的 system / developer 不采信（它们会成为模型的指令，而客户端能随意伪造），剥掉并告警；工具调用与结果、
+// reasoning、activity 不取；最后一条 user 之后的消息不取。
 type RunAgentInput struct {
 	ThreadID string        `json:"threadId"`
 	RunID    string        `json:"runId"`
@@ -53,15 +62,67 @@ const (
 // 防长跑 OOM。淘汰按 owner 分摊、上限是软的，见 [WithMaxSessions]。
 const DefaultMaxSessions = 10000
 
-// AGUIMessage 是 AG-UI 请求里的一条消息（简化：只取 role + content）。
+// AGUIMessage 是 AG-UI 请求里的一条消息（简化：只取 role + content 的文本）。
+//
+// content 可以是字符串，也可以是 ContentPart 数组（AG-UI 1.0 的多模态消息）：数组里的 text 部分按顺序以换行拼成
+// Content，媒体部分（image / audio / video / document）不取——模型层还不把多模态块送给模型。activity 消息的
+// content 是对象，不是对话内容，Content 留空；别的角色的 content 是对象时解码报错。
 type AGUIMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// droppedParts 是 content 数组里没取的媒体部分的类型（按出现顺序），解码时填。
+	droppedParts []string
+}
+
+// UnmarshalJSON 解 role 与 content：content 接受字符串、ContentPart 数组、对象与 null（见类型说明）。
+func (m *AGUIMessage) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	m.Role, m.Content, m.droppedParts = raw.Role, "", nil
+	c := bytes.TrimSpace(raw.Content)
+	switch {
+	case len(c) == 0 || bytes.Equal(c, []byte("null")):
+		return nil
+	case c[0] == '{':
+		// 只有 activity 的 content 是对象（结构化进度，不是对话内容）；别的角色是对象就是非法消息，照跑的话 user 的输入
+		// 成了空串
+		if raw.Role != "activity" {
+			return fmt.Errorf("message content: a %s message's content must be a string or an array of content parts", raw.Role)
+		}
+		return nil
+	case c[0] == '[':
+		var parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(c, &parts); err != nil {
+			return fmt.Errorf("message content: %w", err)
+		}
+		texts := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if p.Type == "text" {
+				texts = append(texts, p.Text)
+				continue
+			}
+			m.droppedParts = append(m.droppedParts, p.Type)
+		}
+		m.Content = strings.Join(texts, "\n")
+		return nil
+	default:
+		return json.Unmarshal(c, &m.Content)
+	}
 }
 
 // AgentFactory 每个 AG-UI 请求调一次，返回处理该请求的 agent。传入的 hooks 是 AG-UI
 // adapter——**必须注入 agent**（`agent_v2.WithHooks(hooks)` 或 chain 进业务 hooks），
-// 否则拿不到 LLM 输出 / tool 调用、AG-UI 事件流只剩纯文本。**必须返回非 nil agent**
+// 否则拿不到 LLM 输出 / tool 调用、AG-UI 事件流只剩纯文本。chain 时 adapter 排在会在 OnModelEnd
+// 里问人的业务钩子前面：续跑沿用那次答复时 adapter 按 hook.ModelResponseReusedKey 不再发（上一次 run
+// 已经交给前端），排在后面、模型又不流式时那次没发出去、这一遍也不发。**必须返回非 nil agent**
 // （返 nil 时 handler fail-fast 发 RunError(code=nil_agent)）。
 //
 // 为什么是工厂而非直接传 agent：AG-UI 是 per-connection SSE，每个请求的 adapter 绑定
@@ -230,6 +291,8 @@ type sessionEntry struct {
 	// （AG-UI：不支持只答一部分，也不能答不在其中的）；审批的答复先校验再开跑，认不出的整批拒绝、这些问题保持
 	// 挂起（交给审批层的话认不出就按拒绝处理，`{"approved":true}`、`Yes.` 曾都被当成拒绝）。
 	open map[string]bool
+	// prior 是 Run 时交给 agent 的调用方前文（agent_v2.WithCallerHistoryCtx），续跑时原样再推。
+	prior []*schema.Message
 	// answers 是这个任务里已经采纳过的全部答复（按 InterruptID），每次续跑都整份交给 Resume。没进工具账的提问
 	// （ask_user、节点里直接 Ask 的）续跑时会重问，框架要 Resume 的调用方把答过的答案带上；只交这一轮的，一个
 	// 节点先后问两问时就会来回重问、永远答不完（实测）。新开任务时 acquireForRun 换上新的 entry，跟着清空。
@@ -242,6 +305,10 @@ type handler struct {
 	maxSessions   int                     // 挂起会话上限（<=0 不限）
 	sessionTTL    time.Duration           // 挂起会话最长闲置（<=0 不按时间回收），见 WithSessionTTL
 	ownerResolver compose_v2.OwnerResolver
+
+	// 客户端内容没采信 / 没取时各告警一次（见 warnClientMessages）
+	warnedInstructions atomic.Bool
+	warnedMedia        atomic.Bool
 
 	mu        sync.Mutex
 	sessions  map[sessionKey]*sessionEntry // (owner, threadId) → 挂起会话状态
@@ -330,11 +397,18 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // serveRun 处理新一轮运行。
 func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInput, key sessionKey) {
-	inputMsg := lastUserMessage(in.Messages)
+	prior, inputMsg, rep := splitClientMessages(in.Messages)
 	if inputMsg == nil {
 		_ = sse.WriteEvent(NewRunError("no user message in request", "bad_request"))
 		return
 	}
+	if inputMsg.Content == "" && rep.inputDropped {
+		// 只有媒体、没有文字：照跑的话模型收到一个空问题，还以为自己看过了用户发的东西
+		_ = sse.WriteEvent(NewRunError("the last user message has no text part; image / audio / video / document parts are not supported", "unsupported_content"))
+		return
+	}
+	h.warnClientMessages(ctx, rep)
+	ctx = agent_v2.WithCallerHistoryCtx(ctx, prior)
 
 	// 占用 threadId（并发保护 + 处理已有挂起会话）。**threadId 到这儿恒非空**——
 	// ServeHTTP 没给就铸一个，见那里的说明。
@@ -413,7 +487,7 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	settled = true
 	adapter.finish()
 
-	h.handleOutcome(ctx, sse, key, runID, sess, err)
+	h.handleOutcome(ctx, sse, key, runID, sess, prior, err)
 }
 
 // serveResume 处理 HITL 续跑——用上次中断挂起的 sess + cp 重建，把答案按 InterruptID
@@ -438,7 +512,7 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 	}
 
 	// 占用挂起会话（并发保护：已 busy = 另一 Resume/Run 在途，拒；不存在 = 会话已结束/过期）。
-	sess, open, ok, busy := h.acquireForResume(key)
+	sess, open, prior, ok, busy := h.acquireForResume(key)
 	if busy {
 		_ = sse.WriteEvent(NewRunError("resume already in progress for this thread", "busy"))
 		return
@@ -448,6 +522,10 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 		return
 	}
 	defer h.releaseBusy(key) // 确保 busy 清（含 panic 路径）
+	// 续跑里才开始跑的成员（Sequential 的后一步之类）同样要看到前文，而且是 Run 时那一份：跟同一个任务里先跑的成员看到
+	// 的一样。不按续跑请求的 messages 重算——前端可能把这一问的答复当成一条 user 追加进去，那样 Run 时的输入会被算进
+	// 前文、续跑才跑的成员看到它两遍。
+	ctx = agent_v2.WithCallerHistoryCtx(ctx, prior)
 
 	// **resume 列表恰好覆盖挂起的那些中断**（AG-UI：每一条答一个挂起的中断，全部都要答到或者明确放弃，不支持只答
 	// 一部分）。规范把这条交给前端检查，这里仍然查：只答一部分的话，没答的那几问照样挂着，而同一批里没进工具账的
@@ -571,14 +649,14 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 	settled = true
 	adapter.finish()
 
-	h.handleOutcome(ctx, sse, key, wireRunID, sess, err)
+	h.handleOutcome(ctx, sse, key, wireRunID, sess, prior, err)
 }
 
-// handleOutcome 按 Run/Resume 结果发终态 + 更新挂起 entry——中断则 entry 留 sess 待续发
+// handleOutcome 按 Run/Resume 结果发终态 + 更新挂起 entry——中断则 entry 留 sess 与 Run 时的前文（prior）待续发
 // （多轮 HITL），成功 / 错误则清 entry（会话结束）。
 // ⚠️ **发回前端的只能是 key.threadID 那一维**——owner 是服务端解析出来的身份，前端只认
 // 它自己给的那个 threadId，把整个键的内容发出去它就认不出来了（顺带把身份泄给了浏览器）。
-func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key sessionKey, runID string, sess *agent_v2.RunSession, err error) {
+func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key sessionKey, runID string, sess *agent_v2.RunSession, prior []*schema.Message, err error) {
 	// **陈旧写回**（`WithStaleWriteGuard` 开启时才可能出现）：这次的结果没落盘，槽里是另一个执行者
 	// 的状态，留 entry 等续发是徒劳——前端答完发回来，框架载入的是别人的状态，于是重新问一遍已经
 	// 答过的问题，来回不收敛（实测：问 q1 → 答 → 问 q2 → 答 → 又问 q1）。引擎出口写档撞上它时返
@@ -666,7 +744,7 @@ func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key session
 			open[q.InterruptID] = false
 			interrupts = append(interrupts, RunInterrupt{ID: q.InterruptID, Reason: reason, Message: q.Question})
 		}
-		h.storeInterrupt(key, sess, open)
+		h.storeInterrupt(key, sess, open, prior)
 		_ = sse.WriteEvent(NewRunInterrupted(key.threadID, runID, interrupts))
 		return
 	}
@@ -753,23 +831,23 @@ func (h *handler) sweepExpiredLocked() []string {
 	return sids
 }
 
-// acquireForResume 为 serveResume 占用挂起会话（标 busy），返回挂起的中断（InterruptID → 是不是工具审批）。不存在
-// （含 busy 壳无 sess）返 ok=false；已 busy 返 busy=true。
-func (h *handler) acquireForResume(key sessionKey) (sess *agent_v2.RunSession, open map[string]bool, ok bool, busy bool) {
+// acquireForResume 为 serveResume 占用挂起会话（标 busy），返回挂起的中断（InterruptID → 是不是工具审批）与 Run 时的
+// 前文。不存在（含 busy 壳无 sess）返 ok=false；已 busy 返 busy=true。
+func (h *handler) acquireForResume(key sessionKey) (sess *agent_v2.RunSession, open map[string]bool, prior []*schema.Message, ok bool, busy bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	e := h.sessions[key]
 	if e == nil || e.sess == nil {
-		return nil, nil, false, false
+		return nil, nil, nil, false, false
 	}
 	if e.busy {
-		return nil, nil, false, true
+		return nil, nil, nil, false, true
 	}
 	// **过期即不可用**，跟惰性回收什么时候真跑无关——见 WithSessionTTL 的两段语义。
 	// 不在这儿判的话，回收延迟就变成语义延迟：一条早该过期的会话在下次扫描之前仍然续
 	// 得起来，而低流量部署下「下次扫描」可能是几天以后。
 	if h.expiredLocked(e) {
-		return nil, nil, false, false
+		return nil, nil, nil, false, false
 	}
 	e.busy = true
 	e.touchedAt = time.Now().UnixNano()
@@ -778,7 +856,7 @@ func (h *handler) acquireForResume(key sessionKey) (sess *agent_v2.RunSession, o
 	for id, approval := range e.open {
 		open[id] = approval
 	}
-	return e.sess, open, true, false
+	return e.sess, open, e.prior, true, false
 }
 
 // recordAnswers 把这一轮采纳的答复并进这个任务累积的答复，返回整份（拷贝）交给 Resume。entry 不在了（被淘汰）时
@@ -813,9 +891,9 @@ func (h *handler) releaseBusy(key sessionKey) {
 	}
 }
 
-// storeInterrupt 中断挂起时把 sess 与这次交给前端的中断（InterruptID → 是不是工具审批）存入 entry，换掉之前记下的
-// 中断；累积的答复留着（busy 保持——releaseBusy defer 会清）。
-func (h *handler) storeInterrupt(key sessionKey, sess *agent_v2.RunSession, open map[string]bool) {
+// storeInterrupt 中断挂起时把 sess、这次交给前端的中断（InterruptID → 是不是工具审批）与 Run 时的前文存入 entry，换掉
+// 之前记下的中断；累积的答复留着（busy 保持——releaseBusy defer 会清）。
+func (h *handler) storeInterrupt(key sessionKey, sess *agent_v2.RunSession, open map[string]bool, prior []*schema.Message) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	e := h.sessions[key]
@@ -825,6 +903,7 @@ func (h *handler) storeInterrupt(key sessionKey, sess *agent_v2.RunSession, open
 	}
 	e.sess = sess
 	e.open = open
+	e.prior = prior
 	e.touchedAt = time.Now().UnixNano()
 }
 
@@ -1045,14 +1124,63 @@ func payloadToString(p any) string {
 	return string(b)
 }
 
-// lastUserMessage 取请求里最后一条 role=user 的消息作 agent 输入。
-func lastUserMessage(msgs []AGUIMessage) *schema.Message {
+// clientMessageReport 记下拆 messages 时没取的东西，给告警用。
+type clientMessageReport struct {
+	// instructions 是剥掉的 system / developer 条数。
+	instructions int
+	// droppedParts 是没取的媒体部分条数（前文与输入合计）。
+	droppedParts int
+	// inputDropped 报这一轮的输入里有没取的媒体部分。
+	inputDropped bool
+}
+
+// splitClientMessages 把请求里的 messages 拆成这一轮的输入（最后一条 user）与此前的轮次（交给
+// agent_v2.WithCallerHistoryCtx 的调用方前文）。前文只取 user / assistant 的文本：system / developer 剥掉（计进
+// report），tool、reasoning、activity 与没有文字的消息不取；最后一条 user 之后的消息不取。没有 user 消息时 input
+// 为 nil。
+func splitClientMessages(msgs []AGUIMessage) (prior []*schema.Message, input *schema.Message, rep clientMessageReport) {
+	last := -1
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if msgs[i].Role == "user" {
-			return schema.UserMessage(msgs[i].Content)
+			last = i
+			break
 		}
 	}
-	return nil
+	if last < 0 {
+		return nil, nil, rep
+	}
+	input = schema.UserMessage(msgs[last].Content)
+	rep.inputDropped = len(msgs[last].droppedParts) > 0
+	rep.droppedParts = len(msgs[last].droppedParts)
+	prior = make([]*schema.Message, 0, last)
+	for _, m := range msgs[:last] {
+		rep.droppedParts += len(m.droppedParts)
+		switch m.Role {
+		case "system", "developer":
+			rep.instructions++
+		case "user":
+			if m.Content != "" {
+				prior = append(prior, schema.UserMessage(m.Content))
+			}
+		case "assistant":
+			if m.Content != "" {
+				prior = append(prior, schema.AssistantMessage(m.Content))
+			}
+		}
+	}
+	return prior, input, rep
+}
+
+// warnClientMessages 对没采信 / 没取的客户端内容各告警一次（每个 handler 一次，每个请求都告警会刷屏）。
+func (h *handler) warnClientMessages(ctx context.Context, rep clientMessageReport) {
+	if rep.instructions > 0 && h.warnedInstructions.CompareAndSwap(false, true) {
+		slog.WarnContext(ctx, "agui: 请求里的 system / developer 消息不采信、已剥掉——客户端能伪造它们，指令只认 agent 自己的前言"+
+			"（本条每个 handler 只记一次）", "count", rep.instructions)
+	}
+	if rep.droppedParts > 0 && h.warnedMedia.CompareAndSwap(false, true) {
+		slog.WarnContext(ctx, "agui: 消息里的 image / audio / video / document 部分不支持、已丢弃，只取文本"+
+			"（本条每个 handler 只记一次）", "count", rep.droppedParts)
+	}
 }
 
 // agentErrorCode 把 agent 返回的错误映射成前端可编程处理的 code。

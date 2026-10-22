@@ -2,6 +2,9 @@ package compose_v2
 
 import (
 	"context"
+	"log/slog"
+
+	"crew-go/internal/panicerr"
 )
 
 // OrchestrationHooks 是 graph 执行生命周期的 5 个观测点回调。
@@ -14,11 +17,16 @@ import (
 // OnNodeEvent 会从多个 goroutine 并发调用——hook 实现须保证线程安全（典型：
 // 内部 mutex 保护写入）。
 //
-// **panic 语义** (audit² 改): 业务 hook panic 由 framework 内部
-// recover 兜底——框架侧的完整分工见 `panic_recovery.go`（compose_v2 四道 + agent_v2
-// 9 编排各自 Run/Resume 入口那道）. hook panic 转 wrapped err
-// 返业务 (不让 Run goroutine crash). 业务 hook = 业务 bug fail-fast 哲学.
-// 例外是 cp 事件：它只作观测，钩子 panic 在发事件那一处兜住、只记带栈日志，不进错误（见 deliverCpEvent）.
+// **panic 语义**：业务钩子 panic 由框架兜住（分工见 `panic_recovery.go`），不让 Run goroutine 崩。
+// 兜住之后怎么处置，看钩子跑在它报告的那段工作之前还是之后：
+//   - OnGraphStart / OnNodeStart 在工作之前：panic 转成这次 Run / 这个节点的错误（同返回 error）。
+//   - OnNodeEnd / OnGraphEnd 在工作之后：节点体（图）失败时 panic 转成那个节点（这次 Run）的错误；
+//     成功时就地兜住、带栈记一条 ERROR，结果与写入照常提交。
+//   - OnNodeEvent 只作观测：任何时候 panic 都就地兜住、记 ERROR（节点里发的事件、Run 级的存档事件都是）。
+//
+// 理由是钩子出错不得让已经做完的工作再做一次：成功之后的钩子 panic 曾经一律转成错误，失败档被续跑或重试
+// 捡起，已经做完的节点体重跑、副作用重放（实测同一个节点体跑 3～4 次）。一个钩子 panic 时，链里排在它
+// 后面的钩子不再调（[ChainOrchHooks] 不逐个隔离）。
 //
 // **ctx-based 协议** (audit² 改): 每个 hook 方法返 context.Context, 入参 ctx 也
 // 由 hook 方法接收. framework 内自动 propagate 给下游 (下一个
@@ -40,12 +48,9 @@ type OrchestrationHooks interface {
 
 	// OnGraphEnd 在 graph 完成后调用一次 (成功或失败). err 是 Run 返回值.
 	//
-	// ⚠️ **hook 里别做会 panic 的事**：panic 会被 Run 入口的 recover 转成 Run 的返回错误，
-	// 而这一刻图体**已经成功收尾**（frontier 已清、成功路径的 cp 清理照跑——哨兵
-	// TestAudit3_A1_OnGraphEndPanic_CleanupStillRuns）。后果是：一次本来成功的 Run 以
-	// 失败返回，存档里却没有可续的进度 ⟹ 调用方 Resume 时**整图从头重跑**；嵌套时
-	// 子图的 OnGraphEnd panic 会让父图把整个子图重跑一遍。要在 hook 里跑可能出错的
-	// 业务代码（含会触发业务 reducer 的 Get），自己 recover 并记日志，别让它冒出去。
+	// panic：图成功跑完时就地兜住、带栈记一条 ERROR，Run 照常返回 nil——这一刻图体已经成功收尾、成功路径的
+	// cp 清理随后照跑，转成错误的话调用方拿到失败而存档里没有可续的进度，重试整图从头重跑，嵌套时父图把整个
+	// 子图重跑一遍（曾经如此，实测）。图失败时 panic 并到 Run 的错误上。
 	OnGraphEnd(ctx context.Context, chs Channels, err error) context.Context
 
 	// OnNodeStart 在节点 NodeFunc 调用前立即调用.
@@ -54,6 +59,8 @@ type OrchestrationHooks interface {
 
 	// OnNodeEnd 在节点 NodeFunc 返回后立即调用. nodeErr = NodeFunc 的返回值
 	// (含业务错 / InterruptError / nil).
+	//
+	// panic：节点体成功时就地兜住、带栈记一条 ERROR，节点结果与写入照常提交；节点体失败时转成这个节点的错误.
 	OnNodeEnd(ctx context.Context, nodeID NodeID, chs Channels, nodeErr error) context.Context
 
 	// OnNodeEvent 在节点内主动发出 event 时实时触发（节点内流式事件投递）.
@@ -61,7 +68,8 @@ type OrchestrationHooks interface {
 	// **只作观测**：在这里做出的上行信号不生效——ctx 上没有收信号处，[EmitSignal] 返回 false，
 	// 转交（agent_v2.HandoffTo）报错。要做决定就在发事件的那段代码里直接做：事件不带它是从哪一段执行
 	// 发出来的，在这里做出的决定归不到它该归的那一段。同理别在这里调起嵌套调用、提问或记节点私有态——
-	// 续跑时被跳过的那些段不会再发事件，这里的次序跨续跑不稳定。返回的 ctx 不被使用。
+	// 续跑时被跳过的那些段不会再发事件，这里的次序跨续跑不稳定。返回的 ctx 不被使用。它 panic 时就地兜住、
+	// 带栈记一条 ERROR，执行照常往下走。
 	//
 	// nodeID 与 ctx：节点体里发的事件，nodeID 是那个节点、ctx 是节点的（带着 OnNodeStart 推的值）；条件边、
 	// 节点级钩子、图级钩子里发的是图级事件，nodeID 为空、ctx 是图的（带着 OnGraphStart 推的值——OnGraphStart
@@ -106,11 +114,8 @@ func (NoOpOrchestrationHooks) OnNodeEvent(ctx context.Context, _ NodeID, _ Event
 // ChainOrchHooks 把多个 OrchestrationHooks 串成一个——业务想同时挂 SSE 适配 +
 // audit 日志 + metrics 等多 hook 时用。对齐 hook.ChainHooks 设计.
 //
-// **panic 语义** (audit² 改): chain 内每个 hook 调用是 raw 调用
-// (不再 per-handler panic isolate). 单 hook panic 中断 chain 后续 handlers 冒泡
-// 给 framework outer recover (compose_v2.Run + runNodeWithHooks + agent_v2 9 编排
-// Run/Resume 都有 outer defer recover) 转 wrapped err 返业务. 业务 hook = 业务
-// bug fail-fast 哲学.
+// **panic 语义**：链里每个钩子直接调、不逐个隔离——一个钩子 panic 时排在它后面的不再调，panic 交给
+// 调用这条链的地方处置（转成错误还是就地兜住记日志，见 [OrchestrationHooks]「panic 语义」）。
 //
 // 用法:
 //
@@ -140,8 +145,7 @@ func NewChainOrchHooks(hooks ...OrchestrationHooks) *ChainOrchHooks {
 // **ctx propagation 协议**: ChainOrchHooks 内 ctx 链式串 — 每个 hook 返的 ctx
 // 给下一个 hook 用. 业务在 hook A 内 push 的 span 让 hook B 拿到.
 //
-// **panic 语义**: 一个 hook panic = 业务 bug fail-fast 中断剩余链.
-// framework Run 入口 outer defer recover 兜底转 err 返业务.
+// **panic 语义**: 一个 hook panic 中断剩余链，处置见 [OrchestrationHooks]「panic 语义」.
 func (c *ChainOrchHooks) OnGraphStart(ctx context.Context, chs Channels) (context.Context, error) {
 	// **audit⁴ B MED-1 fix**: 早 return 用入参 ctx (跟 OnNodeStart + ChainHooks B2 同款).
 	// 之前 `return ctx, err` 看似回入参实际回 `ctx = newCtx` 后的 hook A 已 mutate 值
@@ -195,9 +199,8 @@ func (c *ChainOrchHooks) OnNodeEvent(ctx context.Context, id NodeID, ev Event) c
 }
 
 // audit² 改: 删 safeOrchHooks wrapper + safeOnXxx helper —
-// per-hook panic isolation 是过度设计. framework 已有 defer recover 兜底业务 hook panic
-// → 转 err 返业务（分工见 panic_recovery.go）. ChainOrchHooks 内 for 循环直接调 raw —
-// 一个 hook panic = 业务 bug fail-fast.
+// per-hook panic isolation 是过度设计. 框架在调用这条链的地方兜住业务 hook panic（分工见
+// panic_recovery.go）. ChainOrchHooks 内 for 循环直接调 raw.
 
 // ── 节点内事件发送 helper ──
 
@@ -289,10 +292,15 @@ func (s *nodeEventSink) Send(ev Event) {
 		}
 		ev.Metadata = m
 	}
-	// audit² 改: Send 在 NodeFunc 内被业务调用 — 业务 NodeFunc 走
-	// safeNodeRun panic recover, 加 runNodeWithHooks 整函数 defer recover (覆盖
-	// fanout 跨 goroutine 路径). 双层保护下业务 hook panic 不会 crash 进程.
+	// OnNodeEvent 只作观测：它 panic 时就地兜住、带栈记一条 ERROR，Send 照常返回、节点体接着跑。转成节点的错误的话
+	// 节点体在这里中途失败，失败档被续跑或重试捡起，Send 之前已经做过的副作用重放（实测）。
 	// EventSink.Send 是 fire-and-forget 不收 ctx (业务 NodeFunc 已持 ctx).
+	defer func() {
+		if r := recover(); r != nil {
+			panicerr.Log(s.ctx, slog.LevelError, "compose_v2: OnNodeEvent 钩子 panic（这个事件没投递完，节点照常往下跑）", panicerr.New(r),
+				"node", s.nodeID, "event_type", ev.Type)
+		}
+	}()
 	_ = s.hooks.OnNodeEvent(s.ctx, s.nodeID, ev)
 }
 

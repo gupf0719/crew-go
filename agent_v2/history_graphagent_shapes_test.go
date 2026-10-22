@@ -97,7 +97,7 @@ func TestHistGAShape_NestedGraphInGraph(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	msgs, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "c_nn"})
+	msgs, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "c_nn"})
 	n := 0
 	for _, m := range msgs {
 		if strings.Contains(m.Content, "【内层产出】") {
@@ -127,7 +127,7 @@ func TestHistGAShape_TwoRunsSameConv(t *testing.T) {
 			t.Fatalf("Run(%s): %v", q, err)
 		}
 	}
-	msgs, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "c_2r"})
+	msgs, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "c_2r"})
 	if len(msgs) != 4 {
 		t.Fatalf("两轮各「输入+产出」应共 4 条，实际 %d 条：%s", len(msgs), ownersOf(msgs))
 	}
@@ -149,7 +149,7 @@ func TestHistGAShape_NilOutput(t *testing.T) {
 	if _, err := ga.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("原话")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	msgs, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "c_nil"})
+	msgs, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "c_nil"})
 	if len(msgs) != 1 || msgs[0].Role != schema.RoleUser {
 		t.Errorf("产出为 nil 时只该留输入 1 条，实际 %d 条：%s\n"+
 			"  多出的空 assistant 会让下一轮模型读到一句空话", len(msgs), ownersOf(msgs))
@@ -168,7 +168,7 @@ func TestHistGAShape_Suppressed(t *testing.T) {
 	if _, err := ga.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("原话")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	msgs, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "t", ConvID: "c_supp"})
+	msgs, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "t", ConvID: "c_supp"})
 	if len(msgs) != 0 {
 		t.Errorf("被 WithoutHistoryCtx 摘除时一条都不该记，实际 %d 条：%s\n"+
 			"  记了 = 顶层结算这条路绕过了摘除开关（内部决策 LLM 靠它挡在历史外）",

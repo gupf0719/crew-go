@@ -106,7 +106,7 @@ events, _ := ra.Run(ctx, sess, schema.UserMessage("..."))
 | `WithName(name)` | override agent/tool 名（默认 AgentCard.Name 转合规名）| 消费 |
 | `WithDescription(desc)` | override 描述（默认 AgentCard.Description）| tool 形态能力发现 |
 | `WithClientOptions(opts...)` | 透传 a2aclient FactoryOption：auth header / 自定义 transport | 鉴权 |
-| `WithHumanGate()` | 远程 input-required 抛 InterruptError 走真人 HITL（默认返追问让 host LLM 自动补）；等人答复的那一问按调用位置记进 host 存档：没拿到答复不联系远端、原样再问，远端任务结束之后再跑发原始请求，几次调用 / 并行分支各续各的，续跑不依赖原 session；引擎钩子 / 条件边里远端要人时报错 | 无 LLM 编排嵌远程 / 人类确认 |
+| `WithHumanGate()` | 远程**普通追问**（input-required）抛 InterruptError 走真人 HITL（默认返追问让 host LLM 自动补）。**远端的审批请求不归它管、一律交给真人**：挂起清单标了审批的问题、任务状态 AUTH_REQUIRED，不管开没开都抛中断（宿主模型不能替人批准远端操作）；别家把审批写成纯文本追问时识别不了，对端不是 crew-go 时要真人把关就开它。AUTH_REQUIRED 的凭证走带外通道（规范 §7.6）：按审批问人，人没有拒绝就不发消息、重新挂上那个任务（先轮询到它离开 AUTH_REQUIRED，最多等 30 秒、到时仍停着就再问一次人；之后已结束取终态，还在跑的支持流式就订阅、不支持就接着轮询），拒绝时取消远端任务、这次调用报错。等人答复的那一问按调用位置记进 host 存档：没拿到答复不联系远端、原样再问，远端不再等真人（任务结束、或改问交给宿主模型的普通追问）就清掉、之后再跑发原始请求，几次调用 / 并行分支各续各的，续跑不依赖原 session；在节点执行里被调起时这次调用一律在它自己的相位里问，不占调用它的那段代码的提问序号（调用方按进度跳过它时后面的提问不挪位）；相位名在节点体、工具函数体里按远端 + 请求内容 + 第几次定——请求在续跑之间变了就是另一次调用，要么把拼好的请求记下来、要么经 RunSubAgent + WithCallKey 调；在别人给的相位里（框架交接、被交接的业务壳、钩子）按外层相位名 + 远端 + 第几次定、不看请求内容；引擎钩子 / 条件边里远端要人时报错 | 无 LLM 编排嵌远程 / 人类确认 |
 | `WithHooks(h)` | agent 形态观测（fire OnAgentStart/End 对）| agent 形态嵌编排 |
 | `WithObservability(obs)` | a2a 跨进程 trace：建 `invoke_agent` CLIENT span，把 W3C trace context（traceparent / tracestate / baggage）写进出站 `Message.metadata` | 跨进程 trace 串联 |
 | `WithDiscoveryAgentName(name)` | **仅 FromService**：限发现指定 agentName（同 service 多 Agent Card 精确路由）| 服务发现 |

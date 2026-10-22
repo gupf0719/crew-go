@@ -1175,14 +1175,17 @@ recover) 对齐, 改成 **framework 4 层 outer defer recover 兜底**:
 3. `agent_v2.BasicAgent.Run / Resume` + 其他 8 编排 Run/Resume 各 outer recover
 4. 嵌套 AgentAsTool 子 agent.Run 自带 outer recover 间接保护父 ToolsFn 路径
 
-业务 hook panic 转 wrapped err 返业务:
+业务 hook panic 多数转 wrapped err 返业务；跑在工作之后、只作观测的那几处（节点体成功之后的 OnNodeEnd、图成功
+之后的 OnGraphEnd、任何时候的 OnNodeEvent、调用成功之后的 OnAgentEnd）就地兜住、带栈记一条 ERROR，结果与写入照常
+提交——观测钩子出错不得让已经做完的工作再做一次（逐道的分工见 `compose_v2/panic_recovery.go`）:
 
 **`Run` 出口有两个 recover，分工不同**（一个满足不了两件事）：
 
 ```go
 func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (runErr error) {
     // ① 注册最早 ⟹ LIFO 下最后跑：专收 **defer 链自身**抛的 panic
-    //    （业务 OnGraphEnd hook / 自定义 checkpointer 的 SaveNS / DeleteSubtree）
+    //    （图失败时的业务 OnGraphEnd hook、出口记账的日志；出口的 SaveNS / DeleteSubtree
+    //     由出口存储调用那道单独兜，见 exit_checkpoint.go）
     defer func() {
         if r := recover(); r != nil {
             // runErr 已有值时 errors.Join 保双链，不无条件覆盖
@@ -1208,11 +1211,10 @@ nil ⟹ cleanup 走成功分支 `purgeExitSlot(reason="success")`。实测后果
 一切正常、同时返回 error ⟹ 此后 Resume 恒返 `ErrNoPendingCheckpoint`，会话没了。
 
 **两个前缀刻意不同**：业务据此区分「图主体炸了（存档已正确存成 failed，可续）」与
-「存档写 / hook 炸了（存档可能压根没落盘）」——这两件事的处置相反。
+「收尾段的钩子 / 日志炸了（存档状态以错误链上的结论为准）」。
 
-**eino 哲学**: hook panic = 业务 bug fail-fast, framework 不做 per-hook silent isolate
-(silent isolate 让业务 bug 难发现). chain 内多 hook 时一个 panic 中断剩余 chain (跟
-新 ctx-based 协议 fail-fast 一致).
+**不做 per-hook 隔离**: chain 内多 hook 时一个 panic 中断剩余 chain (跟 ctx-based 协议 fail-fast
+一致). 观测钩子 panic 就地兜住时记的是带栈的 ERROR 日志, 不是静默吞掉.
 
 ---
 
@@ -1326,6 +1328,20 @@ Stage 4 给 7 编排都加了 `WithXxxRetryConfig` / `WithXxxMaxRetries` 选项�
 
 每个编排内部 sub-agent.Run 包 `RunWithRetry` wrapper——业务 LLM 报 5xx / network
 error 自动重试，无感知。
+
+**每次尝试写进会话的事件，只在被下一次从头再跑的尝试取代时作废**：成员共享编排的会话，它每次尝试的会话事件先写在
+一条暂存 lane 上（`agent_v2.attemptLanes`，runMember 与 Handoff 调候选两处）。成功的当场提交给编排的会话；失败的等
+下一次尝试开始时再定——下一次从头再跑（没配 checkpointer，或终局失败清了存档）就丢掉，下一次从存档续就先提交（那些
+步骤不重跑，事件属于留下来的进度）；重试用完时最后那次失败尝试照常提交——没有尝试取代它，它就是调用方该看到的结局
+（软降落的成员带着收尾答复返回 `MaxIterationsError`，丢了调用方就拿不到那条答复）；成员 panic 的那次当场提交（panic
+越过重试往上走，同样不会有下一次）。没有存档时，重来那次因此不会把
+失败那次写下的输入、成员是编排时它里面已经成功的几步的问答当成上文读进去（曾经会：模型看到同一个问题两次、还看到作废
+那次的答复）。尝试进行中，它写的事件只在它拿到的 lane 上看得到，调用方手里的会话要等这次尝试有了结局才看得到（同并行
+分支）。
+
+两个限制：「下一次从存档续」是按错误判的（`compose_v2.LeavesResumableCheckpoint`，配了 checkpointer 且不是终局失败），
+自己不存档的成员（远程 / 自研的壳）配了 checkpointer 时下一次照样从头跑，它失败那次写下的事件仍留在会话里；只管成员
+这一层，顶层调用方拿同一个会话重跑一次失败的 Run 时，失败那次写下的事件仍在会话里。
 
 ### 11.5 CircuitBreaker（仅 AutoCompact 用）
 

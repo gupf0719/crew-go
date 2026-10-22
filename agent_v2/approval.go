@@ -31,6 +31,13 @@ const (
 	ApprovalAuto ApprovalMode = iota
 	// ApprovalAsk 每个业务工具执行前需用户审批（除非启发式放行或已 approve_always）。
 	ApprovalAsk
+	// ApprovalAskWrites 是「只读放行」档：声明只读的工具（tool.IsReadOnly，见 tool.ReadOnlyDeclarer）直接执行，
+	// 其余的执行前问人——没声明只读的一律按有副作用处理（拿不准就问）。业务一个工具都没声明时等同
+	// ApprovalAsk，不会意外放行。
+	//
+	// 启发式照旧可以改判任何一次调用：返 Ask / Deny 的连只读工具也问 / 拒，返 Default 时才落到只读判定。
+	// approve_always 照常生效——那是用户明说的「这件事以后别问」，档位只决定默认。
+	ApprovalAskWrites
 )
 
 // ApprovalDecision 单个工具调用的审批决策（ApprovalHeuristic 返回）。
@@ -341,7 +348,10 @@ func markCallApproved(ctx context.Context) {
 // 内容执行，不按 `OnToolStart` 这一次的改写。不固定的话，两种做法各有一个反例（均审计实测）：只按调用重放，
 // 续跑时被改写成 1000 的参数沿用了启发式对 100 的放行；按内容重判，钩子每次注入新值时每次续跑都重判，
 // 启发式一改口，用户的拒绝就被推翻。
-func approvalDecisionOf(ctx context.Context, cfg *Config, name string, args map[string]any) (ApprovalDecision, bool, error) {
+//
+// readOnly 是这次派发的那件工具有没有声明只读（tool.IsReadOnly），只在 ApprovalAskWrites 档下用到；它跟
+// 结论一起只判一次——结论记下之后工具换了声明也不推翻。
+func approvalDecisionOf(ctx context.Context, cfg *Config, name string, args map[string]any, readOnly bool) (ApprovalDecision, bool, error) {
 	fns, _ := ctx.Value(callApprovalKey{}).(callApprovalFns)
 	if fns.decided != nil {
 		if d, ok := fns.decided(); ok {
@@ -352,8 +362,13 @@ func approvalDecisionOf(ctx context.Context, cfg *Config, name string, args map[
 		return ApprovalDecisionDefault, false, nil
 	}
 	decision := ApprovalDecisionAsk
-	if cfg.ApprovalMode == ApprovalAuto {
+	switch cfg.ApprovalMode {
+	case ApprovalAuto:
 		decision = ApprovalDecisionAllow
+	case ApprovalAskWrites:
+		if readOnly {
+			decision = ApprovalDecisionAllow
+		}
 	}
 	if cfg.ApprovalHeuristic != nil {
 		// 启发式跑在自己的相位里（同工具钩子，见 compose_v2.EnterPhase）：它要是调了 compose_v2.Ask、
@@ -420,14 +435,14 @@ type approvalResult struct {
 // `approve_always` / `approve_always_tool` 的**规则集**存 RunSession KV、按任务（RunID）分
 // （不走 cp），规则只对答应它的那个 agent 实例生效（键带构造时铸的身份，见 approvedToolsKey），跨 Resume 持久需
 // caller 传 `WithResumeSession` 复用同一 session（默认 Resume 新建空 session，规则丢失会重新询问）。
-func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, args map[string]any, minted bool) approvalResult {
+func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, args map[string]any, minted, readOnly bool) approvalResult {
 	if minted {
 		return approvalResult{proceed: true}
 	}
 	name := tc.Function.Name
 	// 默认路径（Auto 模式、无启发式、这次调用也没有记下的结论）直接放行：只查一次记录，不写任何状态
 	// （绝大多数 BasicAgent 走这）。
-	decision, active, err := approvalDecisionOf(ctx, cfg, name, args)
+	decision, active, err := approvalDecisionOf(ctx, cfg, name, args, readOnly)
 	if err != nil {
 		return approvalResult{err: err}
 	}
@@ -438,8 +453,9 @@ func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, arg
 	case ApprovalDecisionAllow:
 		return approvalResult{proceed: true}
 	case ApprovalDecisionDeny:
-		return approvalResult{denyMsg: schema.ToolResultMessage(tc.ID,
-			fmt.Sprintf("[tool_denied] 工具 %q 被审批策略拒绝执行。", name))}
+		return approvalResult{denyMsg: markToolDenied(schema.ToolResultMessage(tc.ID,
+			fmt.Sprintf("[tool_denied] 工具 %q 被审批策略拒绝执行。不要重试同样的调用，也不要换别的工具绕开它；"+
+				"换一个更稳妥的做法，或者向用户说明情况。", name)))}
 	}
 
 	// decision == Ask
@@ -477,8 +493,9 @@ func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, arg
 			markCallApproved(ctx)
 			return approvalResult{proceed: true}
 		default: // deny / 空 / 未识别 → 拒绝（保守 fail-closed）
-			return approvalResult{denyMsg: schema.ToolResultMessage(tc.ID,
-				fmt.Sprintf("[tool_denied] 用户拒绝执行工具 %q。", name))}
+			return approvalResult{denyMsg: markToolDenied(schema.ToolResultMessage(tc.ID,
+				fmt.Sprintf("[tool_denied] 用户拒绝执行工具 %q。不要用同样的参数再试；换一个更稳妥的做法，"+
+					"或者向用户说明情况、问清楚再继续。", name)))}
 		}
 	}
 	// 2) 无本次答案 → don't-ask-again fast-path：approve_always 规则命中。**规则存 RunSession KV——跨 Resume 持久需
@@ -512,11 +529,56 @@ func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, arg
 	}}
 }
 
-// WithApprovalMode 设置工具执行审批模式（仅 BasicAgent 的 tool 执行生效，其余编排嵌 BasicAgent
-// 透传）。默认 ApprovalAuto（全放行、零改动）；ApprovalAsk 让每个业务工具执行前抛 InterruptError
-// 等 caller 审批（骑 HITL Resume 机制，用 WithResumeUserInputs 回注 approve/approve_always/deny）。
+// WithApprovalMode 设置工具执行审批模式。三档：
+//
+//   - ApprovalAuto（默认）——全放行、零开销
+//   - ApprovalAsk——每个业务工具执行前抛 InterruptError 等调用方审批（骑 HITL Resume 机制，用
+//     WithResumeUserInputs 回注 approve / approve_always / approve_always_tool / deny）
+//   - ApprovalAskWrites——只读放行：声明只读的工具直接执行，其余同 ApprovalAsk
+//
+// 框架工具（ask_user / activate_skill / final_output 等，按实例认）三档下都豁免。审批生效时（非 Auto，或配了
+// 启发式）框架还会在这个 agent 的系统提示里写一段当前审批方式（见 [WithApprovalPrompt]），让模型事先知道
+// 哪些调用会停下来等人、被拒了该怎么办，而不是靠试错。
+//
+// **只对设置它的这个 BasicAgent 生效**：编排里的每个 BasicAgent 各自设置；PlanAgent 现造的执行体
+// （TmpSubAgent）经 [WithPlanTmpSubAgentOptions] 设置。
 func WithApprovalMode(mode ApprovalMode) Option {
 	return func(c *Config) { c.ApprovalMode = mode }
+}
+
+// WithApprovalPrompt 替换框架写进系统提示的那段「当前审批方式」说明（审批生效时才写，默认文案见
+// approvalPrompt）。传空串 = 不写这一段（业务自己的系统提示里已经讲清楚时）。
+func WithApprovalPrompt(text string) Option {
+	return func(c *Config) { c.ApprovalPrompt = &text }
+}
+
+// approvalPrompt 是写进系统提示的「当前审批方式」说明，审批不生效时为空。
+//
+// 讲的是「会发生什么、该怎么做」，不讲内部机制：哪些调用会停下来等人；需要批准的就直接调用（系统会去问），
+// 别先在回复里征求许可、别换工具绕开；被拒了别原样重试。不列工具名：哪些调用要批准是每次调用判一次的
+// （启发式、approve_always 规则都参与），而工具清单可能随渐进披露变化，静态清单会跟实际对不上。
+//
+// 位置在 agent 的前言里（跟系统提示一起，每次模型调用都在、不进会话历史、不被压缩）；一个任务里审批配置
+// 不变，前言是稳定的前缀。
+func approvalPrompt(cfg *Config) string {
+	if !approvalActive(cfg) {
+		return ""
+	}
+	if cfg.ApprovalPrompt != nil {
+		return *cfg.ApprovalPrompt
+	}
+	var head string
+	switch cfg.ApprovalMode {
+	case ApprovalAsk:
+		head = "本次任务里，你调用的工具在执行前都要经过用户批准（少数框架内置工具除外）。"
+	case ApprovalAskWrites:
+		head = "本次任务里，只读的工具（只查询、不改动任何状态）直接执行，其余工具在执行前要经过用户批准。"
+	default:
+		head = "本次任务里，部分工具调用在执行前可能需要用户批准。"
+	}
+	return "【工具审批】" + head + "调用前不必先在回复里征求同意：直接调用，需要批准时系统会去问用户；也不要换别的工具" +
+		"绕开审批。被拒绝时你会收到以 [tool_denied] 开头的结果——不要用同样的参数再试，换一个更稳妥的做法，" +
+		"或者向用户说明情况、问清楚再继续。"
 }
 
 // ApprovalScope 把一次工具调用归一化成「这算哪件事」的指纹——决定 `approve_always`

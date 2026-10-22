@@ -216,7 +216,7 @@ func TestHistory_DerivedInput_NotRecorded(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-derived"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-derived"})
 	dumpPrompt(t, "历史", got)
 
 	// 形状：一条真实用户输入 + 两步各自的产出。跟 Sequential 自己那条消息流一致。
@@ -287,7 +287,7 @@ func TestHistory_DerivedInput_Kept_WhenNotRecomputable(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-reflect"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-reflect"})
 	dumpPrompt(t, "历史", got)
 	if !containsMsg(got, "CRITIQUE_MARK") {
 		t.Error("评审反馈没进历史——它来自被摘除的 reflector，这条派生输入是它唯一的落脚点。" +
@@ -348,7 +348,7 @@ func TestHistory_DerivedInput_Kept_Plan(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-plan"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-plan"})
 	dumpPrompt(t, "历史", got)
 	for _, mark := range []string{"STEP1_TASK_MARK", "STEP2_TASK_MARK"} {
 		if !containsMsg(got, mark) {
@@ -406,7 +406,7 @@ func TestHistory_DerivedInput_Kept_PlanExecutor(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-plan-exec"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-plan-exec"})
 	dumpPrompt(t, "历史", got)
 	if !containsMsg(got, "EXEC_TASK_MARK") {
 		t.Error("任务描述没进历史——它来自被摘除的 planner")

@@ -128,7 +128,7 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		// 容忍部分失败).
 		// **先补历史再删 cp。** 顺序承重：补记只依赖历史层，但放在删之后的话，
 		// DeleteSubtree 失败提前 return 时补记就跟着丢了。
-		closeUnansweredToolCallsOnAbort(ctx, resolveHistoryConfigForAbort(ctx, subs), agentName)
+		closeUnansweredToolCallsOnAbort(ctx, resolveHistoryConfigForAbort(ctx, subs), agentName, sessionID)
 
 		delStart := time.Now()
 		delCount, dErr := cper.DeleteSubtree(ctx, sessionID, ns)
@@ -157,7 +157,7 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 				return hooks.OnAgentStart(c, info, &hook.AgentInput{})
 			})
 			// Abort 是用户主动操作非 error 路径 — 不 push WithEndError, GetEndError 返 nil.
-			_ = hooks.OnAgentEnd(endCtx, info, &hook.AgentOutput{})
+			fireAgentEnd(endCtx, hooks, info, &hook.AgentOutput{}, nil) // 放弃是成功的收尾，钩子 panic 不把它变成错误
 		}
 		return &resumePrep{Cper: cper, Rcfg: rcfg, AbortDone: true}, ctx, nil
 	}

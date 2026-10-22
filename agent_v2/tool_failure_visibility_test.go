@@ -166,7 +166,7 @@ func TestToolFailureVisibility_FrameworkRejection(t *testing.T) {
 // marker。
 //
 // 这条曾是唯一漏标的框架合成路径（合成点写成裸 ToolResultMessage，marker 忘了打）：
-// OnToolEnd 收到 Success=true ⟹ gen_ai.tool.error.total 不计超时、span 标成功——
+// OnToolEnd 收到 Success=true ⟹ 工具 span 把超时记成 success——
 // **最需要被观测到的工具失败反而不可见**。合成入口现已收敛到 failedToolResult。
 //
 // sanity-revert：把 basic_agent.go 超时分支换回裸 schema.ToolResultMessage ⟹ 本条红。
@@ -202,7 +202,7 @@ func TestToolFailureVisibility_Timeout(t *testing.T) {
 		t.Fatalf("应恰 1 次 OnToolEnd, got %d", len(got))
 	}
 	if got[0].Success {
-		t.Errorf("工具超时应 Success=false, got true —— 观测层按 !Success 计 gen_ai.tool.error.total，"+
+		t.Errorf("工具超时应 Success=false, got true —— 观测层按 !Success 把工具调用记成失败，"+
 			"漏标时超时这类失败恒不计、span 还标成功。Output=%q", got[0].Output)
 	}
 	if got[0].ErrorCode == "" {

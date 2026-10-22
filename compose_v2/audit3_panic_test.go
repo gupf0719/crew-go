@@ -279,8 +279,9 @@ func TestAudit3_ChainOrchHooks_PanicAtGraphEnd(t *testing.T) {
 		Compile()
 	cm := compose_v2.NewChannelManager()
 	err := compose_v2.Run(context.Background(), g, cm, compose_v2.WithHooks(chain))
-	if err == nil {
-		t.Fatal("OnGraphEnd panic 应被 outer recover 转 wrapped err")
+	// 图已经成功：OnGraphEnd 是观测钩子，它 panic 不把成功报成失败（就地兜住、记 ERROR，见 observer_hook_panic_test.go）
+	if err != nil {
+		t.Fatalf("图成功时 OnGraphEnd panic 不该让 Run 失败，got %v", err)
 	}
 	if !contains(log, "a:ge") {
 		t.Errorf("h1 OnGraphEnd 应已被调 (panic 前)")
@@ -303,8 +304,9 @@ func TestAudit3_ChainOrchHooks_PanicAtNodeEnd(t *testing.T) {
 		Compile()
 	cm := compose_v2.NewChannelManager()
 	err := compose_v2.Run(context.Background(), g, cm, compose_v2.WithHooks(chain))
-	if err == nil {
-		t.Fatal("OnNodeEnd panic 应转 wrapped err (audit² fail-fast spec)")
+	// 节点体已经成功：OnNodeEnd panic 不让这次执行作废（见 observer_hook_panic_test.go）
+	if err != nil {
+		t.Fatalf("节点体成功时 OnNodeEnd panic 不该让 Run 失败，got %v", err)
 	}
 }
 
@@ -376,7 +378,8 @@ func TestAudit3_ChainOrchHooks_PanicAtNodeEvent(t *testing.T) {
 		Compile()
 	cm := compose_v2.NewChannelManager()
 	err := compose_v2.Run(context.Background(), g, cm, compose_v2.WithHooks(chain))
-	if err == nil {
-		t.Fatal("OnNodeEvent panic 应转 wrapped err (audit² fail-fast spec)")
+	// OnNodeEvent 只作观测：它 panic 不让节点体中途失败（见 observer_hook_panic_test.go）
+	if err != nil {
+		t.Fatalf("OnNodeEvent panic 不该让 Run 失败，got %v", err)
 	}
 }

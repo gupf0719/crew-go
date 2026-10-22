@@ -29,8 +29,12 @@ func (f fnExec) Execute(_ context.Context, execCtx *a2asrv.ExecutorContext) iter
 	return func(yield func(a2atypes.Event, error) bool) { f(execCtx, yield) }
 }
 
-func (fnExec) Cancel(_ context.Context, _ *a2asrv.ExecutorContext) iter.Seq2[a2atypes.Event, error] {
-	return func(yield func(a2atypes.Event, error) bool) {}
+// Cancel 按规范发一个 canceled 状态：什么都不发的话服务端的 CancelTask 一直等，RemoteAgent 取消在等人的远端任务时
+// 要等到自己的超时（审批请求落在接不住中断的位置时会取消远端任务）。
+func (fnExec) Cancel(_ context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2atypes.Event, error] {
+	return func(yield func(a2atypes.Event, error) bool) {
+		yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateCanceled, nil), nil)
+	}
 }
 
 // startServer 起一个 in-process A2A server（JSON-RPC + AgentCard），返回 base URL。

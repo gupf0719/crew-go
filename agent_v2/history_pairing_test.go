@@ -227,7 +227,7 @@ func TestHistory_LoopInput_NotRecordedTwice(t *testing.T) {
 		t.Fatalf("Run 2: %v", err)
 	}
 
-	got, _ := hs.Load(ctx, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
+	got, _ := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "tenant-a", ConvID: "conv-1"})
 	n := 0
 	for _, msg := range got {
 		if strings.Contains(msg.Content, "第1轮结论") {

@@ -73,6 +73,21 @@ type AskQuery struct {
 	// **业务自定义工具想要同款能力**时自填即可（框架只在审批路径自动填）。
 	ToolCallID string `json:"tool_call_id,omitempty"`
 	ToolName   string `json:"tool_name,omitempty"`
+
+	// Breakpoint 非 nil 表示这一问是声明式断点停下的（[GraphBuilder.WithInterruptBefore] /
+	// [WithInterruptBefore] 等），不是节点在提问：没有要回答的问题，续跑（带不带答案都行）就继续。
+	// 由框架填；业务经 [Ask] 提问时填了也会被清掉。
+	Breakpoint *Breakpoint `json:"breakpoint,omitempty"`
+}
+
+// clone 深拷贝一条挂起：切片与断点信息都另起一份，调用方改副本碰不到框架的记录。
+func (q *AskQuery) clone() *AskQuery {
+	c := *q
+	if q.Options != nil {
+		c.Options = append([]string(nil), q.Options...)
+	}
+	c.Breakpoint = q.Breakpoint.clone()
+	return &c
 }
 
 // InterruptError 表示节点主动挂起等待用户输入——错误作为控制流模式。
@@ -1161,12 +1176,10 @@ func Ask(ctx context.Context, q *AskQuery) (*schema.Message, error) {
 	}
 	// 框架自己的记录，与调用方的对象脱钩：调用方之后改 q 不影响已挂起的这一条，
 	// 复用同一个 q 再问也不会带着上一问的身份。
-	rec := *q
+	rec := q.clone()
 	rec.InterruptID = id
-	if q.Options != nil {
-		rec.Options = append([]string(nil), q.Options...)
-	}
-	return nil, &InterruptError{Reason: rec.Reason, Query: &rec}
+	rec.Breakpoint = nil // 断点信息只由框架填，提问不是断点
+	return nil, &InterruptError{Reason: rec.Reason, Query: rec}
 }
 
 // clearInheritedNodePosition 清掉从**外层图**继承来的节点位置维度。

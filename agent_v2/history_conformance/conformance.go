@@ -40,13 +40,22 @@
 //   - **字段完整** — Message 上 ToolCalls / Annotations 这些不是装饰：工具调用链断
 //     了模型会重复调用，Annotations 丢了归属就没了（框架正是靠它标「这条是谁说的」）。
 //   - **空会话不是错误** — 「没聊过」和「出错了」必须能区分，否则第一轮对话就报错。
+//   - **分页读** — 框架每次 Run 只读最近一段（`HistoryQuery` 的 Before + Limit）。Limit 取成最早
+//     的 N 条、游标随追加漂移、More 报错，都不报错——只是模型看到的上文错了一截。
+//   - **按条件读** — 框架的去重只靠 `HistoryQuery` 的 MessageID / Task / Agent 问后端，「只看自己」
+//     的视图按归属读。条件没生效或按「或」处理，去重误判「记过」、该记的没记；More 把不满足条件的
+//     更早记录也算进去，框架判后端违约、同一句话记两份。
 //
-// # 覆盖什么（10 条子测试）
+// # 覆盖什么（19 条子测试）
 //
 // RoundTrip / AppendOnly / Order / KeyIsolation（含**分隔符歧义**：`{acme/eu, c-1}` 与
 // `{acme, eu/c-1}` 拼串主键会撞）/ MessageFields（ToolCalls 全字段 + Annotations +
-// **tool 消息正文** + **ReasoningContent**）/ EmptyConv / EmptyBatch / LoadSnapshot /
-// AppendNoMutation（不得原地改写入参）/ Concurrent。
+// **tool 消息正文** + **ReasoningContent**）/ EmptyConv（含带 Limit 读）/ EmptyBatch / LoadSnapshot /
+// AppendNoMutation（不得原地改写入参）/ Concurrent / 分页五条：LoadLimitReturnsLatest /
+// PagingCoversAllOnce / PagingStableUnderAppend（往前翻页时别人在追加）/ LimitBeyondTotal /
+// BeforeOldestIsEmpty / 按条件读四条：FilterByMessageID（同一个 ID 的每一份）/ FilterConditionsAreANDed /
+// FilterPagingCoversMatchesOnce（含「最早一条满足条件的之前还有不满足的」时 More 为 false、翻页中途追加）/
+// FilterNoMatchIsEmpty。
 //
 // 其中两条最容易被自研 backend 漏掉：**tool 消息的正文**（配对信息全对但正文丢了，模型
 // 下一轮不知道查到的是什么）和 **ReasoningContent**（thinking 类模型要求上一轮的 reasoning
@@ -89,12 +98,21 @@ func RunHistoryStoreTests(t *testing.T, factory HistoryStoreFactory) {
 	t.Run("EmptyAppend", func(t *testing.T) { testEmptyAppend(t, factory) })
 	t.Run("LoadSnapshotIsolation", func(t *testing.T) { testLoadSnapshotIsolation(t, factory) })
 	t.Run("Concurrent", func(t *testing.T) { testConcurrent(t, factory) })
+	t.Run("LoadLimitReturnsLatest", func(t *testing.T) { testLoadLimitReturnsLatest(t, factory) })
+	t.Run("PagingCoversAllOnce", func(t *testing.T) { testPagingCoversAllOnce(t, factory) })
+	t.Run("PagingStableUnderAppend", func(t *testing.T) { testPagingStableUnderAppend(t, factory) })
+	t.Run("LimitBeyondTotal", func(t *testing.T) { testLimitBeyondTotal(t, factory) })
+	t.Run("BeforeOldestIsEmpty", func(t *testing.T) { testBeforeOldestIsEmpty(t, factory) })
+	t.Run("FilterByMessageID", func(t *testing.T) { testFilterByMessageID(t, factory) })
+	t.Run("FilterConditionsAreANDed", func(t *testing.T) { testFilterConditionsAreANDed(t, factory) })
+	t.Run("FilterPagingCoversMatchesOnce", func(t *testing.T) { testFilterPagingCoversMatchesOnce(t, factory) })
+	t.Run("FilterNoMatchIsEmpty", func(t *testing.T) { testFilterNoMatchIsEmpty(t, factory) })
 }
 
 // mustLoad 读一次会话，出错即 fatal。
 func mustLoad(t *testing.T, hs agent_v2.HistoryStore, key agent_v2.HistoryKey) []*schema.Message {
 	t.Helper()
-	got, err := hs.Load(context.Background(), key)
+	got, err := agent_v2.LoadAllHistory(context.Background(), hs, key)
 	if err != nil {
 		t.Fatalf("Load(%s): %v", key, err)
 	}

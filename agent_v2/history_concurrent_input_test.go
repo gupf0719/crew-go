@@ -21,13 +21,15 @@ import (
 // 天然串行的点。
 //
 // **测试必须逼出真并发，而且 barrier 要卡在对的地方**：把它卡在 model 上是不够的——记
-// input 发生在 preamble，等分支跑到 model 时判断早就做完了；更麻烦的是 `loadHistory` 会
+// input 发生在 preamble，等分支跑到 model 时判断早就做完了；更麻烦的是读历史（`resolveHistorySource`）会
 // 等写入器排空，所以只要分支之间稍有先后，后来者读 prior 时前一个的写已经落盘，读侧判据
 // 反而变得可靠，**坏的实现也能过**（实测：barrier 卡 model 时 revert 后连跑五次全绿）。
 //
 // 屏障必须卡在**读历史那一刻**：三个分支的 Load 都到齐了才一起返回，此时谁的写都还没
 // 发生，读侧判据必然三个都判「没记过」。这也正是真实慢后端（Redis/PG 往返几毫秒）下的
-// 常态——差别只是那里靠网络延迟拉开窗口，这里靠屏障把窗口钉死。
+// 常态——差别只是那里靠网络延迟拉开窗口，这里靠屏障把窗口钉死。读侧有两次：读 prior，
+// 以及按消息 ID 在本任务的记录里再查一遍（prior 只是最近一段）——两次各卡一道屏障，否则
+// 后到的分支查 ID 时先到的已经写下了，读侧判据又替认领挡住了重复。
 //
 // **sanity-revert**：把 basic_agent.go 的 `claimSharedRootInput(...)` 换回
 // `!priorHasRootInputNonce(priorForDedup, rootInputNonce(input))`，本测试 FAIL 并报
@@ -37,6 +39,7 @@ func TestHistory_ConcurrentFanout_SharedInputRecordedOnce(t *testing.T) {
 	hs := &gatedHistoryStore{
 		HistoryStore: agent_v2.NewInMemoryHistoryStore(),
 		gate:         newFanoutBarrier(branches),
+		gateByID:     newFanoutBarrier(branches),
 	}
 
 	mk := func(name, reply string) agent_v2.Agent {
@@ -60,7 +63,7 @@ func TestHistory_ConcurrentFanout_SharedInputRecordedOnce(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	msgs, err := hs.Load(ctx, agent_v2.HistoryKey{Owner: "acme", ConvID: "conv-cc"})
+	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "acme", ConvID: "conv-cc"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -99,12 +102,18 @@ func TestHistory_ConcurrentFanout_SharedInputRecordedOnce(t *testing.T) {
 // 写照常透传（屏障只钉读窗口，不影响写入器的单 worker 语义）。
 type gatedHistoryStore struct {
 	agent_v2.HistoryStore
-	gate *fanoutBarrier
+	gate     *fanoutBarrier // 读 prior（不带过滤条件）
+	gateByID *fanoutBarrier // 按消息 ID 查（nil 时不卡）
 }
 
-func (s *gatedHistoryStore) Load(ctx context.Context, key agent_v2.HistoryKey) ([]*schema.Message, error) {
-	s.gate.wait()
-	return s.HistoryStore.Load(ctx, key)
+func (s *gatedHistoryStore) Load(ctx context.Context, key agent_v2.HistoryKey, q agent_v2.HistoryQuery) (agent_v2.HistoryPage, error) {
+	switch {
+	case q.MessageID == "" && q.Task == "" && q.Agent == "":
+		s.gate.wait()
+	case q.MessageID != "" && s.gateByID != nil:
+		s.gateByID.wait()
+	}
+	return s.HistoryStore.Load(ctx, key, q)
 }
 
 // fanoutBarrier 卡住前 n 个到达者，等人齐了一起放行。

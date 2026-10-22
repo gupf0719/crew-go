@@ -37,6 +37,36 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
 - ~~AG-UI 标准审批答案被当成拒绝（`{"approved":true}`、`Yes.` 都落进拒绝分支，实测）~~ 已修（2026-10-19，`fix/approval-answers`）
 - ~~中断时根 cp 写失败，agui / a2a 仍当成正常挂起（实测：用户答完续跑找不到存档，工具 0 次执行）~~ 已修（2026-10-19，`fix/interrupt-not-persisted`）
 
+**review-v7 未实施项（2026-10-22，审计见 [doc/review/review-v7.md](../review/review-v7.md)）**
+
+拍板类（需要设计决策，不是补哨兵能解决的）：
+- **软降落轮遇上不守 `tool_choice=none` 的 provider 时，一个收尾答复都不交付**（review-v7 H-02）。
+  整批被拦 ⟹ 回 model 节点 ⟹ 撞 `maxVisit` ⟹ 图失败 ⟹ postamble 不跑 ⟹ `FinalMessage == nil`。
+  `maxVisit = maxRounds+1` 没给「整批被拦之后再来一次真正无工具的轮次」留格子。两个方向：整批被拦
+  （**没有任何工具真执行**）时走出口边收尾，或留一格无工具轮。**已修的只是可观测性那半**（错误正文
+  现在点出软降落 + `round_budget_exhausted` + FinalMessage 可能为 nil，哨兵
+  `TestSoftLanding_HardToolCallErrorMentionsSoftLanding`）。
+  ⚠️ 曝光面大小取决于**qwen / deepseek 到底强制不强制执行 none**——那个至今只核过官方文档、没有真 key
+  实测（`b3583bd` 自述），而 qwen 是本仓默认测试模型。**先验这一件再决定做哪个方向。**
+- 同一条路上，业务 `OnToolStart` 里的 HITL 确认会**问一个注定答不成的问题**（用户答完只换来
+  `MaxIterationsError` + 无答复）。既有用例 `TestSoftLanding_HardToolCallNotExecutedAfterResume` 把它当
+  fixture 而不是问题。
+
+补哨兵类（实现正确、缺防回归；review-v7 H-04 剩余）：
+- `crew.node.instance`（扇出实例维）零断言——变异 `inst := ""` 后 `go test ./observability/` 全绿。
+  连带：嵌套同名节点时第二个实例的 span 会被判「已开过」整个不建，而 `assertAllEnded` 只比
+  started/ended 数、抓不到「凭空少一个」。
+- `StartA2AServerSpan` 只在 `TestNilObservability_NoPanic` 里被调一次（nil 接收者），没有一条验行为——
+  丢远端父 + 改 `SpanKind` 后全绿，后果是跨进程 trace 断成两棵树。inject / extract 那半有
+  `TestPropagation_RoundTrip`，**消费 extract 结果的那半没有**。
+- `crew.tool.category` 白名单（只放行 retrieval / embedding / guardrail）零断言——放开后业务
+  `tool.Categorizer` 返任意字符串，指标 / 属性基数无上限。
+- mcp 两条已实现但无哨兵的不变量：`goOnline` 的 `s.closed` 早退（缺它会泄漏一个永不关闭的新连接）、
+  `markOffline` 的 `bg.Add(1)` 必须在 `s.mu` 内（挪出去 `-race` 直接报竞争）。探针写法见 review-v7。
+- `agent_v2/history_conformance` 没有长 key 用例（最长的 key 只有个位数字符），而 `ConvID` 常直接来自
+  wire：超 1020 字节时 MySQL 严格模式整批 Append 失败、PG 约 2704 字节撞 btree 索引行上限、SQLite 照样
+  成功。`HistoryKey` godoc 也没声明可移植上限。
+
 **P0：先拍板，拍完即修（安全 / 正确性）**
 - ~~approve_always 规则不分 agent（沙箱子 agent 里答的「一直允许」放行父 agent 的同名生产工具）——先定「一直允许」管 agent 还是任务~~ 已修（2026-10-20，`fix/approval-rule-owner`）
 - a2a 默认配置下，host 端 LLM 能替人批准远端工具

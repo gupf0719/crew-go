@@ -231,7 +231,12 @@ func (s *server) call(ctx context.Context, name, source string, args map[string]
 	}
 	defer cancel()
 
-	res, err := c.CallTool(callCtx, source, args)
+	res, err, panicked := s.callClient(callCtx, c, source, args)
+	if panicked != nil {
+		// 业务自定义 Client 的 CallTool panic：按这次调用失败交回模型，**不标掉线**——panic 是
+		// 调用方代码里的 bug，连接本身可能好着，标掉线会把一个工具的 bug 变成整个 server 的降级。
+		return panicked, nil
+	}
 	if err != nil {
 		return s.callFailed(ctx, callCtx, name, gen, err)
 	}
@@ -249,6 +254,35 @@ func (s *server) call(ctx context.Context, name, source string, args map[string]
 		return tool.Success(res.Structured), nil
 	}
 	return tool.Success(flattenContent(res.Content)), nil
+}
+
+// callClient 调业务 Client 的 CallTool，兜住它的 panic。
+//
+// 为什么这里必须兜：[RemoteTool.Call] 的契约是**只在调用方 ctx 结束时返回 error**，其余失败一律
+// 以 tool.Failure 交回模型（BasicAgent 把工具 error 当整轮失败）。Client 是业务可自定义的实现，
+// 它 panic 时既不是 error 也不是 Failure——panic 会穿过 RemoteTool.Call 与 tool.Toolkit.Call（那一层
+// 不 recover），直到 agent_v2 / compose_v2 的外层兜底转成 error，于是**一个 server 的 bug 拖垮整个
+// Run**，正是「按 server 降级」要避免的那件事。
+//
+// 兜住之后 panic 只毁掉这一次工具调用：模型拿到一条失败的 tool_result，照常可以换个工具或改参数重试。
+// connect / closeQuietly / Hub.Close 三处同样兜业务 Client 的 panic，本函数是第四处（调用热路径）。
+//
+// 返回值三选一：panicked 非 nil 表示兜住了 panic（此时 res / err 都不可用），否则按 res / err 走常路。
+func (s *server) callClient(ctx context.Context, c Client, source string, args map[string]any) (res *CallResult, err error, panicked *tool.Result) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		pe := panicerr.New(r)
+		panicerr.Log(ctx, slog.LevelError, "mcp: 调用工具时兜住 panic，已转成失败结果", pe,
+			"mcp_server", s.name, "tool", source)
+		res, err = nil, nil
+		panicked = tool.Failure(tool.ErrCodeInternal,
+			fmt.Sprintf("%s 的工具 %s 执行时崩溃了（panic），这次调用没有结果", s.name, source))
+	}()
+	res, err = c.CallTool(ctx, source, args)
+	return res, err, nil
 }
 
 // admit 按当前状态决定这次调用能不能发出：能发时交出当前连接与它的代数，不能时交出给模型的失败结果。

@@ -1707,3 +1707,131 @@ func TestNilObservability_NoPanic(t *testing.T) {
 		t.Error("nil 实例的挂起记录数应是 0")
 	}
 }
+
+// TestLastAssistant_SkipsUnresolvedCallsRecord：agent span 的输出内容不把**框架合成的记账文本**当最终答复。
+//
+// 背景：上一轮留下悬空 tool_call 时，preamble 会把那一轮洗成一条记账文本（「此前发起过以下工具调用，但历史中
+// 没有它们的结果：…」，带 agent_v2.UnresolvedCallsRecordAnnotation）。它是「assistant + 零 tool_call」，
+// **长得正像一条最终答复**，所以凡是框架挑一条消息代表「最终答复」的地方都必须跳过它。
+//
+// ⚠️ 这条**必须单独存在**：出事的路径是「模型在产出任何 assistant 之前就失败 / 中断」，而那恰好是有人看
+// trace 排障的时候——他会读到一句框架中文记账，以为那就是 agent 的答复。改用原来那套测试的说法：把
+// lastAssistantMessage 里的跳过 revert 掉，全仓 `go test ./...` 照样全绿（本轮实测仍然如此，故补回）。
+func TestLastAssistant_SkipsUnresolvedCallsRecord(t *testing.T) {
+	h := newHarness(t, observability.WithContentRecording(true))
+	ah := h.obs.AgentHooks()
+	info := &hook.AgentInfo{Name: "a", Type: "base"}
+	ctx, _ := ah.OnAgentStart(context.Background(), info, &hook.AgentInput{})
+	record := schema.AssistantMessage("此前发起过以下工具调用，但历史中没有它们的结果：get_weather")
+	record.Annotations = map[string]any{agent_v2.UnresolvedCallsRecordAnnotation: true}
+	ah.OnAgentEnd(ctx, info, &hook.AgentOutput{Messages: []*schema.Message{
+		schema.AssistantMessage("北京今天晴"),
+		record,
+	}})
+	out := strAttr(t, h.span(t, "invoke_agent a"), observability.AttrOutputMessages)
+	if strings.Contains(out, "此前发起过") {
+		t.Errorf("框架合成的记账文本被当成最终答复上报了：%.160s", out)
+	}
+	if !strings.Contains(out, "北京今天晴") {
+		t.Errorf("应取记账文本之前的那条真答复，got %.160s", out)
+	}
+}
+
+// TestContent_RedactedBeforeTruncated：写进**内容属性**的文本跟错误信息一样「先脱敏再截断」，而且截断不切坏
+// UTF-8。
+//
+// ⚠️ 姊妹用例 TestErrorMessage_RedactedBeforeTruncated 钉的是错误路径（errText），内容路径（text / jsonText）
+// 此前**没有**哨兵：TestContent_RecordedAndRedacted 用默认 16384 + 短文本（顺序不承重），TestContent_Truncated
+// 不配脱敏规则——两个轴各测一半，交叉点空着。反过来（先截断再脱敏）的后果：敏感串跨在截断点上时正则匹配不到，
+// **前半段明文进 gen_ai.input.messages**。
+//
+// 顺带钉 truncate 的字符边界：按字节切会让属性含非法 UTF-8，OTLP 后端丢属性甚至整条 span（既有
+// TestContent_Truncated 只数「长」的出现次数，按字节切照过）。
+func TestContent_RedactedBeforeTruncated(t *testing.T) {
+	const max = 64
+	h := newHarness(t,
+		observability.WithContentRecording(true),
+		observability.WithMaxContentChars(max),
+		observability.WithRedactPatterns(regexp.MustCompile(`1[3-9]\d{9}`)))
+	// 手机号正好跨在截断点上：前 max-4 个汉字之后紧跟手机号，先截断就只剩「1381」这个匹配不上正则的残段。
+	input := strings.Repeat("长", max-4) + "13812345678 尾巴"
+	m := &scriptModel{}
+	if _, err := runWeatherAgent(t, h, m, tool.NewToolkit(), input); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	in := strAttr(t, h.span(t, "invoke_agent weather_agent"), observability.AttrInputMessages)
+	if strings.Contains(in, "1381") {
+		t.Errorf("跨截断点的手机号漏进了内容属性（先截断再脱敏就会这样）：%.200s", in)
+	}
+	// ⚠️ 这个断言的形式是实测定下来的，两种「看起来更自然」的写法都**不承重**（truncate 换成
+	// s[:max] 时照样绿）：
+	//   - utf8.ValidString(in)：内容经 json 编码进属性，编码会把非法字节换掉，编码结果永远合法；
+	//   - strings.ContainsRune(in, utf8.RuneError)：json 把非法字节转义成**字面六个字符** \ufffd，
+	//     而不是 U+FFFD 这个码点，所以按码点找也找不到。
+	// 会变的量是那个字面子串本身。
+	if strings.Contains(in, `\ufffd`) {
+		t.Errorf("截断切在字符中间（按字节切就会这样），内容里出现了替换字符：%.200s", in)
+	}
+}
+
+// TestCompactionMetric_OnlyAfterCounts：只有 after 事件计一次 crew.compactions——before / generate / retry 都
+// 不计。
+//
+// ⚠️ 一次压缩会连发 before + after（AutoCompact 还有 generate），放开那道闸门就是**压缩次数静默翻倍**，
+// 全程 err == nil、只在仪表盘上错。老 suite 对事件→指标映射有 6 条专钉，重写后只剩一条（而那条只钉「装两层
+// 不重复记」），MetricCompactions 本身 0 处断言。
+func TestCompactionMetric_OnlyAfterCounts(t *testing.T) {
+	h := newHarness(t)
+	oh := h.obs.OrchHooks()
+	ctx, _ := oh.OnNodeStart(context.Background(), "model")
+	send := func(a *agent_v2.CompactionAction) {
+		oh.OnNodeEvent(ctx, "model", agent_v2.Event{Type: agent_v2.CompactionEventType,
+			Metadata: map[string]any{"action": a}})
+	}
+	send(&agent_v2.CompactionAction{Layer: agent_v2.CompactionLayerAuto, Type: agent_v2.CompactionActionBefore,
+		Before: &agent_v2.CompactionBeforeAction{InputTokens: 1000}})
+	send(&agent_v2.CompactionAction{Layer: agent_v2.CompactionLayerAuto, Type: agent_v2.CompactionActionAfter,
+		After: &agent_v2.CompactionAfterAction{}})
+	oh.OnNodeEnd(ctx, "model", nil)
+
+	rm := h.collect(t)
+	if n := sumInt(t, rm, observability.MetricCompactions, map[string]string{"crew.compact.layer": "auto", "crew.outcome": "success"}); n != 1 {
+		t.Errorf("一次压缩（before + after 两个事件）应只计 1 次 crew.compactions，got %d", n)
+	}
+}
+
+// TestInterrupt_CheckpointNotPersisted_IsErrorNotBlocked：**档没写成的中断不算 blocked**——它是失败。
+//
+// compose_v2.ErrCheckpointNotPersisted 表示「Run 出口要写的那份存档没写成」，于是那个中断**续不上**：
+// 前端照常请用户回答，答完却找不到档。把它记成 blocked 的后果是运维视角里它跟「正常等人答复」一模一样
+// （outcome=blocked、span status 不标 Error），而实际上这个任务已经废了。
+//
+// ⚠️ 这条判据是本次 observability 重写**新加**的（`handle.go` 里 IsInterrupt 之外那半），此前没有哨兵：
+// 实测去掉 `!errors.Is(err, ErrCheckpointNotPersisted)` 这一截，`go test ./observability/` 全绿。
+// 连带后果不止 outcome 一处——那条路还会多计一次 crew.interrupts 并留下一条永不被取走的挂起记录
+// （PendingInterrupts() 永久 +1），所以这里一并断言。
+func TestInterrupt_CheckpointNotPersisted_IsErrorNotBlocked(t *testing.T) {
+	h := newHarness(t)
+	ah := h.obs.AgentHooks()
+	info := &hook.AgentInfo{Name: "a", Type: "base"}
+	ctx, _ := ah.OnAgentStart(context.Background(), info, &hook.AgentInput{})
+	ie := &compose_v2.InterruptError{Reason: "ask", Query: &compose_v2.AskQuery{
+		InterruptID: "iid-1", Question: "继续吗",
+	}}
+	// 中断 + 档没写成：两个哨兵并列挂在同一个错误上（Run 出口就是这么交出来的）。
+	err := fmt.Errorf("save cp: %w: %w", compose_v2.ErrCheckpointNotPersisted, ie)
+	ah.OnAgentEnd(agent_v2.WithEndError(ctx, err), info, &hook.AgentOutput{})
+
+	span := h.span(t, "invoke_agent a")
+	if got := strAttr(t, span, observability.AttrOutcome); got == "blocked" {
+		t.Errorf("档没写成的中断续不上，是失败而不是 blocked——运维看到 blocked 会以为在正常等人答复")
+	} else if got != "error" {
+		t.Errorf("crew.outcome=%s 应=error", got)
+	}
+	if span.Status().Code != codes.Error {
+		t.Errorf("档没写成是失败，span status 应标 Error，got %v", span.Status())
+	}
+	if n := h.obs.PendingInterrupts(); n != 0 {
+		t.Errorf("档没写成的中断不该留下挂起记录（它续不上），PendingInterrupts()=%d", n)
+	}
+}

@@ -257,6 +257,19 @@ func digestValue(v any) (canonical []byte, bad []string) {
 // 嵌套正是走到逐叶子这条路的原因之一——用它编码，整份值就落进「根上一个坏叶子」，只在别的叶子上不同的
 // 两份输入算出同一个身份。树里只有 nil / bool / float64 / string / map[string]any / []any（walk 与
 // leaf 的产物），深度来自业务值本身的结构，递归在 Go 的可增长栈上走得下去（walk 本身也是递归）。
+//
+// ⚠️ **本函数与 [digestValue] 的接线只在 go1.27+ 才有测试覆盖**。本函数自己的两条哨兵
+// （TestEncodeTree_MatchesJSONMarshal / TestEncodeTree_DeeperThanJSONLimit）直接调它，碰不到
+// digestValue 里那一行；而唯一会因为接线退回 json.Marshal 而变红的用例
+// （TestInputDigest_BadLeafAnywhere_OtherLeavesStillCount 的「嵌套超过一万层」分支）依赖 1.27 的编码
+// 深度上限，本模块的 toolchain 是 1.26.x，所以在本仓 `go test` 下它恒绿。实测过：把那一行换回
+// json.Marshal，全量 `go test ./agent_v2/` 照样全绿。
+//
+// 做不出版本无关的接线哨兵：walk 已经去环去共享，交给它的是一棵真树，而这棵树上 json.Marshal 在 1.26
+// 永不报错——构造不出「两个版本都失败」的输入。所以这条只能靠这段话守着：**改 digestValue 里那一行之前，
+// 先想清楚下游用 1.27 构建的应用会不会重新吃到「只在别的标注上不同的两份输入算出同一个身份」**（那意味着
+// 工单-1 的批准被兑付给工单-2，全程 err == nil）。要机械化就得埋 seam（把编码器提成包级变量，或加一个
+// digestValueWith(enc) 供内部测试注入一个深度受限的编码器）。
 func encodeTree(buf *bytes.Buffer, v any) error {
 	switch t := v.(type) {
 	case map[string]any:

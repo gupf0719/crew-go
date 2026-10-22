@@ -700,3 +700,72 @@ func TestSoftLanding_OpenAIWireKeepsToolsSendsNone(t *testing.T) {
 		t.Errorf("应以收尾答复 + MaxIterationsError 结束，实际答复 %+v err %v", fm, err)
 	}
 }
+
+// TestSoftLanding_HardCalledFrameworkToolNotExecuted：软降落轮硬调**框架工具**时同样不执行——放行的只有
+// 框架那件 final_output（结构化输出的唯一投递通道），按实例认。
+//
+// ⚠️ 这条钉的是 makeToolsFn 那道闸用 isFrameworkFinalOutput 而**不是** isFrameworkMintedIn。两者就差一个词、
+// 在相邻两行、形状相同，而注释反复讲「判的是实例不是名字」，极易被误改成后者。实测过：换成
+// isFrameworkMintedIn，`go test ./agent_v2/` 全量照样全绿——既有用例一条都钉不住它，因为
+// TestSoftLanding_BusinessFinalOutputWithoutSchemaNotExempt 验的是**业务**工具（本来就不是 minted，两种判据下
+// 都被拦）。
+//
+// 断言选在「ask_user 有没有真执行」而不是「有没有报错」：ask_user 真执行的表现就是抛中断，于是「Run 没中断」
+// 恰好是「它没执行」的可观测量（CLAUDE.md：验泄漏要断言工具有没有真执行，不是断言有没有中断——这里两者同一）。
+// 误放行的后果是把用户停在一个注定答不成的问题上：答完 Resume 只换来预算耗尽 + FinalMessage 为 nil。
+func TestSoftLanding_HardCalledFrameworkToolNotExecuted(t *testing.T) {
+	var noop atomic.Int32
+	m := &landingModel{hardCall: agent_v2.AskUserToolName}
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("slf"), agent_v2.WithModel(m), agent_v2.WithAskUser(),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &noop, "ok"))),
+		agent_v2.WithMaxRounds(1))
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+
+	rounds, choices := m.seen()
+	if len(rounds) != 2 {
+		t.Fatalf("fixture 没搭对：maxRounds=1 应调模型 2 次，实际 %d 次", len(rounds))
+	}
+	if !slices.Contains(rounds[1], agent_v2.AskUserToolName) || !isNone(choices[1]) {
+		t.Fatalf("fixture 没搭对：软降落轮应照旧绑着 ask_user 并发 tool_choice=none，"+
+			"实际那轮工具=%v tool_choice=%v", rounds[1], choiceNames(choices[1:]))
+	}
+	if ie, ok := compose_v2.IsInterrupt(err); ok {
+		t.Errorf("软降落轮硬调的 ask_user 被执行了——Run 停在提问 %q 上，而这个问题答完也只换来预算耗尽",
+			ie.Query.Question)
+	}
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(err, &mie) {
+		t.Errorf("软降落轮硬调工具、整批被拦后应以预算耗尽收尾，got err=%v", err)
+	}
+}
+
+// TestSoftLanding_HardToolCallErrorMentionsSoftLanding：provider 不守 tool_choice=none 时，报出去的错误
+// 正文要说清**发生了什么**——不能是裸的引擎消息。
+//
+// 这条路上图是失败的（整批被拦 ⟹ 条件边判「末条有 tool_call」回 model 节点 ⟹ 撞 maxVisit），所以 Run 出口
+// 那段友好正文的旧判据 `err == nil` 永不成立，调用方拿到的是 `node "model" visited N times (max M)`——
+// 一个字没提软降落，排查方向指不出去（审计实测）。而这条路上 postamble 没跑完，`FinalMessage` 可能是 nil，
+// 所以文案也不能照抄成功那条的「答复在 events 里」。
+//
+// ⚠️ 断言挑的是正文里那几个**只有这条路才会出现**的词（软降落 / round_budget_exhausted / FinalMessage
+// 可能为 nil），不是「正文非空」——后者在裸引擎消息下也成立，不承重。
+func TestSoftLanding_HardToolCallErrorMentionsSoftLanding(t *testing.T) {
+	var n atomic.Int32
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("sl"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(2))
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+	if err == nil {
+		t.Fatal("fixture 没搭对：软降落轮硬调工具、整批被拦，应以错误收尾")
+	}
+	for _, want := range []string{"软降落轮", "round_budget_exhausted", "FinalMessage 可能为 nil"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误正文应点出 %q，实际正文：%v", want, err)
+		}
+	}
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(err, &mie) {
+		t.Errorf("仍应能 errors.As 出 MaxIterationsError（调用方据它判预算耗尽），实际 %v", err)
+	}
+}

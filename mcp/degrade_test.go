@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1588,5 +1589,64 @@ func TestStreamableHTTP_RedactEdges(t *testing.T) {
 	}
 	if strings.Contains(st.Err.Error(), "sk-PATH-SECRET-1234567") && strings.Contains(st.Err.Error(), "Cannot POST") {
 		t.Errorf("响应体里回显的 URL 路径秘密没抹：%v", st.Err)
+	}
+}
+
+// TestHub_ClientCallToolPanic_IsFailureNotPanic 钉住 [mcp.RemoteTool.Call] 的契约在业务 Client panic 时
+// 也成立：只在调用方 ctx 结束时返回 error，其余失败（panic 在内）一律以 tool.Failure 交回模型。
+//
+// ⚠️ 这条**必须单独存在**：panic 不兜的话它穿过 RemoteTool.Call 与 tool.Toolkit.Call（那一层不 recover），
+// 直到 agent_v2 外层兜底转成 error ⟹ 一个 server 的 bug 拖垮整个 Run，而「按 server 降级」的全部意义就是
+// 不让这件事发生。实测过：把 server.callClient 的 recover 去掉，全套 mcp 测试照样全绿。
+//
+// 同时钉「panic 不标掉线」：panic 是调用方代码的 bug，连接可能好着，标掉线会把一个工具的 bug 升级成整个
+// server 的降级（后续调用全部快速失败）。
+func TestHub_ClientCallToolPanic_IsFailureNotPanic(t *testing.T) {
+	c := &memClient{
+		name:  "s",
+		tools: specs("boom", "fine"),
+		onCall: func(_ context.Context, name string, _ map[string]any) (*mcp.CallResult, error) {
+			if name == "boom" {
+				panic("业务 Client 炸了")
+			}
+			return &mcp.CallResult{Content: []mcp.Block{{Type: "text", Text: "ok"}}}, nil
+		},
+	}
+	h := mcp.NewHub(mcp.WithClient(c))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+
+	byName := map[string]*mcp.RemoteTool{}
+	for _, tl := range h.Tools() {
+		byName[tl.Name()] = tl
+	}
+	boom, fine := byName["mcp_s_boom"], byName["mcp_s_fine"]
+	if boom == nil || fine == nil {
+		t.Fatalf("期望注册 mcp_s_boom 与 mcp_s_fine，实际 %v", slices.Sorted(maps.Keys(byName)))
+	}
+
+	res, err := func() (r *tool.Result, e error) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				t.Fatalf("panic 冲出了 RemoteTool.Call：%v（契约要求转成 tool.Failure）", rec)
+			}
+		}()
+		return boom.Call(context.Background(), map[string]any{"q": "x"})
+	}()
+	if err != nil {
+		t.Errorf("panic 应转成 tool.Failure 而不是 error，got err=%v", err)
+	}
+	if res == nil || res.Error == nil || res.Error.Code != tool.ErrCodeInternal {
+		t.Errorf("期望 tool.Failure(%s)，got %+v", tool.ErrCodeInternal, res)
+	}
+
+	// panic 不标掉线：同一个 server 的另一件工具照常调得通。
+	if res, err := fine.Call(context.Background(), map[string]any{"q": "x"}); err != nil || res == nil || res.Error != nil {
+		t.Errorf("panic 把 server 标成掉线了：后续调用 res=%+v err=%v", res, err)
+	}
+	if st := h.Status(); len(st) != 1 || st[0].State != mcp.ServerOnline {
+		t.Errorf("panic 之后 server 状态应仍是 online，got %+v", st)
 	}
 }

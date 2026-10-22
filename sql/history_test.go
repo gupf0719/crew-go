@@ -96,7 +96,7 @@ func TestSQLiteHistoryStore_SurvivesReopen(t *testing.T) {
 			Toolcall: &schema.ToolcallContentBlock{Id: "toolu_1", Name: "clock__now", Arguments: `{"tz":"Asia/Shanghai","n":12345678901234567890}`},
 		}},
 		Annotations: map[string]any{
-			"anthropic.assistant_content": `{"v":1,"content":[{"type":"thinking","thinking":"嗯","signature":"EqQBCkgIBh+/="}]}`,
+			"anthropic.assistant_content":   `{"v":1,"content":[{"type":"thinking","thinking":"嗯","signature":"EqQBCkgIBh+/="}]}`,
 			agent_v2.HistoryAgentAnnotation: "deskbot",
 		},
 	}

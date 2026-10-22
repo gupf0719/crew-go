@@ -70,6 +70,19 @@ orch := obs.OrchHooks(sseOrchHooks)                // 编排级
 被里面的钩子拒绝的模型 / 工具调用：span 以失败收尾（`error.type` 为 `model_start_error` / `tool_start_error`，闸门
 中断记 `blocked`），不记时长样本、不计入 agent 的调用次数——调用没有发生。
 
+包在里面还带来两点：
+
+- **记改写之后的值**：开始一侧 observability 先开 span（父子关系要它），输入消息、工具名与参数、token 模态等
+  里面的钩子跑完再记；结束一侧里面的钩子先跑。业务在钩子里改写 [消费] 字段（PII 过滤输入、脱敏或改判工具结果）
+  时，span 记的是改写之后、真正交下去 / 被框架用上的那份。里面的结束钩子报错时由随后的 `OnError` 以失败收尾。
+- **外来 ctx**：里面的钩子返回外来的 ctx（缓存下来的、`Background`）属于违约（框架会告警），observability 仍把
+  自己的句柄与当前 span 挂回去，span 照常收尾。
+
+同一个 Observability 装了两层（`Install` 两次、`Install` 之外又 `WithHooks(obs.AgentHooks())`、ctx 上已有它的编排
+钩子再 `Install`）时只记一份；两个不同的 Observability 叠在一起时各记各的（句柄按实例区分）。顶不掉的范围到
+`Install` 拿到的 opts / ctx 为止：之后再接 `agent_v2.WithHooks(x)` 会整个覆盖业务级钩子，Run 时传 RunOption
+`agent_v2.WithOrchHooks` 会盖过 ctx 上的编排钩子。
+
 ### 1.3 选项
 
 | 选项 | 默认 | 说明 |
@@ -192,9 +205,11 @@ A2A client span 按发请求用的 ctx 判（`A2AClientSpan.End(ctx, err)`），
 对端的敏感信息）。工具失败但没给错误说明时，只有打开内容采集才拿工具输出当错误信息。
 
 **错误路径上的收尾**：模型 / 工具调用失败时框架不调 `OnModelEnd` / `OnToolEnd`，`chat` / `execute_tool` span 由
-`OnError` 以失败结束，同时记带 `error.type` 的时长样本。一批工具整体失败（`CommError.Code` 为 `tool_call_error`）
-时 `OnError` 收到的是节点的 ctx、分不出是哪一个，这批还开着的工具 span 一起以失败结束；别的 `tool_*` 错误只关乎
-单个调用（比如第 i 个调用的开始钩子失败），不波及同一批里已经在跑的调用。仍没收尾的（例如抛出中断的
+`OnError` 以失败结束，同时记带 `error.type` 的时长样本。`OnError` 按错误码分层：`model_*` 只收模型 span、
+`tool_*` 只收工具 span；agent / 编排层的错误（`agent_start_error`、`branch_error`……）不碰叶子——框架报这些时
+交来的 ctx 可能是开始之前的，最内层是外层的工具调用（比如工具里跑的子 agent 开始被拒）。一批工具的开始钩子失败
+（`tool_start_error`）或整批执行失败（`tool_call_error`）时 `OnError` 收到的是节点的 ctx、分不出是哪一个，这批
+还开着的工具 span 一起以失败结束——开始失败时框架当场让这批失败，前面的调用不会再执行。仍没收尾的（例如抛出中断的
 那次工具调用）由所在 agent 的 `OnAgentEnd` 收尾：结局跟 agent 相同（挂起时 `blocked`，不算失败），agent 本身
 成功的话记 `error` / `_OTHER`；这些叶子不记时长样本。`OnError` 报到 agent / 节点 / 工作流上的错误不在那里记——
 错误要是被处理掉了（重试成功、分支失败被兜住），按 OTel 的 recording-errors 指引不该记；没被处理的话，那个 span

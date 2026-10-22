@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -28,12 +29,34 @@ var workflowKinds = map[string]bool{
 }
 
 // agentHooks 实现 hook.Hooks：agent 调用、模型调用、工具调用各一个 span。
+//
+// 开始一侧拆成两步：startXxx 开 span（结构性属性，决定父子关系），xxxStartContent 记依赖入参内容的属性
+// （输入消息、工具名与参数、token 模态）。单独装时两步连着做；包在 wrappedHooks 里时第二步等里面的钩子跑完
+// 再做——业务钩子可以改写这些 [消费] 字段（比如 PII 过滤），span 要记的是改写之后、真正交下去的那份。
 type agentHooks struct{ o *Observability }
 
 var _ hook.Hooks = (*agentHooks)(nil)
 
 func (h *agentHooks) OnAgentStart(ctx context.Context, info *hook.AgentInfo, in *hook.AgentInput) (context.Context, error) {
-	o := h.o
+	ctx, ah := h.o.startAgent(ctx, info)
+	h.o.agentStartContent(ctx, ah, in)
+	return ctx, nil
+}
+
+func (h *agentHooks) OnAgentEnd(ctx context.Context, info *hook.AgentInfo, out *hook.AgentOutput) context.Context {
+	h.o.endAgent(ctx, info, out)
+	return ctx
+}
+
+// startAgent 开 agent / 工作流 span。同一个 Observability 被装了两层（Install 两次、Install 之外又手动
+// WithHooks(obs.AgentHooks())）时，里层进来看到的最内层句柄就是外层刚为同一次调用开的那个：不再开第二个，
+// 返回 nil 句柄——两层的结束都落到同一个句柄上，finish 只生效一次。
+func (o *Observability) startAgent(ctx context.Context, info *hook.AgentInfo) (context.Context, *handle) {
+	graphNS := compose_v2.GetGraphNS(ctx)
+	if cur := o.handleFrom(ctx); cur != nil && cur.kind == kindAgent && !cur.ended.Load() &&
+		cur.name == info.Name && cur.graphNS == graphNS {
+		return ctx, nil
+	}
 	workflow := workflowKinds[info.Type]
 	op, nameKey := OpInvokeAgent, AttrAgentName
 	if workflow {
@@ -43,7 +66,6 @@ func (h *agentHooks) OnAgentStart(ctx context.Context, info *hook.AgentInfo, in 
 	if info.Name != "" {
 		spanName += " " + info.Name
 	}
-	graphNS := compose_v2.GetGraphNS(ctx)
 	attrs := []attribute.KeyValue{AttrOperationName.String(op), nameKey.String(info.Name)}
 	if info.Type != "" {
 		attrs = append(attrs, AttrAgentKind.String(info.Type))
@@ -58,7 +80,6 @@ func (h *agentHooks) OnAgentStart(ctx context.Context, info *hook.AgentInfo, in 
 	ah.scope = &agentScope{}
 	o.inst.agentActive.Add(ctx, 1, metric.WithAttributes(AttrAgentName.String(info.Name)))
 
-	var inputMsgs []*schema.Message
 	if action, isResume := agent_v2.GetResumePhase(ctx); isResume {
 		labels := metric.WithAttributes(AttrAgentName.String(info.Name), AttrAgentKind.String(info.Type),
 			AttrResumeAction.String(action.String()))
@@ -77,27 +98,38 @@ func (h *agentHooks) OnAgentStart(ctx context.Context, info *hook.AgentInfo, in 
 		}
 		if rc, ok := compose_v2.GetResumeContext(ctx); ok && rc != nil {
 			evAttrs = append(evAttrs, attribute.Int("crew.resume.inputs", resumeInputCount(rc)))
-			inputMsgs = resumeInputMessages(rc)
 		}
 		span.AddEvent("crew.resume", trace.WithAttributes(evAttrs...))
+	}
+	return o.withHandle(ctx, ah), ah
+}
+
+// agentStartContent 记 agent 这次收到的输入（打开内容采集时）：首跑取最后一条用户消息，续跑取调用方这次给的输入。
+func (o *Observability) agentStartContent(ctx context.Context, ah *handle, in *hook.AgentInput) {
+	if ah == nil || !o.recordContent {
+		return
+	}
+	var inputMsgs []*schema.Message
+	if _, isResume := agent_v2.GetResumePhase(ctx); isResume {
+		if rc, ok := compose_v2.GetResumeContext(ctx); ok && rc != nil {
+			inputMsgs = resumeInputMessages(rc)
+		}
 	} else if in != nil {
 		if m := lastUserMessage(in.Messages); m != nil {
 			inputMsgs = []*schema.Message{m}
 		}
 	}
-	if o.recordContent && len(inputMsgs) > 0 {
-		span.SetAttributes(AttrInputMessages.String(o.messagesJSON(inputMsgs, "")))
+	if len(inputMsgs) > 0 {
+		ah.span.SetAttributes(AttrInputMessages.String(o.messagesJSON(inputMsgs, "")))
 	}
-	return withHandle(ctx, ah), nil
 }
 
-func (h *agentHooks) OnAgentEnd(ctx context.Context, info *hook.AgentInfo, out *hook.AgentOutput) context.Context {
-	o := h.o
-	ah := agentHandleFrom(ctx)
+func (o *Observability) endAgent(ctx context.Context, info *hook.AgentInfo, out *hook.AgentOutput) {
+	ah := o.agentHandleFrom(ctx)
 	// 只收本次调用自己的句柄：框架在某些路径上拿开始之前的 ctx 调结束钩子（如放弃续跑时开始钩子报错），那个
 	// ctx 里最内层的 agent 句柄可能是外层 agent 的，收了就把外层的 span 提前结束了。
 	if ah == nil || ah.ended.Load() || ah.name != info.Name || ah.graphNS != compose_v2.GetGraphNS(ctx) {
-		return ctx
+		return
 	}
 	r := classify(ctx, agent_v2.GetEndError(ctx))
 	// 只装了一半的告警只在「这次调用一定跑过图」时判：跑图的 agent（BasicAgent 与各编排）正常结束（成功或挂起）。
@@ -148,7 +180,7 @@ func (h *agentHooks) OnAgentEnd(ctx context.Context, info *hook.AgentInfo, out *
 	extra = append(extra, attribute.Int64("crew.agent.inference_calls", ah.scope.inference.Load()),
 		attribute.Int64("crew.agent.tool_calls", ah.scope.toolCalls.Load()))
 	if !o.finish(ah, r, extra...) {
-		return ctx
+		return
 	}
 
 	errAttr := []attribute.KeyValue{}
@@ -170,11 +202,19 @@ func (h *agentHooks) OnAgentEnd(ctx context.Context, info *hook.AgentInfo, out *
 	o.inst.agentInvocations.Add(ctx, 1, metric.WithAttributes(AttrAgentName.String(info.Name),
 		AttrAgentKind.String(info.Type), AttrOutcome.String(r.outcome)))
 	o.inst.agentActive.Add(ctx, -1, metric.WithAttributes(AttrAgentName.String(info.Name)))
-	return ctx
 }
 
 func (h *agentHooks) OnModelStart(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
-	o := h.o
+	ctx, mh := h.o.startModel(ctx, info, in)
+	h.o.modelStartContent(mh, in)
+	return ctx, nil
+}
+
+// startModel 开 chat span。最内层已经是一个还开着的模型句柄时（同一个 Observability 装了两层），不再开第二个。
+func (o *Observability) startModel(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, *handle) {
+	if cur := o.handleFrom(ctx); cur != nil && cur.kind == kindModel && !cur.ended.Load() {
+		return ctx, nil
+	}
 	attrs := []attribute.KeyValue{AttrOperationName.String(OpChat), AttrAgentName.String(info.Name),
 		AttrAgentRound.Int(int(info.Round))}
 	var reqModel string
@@ -196,34 +236,45 @@ func (h *agentHooks) OnModelStart(ctx context.Context, info *hook.AgentInfo, in 
 	if conv := compose_v2.GetThreadID(ctx); conv != "" {
 		attrs = append(attrs, AttrConversationID.String(conv))
 	}
-	if o.recordContent && in != nil {
-		if sys := o.systemJSON(in.Preamble); sys != "" {
-			attrs = append(attrs, AttrSystemInstructions.String(sys))
-		}
-		attrs = append(attrs, AttrInputMessages.String(o.messagesJSON(in.Messages, "")))
-	}
 	spanName := OpChat
 	if reqModel != "" {
 		spanName += " " + reqModel
 	}
 	ctx, span := o.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 	mh := &handle{kind: kindModel, span: span, start: time.Now(), name: info.Name,
-		graphNS: compose_v2.GetGraphNS(ctx), requestModel: reqModel, scope: scopeFrom(ctx), inputModality: "text"}
-	if in != nil {
-		mh.inputModality = tokenModality(in.Preamble, in.Messages)
-	}
+		graphNS: compose_v2.GetGraphNS(ctx), requestModel: reqModel, scope: o.scopeFrom(ctx), inputModality: "text"}
 	mh.scope.add(mh)
 	if mh.scope != nil {
 		mh.scope.inference.Add(1)
 	}
-	return withHandle(ctx, mh), nil
+	return o.withHandle(ctx, mh), mh
+}
+
+// modelStartContent 按交给模型的输入记 token 模态与（打开内容采集时）输入内容。
+func (o *Observability) modelStartContent(mh *handle, in *schema.ModelInput) {
+	if mh == nil || in == nil {
+		return
+	}
+	mh.inputModality = tokenModality(in.Preamble, in.Messages)
+	if !o.recordContent {
+		return
+	}
+	var attrs []attribute.KeyValue
+	if sys := o.systemJSON(in.Preamble); sys != "" {
+		attrs = append(attrs, AttrSystemInstructions.String(sys))
+	}
+	attrs = append(attrs, AttrInputMessages.String(o.messagesJSON(in.Messages, "")))
+	mh.span.SetAttributes(attrs...)
 }
 
 // OnModelEndStream 给流包一层，记首片到达的时间（gen_ai.response.time_to_first_chunk）。
 func (h *agentHooks) OnModelEndStream(ctx context.Context, info *hook.AgentInfo, sr specModel.MessageStreamReader) (context.Context, specModel.MessageStreamReader, error) {
-	mh := handleFrom(ctx)
+	mh := h.o.handleFrom(ctx)
 	if mh == nil || mh.kind != kindModel || sr == nil {
 		return ctx, sr, nil
+	}
+	if _, wrapped := sr.(*firstChunkReader); wrapped {
+		return ctx, sr, nil // 装了两层时里层不再包一次
 	}
 	mh.span.SetAttributes(AttrRequestStream.Bool(true))
 	return ctx, &firstChunkReader{inner: sr, h: mh}, nil
@@ -246,7 +297,7 @@ func (r *firstChunkReader) Close() error { return r.inner.Close() }
 
 func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
 	o := h.o
-	mh := handleFrom(ctx)
+	mh := o.handleFrom(ctx)
 	if mh == nil || mh.kind != kindModel {
 		return ctx, nil
 	}
@@ -261,7 +312,7 @@ func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *
 	}
 	if respModel != "" {
 		extra = append(extra, AttrResponseModel.String(respModel))
-		if mh.requestModel == "" {
+		if mh.requestModel == "" && !mh.ended.Load() {
 			mh.span.SetName(OpChat + " " + respModel)
 		}
 	}
@@ -340,41 +391,62 @@ func addTokens(ctx context.Context, c metric.Int64Counter, n int32, opt metric.A
 }
 
 func (h *agentHooks) OnToolStart(ctx context.Context, info *hook.AgentInfo, in *schema.ToolInput) (context.Context, error) {
-	o := h.o
+	ctx, th := h.o.startTool(ctx, info, in)
+	h.o.toolStartContent(th, in)
+	return ctx, nil
+}
+
+// startTool 开 execute_tool span。工具名、类别、参数这些可能被业务钩子改写的，由 toolStartContent 记。最内层已经
+// 是同一个 tool_call 还开着的句柄时（同一个 Observability 装了两层），不再开第二个。
+func (o *Observability) startTool(ctx context.Context, info *hook.AgentInfo, in *schema.ToolInput) (context.Context, *handle) {
 	if in == nil {
 		return ctx, nil
 	}
-	category, skill := toolCategory(in)
-	attrs := []attribute.KeyValue{AttrOperationName.String(OpExecuteTool), AttrToolName.String(in.Name),
-		AttrToolType.String("function"), AttrAgentName.String(info.Name)}
+	if cur := o.handleFrom(ctx); cur != nil && cur.kind == kindTool && !cur.ended.Load() && cur.callID == in.CallId {
+		return ctx, nil
+	}
+	attrs := []attribute.KeyValue{AttrOperationName.String(OpExecuteTool), AttrToolType.String("function"),
+		AttrAgentName.String(info.Name)}
 	if in.CallId != "" {
 		attrs = append(attrs, AttrToolCallID.String(in.CallId))
 	}
+	if conv := compose_v2.GetThreadID(ctx); conv != "" {
+		attrs = append(attrs, AttrConversationID.String(conv))
+	}
+	ctx, span := o.tracer.Start(ctx, OpExecuteTool+" "+in.Name, trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrs...))
+	th := &handle{kind: kindTool, span: span, start: time.Now(), name: in.Name, graphNS: compose_v2.GetGraphNS(ctx),
+		callID: in.CallId, scope: o.scopeFrom(ctx)}
+	th.scope.add(th)
+	if th.scope != nil {
+		th.scope.toolCalls.Add(1)
+	}
+	return o.withHandle(ctx, th), th
+}
+
+// toolStartContent 按最终交给工具执行的入参记工具名、类别、skill 与（打开内容采集时）参数。加载 skill 的工具调用
+// 按 GenAI 约定把 skill 名也放进 span 名：execute_tool {工具名} {skill 名}。
+func (o *Observability) toolStartContent(th *handle, in *schema.ToolInput) {
+	if th == nil || in == nil {
+		return
+	}
+	category, skill := toolCategory(in)
+	th.name, th.category, th.skill = in.Name, category, skill
+	spanName := OpExecuteTool + " " + in.Name
+	if skill != "" {
+		spanName += " " + skill
+	}
+	th.span.SetName(spanName)
+	attrs := []attribute.KeyValue{AttrToolName.String(in.Name)}
 	if category != "" {
 		attrs = append(attrs, AttrToolCategory.String(category))
 	}
 	if skill != "" {
 		attrs = append(attrs, AttrSkillName.String(skill))
 	}
-	if conv := compose_v2.GetThreadID(ctx); conv != "" {
-		attrs = append(attrs, AttrConversationID.String(conv))
-	}
 	if o.recordContent {
 		attrs = append(attrs, AttrToolCallArguments.String(o.jsonText(in.ArgumentsJSON)))
 	}
-	// 加载 skill 的工具调用按 GenAI 约定把 skill 名也放进 span 名：execute_tool {工具名} {skill 名}。
-	spanName := OpExecuteTool + " " + in.Name
-	if skill != "" {
-		spanName += " " + skill
-	}
-	ctx, span := o.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrs...))
-	th := &handle{kind: kindTool, span: span, start: time.Now(), name: in.Name, graphNS: compose_v2.GetGraphNS(ctx),
-		callID: in.CallId, category: category, skill: skill, scope: scopeFrom(ctx)}
-	th.scope.add(th)
-	if th.scope != nil {
-		th.scope.toolCalls.Add(1)
-	}
-	return withHandle(ctx, th), nil
+	th.span.SetAttributes(attrs...)
 }
 
 // toolCategory 给工具调用分类：activate_skill 是 skill 激活（带上 skill 名）；业务工具实现了
@@ -403,9 +475,9 @@ func (h *agentHooks) OnToolEnd(ctx context.Context, info *hook.AgentInfo, out *s
 	if out == nil {
 		return ctx, nil
 	}
-	th := handleFrom(ctx)
+	th := o.handleFrom(ctx)
 	if th == nil || th.kind != kindTool || (out.CallId != "" && th.callID != "" && th.callID != out.CallId) {
-		th = scopeFrom(ctx).findTool(out.CallId)
+		th = o.scopeFrom(ctx).findTool(out.CallId)
 	}
 	if th == nil {
 		return ctx, nil
@@ -448,10 +520,16 @@ func (o *Observability) recordToolDuration(ctx context.Context, th *handle, agen
 	o.inst.toolDuration.Record(ctx, seconds(th.start), metric.WithAttributes(a...))
 }
 
-// OnError 在框架报告错误时收尾：模型 / 工具 span 在错误路径上等不到结束钩子，在这里以失败结束。一批工具
-// 整体失败时框架交来的是节点的 ctx，分不出是哪一个，这批还开着的工具 span 一起以失败结束。agent / 节点 /
-// 工作流 span 这里不碰：错误要是被处理掉了（重试成功、分支失败被兜住），按 OTel 的 recording-errors 指引
-// 不该记；要是没被处理，它们结束时自己会以失败收尾。
+// OnError 在框架报告错误时收尾：模型 / 工具 span 在错误路径上等不到结束钩子，在这里以失败结束。按错误码分层：
+// model_* 只收模型句柄、tool_* 只收工具句柄——框架报 agent / 编排层的错误（agent_start_error、branch_error……）
+// 时交来的 ctx 可能是开始之前的，最内层句柄是外层的工具 / 模型调用（比如工具里跑的子 agent 开始被拒），不能
+// 把外层的叶子收成失败。
+//
+// 一批工具的开始钩子失败（tool_start_error）或整批执行失败（tool_call_error）时框架交来的是节点的 ctx，分不出
+// 是哪一个：这批还开着的工具 span 一起以失败结束——开始失败时前面的调用不会再执行，整批失败时它们都没成。
+//
+// agent / 节点 / 工作流 span 这里不碰：错误要是被处理掉了（重试成功、分支失败被兜住），按 OTel 的
+// recording-errors 指引不该记；要是没被处理，它们结束时自己会以失败收尾。
 func (h *agentHooks) OnError(ctx context.Context, info *hook.AgentInfo, err *schema.CommError) context.Context {
 	o := h.o
 	if err == nil {
@@ -464,28 +542,23 @@ func (h *agentHooks) OnError(ctx context.Context, info *hook.AgentInfo, err *sch
 	if ctx.Err() != nil {
 		r = classify(ctx, errors.New(err.Message))
 	}
-	cur := handleFrom(ctx)
+	cur := o.handleFrom(ctx)
 	switch {
-	case cur != nil && cur.kind == kindModel:
+	case cur != nil && cur.kind == kindModel && strings.HasPrefix(err.Code, "model_"):
 		cur.scope.remove(cur)
 		if o.finish(cur, r) {
 			o.inst.inferenceDuration.Record(ctx, seconds(cur.start), metric.WithAttributes(
 				append(inferenceLabels("", cur.requestModel, ""), AttrErrorType.String(r.errType))...))
 		}
-	case cur != nil && cur.kind == kindTool:
+	case cur != nil && cur.kind == kindTool && strings.HasPrefix(err.Code, "tool_"):
 		cur.scope.remove(cur)
 		if o.finish(cur, r) {
 			o.recordToolDuration(ctx, cur, info.Name, r)
 		}
-	default:
-		// 只有一批工具整体失败（tool_call_error，交来的是节点 ctx）才收尾这批还开着的工具 span。别的 tool_* 错误
-		// 只关乎单个调用：比如第 i 个调用的开始钩子失败（tool_start_error）时，排在它前面的调用已经开了 span、
-		// 照常执行，不能被一起记成失败。
-		if err.Code == "tool_call_error" {
-			for _, th := range scopeFrom(ctx).drain(kindTool) {
-				if o.finish(th, r) {
-					o.recordToolDuration(ctx, th, info.Name, r)
-				}
+	case err.Code == "tool_start_error" || err.Code == "tool_call_error":
+		for _, th := range o.scopeFrom(ctx).drain(kindTool) {
+			if o.finish(th, r) {
+				o.recordToolDuration(ctx, th, info.Name, r)
 			}
 		}
 	}

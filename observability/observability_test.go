@@ -1231,20 +1231,241 @@ func TestAgentHooks_InnerModelAndToolStartRejected(t *testing.T) {
 	}
 }
 
-// TestToolStartError_DoesNotEndSiblings：一批里第 2 个调用的开始钩子失败（tool_start_error）时，第 1 个调用已经
-// 开了 span、照常执行，不能被一起记成失败——只有整批失败（tool_call_error）才收尾整批。
-func TestToolStartError_DoesNotEndSiblings(t *testing.T) {
+// batchModel 第一轮一次发两个 tool_call（lookup_a、lookup_b），拿到结果后给最终答复。
+type batchModel struct{}
+
+func (batchModel) WithTools([]*schema.ToolInfo) (model.ChatModel, error) { return batchModel{}, nil }
+
+func (batchModel) Generate(_ context.Context, msgs []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	if msgs[len(msgs)-1].Role == schema.RoleTool {
+		return schema.AssistantMessage("done"), nil
+	}
+	return schema.AssistantToolCallMessage([]schema.ToolCall{
+		{ID: "a1", Type: "function", Function: schema.FunctionCall{Name: "lookup_a", Arguments: `{}`}},
+		{ID: "b1", Type: "function", Function: schema.FunctionCall{Name: "lookup", Arguments: `{}`}},
+	}), nil
+}
+
+func (m batchModel) Stream(ctx context.Context, msgs []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	resp, err := m.Generate(ctx, msgs, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.NewSingleChunkReader(resp), nil
+}
+
+// TestToolStartRejected_BatchSpansEndPromptly：同一批里第 2 个调用的开始钩子拒绝时，框架当场让这批失败、前面的
+// 调用不再执行。两个 span 都当场以 tool_start_error 收尾，而不是拖到 agent 结束时按 agent 的结局收。
+func TestToolStartRejected_BatchSpansEndPromptly(t *testing.T) {
 	h := newHarness(t)
-	ah := h.obs.AgentHooks()
-	info := &hook.AgentInfo{Name: "a", Type: "base"}
-	ctx, _ := ah.OnAgentStart(context.Background(), info, &hook.AgentInput{})
-	nodeCtx := compose_v2.WithGraphNS(ctx, "")
-	c1, _ := ah.OnToolStart(nodeCtx, info, &schema.ToolInput{Name: "first", CallId: "c1"})
-	ah.OnError(nodeCtx, info, &schema.CommError{Code: "tool_start_error", Message: "second rejected"})
-	ah.OnToolEnd(c1, info, &schema.ToolOutput{CallId: "c1", Result: &schema.ToolCallResult{Success: true, Output: "ok"}})
-	ah.OnAgentEnd(ctx, info, &hook.AgentOutput{})
-	if s := strAttr(t, h.span(t, "execute_tool first"), observability.AttrOutcome); s != "success" {
-		t.Errorf("兄弟调用的开始钩子失败不该波及已经在跑的调用，got %s", s)
+	tk := tool.NewToolkit()
+	for _, name := range []string{"lookup_a", "lookup"} {
+		tk.Register(tool.NewFuncTool(name, name, map[string]any{"type": "object"},
+			func(context.Context, map[string]any) (*tool.Result, error) {
+				return &tool.Result{Success: true, Output: "ok"}, nil
+			}))
+	}
+	ctx, opts := h.obs.Install(context.Background(), agent_v2.WithName("batch"), agent_v2.WithModel(batchModel{}),
+		agent_v2.WithToolkit(tk), agent_v2.WithHooks(&rejectHooks{tool: errors.New("lookup forbidden")}))
+	if _, err := agent_v2.NewBasicAgent(opts...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("go")); err == nil {
+		t.Fatal("工具开始钩子拒绝时 Run 应返错")
+	}
+	h.assertAllEnded(t)
+	for _, name := range []string{"execute_tool lookup_a", "execute_tool lookup"} {
+		sp := h.span(t, name)
+		if s := strAttr(t, sp, observability.AttrErrorType); s != "tool_start_error" {
+			t.Errorf("%s 应当场以 tool_start_error 收尾，got error.type=%s", name, s)
+		}
+	}
+}
+
+// foreignCtxHooks 在开始钩子里返回 context.Background()（违约，但业务会这么写：缓存 / 丢掉了入参 ctx）。
+type foreignCtxHooks struct{ hook.NoOpHooks }
+
+func (foreignCtxHooks) OnAgentStart(context.Context, *hook.AgentInfo, *hook.AgentInput) (context.Context, error) {
+	return context.Background(), nil
+}
+
+func (foreignCtxHooks) OnModelStart(context.Context, *hook.AgentInfo, *schema.ModelInput) (context.Context, error) {
+	return context.Background(), nil
+}
+
+// TestInnerForeignCtx_HandlesKept：里面的钩子返回外来 ctx 时，observability 把句柄挂回去：span 照常收尾、在途数
+// 回到 0、成功的模型调用记成功。
+func TestInnerForeignCtx_HandlesKept(t *testing.T) {
+	h := newHarness(t)
+	ctx, opts := h.obs.Install(context.Background(), agent_v2.WithName("fa"), agent_v2.WithModel(&scriptModel{}),
+		agent_v2.WithHooks(foreignCtxHooks{}))
+	if _, err := agent_v2.NewBasicAgent(opts...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("hi")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	h.assertAllEnded(t)
+	if s := strAttr(t, h.span(t, "chat mock-model"), observability.AttrOutcome); s != "success" {
+		t.Errorf("成功的模型调用应记 success，got %s", s)
+	}
+	if n := sumInt(t, h.collect(t), observability.MetricAgentActive, nil); n != 0 {
+		t.Errorf("在途 agent 数=%d 应=0", n)
+	}
+}
+
+// TestDoubleInstall_RecordedOnce：同一个 Observability 装了两层（Install 两次 / Install 之外又手动 WithHooks / ctx 上
+// 已有它的编排钩子再 Install）时只记一份：一个 agent span、每个节点一个 span、指标不翻倍，全部收尾。
+func TestDoubleInstall_RecordedOnce(t *testing.T) {
+	cases := map[string]func(h *harness) (context.Context, []agent_v2.Option){
+		"Install 两次": func(h *harness) (context.Context, []agent_v2.Option) {
+			ctx, opts := h.obs.Install(context.Background(), agent_v2.WithName("dup"), agent_v2.WithModel(&scriptModel{}))
+			return h.obs.Install(ctx, opts...)
+		},
+		"手动 WithHooks 加 Install": func(h *harness) (context.Context, []agent_v2.Option) {
+			return h.obs.Install(context.Background(), agent_v2.WithName("dup"), agent_v2.WithModel(&scriptModel{}),
+				agent_v2.WithHooks(h.obs.AgentHooks()))
+		},
+		"ctx 上已有编排钩子再 Install": func(h *harness) (context.Context, []agent_v2.Option) {
+			ctx := agent_v2.WithCtxOrchHooks(context.Background(), h.obs.OrchHooks())
+			return h.obs.Install(ctx, agent_v2.WithName("dup"), agent_v2.WithModel(&scriptModel{}))
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			ctx, opts := setup(h)
+			if _, err := agent_v2.NewBasicAgent(opts...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("hi")); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			h.assertAllEnded(t)
+			h.span(t, "invoke_agent dup")
+			h.span(t, "chat mock-model")
+			if n := len(h.spansNamed("node model")); n != 1 {
+				t.Errorf("model 节点只执行了一次，应只有 1 个 span，got %d", n)
+			}
+			rm := h.collect(t)
+			if n := sumInt(t, rm, observability.MetricNodeExecutions, map[string]string{"crew.node.id": "model"}); n != 1 {
+				t.Errorf("crew.node.executions{model}=%d 应=1", n)
+			}
+			if n := histCount(t, rm, observability.MetricInferenceDuration, nil); n != 1 {
+				t.Errorf("推理时长样本=%d 应=1", n)
+			}
+			if n := sumInt(t, rm, observability.MetricAgentActive, nil); n != 0 {
+				t.Errorf("在途 agent 数=%d 应=0", n)
+			}
+		})
+	}
+}
+
+// TestDoubleInstall_EventsOnce：同一个 Observability 装了两层时，同一次事件投递只处理一次——片段计数、span 事件、
+// 框架指标不翻倍。
+func TestDoubleInstall_EventsOnce(t *testing.T) {
+	h := newHarness(t)
+	oh := h.obs.OrchHooks(h.obs.OrchHooks())
+	ctx, _ := oh.OnNodeStart(context.Background(), "tools")
+	oh.OnNodeEvent(ctx, "tools", agent_v2.Event{Type: "chunk", Content: "x"})
+	oh.OnNodeEvent(ctx, "tools", agent_v2.Event{Type: agent_v2.FanoutEventType,
+		Metadata: map[string]any{"action": &agent_v2.FanoutAction{Kind: agent_v2.FanoutKindToolCalls, Branches: 2}}})
+	oh.OnNodeEnd(ctx, "tools", nil)
+	h.assertAllEnded(t)
+	sp := h.span(t, "node tools")
+	if s := strAttr(t, sp, observability.AttrStreamChunks); s != "1" {
+		t.Errorf("一个片段应只计一次，crew.stream.chunks=%s", s)
+	}
+	n := 0
+	for _, e := range sp.Events() {
+		if e.Name == "crew."+agent_v2.FanoutEventType {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("一次扇出事件应只记一条 span 事件，got %d", n)
+	}
+	if c := histCount(t, h.collect(t), observability.MetricFanoutBranches, nil); c != 1 {
+		t.Errorf("crew.fanout.branches 样本=%d 应=1", c)
+	}
+}
+
+// TestTwoInstancesStacked_EachComplete：两个 Observability（各接一个 provider）叠在一起时各记各的，互不收掉对方的 span。
+func TestTwoInstancesStacked_EachComplete(t *testing.T) {
+	a, b := newHarness(t), newHarness(t)
+	ctx := agent_v2.WithCtxOrchHooks(context.Background(), a.obs.OrchHooks(b.obs.OrchHooks()))
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("both"), agent_v2.WithModel(&scriptModel{}),
+		agent_v2.WithHooks(a.obs.AgentHooks(b.obs.AgentHooks())))
+	if _, err := ag.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("hi")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for name, h := range map[string]*harness{"外层": a, "里层": b} {
+		h.assertAllEnded(t)
+		if len(h.spansNamed("invoke_agent both")) != 1 || len(h.spansNamed("node model")) != 1 {
+			t.Errorf("%s 实例应各有一份完整的 span，got %v", name, names(h.spans()))
+		}
+	}
+}
+
+// TestNestedAgentStartRejected_ParentToolUntouched：工具里跑的子 agent 开始被拒时，框架拿开始之前的 ctx 报
+// agent_start_error——那里最内层是父 agent 的工具 span，不能被收成失败。
+func TestNestedAgentStartRejected_ParentToolUntouched(t *testing.T) {
+	h := newHarness(t)
+	parent := h.obs.AgentHooks()
+	child := h.obs.AgentHooks(&rejectHooks{agent: errors.New("quota")})
+	pinfo, cinfo := &hook.AgentInfo{Name: "parent", Type: "base"}, &hook.AgentInfo{Name: "child", Type: "base"}
+	pctx, _ := parent.OnAgentStart(context.Background(), pinfo, &hook.AgentInput{})
+	tctx, _ := parent.OnToolStart(pctx, pinfo, &schema.ToolInput{Name: "delegate", CallId: "d1"})
+	childIn := compose_v2.WithGraphNS(tctx, "delegate")
+	if _, err := child.OnAgentStart(childIn, cinfo, &hook.AgentInput{}); err == nil {
+		t.Fatal("子 agent 开始应被拒")
+	}
+	child.OnError(childIn, cinfo, &schema.CommError{Code: "agent_start_error", Message: "quota"})
+	parent.OnToolEnd(tctx, pinfo, &schema.ToolOutput{CallId: "d1", Result: &schema.ToolCallResult{Success: true, Output: "fallback"}})
+	parent.OnAgentEnd(pctx, pinfo, &hook.AgentOutput{})
+	h.assertAllEnded(t)
+	if s := strAttr(t, h.span(t, "execute_tool delegate"), observability.AttrOutcome); s != "success" {
+		t.Errorf("父工具自己兜住了错误、成功结束，got outcome=%s", s)
+	}
+	if s := strAttr(t, h.span(t, "invoke_agent child"), observability.AttrOutcome); s != "error" {
+		t.Errorf("被拒绝的子 agent 应记 error，got %s", s)
+	}
+}
+
+// rewriteHooks 在 [消费] 字段上做业务改写：OnModelStart 过滤掉输入里的社保号，OnToolEnd 把结果脱敏并改成失败。
+type rewriteHooks struct{ hook.NoOpHooks }
+
+func (rewriteHooks) OnModelStart(ctx context.Context, _ *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
+	filtered := make([]*schema.Message, 0, len(in.Messages))
+	for _, m := range in.Messages {
+		cp := *m
+		cp.Content = strings.ReplaceAll(cp.Content, "123-45-6789", "***")
+		filtered = append(filtered, &cp)
+	}
+	in.Messages = filtered
+	return ctx, nil
+}
+
+func (rewriteHooks) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ToolOutput) (context.Context, error) {
+	out.Result = &schema.ToolCallResult{Success: false, Output: "redacted", ErrorCode: "policy_blocked", Error: "blocked by policy"}
+	return ctx, nil
+}
+
+// TestContent_RecordsBusinessRewrite：span 记的是业务钩子改写之后、真正交下去 / 被框架用上的那份——PII 过滤后的输入、
+// 改写后的工具结局与结果。
+func TestContent_RecordsBusinessRewrite(t *testing.T) {
+	h := newHarness(t, observability.WithContentRecording(true))
+	m := &scriptModel{toolName: "get_weather", toolArgs: `{"city":"北京"}`}
+	ctx, opts := h.obs.Install(context.Background(), agent_v2.WithName("rw"), agent_v2.WithModel(m),
+		agent_v2.WithToolkit(weatherToolkit(sunny)), agent_v2.WithHooks(rewriteHooks{}))
+	if _, err := agent_v2.NewBasicAgent(opts...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("my ssn 123-45-6789, 北京天气")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, c := range h.spansNamed("chat mock-model") {
+		if in := strAttr(t, c, observability.AttrInputMessages); strings.Contains(in, "123-45-6789") {
+			t.Errorf("chat 输入应是业务过滤之后的，got %s", in)
+		}
+	}
+	ts := h.span(t, "execute_tool get_weather")
+	if s := strAttr(t, ts, observability.AttrOutcome); s != "error" {
+		t.Errorf("业务把结果改成失败，工具 span 应记 error，got %s", s)
+	}
+	if s := strAttr(t, ts, observability.AttrErrorType); s != "policy_blocked" {
+		t.Errorf("error.type=%s 应=policy_blocked", s)
+	}
+	if s := strAttr(t, ts, observability.AttrToolCallResult); s != "redacted" {
+		t.Errorf("工具结果应是改写之后的，got %s", s)
 	}
 }
 
@@ -1326,6 +1547,37 @@ func TestNodeEnd_IgnoresSameNameOuterNode(t *testing.T) {
 	h.assertAllEnded(t)
 	if s := strAttr(t, h.span(t, "node x"), observability.AttrOutcome); s != "success" {
 		t.Errorf("外层节点自己的结局应是 success，got %s", s)
+	}
+}
+
+// TestNestedOrchestrations_SpansComplete：真实嵌套编排（Sequential 套 Parallel，分支里各有一轮工具调用）下，每次
+// agent / 编排调用恰好一个 span、全部收尾、在途数归零——重复进入的识别不误伤正常嵌套。
+func TestNestedOrchestrations_SpansComplete(t *testing.T) {
+	h := newHarness(t)
+	ctx := agent_v2.WithCtxOrchHooks(context.Background(), h.obs.OrchHooks())
+	leaf := func(name string) agent_v2.Agent {
+		return agent_v2.NewBasicAgent(agent_v2.WithName(name),
+			agent_v2.WithModel(&scriptModel{toolName: "get_weather", toolArgs: `{"city":"北京"}`}),
+			agent_v2.WithToolkit(weatherToolkit(sunny)), agent_v2.WithHooks(h.obs.AgentHooks()))
+	}
+	par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("par"), agent_v2.WithParallelHooks(h.obs.AgentHooks())).
+		AddBranch("b1", leaf("worker")).AddBranch("b2", leaf("worker"))
+	seq := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("seq"), agent_v2.WithSequentialHooks(h.obs.AgentHooks())).
+		AddStep("first", leaf("planner")).AddStep("fan", par)
+	if _, err := seq.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("go")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	h.assertAllEnded(t)
+	for name, want := range map[string]int{
+		"invoke_workflow seq": 1, "invoke_workflow par": 1, "invoke_agent planner": 1, "invoke_agent worker": 2,
+		"execute_tool get_weather": 3,
+	} {
+		if got := len(h.spansNamed(name)); got != want {
+			t.Errorf("%s span 应有 %d 个，got %d；全部：%v", name, want, got, names(h.spans()))
+		}
+	}
+	if n := sumInt(t, h.collect(t), observability.MetricAgentActive, nil); n != 0 {
+		t.Errorf("在途调用数=%d 应=0", n)
 	}
 }
 

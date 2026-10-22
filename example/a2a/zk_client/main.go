@@ -147,7 +147,7 @@ func main() {
 		sess := agent_v2.NewRunSession()
 		runCtx := compose_v2.WithSessionIDCtx(ctx, sess.RunID)
 		ah := obs.AgentHooks()
-		info := &hook.AgentInfo{Name: "zk_client_host", Type: "base"}
+		info := &hook.AgentInfo{Name: "zk_client_host", Type: "host"} // 手动开的宿主 span，不是 BasicAgent（base 会被当成跑图的 agent）
 		runCtx, _ = ah.OnAgentStart(runCtx, info, &hook.AgentInput{Messages: []*schema.Message{schema.UserMessage(*query)}})
 		endHost := func(out *schema.Message) {
 			var outMsgs []*schema.Message

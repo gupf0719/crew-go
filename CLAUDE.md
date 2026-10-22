@@ -66,7 +66,8 @@
   - **业务自己也有钩子时交给 `obs.AgentHooks(业务钩子…)` / `obs.OrchHooks(业务编排钩子…)` 包在里面，别自己用
     `NewChainHooks` / `NewChainOrchHooks` 串**：链在后面的钩子开始失败（鉴权拒绝、HITL 闸门抛中断）时交回开始之前的
     ctx，框架随后不再调（agent 级）或拿开始之前的 ctx 调（节点 / 图）结束钩子，observability 的 span 永远收不了尾、
-    `crew.agent.active` 永久 +1。包在里面时它当场收尾（`observability/wrap.go`，决策见 observability-callback.md 决策 7）。
+    `crew.agent.active` 永久 +1。包在里面时它当场收尾，另外记的是业务改写之后的值、里面的钩子返回外来 ctx 时把句柄
+    挂回去（`observability/wrap.go`，决策见 observability-callback.md 决策 7）。同一实例装了两层只记一份，句柄按实例区分。
   - agent 建一次、ctx 每请求另备的拓扑（a2a/server）两半各装各的：`WithHooks(obs.AgentHooks())` +
     `agent_v2.WithCtxOrchHooks(ctx, obs.OrchHooks())`。⚠️ 漏装编排那半不报错，节点 span 与框架指标静默缺失；
     框架在首次 `OnAgentEnd` 发现「编排钩子一次没跑过」时 warn 一次（判据是编排钩子自己跑过没有，不是 ctx）。

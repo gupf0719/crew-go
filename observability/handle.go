@@ -47,7 +47,8 @@ type handle struct {
 	category string
 	skill    string // activate_skill 调用激活的 skill
 
-	// node：流式片段统计
+	// node
+	instance   string // 扇出实例身份（crew.node.instance）
 	chunks     atomic.Int64
 	firstNano  atomic.Int64
 	partialBuf *boundedBuffer
@@ -118,32 +119,49 @@ func (s *agentScope) findTool(callID string) *handle {
 	return nil
 }
 
-type handleKey struct{}      // 最内层的句柄
-type agentHandleKey struct{} // 最内层的 agent 句柄
+// handleKey / agentHandleKey 按 Observability 实例区分：同一个 ctx 链上叠了两个实例（不同的 provider、或业务
+// 把一个实例包进另一个）时，各取各的句柄，不会一个把另一个的 span 收掉。
+type handleKey struct{ o *Observability }      // 最内层的句柄
+type agentHandleKey struct{ o *Observability } // 最内层的 agent 句柄
 
-func withHandle(ctx context.Context, h *handle) context.Context {
-	ctx = context.WithValue(ctx, handleKey{}, h)
+func (o *Observability) withHandle(ctx context.Context, h *handle) context.Context {
+	ctx = context.WithValue(ctx, handleKey{o}, h)
 	if h.kind == kindAgent {
-		ctx = context.WithValue(ctx, agentHandleKey{}, h)
+		ctx = context.WithValue(ctx, agentHandleKey{o}, h)
 	}
 	return ctx
 }
 
-func handleFrom(ctx context.Context) *handle {
-	h, _ := ctx.Value(handleKey{}).(*handle)
+func (o *Observability) handleFrom(ctx context.Context) *handle {
+	h, _ := ctx.Value(handleKey{o}).(*handle)
 	return h
 }
 
-func agentHandleFrom(ctx context.Context) *handle {
-	h, _ := ctx.Value(agentHandleKey{}).(*handle)
+func (o *Observability) agentHandleFrom(ctx context.Context) *handle {
+	h, _ := ctx.Value(agentHandleKey{o}).(*handle)
 	return h
 }
 
-func scopeFrom(ctx context.Context) *agentScope {
-	if h := agentHandleFrom(ctx); h != nil {
+func (o *Observability) scopeFrom(ctx context.Context) *agentScope {
+	if h := o.agentHandleFrom(ctx); h != nil {
 		return h.scope
 	}
 	return nil
+}
+
+// keepHandles 在里面的钩子返回的 ctx（to）里没有本层句柄时把它挂回去：钩子返回外来的 ctx（缓存下来的、
+// Background）时，框架采纳它、业务值先查钩子那份——不挂回去的话本层的 span 就丢了（永不结束、在途数多 1），
+// 缓存的 ctx 还会让本次的结束收掉上一次的 span。同时挂回 OTel 的当前 span，下游 span 才挂在本层下面。
+func (o *Observability) keepHandles(from, to context.Context) context.Context {
+	h := o.handleFrom(from)
+	if h == nil || o.handleFrom(to) == h {
+		return to
+	}
+	to = context.WithValue(to, handleKey{o}, h)
+	if ah := o.agentHandleFrom(from); ah != nil {
+		to = context.WithValue(to, agentHandleKey{o}, ah)
+	}
+	return trace.ContextWithSpan(to, trace.SpanFromContext(from))
 }
 
 // result 是一次执行的结局：outcome 进 crew.outcome；errType / errMsg 只在 error / timeout 时有值。

@@ -14,6 +14,9 @@ import (
 	"crew-go/fallback"
 )
 
+// eventSeenKey 标记「这次事件投递本实例已经处理过」（见 OnNodeEvent）。
+type eventSeenKey struct{ o *Observability }
+
 // orchHooks 实现 agent_v2.OrchestrationHooks：图与节点各一个 span，框架事件记成节点 span 上的事件并转成指标。
 type orchHooks struct{ o *Observability }
 
@@ -23,10 +26,17 @@ var _ agent_v2.OrchestrationHooks = (*orchHooks)(nil)
 // invoke_agent / invoke_workflow span，再建一层是同一段时间的重复。直接用 compose_v2.Run 跑图时
 // 图就是唯一的表达。
 func (h *orchHooks) OnGraphStart(ctx context.Context) (context.Context, error) {
-	o := h.o
+	ctx, _ = h.o.startGraph(ctx)
+	return ctx, nil
+}
+
+// startGraph 建工作流 span；没建（外面是同一 ns 的 agent，或同一个 Observability 装了两层、外层已为这张图建过）
+// 时返回 nil 句柄。
+func (o *Observability) startGraph(ctx context.Context) (context.Context, *handle) {
 	o.orchFired.Store(true)
 	graphNS := compose_v2.GetGraphNS(ctx)
-	if cur := handleFrom(ctx); cur != nil && cur.kind == kindAgent && cur.graphNS == graphNS {
+	if cur := o.handleFrom(ctx); cur != nil && cur.graphNS == graphNS && !cur.ended.Load() &&
+		(cur.kind == kindAgent || cur.kind == kindGraph) {
 		return ctx, nil
 	}
 	name := workflowName(graphNS)
@@ -35,7 +45,8 @@ func (h *orchHooks) OnGraphStart(ctx context.Context) (context.Context, error) {
 		attrs = append(attrs, AttrGraphNS.String(graphNS))
 	}
 	ctx, span := o.tracer.Start(ctx, OpInvokeWorkflow+" "+name, trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrs...))
-	return withHandle(ctx, &handle{kind: kindGraph, span: span, start: time.Now(), name: name, graphNS: graphNS, scope: scopeFrom(ctx)}), nil
+	gh := &handle{kind: kindGraph, span: span, start: time.Now(), name: name, graphNS: graphNS, scope: o.scopeFrom(ctx)}
+	return o.withHandle(ctx, gh), gh
 }
 
 // workflowName 是嵌套图的工作流名：ns 最后一段的节点 ID，不带扇出实例号（#N）与重访序号（@N）——实例号
@@ -54,7 +65,7 @@ func workflowName(graphNS string) string {
 
 func (h *orchHooks) OnGraphEnd(ctx context.Context, err error) context.Context {
 	o := h.o
-	gh := handleFrom(ctx)
+	gh := o.handleFrom(ctx)
 	if gh == nil || gh.kind != kindGraph || gh.graphNS != compose_v2.GetGraphNS(ctx) {
 		return ctx
 	}
@@ -72,13 +83,23 @@ func (h *orchHooks) OnGraphEnd(ctx context.Context, err error) context.Context {
 // OnNodeStart 建节点 span。节点声明了组件类型（compose_v2.WithNodeComponent）时按 GenAI 约定的操作名标：
 // retrieval / embedding 分别是 retrieval / embeddings 操作，guardrail 只标 crew.node.component。
 func (h *orchHooks) OnNodeStart(ctx context.Context, nodeID string) (context.Context, error) {
-	o := h.o
+	ctx, _ = h.o.startNode(ctx, nodeID)
+	return ctx, nil
+}
+
+// startNode 建节点 span；同一个 Observability 装了两层、外层已为这次节点执行建过时返回 nil 句柄。
+func (o *Observability) startNode(ctx context.Context, nodeID string) (context.Context, *handle) {
 	graphNS := compose_v2.GetGraphNS(ctx)
+	inst := compose_v2.GetCurrentInstanceID(ctx)
+	if cur := o.handleFrom(ctx); cur != nil && cur.kind == kindNode && !cur.ended.Load() &&
+		cur.name == nodeID && cur.graphNS == graphNS && cur.instance == inst {
+		return ctx, nil
+	}
 	attrs := []attribute.KeyValue{AttrNodeID.String(nodeID)}
 	if graphNS != "" {
 		attrs = append(attrs, AttrGraphNS.String(graphNS))
 	}
-	if inst := compose_v2.GetCurrentInstanceID(ctx); inst != "" {
+	if inst != "" {
 		attrs = append(attrs, AttrNodeInstance.String(inst))
 	}
 	spanName := "node " + nodeID
@@ -94,17 +115,17 @@ func (h *orchHooks) OnNodeStart(ctx context.Context, nodeID string) (context.Con
 		spanName = "guardrail " + nodeID
 	}
 	ctx, span := o.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrs...))
-	nh := &handle{kind: kindNode, span: span, start: time.Now(), name: nodeID, graphNS: graphNS, scope: scopeFrom(ctx)}
+	nh := &handle{kind: kindNode, span: span, start: time.Now(), name: nodeID, graphNS: graphNS, instance: inst, scope: o.scopeFrom(ctx)}
 	if o.recordContent {
 		nh.partialBuf = &boundedBuffer{max: o.maxContent}
 	}
 	o.inst.nodeExecutions.Add(ctx, 1, metric.WithAttributes(AttrNodeID.String(nodeID)))
-	return withHandle(ctx, nh), nil
+	return o.withHandle(ctx, nh), nh
 }
 
 func (h *orchHooks) OnNodeEnd(ctx context.Context, nodeID string, err error) context.Context {
 	o := h.o
-	nh := handleFrom(ctx)
+	nh := o.handleFrom(ctx)
 	// 只收本次执行自己的句柄：开始钩子失败时框架拿开始之前的 ctx 调结束钩子，那里最内层的句柄可能是外层的
 	// 同名节点，靠 ns 区分。
 	if nh == nil || nh.kind != kindNode || nh.name != nodeID || nh.graphNS != compose_v2.GetGraphNS(ctx) {
@@ -132,7 +153,14 @@ func (h *orchHooks) OnNodeEnd(ctx context.Context, nodeID string, err error) con
 // 只计数、记首片时间。
 func (h *orchHooks) OnNodeEvent(ctx context.Context, nodeID string, ev agent_v2.Event) context.Context {
 	o := h.o
-	cur := handleFrom(ctx)
+	// 同一个 Observability 装了两层时，同一次投递会被两层各交一次：第一层处理完在返回的 ctx 上留个记号，
+	// 链里往下传到第二层时认出来跳过——不然片段计数、事件、框架指标都翻倍。框架不采纳 OnNodeEvent 的返回值，
+	// 记号留不到下一次投递。
+	if ctx.Value(eventSeenKey{o}) != nil {
+		return ctx
+	}
+	ctx = context.WithValue(ctx, eventSeenKey{o}, true)
+	cur := o.handleFrom(ctx)
 	if ev.Type == "chunk" {
 		if cur != nil && cur.kind == kindNode {
 			cur.chunks.Add(1)

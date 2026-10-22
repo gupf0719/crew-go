@@ -177,6 +177,13 @@ observability 按这个错误当场收掉刚开的 span（中断记 blocked 并�
 `Install` 把 opts 里已配的 `WithHooks`、ctx 上已有的编排钩子包进来。结束钩子另外核对句柄归属（agent 按名字与 ns、节点按
 节点 ID 与 ns），框架拿开始之前的 ctx 调结束钩子时不会误收外层的同名 span。
 
+第二轮审计后补的三点（都是「observability 在最外层」才做得到的）：
+- **记改写之后的值**：开始一侧先开 span、等里面的钩子跑完再记输入内容 / 工具名与参数；结束一侧里面的钩子先跑——业务在
+  [消费] 字段上做的 PII 过滤、结果改判，span 里看到的是改写之后的（原先 observability 先跑，记的是原文）。
+- **外来 ctx**：里面的钩子返回缓存的 / `Background` 的 ctx 时把句柄与当前 span 挂回去（框架采纳外来 ctx 时业务值先查钩子那份）。
+- **装两层**：句柄的 ctx key 按 Observability 实例区分，同一实例在同一次调用里再进来时认出是重复、不开第二个 span，同一次
+  事件投递只处理一次（框架不采纳 OnNodeEvent 的返回值，记号留在链内传给下一层）。
+
 ### 为什么不改链 / 框架
 「start 失败时逆序收尾已成功的前缀」本是更通用的修法（`ChainHooks.OnModelEndStream` 已经这么关已包过的流），但 agent 级要把
 结束错误交给前缀钩子（那个 ctx key 在 agent_v2，hook 包够不着），节点 / 图级又跟「开始报错时结束照样调」的既有约定冲突（前缀

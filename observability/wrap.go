@@ -10,14 +10,20 @@ import (
 )
 
 // 包装层：AgentHooks(inner...) / OrchHooks(inner...) 把业务钩子包在 observability 里面。跟自己用
-// hook.NewChainHooks / agent_v2.NewChainOrchHooks 把 observability 排在第一位串起来相比，只差在开始一侧失败时：
-// 里面的钩子开始失败（报错或抛中断）时，observability 当场收掉它刚开的 span。
+// hook.NewChainHooks / agent_v2.NewChainOrchHooks 把 observability 跟别的钩子串起来相比，差在三处：
 //
-// 链本身做不到这一点：链在后面的钩子失败时交回开始之前的 ctx，框架随后要么不再调结束钩子（agent 级），要么
-// 拿开始之前的 ctx 调（节点 / 图）——两种情况下 observability 都取不到自己的句柄，span 永远不结束（不会被导出），
-// crew.agent.active 也永久多 1。这正是鉴权 / 限额钩子拒绝一次调用、HITL 闸门在节点前抛中断时会走的路。
+//   - 开始一侧失败：里面的钩子开始失败（报错或抛中断）时，observability 当场收掉它刚开的 span。链做不到——链在
+//     后面的钩子失败时交回开始之前的 ctx，框架随后要么不再调结束钩子（agent 级），要么拿开始之前的 ctx 调
+//     （节点 / 图），observability 都取不到自己的句柄：span 永远不结束（不会被导出），crew.agent.active 永久多 1。
+//     鉴权 / 限额钩子拒绝一次调用、HITL 闸门在节点前抛中断，走的都是这条路。
+//   - 外来 ctx：里面的钩子返回外来的 ctx（缓存的、Background）时，把本层的句柄与 span 挂回去（keepHandles）。
+//   - 改写之后的值：开始一侧先开 span（父子关系要它），依赖入参内容的属性等里面的钩子跑完再记；结束一侧里面的
+//     钩子先跑、observability 后记。业务钩子可以改写 [消费] 字段（输入消息、工具名与参数、模型输出、工具结果），
+//     span 记的是改写之后、真正交下去 / 被框架用上的那份——业务在钩子里做的 PII 过滤，span 里也是过滤后的。
+//     里面的结束钩子报错时 observability 不在这里收尾：框架随后报 model_end_error / tool_end_error，OnError 以
+//     失败收尾。
 
-// wrappedHooks 是 AgentHooks(inner...) 的返回值。结束一侧与 OnError 跟链一样按顺序调：observability 先、inner 后。
+// wrappedHooks 是 AgentHooks(inner...) 的返回值。
 type wrappedHooks struct {
 	obs   *agentHooks
 	inner hook.Hooks
@@ -26,29 +32,36 @@ type wrappedHooks struct {
 var _ hook.Hooks = (*wrappedHooks)(nil)
 
 func (w *wrappedHooks) OnAgentStart(ctx context.Context, info *hook.AgentInfo, in *hook.AgentInput) (context.Context, error) {
-	ctx1, _ := w.obs.OnAgentStart(ctx, info, in)
+	o := w.obs.o
+	ctx1, ah := o.startAgent(ctx, info)
 	ctx2, err := w.inner.OnAgentStart(ctx1, info, in)
 	if err != nil {
 		// 框架对开始失败的 agent 不再调 OnAgentEnd：按这个错误当场收尾（中断记 blocked 并留挂起记录）。
-		w.obs.OnAgentEnd(agent_v2.WithEndError(ctx1, err), info, &hook.AgentOutput{})
+		if ah != nil {
+			o.endAgent(agent_v2.WithEndError(ctx1, err), info, &hook.AgentOutput{})
+		}
 		return ctx, err
 	}
-	return ctx2, nil
+	o.agentStartContent(ctx1, ah, in)
+	return o.keepHandles(ctx1, ctx2), nil
 }
 
 func (w *wrappedHooks) OnAgentEnd(ctx context.Context, info *hook.AgentInfo, out *hook.AgentOutput) context.Context {
-	ctx = w.obs.OnAgentEnd(ctx, info, out)
-	return w.inner.OnAgentEnd(ctx, info, out)
+	ret := w.inner.OnAgentEnd(ctx, info, out)
+	w.obs.o.endAgent(ctx, info, out)
+	return ret
 }
 
 func (w *wrappedHooks) OnModelStart(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
-	ctx1, _ := w.obs.OnModelStart(ctx, info, in)
+	o := w.obs.o
+	ctx1, mh := o.startModel(ctx, info, in)
 	ctx2, err := w.inner.OnModelStart(ctx1, info, in)
 	if err != nil {
-		w.obs.o.abortLeaf(ctx1, err, "model_start_error")
+		o.abortLeaf(ctx1, mh, err, "model_start_error")
 		return ctx, err
 	}
-	return ctx2, nil
+	o.modelStartContent(mh, in)
+	return o.keepHandles(ctx1, ctx2), nil
 }
 
 func (w *wrappedHooks) OnModelEndStream(ctx context.Context, info *hook.AgentInfo, sr specModel.MessageStreamReader) (context.Context, specModel.MessageStreamReader, error) {
@@ -61,35 +74,37 @@ func (w *wrappedHooks) OnModelEndStream(ctx context.Context, info *hook.AgentInf
 		}
 		return ctx, nil, err
 	}
-	return ctx2, sr2, nil
+	return w.obs.o.keepHandles(ctx1, ctx2), sr2, nil
 }
 
 func (w *wrappedHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
-	ctx1, _ := w.obs.OnModelEnd(ctx, info, out)
-	ctx2, err := w.inner.OnModelEnd(ctx1, info, out)
+	ret, err := w.inner.OnModelEnd(ctx, info, out)
 	if err != nil {
 		return ctx, err
 	}
-	return ctx2, nil
+	_, _ = w.obs.OnModelEnd(ctx, info, out)
+	return ret, nil
 }
 
 func (w *wrappedHooks) OnToolStart(ctx context.Context, info *hook.AgentInfo, in *schema.ToolInput) (context.Context, error) {
-	ctx1, _ := w.obs.OnToolStart(ctx, info, in)
+	o := w.obs.o
+	ctx1, th := o.startTool(ctx, info, in)
 	ctx2, err := w.inner.OnToolStart(ctx1, info, in)
 	if err != nil {
-		w.obs.o.abortLeaf(ctx1, err, "tool_start_error")
+		o.abortLeaf(ctx1, th, err, "tool_start_error")
 		return ctx, err
 	}
-	return ctx2, nil
+	o.toolStartContent(th, in)
+	return o.keepHandles(ctx1, ctx2), nil
 }
 
 func (w *wrappedHooks) OnToolEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ToolOutput) (context.Context, error) {
-	ctx1, _ := w.obs.OnToolEnd(ctx, info, out)
-	ctx2, err := w.inner.OnToolEnd(ctx1, info, out)
+	ret, err := w.inner.OnToolEnd(ctx, info, out)
 	if err != nil {
 		return ctx, err
 	}
-	return ctx2, nil
+	_, _ = w.obs.OnToolEnd(ctx, info, out)
+	return ret, nil
 }
 
 func (w *wrappedHooks) OnError(ctx context.Context, info *hook.AgentInfo, err *schema.CommError) context.Context {
@@ -106,34 +121,42 @@ type wrappedOrchHooks struct {
 var _ agent_v2.OrchestrationHooks = (*wrappedOrchHooks)(nil)
 
 func (w *wrappedOrchHooks) OnGraphStart(ctx context.Context) (context.Context, error) {
-	ctx1, _ := w.obs.OnGraphStart(ctx)
+	o := w.obs.o
+	ctx1, gh := o.startGraph(ctx)
 	ctx2, err := w.inner.OnGraphStart(ctx1)
 	if err != nil {
 		// 框架随后用开始之前的 ctx 调 OnGraphEnd，那里取不到这个 span：当场收尾。
-		w.obs.OnGraphEnd(ctx1, err)
+		if gh != nil {
+			w.obs.OnGraphEnd(ctx1, err)
+		}
 		return ctx, err
 	}
-	return ctx2, nil
+	return o.keepHandles(ctx1, ctx2), nil
 }
 
 func (w *wrappedOrchHooks) OnGraphEnd(ctx context.Context, err error) context.Context {
-	ctx = w.obs.OnGraphEnd(ctx, err)
-	return w.inner.OnGraphEnd(ctx, err)
+	ret := w.inner.OnGraphEnd(ctx, err)
+	w.obs.OnGraphEnd(ctx, err)
+	return ret
 }
 
 func (w *wrappedOrchHooks) OnNodeStart(ctx context.Context, nodeID string) (context.Context, error) {
-	ctx1, _ := w.obs.OnNodeStart(ctx, nodeID)
+	o := w.obs.o
+	ctx1, nh := o.startNode(ctx, nodeID)
 	ctx2, err := w.inner.OnNodeStart(ctx1, nodeID)
 	if err != nil {
-		w.obs.OnNodeEnd(ctx1, nodeID, err)
+		if nh != nil {
+			w.obs.OnNodeEnd(ctx1, nodeID, err)
+		}
 		return ctx, err
 	}
-	return ctx2, nil
+	return o.keepHandles(ctx1, ctx2), nil
 }
 
 func (w *wrappedOrchHooks) OnNodeEnd(ctx context.Context, nodeID string, err error) context.Context {
-	ctx = w.obs.OnNodeEnd(ctx, nodeID, err)
-	return w.inner.OnNodeEnd(ctx, nodeID, err)
+	ret := w.inner.OnNodeEnd(ctx, nodeID, err)
+	w.obs.OnNodeEnd(ctx, nodeID, err)
+	return ret
 }
 
 func (w *wrappedOrchHooks) OnNodeEvent(ctx context.Context, nodeID string, ev agent_v2.Event) context.Context {
@@ -142,10 +165,9 @@ func (w *wrappedOrchHooks) OnNodeEvent(ctx context.Context, nodeID string, ev ag
 }
 
 // abortLeaf 收尾一个没开始成的模型 / 工具调用（里面的钩子在开始一侧拒绝了它）：span 按这个错误结束（中断记
-// blocked），不记时长样本——调用没有发生——并把 agent 下的调用计数退回去。
-func (o *Observability) abortLeaf(ctx context.Context, err error, code string) {
-	h := handleFrom(ctx)
-	if h == nil || (h.kind != kindModel && h.kind != kindTool) {
+// blocked），不记时长样本——调用没有发生——并把 agent 下的调用计数退回去。h 为 nil（本层没开 span）时什么也不做。
+func (o *Observability) abortLeaf(ctx context.Context, h *handle, err error, code string) {
+	if h == nil {
 		return
 	}
 	h.scope.remove(h)

@@ -129,6 +129,14 @@ func (m *tracked) Stream(ctx context.Context, msgs []*schema.Message, opts ...mo
 	return sr, nil
 }
 
+// ModelName 转发里面那个客户端的模型名（满足 model.ModelNamer）。
+func (m *tracked) ModelName() string {
+	if n, ok := m.inner.(model.ModelNamer); ok {
+		return n.ModelName()
+	}
+	return m.name
+}
+
 func (m *tracked) WithTools(tools []*schema.ToolInfo) (model.ChatModel, error) {
 	bound, err := m.inner.WithTools(tools)
 	if err != nil {

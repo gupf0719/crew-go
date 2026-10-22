@@ -280,6 +280,9 @@ func WithEffortOption(e Effort) model.Option {
 	return model.WithExtraBody(map[string]any{"output_config": map[string]any{"effort": string(e)}})
 }
 
+// ModelName 返回构造时配的模型名（满足 model.ModelNamer；按次的 model.WithModel 覆盖它）。
+func (c *Client) ModelName() string { return c.model }
+
 // WithTools 返回绑定了 tools 的新 Client（原 Client 不变）。
 func (c *Client) WithTools(tools []*schema.ToolInfo) (model.ChatModel, error) {
 	cp := *c

@@ -481,6 +481,26 @@ func isNilModel(m model.ChatModel) bool {
 	}
 }
 
+// ModelName 返回这次调用起手请求的那个候选的模型名（满足 model.ModelNamer）：断路器没跳开的第一个候选，全都跳开时
+// 是第一个候选。中途切到别的候选时，实际回答的模型看响应里的模型名（gen_ai.response.model）与 failover 事件。
+// 候选没实现 model.ModelNamer 时返回空串。断路器状态只读，不影响放行决策。
+func (f *FallbackChatModel) ModelName() string {
+	if f == nil || len(f.members) == 0 {
+		return ""
+	}
+	pick := f.members[0]
+	for _, mem := range f.members {
+		if !mem.breaker.Tripped() {
+			pick = mem
+			break
+		}
+	}
+	if n, ok := pick.model.(model.ModelNamer); ok {
+		return n.ModelName()
+	}
+	return ""
+}
+
 // StructuredCapability 让 FallbackChatModel 满足 `model.StructuredCapable`——
 // 返回**所有成员能力的交集**。
 //

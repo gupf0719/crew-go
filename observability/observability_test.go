@@ -380,6 +380,36 @@ func TestSpanTree_ReActRun(t *testing.T) {
 	}
 }
 
+// aliasModel 报请求用的模型别名（mock-alias），响应里带回的是具体版本（scriptModel 写的 mock-model）。
+type aliasModel struct{ *scriptModel }
+
+func (aliasModel) ModelName() string { return "mock-alias" }
+
+// TestRequestModel_FromClient：客户端报了模型名时，chat span 按请求模型命名、记 gen_ai.request.model，响应模型另记；
+// 推理与 agent 指标都带请求模型维度。
+func TestRequestModel_FromClient(t *testing.T) {
+	h := newHarness(t)
+	ctx, opts := h.obs.Install(context.Background(), agent_v2.WithName("req"), agent_v2.WithModel(aliasModel{&scriptModel{}}))
+	if _, err := agent_v2.NewBasicAgent(opts...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("hi")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	chat := h.span(t, "chat mock-alias")
+	if s := strAttr(t, chat, observability.AttrRequestModel); s != "mock-alias" {
+		t.Errorf("gen_ai.request.model=%s 应=mock-alias", s)
+	}
+	if s := strAttr(t, chat, observability.AttrResponseModel); s != "mock-model" {
+		t.Errorf("gen_ai.response.model=%s 应=mock-model", s)
+	}
+	rm := h.collect(t)
+	if n := histCount(t, rm, observability.MetricInferenceDuration, map[string]string{
+		"gen_ai.request.model": "mock-alias", "gen_ai.response.model": "mock-model"}); n != 1 {
+		t.Errorf("推理时长应带请求与响应两个模型维度，got %d", n)
+	}
+	if n := histCount(t, rm, observability.MetricInvokeAgentDuration, map[string]string{"gen_ai.request.model": "mock-alias"}); n != 1 {
+		t.Errorf("agent 时长应带请求模型维度，got %d", n)
+	}
+}
+
 // TestMetrics_ReActRun：同一次 ReAct 产出 GenAI 约定的推理 / token / 工具 / agent 指标与 crew.* 指标。
 func TestMetrics_ReActRun(t *testing.T) {
 	h := newHarness(t)

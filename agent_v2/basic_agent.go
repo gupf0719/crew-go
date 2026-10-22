@@ -2185,6 +2185,10 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	if a.config.Hooks != nil {
 		bld = bld.WithAgentHooks(a.config.Hooks)
 	}
+	// 交给 OnModelStart 的请求配置：跟 modelFn 发请求用的同一个模型（按次 WithRunModel 覆盖构造期的）与同一组按次选项。
+	bld = bld.WithModelConfig(func(ctx context.Context) *schema.ModelConfig {
+		return model.RequestConfig(resolveModel(ctx, a.config.Model), resolveModelOpts(ctx)...)
+	})
 	g, err := bld.Compile()
 	return g, dispatchToolkit, err
 }

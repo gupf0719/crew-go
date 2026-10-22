@@ -116,8 +116,10 @@ instrumentation scope 名是 `crew-go/observability`（`observability.ScopeName`
 | `invoke_agent {远端 agent 名}` | CLIENT | `a2a.RemoteAgent`（配了 `a2a.WithObservability`） | `invoke_agent` |
 | `a2a.server {操作}` | SERVER | `a2a/server` executor（配了 `server.WithExecutorObservability`） | 无 |
 
-- `chat` span 的模型名取请求模型（`ModelInput.Config.ModelName`）。框架目前不填这个字段，所以实际是结束时
-  改名成 `chat {响应模型}`；响应里也没有模型名时就叫 `chat`。
+- `chat` span 的模型名取请求模型（`ModelInput.Config.ModelName`）。BasicAgent 每次调模型前用 `model.RequestConfig`
+  填它：按次的 `model.WithModel` 覆盖优先，没有时取模型客户端实现的 `model.ModelNamer`（openai 兼容客户端——含 qwen /
+  deepseek——、anthropic 客户端、`fallback` 都实现了；fallback 报起手请求的那个候选）。客户端不报模型名时（业务自研
+  的 `ChatModel` 没实现 `ModelNamer`），结束时改名成 `chat {响应模型}`，响应里也没有模型名时就叫 `chat`。
 - `OnGraphStart` 建的工作流 span 名取 ns 最后一段的节点 ID，**不带**扇出实例号（`#N`）与重访序号（`@N`）——
   实例号每次投递都新铸，带上的话 span 名与 `gen_ai.workflow.name` 指标维度的取值没有上限。完整 ns 记在
   `crew.graph.ns`；顶层图叫 `root`。
@@ -273,8 +275,8 @@ trace。
   `model/anthropic` 报。
 - `gen_ai.token.modality`：供应商只给总数。输入里全是文本时记 `text`；有图片 / 音频 / 文件块时分不出各模态
   各占多少，按约定记 `unknown`。输出同理。cache_read / cache_write 跟输入那一侧、reasoning 跟输出那一侧。
-- `gen_ai.request.model` 只填调用方请求的模型；请求时不知道就不填，不拿响应里的模型名去顶（两者可以不同，
-  比如别名解析到具体版本）。
+- `gen_ai.request.model` 只填调用方请求的模型（来源同上）；客户端不报模型名时不填，不拿响应里的模型名去顶（两者
+  可以不同，比如别名解析到具体版本）。
 
 ### 3.2 框架指标 `crew.*`
 

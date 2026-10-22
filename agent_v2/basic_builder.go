@@ -200,6 +200,8 @@ type BasicAgentBuilder struct {
 	postamble BasicAgentPostambleFn // ISSUE-75 修：可选 postamble 节点（graph 末段收尾，如 store.Put）
 	maxRounds int
 	hooks     hook.Hooks // 业务级 hook（OnAgentStart/End + OnModelStart/End + OnToolStart/End + OnError）
+	// modelConfig 算这次模型调用的请求配置（模型名与按次参数），交给 OnModelStart 的 ModelInput.Config；nil 时不填。
+	modelConfig func(ctx context.Context) *schema.ModelConfig
 }
 
 // ReturnDirectAnnotation 是 tool result message 上的 marker——某工具声明"调用后立即
@@ -606,6 +608,14 @@ func (b *BasicAgentBuilder) WithAgentHooks(h hook.Hooks) *BasicAgentBuilder {
 	return b
 }
 
+// WithModelConfig 设算请求配置的函数：每次模型调用前调它，结果放进交给 OnModelStart 的 ModelInput.Config（本次
+// 请求的模型名、温度等，观测层据此记 gen_ai.request.model 与请求参数）。它是 [只读] 视图：框架发请求不读它，钩子
+// 改了不影响调用。BasicAgent 用 model.RequestConfig 按「按次的 model.WithModel 覆盖 > 客户端的 model.ModelNamer」算。
+func (b *BasicAgentBuilder) WithModelConfig(fn func(ctx context.Context) *schema.ModelConfig) *BasicAgentBuilder {
+	b.modelConfig = fn
+	return b
+}
+
 // Compile 编译为 compose_v2.Graph。
 func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	if b.model == nil {
@@ -619,6 +629,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	model := b.model
 	tools := b.tools
 	hooks := b.hooks
+	modelConfig := b.modelConfig
 	// nil 防护: 业务自定义 hook pointer receiver + 传 nil pointer 时 hooks 是 typed nil
 	// (interface 持非 nil type tag), `hooks == nil` 返 false 漏 fail-fast → 下游
 	// hooks.OnModel* / OnTool* / OnError 调用 nil deref panic
@@ -681,6 +692,9 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		sysPre, _ := compose_v2.Get(chs, basicSysPreambleCh)
 
 		modelIn := &schema.ModelInput{Preamble: sysPre, Messages: msgs}
+		if modelConfig != nil {
+			modelIn.Config = modelConfig(ctx)
+		}
 		// 按 compose_v2.CallHook 的规则采纳：钩子返回别处缓存的 ctx 时，模型的答复照样记进
 		// 这次 Run 的会话历史、之后的转交照样交给这次执行（曾经直接换成钩子的，两样都静默丢，实测）。
 		//

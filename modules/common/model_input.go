@@ -27,8 +27,11 @@ type ModelInput struct {
 	// 以及本次调用里累积的模型产出与工具结果。
 	//
 	// ⚠️ 它**不是**最终发给模型的那一份——四层压缩在 `OnModelStart` **之后**才跑。
-	Messages []*Message     `json:"messages"`
-	Tools    []*ToolInfo    `json:"tools"`
-	Config   *ModelConfig   `json:"config"`
-	Extra    map[string]any `json:"extra"`
+	Messages []*Message  `json:"messages"`
+	Tools    []*ToolInfo `json:"tools"`
+	// Config 是本次请求的模型名与按次参数（温度、max_tokens、top_p），给钩子看：BasicAgent 用 model.RequestConfig
+	// 算——模型名取按次的 model.WithModel 覆盖，没有时取客户端实现的 model.ModelNamer。**[只读] 档**：发请求不读它，
+	// 改了不影响调用。客户端构造时配的默认参数不在内；什么都不知道时为 nil。
+	Config *ModelConfig   `json:"config"`
+	Extra  map[string]any `json:"extra"`
 }

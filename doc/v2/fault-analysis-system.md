@@ -469,7 +469,7 @@ if ie, ok := agent_v2.IsInterrupt(err); ok {
 > 下方是在 §5.1 的 `orch` 构造上**追加** `WithPlanHooks` 接观测——**同一个 PlanAgent，非新建**。
 
 ```go
-obs, err := observability.New(cfg)   // 注意：返 (*Observability, error)
+obs := observability.New()   // 注意：单返回值，SDK（导出器/采样/Resource）由应用自己装配
 if err != nil { /* 处理 */ }
 
 ctx = compose_v2.WithSessionIDCtx(ctx, sess.RunID)
@@ -677,7 +677,7 @@ tool.ReturnDirectMetaKey  // 工具短路 ReAct 循环
 compose_v2.WithCheckpointerCtx(ctx, cp) / compose_v2.WithSessionIDCtx(ctx, sid) / compose_v2.InterruptError
 schema.SystemMessage/UserMessage/AssistantMessage(content) *Message
 
-observability.New(cfg Config) (*Observability, error)   // 返两值
+observability.New(opts ...Option) *Observability   // 单返回值
 obs.AgentHooks() hook.Hooks;  obs.OrchHooks() agent_v2.OrchestrationHooks;  obs.CleanupSession(sid)
 agent_v2.WithCtxOrchHooks(ctx, h) context.Context
 store.FromContext(ctx) store.Store            // 单返回值；未注入返 nil

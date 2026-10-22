@@ -324,10 +324,26 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	// ⚠️ 用 resolveMaxRounds 不用 `cfg.maxRounds`——后者是 **per-call 覆盖值**，没传时是 0。
 	// 判据是 `lastRound > maxRounds`：model 节点每轮访问一次，maxVisit = maxRounds+1，
 	// 所以「跑满」意味着访问了 maxRounds+1 次。模型自己提前答完的运行到不了这个数。
-	if mr := resolveMaxRounds(ctx, a.config.MaxRounds); err == nil && mr > 0 && int(lastRound) > mr {
-		err = fmt.Errorf("basic agent %q: 轮次预算耗尽，最后一轮关掉了工具调用（tool_choice=none；配了结构化输出时只留 final_output）逼模型收尾"+
-			"（答复在 events 里，用 FinalMessage 取）: %w",
-			a.config.Name, &compose_v2.MaxIterationsError{Iterations: int(lastRound)})
+	//
+	// ⚠️ 两条路都要报，而且**文案不同**——曾经只判 `err == nil`，于是下面那条路上报的是裸引擎消息
+	// （`node "model" visited 4 times (max 3)`），一个字没提软降落，排查方向指不出去（审计实测）。
+	if mr := resolveMaxRounds(ctx, a.config.MaxRounds); mr > 0 && int(lastRound) > mr {
+		var mie *compose_v2.MaxIterationsError
+		switch {
+		case err == nil:
+			// 软降落奏效了：模型在那一轮产出了文本（答复在 events 里），只是预算确实耗尽了。
+			err = fmt.Errorf("basic agent %q: 轮次预算耗尽，最后一轮关掉了工具调用（tool_choice=none；配了结构化输出时只留 final_output）逼模型收尾"+
+				"（答复在 events 里，用 FinalMessage 取）: %w",
+				a.config.Name, &compose_v2.MaxIterationsError{Iterations: int(lastRound)})
+		case errors.As(err, &mie):
+			// 引擎以 maxVisit 收尾：软降落轮模型**仍硬调了工具**（provider 不强制执行 tool_choice=none，
+			// 或业务自己的 ChatModel 不认它），整批被拦成失败结果（round_budget_exhausted）⟹ 条件边判
+			// 「末条有 tool_call」回 model 节点 ⟹ 撞 maxVisit。这条路上 postamble 没跑完，
+			// **FinalMessage 可能是 nil**——所以文案不能照抄上面那句「答复在 events 里」。
+			err = fmt.Errorf("basic agent %q: 轮次预算耗尽，软降落轮（tool_choice=none）模型仍硬调了工具、"+
+				"这一批没有执行（round_budget_exhausted），因此没能收尾——provider 或业务的 ChatModel 不强制执行 none 时会这样，"+
+				"此时 FinalMessage 可能为 nil: %w", a.config.Name, err)
+		}
 	}
 	if err != nil {
 		// finalMessagesRef 让 OnAgentEnd 看到尽可能完整的 messages
@@ -478,11 +494,20 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	//
 	// `basicRoundCh` 随 cp 走 ⟹ round 跨 Resume **接着数**，预算是会话总额不是 per-Run，
 	// 所以判据在这条路上同样成立（实测 lastRound=4 > maxRounds=3）。
-	if mr := resolveMaxRounds(ctx, a.config.MaxRounds); runErr == nil && mr > 0 &&
-		int(info.Round) > mr {
-		runErr = fmt.Errorf("basic agent %q: 轮次预算耗尽，最后一轮关掉了工具调用（tool_choice=none；配了结构化输出时只留 final_output）逼模型收尾"+
-			"（答复在 events 里，用 FinalMessage 取）: %w",
-			a.config.Name, &compose_v2.MaxIterationsError{Iterations: int(info.Round)})
+	if mr := resolveMaxRounds(ctx, a.config.MaxRounds); mr > 0 && int(info.Round) > mr {
+		var mie *compose_v2.MaxIterationsError
+		switch {
+		case runErr == nil:
+			runErr = fmt.Errorf("basic agent %q: 轮次预算耗尽，最后一轮关掉了工具调用（tool_choice=none；配了结构化输出时只留 final_output）逼模型收尾"+
+				"（答复在 events 里，用 FinalMessage 取）: %w",
+				a.config.Name, &compose_v2.MaxIterationsError{Iterations: int(info.Round)})
+		case errors.As(runErr, &mie):
+			// 软降落轮模型硬调工具、整批被拦，续跑时撞的是 model 节点开头「一个预算至多一个软降落轮」那道闸
+			// （顶层 Run 上撞的是引擎 maxVisit）。文案与 Run 那处同款，理由见那里。
+			runErr = fmt.Errorf("basic agent %q: 轮次预算耗尽，软降落轮（tool_choice=none）模型仍硬调了工具、"+
+				"这一批没有执行（round_budget_exhausted），因此没能收尾——provider 或业务的 ChatModel 不强制执行 none 时会这样，"+
+				"此时 FinalMessage 可能为 nil: %w", a.config.Name, runErr)
+		}
 	}
 
 	if runErr != nil {

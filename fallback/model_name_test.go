@@ -78,3 +78,33 @@ func TestFallback_ModelName_HalfOpenProbe(t *testing.T) {
 		t.Errorf("ModelName 不该占掉探测名额，再问一次仍应报 qwen-max，got %q", got)
 	}
 }
+
+// TestFallback_ModelName_AllGatesClosed：**所有候选的门都关着**时，报的是「等完之后真正起手请求的那个」
+// ——推迟中最早能再请求的候选，不是排序最靠前的。
+//
+// ⚠️ 这条钉的是 ModelName 复用 nextMember（选法只有一份）而不是自己写一遍。自己写的那一版漏掉了选法里
+// 「都要等时等最早能再请求的那个」这一档：首选 Retry-After=30m、备选 2m 时它报首选，而 tryMembers 睡完
+// 2 分钟之后起手请求的是备选。实测过：把 startIndex 换回「按顺序找第一个门开着且断路器放行的、都不满足
+// 时取 members[0]」，这条红、另外三条 ModelName 用例照样全绿。
+//
+// fixture 说明：Retry-After 必须超过 memberRetryAfterLimit（60 秒）才会设门推迟，所以用 30m / 2m；ctx 给
+// 一个很短的 deadline 让 tryMembers 不真睡那 2 分钟（它会以 ctx 错返回，而两个门已经设上了——门是跨调用的
+// 持久状态，正是下一次调用起手时要看的东西）。
+func TestFallback_ModelName_AllGatesClosed(t *testing.T) {
+	primary := &namedStub{stubModel: &stubModel{name: "p", respond: func(int, []*schema.Message) (*schema.Message, error) {
+		return nil, &model.APIError{Provider: "test", StatusCode: 429, RetryAfter: 30 * time.Minute}
+	}}, model: "qwen-max"}
+	backup := &namedStub{stubModel: &stubModel{name: "b", respond: func(int, []*schema.Message) (*schema.Message, error) {
+		return nil, &model.APIError{Provider: "test", StatusCode: 429, RetryAfter: 2 * time.Minute}
+	}}, model: "qwen-plus"}
+	fb := fallback.New([]model.ChatModel{primary, backup})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := fb.Generate(ctx, []*schema.Message{schema.UserMessage("hi")}); err == nil {
+		t.Fatal("fixture 没搭对：两个候选都让等很久，这次调用应该失败")
+	}
+	if got := fb.ModelName(); got != "qwen-plus" {
+		t.Errorf("两个门都关着时，起手请求的是最早能再请求的备选（2m < 30m），应报 qwen-plus，got %q", got)
+	}
+}

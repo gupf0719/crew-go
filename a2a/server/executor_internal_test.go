@@ -34,6 +34,10 @@ import (
 
 	a2atypes "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 // reAskGateModel：round1 → ask_user("Q1")；resume 轮（见 tool_result）→ 发 hit 信号、阻塞 gate
@@ -183,35 +187,28 @@ func TestCancelDuringResume_NoOrphanCp(t *testing.T) {
 	}
 }
 
-// TestIdleCancel_CleansSession 验 R33 cross-verify MEDIUM 修复：input-required 后客户端
-// idle-Cancel（不续发，走 Cancel 的 !busy 分支）时 executor 接管清 session——conclude 的
-// CleanupSession 只覆盖续发收尾路径，idle-Cancel 不经 conclude，不清则 idle-Cancelled HITL
-// task 的 session 永久泄漏（unbounded），且矛盾 package doc 把 Cancel 列为 stuck pending
-// 的释放路径。sanity-revert：删 !busy 分支的 CleanupSession → ActiveSessions()!=0 → FAIL。
+// TestIdleCancel_CleansSession 验：input-required 后客户端 idle-Cancel（不续发，走 Cancel 的 !busy
+// 分支）时 executor 接管清掉该会话的挂起记录——conclude 的 CleanupSession 只覆盖续发收尾路径，
+// idle-Cancel 不经 conclude，不清则被放弃的 HITL task 的挂起记录要等过期才清。
+// sanity-revert：删 !busy 分支的 CleanupSession → PendingInterrupts()!=0 → FAIL。
 func TestIdleCancel_CleansSession(t *testing.T) {
-	// 不配 TraceEndpoint（exporter nil）：本测只验 sessions map（ActiveSessions），session
-	// 由 served agent OnAgentStart 的 o.session 建/CleanupSession 清，不依赖 span export——
-	// 省去占位 addr 的 grpc dial deadline 阻塞（Close 不 flush）。
-	obs, err := observability.New(observability.Config{
-		Resource: observability.Resource{AppName: "idle-cancel", EnvName: "test", IP: "127.0.0.1", SDKVersion: "v"},
-	})
-	if err != nil {
-		t.Fatalf("obs: %v", err)
-	}
-	defer obs.Close()
+	obs := observability.New(
+		observability.WithTracerProvider(tracenoop.NewTracerProvider()),
+		observability.WithMeterProvider(metricnoop.NewMeterProvider()),
+	)
 
 	gm := &reAskGateModel{gate: make(chan struct{}), hit: make(chan struct{})}
 	ag := agent_v2.NewBasicAgent(
 		agent_v2.WithName("gated"),
 		agent_v2.WithModel(gm),
 		agent_v2.WithAskUser(),
-		agent_v2.WithHooks(obs.AgentHooks()), // served agent OnAgentStart 建 session
+		agent_v2.WithHooks(obs.AgentHooks()), // OnAgentEnd 在中断时记挂起
 	)
 	e := NewExecutor(ag, WithExecutorObservability(obs), WithOwnerResolver(func(context.Context) string { return "" }))
 	ctx := context.Background()
 	tid := a2atypes.TaskID("t-idle-cancel")
 
-	// 1. 新 task → ask_user 中断 → input-required（session 建 + 保留待续发，cleanupSession=false）
+	// 1. 新 task → ask_user 中断 → input-required（挂起记录留着待续发）
 	newCtx := &a2asrv.ExecutorContext{
 		TaskID: tid, ContextID: "c-idle",
 		Message: a2atypes.NewMessage(a2atypes.MessageRoleUser, a2atypes.NewTextPart("ask me")),
@@ -220,17 +217,17 @@ func TestIdleCancel_CleansSession(t *testing.T) {
 	if got := lastStatus(evs); got != a2atypes.TaskStateInputRequired {
 		t.Fatalf("应停在 input-required, got %s", got)
 	}
-	if n := obs.ActiveSessions(); n != 1 {
-		t.Fatalf("input-required 应保留 session 待续发，ActiveSessions=%d 应=1", n)
+	if n := obs.PendingInterrupts(); n != 1 {
+		t.Fatalf("input-required 应留一条挂起记录待续发，PendingInterrupts=%d 应=1", n)
 	}
 
 	// 2. 客户端放弃 idle prompt → Cancel（不续发，无在途 → 走 Cancel 的 !busy 分支）
 	cancelCtx := &a2asrv.ExecutorContext{TaskID: tid, ContextID: "c-idle"} // Message nil = cancellation
 	_ = drain(func(y func(a2atypes.Event, error) bool) { e.Cancel(ctx, cancelCtx)(y) })
 
-	// 3. 锚点：idle-Cancel 应清 session（!busy 分支接管 CleanupSession，不经 conclude）
-	if n := obs.ActiveSessions(); n != 0 {
-		t.Fatalf("idle-Cancel 应清 session（Cancel 的 !busy 分支接管 CleanupSession），残留 %d 个（unbounded leak）", n)
+	// 3. 锚点：idle-Cancel 应清挂起记录（!busy 分支接管 CleanupSession，不经 conclude）
+	if n := obs.PendingInterrupts(); n != 0 {
+		t.Fatalf("idle-Cancel 应清挂起记录（Cancel 的 !busy 分支接管 CleanupSession），残留 %d 条", n)
 	}
 }
 
@@ -422,5 +419,70 @@ func TestExecute_CheckpointNotPersistedFailsTask(t *testing.T) {
 	cEvs := drain(func(y func(a2atypes.Event, error) bool) { e.Execute(context.Background(), cont)(y) })
 	if m := lastMessageText(cEvs); !strings.Contains(m, "no resumable state") {
 		t.Errorf("挂起状态应已清掉，续发应得「没有可续的状态」，实际 %q", m)
+	}
+}
+
+// errModel 每次调用都返同一个错误。
+type errModel struct{ err error }
+
+func (m *errModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	return nil, m.err
+}
+
+func (m *errModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	return nil, m.err
+}
+
+func (m *errModel) WithTools([]*schema.ToolInfo) (model.ChatModel, error) { return m, nil }
+
+// TestServerSpan_TimeoutAndCancelOutcomes 钉住：a2a server span 的结局跟 agent span 同一个口径——执行 ctx 结束时
+// 按 ctx 判（取消不是失败）；ctx 还活着时错误链上的软取消是取消、DeadlineExceeded 是超时，context.Canceled 不算
+// 取消（别处被连带取消，这次执行失败了）。普通错误仍是 a2a_agent_error。
+func TestServerSpan_TimeoutAndCancelOutcomes(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	cases := []struct {
+		name, outcome, errType string
+		ctx                    context.Context
+		err                    error
+	}{
+		{"执行 ctx 取消", observability.OutcomeCancelled, "", canceled, fmt.Errorf("upstream: %w", context.Canceled)},
+		{"错误链上的超时", observability.OutcomeTimeout, "timeout", context.Background(), fmt.Errorf("upstream: %w", context.DeadlineExceeded)},
+		{"软取消", observability.OutcomeCancelled, "", context.Background(), fmt.Errorf("stop: %w", compose_v2.ErrSoftCanceled)},
+		{"错误链上的取消", observability.OutcomeError, "a2a_agent_error", context.Background(), fmt.Errorf("sibling: %w", context.Canceled)},
+		{"普通错误", observability.OutcomeError, "a2a_agent_error", context.Background(), errors.New("boom")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+			obs := observability.New(observability.WithTracerProvider(tp),
+				observability.WithMeterProvider(metricnoop.NewMeterProvider()))
+			ag := agent_v2.NewBasicAgent(agent_v2.WithName("failing"), agent_v2.WithModel(&errModel{err: c.err}))
+			e := NewExecutor(ag, WithExecutorObservability(obs), WithOwnerResolver(func(context.Context) string { return "" }))
+			execCtx := &a2asrv.ExecutorContext{TaskID: a2atypes.TaskID("t-" + c.name), ContextID: "c",
+				Message: a2atypes.NewMessage(a2atypes.MessageRoleUser, a2atypes.NewTextPart("hi"))}
+			_ = drain(func(y func(a2atypes.Event, error) bool) { e.Execute(c.ctx, execCtx)(y) })
+
+			var srv sdktrace.ReadOnlySpan
+			for _, s := range rec.Ended() {
+				if s.Name() == "a2a.server message_stream" {
+					srv = s
+				}
+			}
+			if srv == nil {
+				t.Fatal("应有 a2a server span")
+			}
+			attrs := map[string]string{}
+			for _, a := range srv.Attributes() {
+				attrs[string(a.Key)] = a.Value.Emit()
+			}
+			if attrs["crew.outcome"] != c.outcome {
+				t.Errorf("crew.outcome=%q 应=%q", attrs["crew.outcome"], c.outcome)
+			}
+			if attrs["error.type"] != c.errType {
+				t.Errorf("error.type=%q 应=%q", attrs["error.type"], c.errType)
+			}
+		})
 	}
 }

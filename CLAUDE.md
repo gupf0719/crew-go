@@ -57,79 +57,41 @@
 
 - 关键操作通过 ctx 透传 trace，不用全局 logger
 - 结构化日志用 `slog`，字段 key 用常量不用魔法字符串
-- **业务接 observability** (Phase 2 Sub-5 完成):
-  - **优先用 `ctx, opts := obs.Install(ctx, agentOpts...)`** — 一次接上两条链（业务级 8
-    method + 编排级 5 method），**拿不到 opts 就拿不到 ctx**，没有只装一半的用法。
-    业务自己也配了 `WithHooks` 时不会被顶掉（走 `WithHooksChained`，obs 链在最前）。
-  - 两半各自的入口 `obs.AgentHooks()` / `obs.OrchHooks()` 仍在，给 **Install 覆盖不了的那一档**：
-    agent 建一次、ctx 每请求 push（典型 a2a/server），结构上就是两个安装点。
-    ⚠️ 那一档**漏装不报错**——Compact/Cp/Fanout/Node/Skill 8 个 metric 全不 fire、node 与
-    graph 的 span 也不建。框架会在首次 `OnAgentEnd` 发现「业务级接了、编排级没跑过」时
-    **warn 一次**（判据是「obs 自己那半跑过没有」，不是「ctx 里有没有」——编排 hook 走
-    RunOption 也合法，只查 ctx 会误报）
-  - 业务必 `compose_v2.WithSessionIDCtx(ctx, sess.RunID)` push sid + `defer obs.CleanupSession(sid)`
-    防 sessions map leak (长跑高 QPS 不调会 OOM)
-  - **trace span 身份 attr** (对齐 AI_TRACE_SPEC / CS-OSS Monitor): `gen_ai.request.id`
-    (=sid, 自动) + `gen_ai.session.id` (跨 run 会话聚类, 业务 opt-in
-    `compose_v2.WithThreadIDCtx(ctx, convID)`, 不 push 不 emit, 类比 LangGraph thread_id) +
-    `gen_ai.system` (provider, model client `openai.WithSystem` 透传 → `Message.Metadata.System`,
-    deepseek/qwen 默认已注入) + `gen_ai.response.model`. **`agent_v2.WithSession` 自动把
-    sid=RunID 提前 push** (RunID 非空就推、覆盖 ctx 上已有的——任务的身份就是 RunID；嵌套位置上 session 的
-    RunID 必须是所在任务的、跟父相同, 沿用父 sid) 让顶层 agent span (OnAgentStart 早于 runGraph) 也带 request.id +
-    不落孤儿 session。`agent_v2.DetachTask` 开的独立任务有自己的 sid ⟹ 观测层是另一个会话，要自己 `CleanupSession`（会话 ID 也被剥掉，`gen_ai.session.id` 要自己推）
-- **metric 协议** (31 个 metric name 常量 in `observability/metric.go` — P0+P1 后 +3 新常量 resumes/plan_replans/route_decisions + interrupts/interrupt_resume_duration 升级 auto-fire + failover / member.tripped sink-gated auto-fire):
-  - **25 framework auto-fire** (业务接 hook 后自动): agent.run.total/duration/rounds /
-    runs.inprogress / llm.call.duration / llm.tokens.total / tool.call.duration /
-    tool.error.total / node.execution.total / skill.activate.total / active.sessions /
-    compact.{total,duration,ratio} / cp.{save.total,size.bytes} / fanout.branches /
-    **interrupts** (P0 新) / **interrupt_resume_duration** (P0 新) / **resumes** (P0 新, label{action}) /
-    **plan_replans** (P1 新, label{phase}) / **route_decisions** (P1 新, label{target}) /
-    **failover** (fallback 候选切换, sink-gated 同 compact — 业务用 fallback + 接 observability 自动采集, label{reason,from}) /
-    **stale_writes** (陈旧写回检测命中, `WithStaleWriteGuard` 开启时才可能 fire, label{crew_stale_op}) /
-    **member.tripped** (fallback 候选断路器熔断, sink-gated 同 failover — 区别 failover 计成员间切换, tripped 计单成员 closed→open 熔断边缘含"全员挂光"failover 计不到, label{member,reason})
-  - **6 业务自填** (framework 拿不到 / 跨 Run 控制流): LLMCostUSD / LLMTTFT / LLMTPOT /
-    LLMError / StreamChunks / ToolCallsPerRound (业务 metric — 之前 InterruptTotal /
-    InterruptResumeDuration 已 P0 升级 auto-fire 走 agent_v2.WithEndError / WithResumePhase ctx 协议)
-- **metric label 命名** (Round 5 audit Q1 fix): 对齐 OTel GenAI semconv —
-  `gen_ai.agent.name` / `gen_ai.agent.kind` / `gen_ai.tool.name` / `gen_ai.request.model` /
-  `gen_ai.system` (provider, 业务 cost metric 用) / `gen_ai.usage.type`. crew-go 自定义 label 用 `crew.*` prefix (e.g.,
-  `crew.compact.layer` / `crew.outcome` / `crew.cp.op` / `crew.node.id` /
-  `crew.resume.action` / `crew.route.target` / `crew.plan.phase` /
-  `crew.failover.reason` / `crew.failover.from` / `crew.tripped.member` / `crew.tripped.reason`)
-- **cardinality cap** (`Config.MaxMetricSeries` default 10000, per-type 独立): 业务高基数
-  label (e.g., user_id / request_id) 触发 cap 后 Counter/Histogram/Gauge() 返 nil
-  + `obs.MetricCardinalityDropped()` 业务可监控
-- **per-category 关闭** (`Config.DisabledMetrics []string`): metric name 黑名单 (wire 名如
-  `gen_ai_compacts` / `gen_ai_failovers`)——命中的 metric 在 Counter/Histogram/Gauge 入口返
-  nil (复用 cap 同款 nil-safe silent skip), 业务按类关观测降本 (省 series/cardinality/上报);
-  event emit 仍发 (下层 fallback/compact 零改动只是不转 metric)。空=全采 (默认不变), 对齐
-  OTel View DropAggregation 的 name-based drop
-- **component span kind** (Phase 2): trace 标组件类型 (retrieval/embedding/guardrail，对齐
-  CS-OSS `gen_ai.retrieval.*` + OTel operation.name) 两路径 — (1) **BasicAgent ReAct tool
-  路径**外部能力是 tool, 业务 tool 实现 `tool.Categorizer` 返 `CategoryRetrieval` 等 → tool
-  span 标 kind; (2) **GraphAgent 显式编排路径** node 直调组件 (不经 LLM tool_call),
-  `compose_v2.WithNodeComponent("retrieval")` 声明 → node span operation.name 标 kind. 机制:
-  只改 span operation.name + spanName 展示, **registry 配对锚点恒 node kind 不变** (跟 tool
-  span callID 路径零冲突); graph_loop 进 node 时 `WithComponentKind` 总是 set (含空) consume
-  清除继承, 防 component 跨 graph/agent 边界泄漏 (component 只作用声明它的那层). 非法 kind 经
-  `isToolKind` 校验 fallback 默认 kind. **agent span 不标 component** (OnAgentStart 不读, 恒
-  operation.name=agent 对齐 OTel invoke_agent) — 原 ReflectAgent evaluator/reflector 标
-  evaluator 已退化删除 (CS-OSS/OTel operation.name 无 evaluator, sub-agent 即 invoke_agent)
-- 三方对照决策见 `doc/description/three-way-comparison/observability-callback.md`
-  (callback 协议) + `observability-trace-spec.md` (trace/metric 字段 vs AI_TRACE_SPEC + 3 gap 已补)
-- **改 observability span attr / metric 前必对照 monitor-agent spec** (CS-OSS Monitor 上报规范, 本地
-  `/Users/gupengfei/program/go/src/monitor-agent/docs/` — `AI_TRACE_SPEC.md` trace attr + `AI_METRICS_SPEC.md`
-  metric)。三铁律 (2026-07 一连串偏离/误删的血泪教训):
-  1. **命名两套别混** (AI_METRICS_SPEC line 143/147): trace span attr **点号** (`gen_ai.model` / `gen_ai.system` /
-     `gen_ai.status` / `gen_ai.agent.kind`) vs metric label **下划线** (`gen_ai_model` / `gen_ai_system`)。同一语义
-     trace/metric wire 名不同, `metrics_mapping` value 存 metric 下划线名。把 metric 下划线误用到 span attr =
-     前端按 spec 点号读不到 (曾偏 4 个 attr, commit `5296699` 修)
-  2. **体量控制走 spec 机制、别砍 span attr**: 大内容进 `gen_ai_content` event (spec 定 1MB 单独限) +
-     `RecordMessageContent` 开关 + `MaxAttributeValueChars`。**别加 fail-closed 白名单裁 span attr** — 新增 attr
-     默认被砍反复漏 (metrics_mapping 差点砍掉、补后又漏 tool.call_id/usage) + 违反 spec (砍掉 spec 定义 attr 致
-     前端缺字段) + 省不了体量 (span attr 全小 value, 大头 content 在 event、filter 不碰)。曾加 TraceMinimalAttrs 已删
-  3. **审计 attr 覆盖穷举所有 helper × 调用点**: `strKV` / `intAttr` / `floatAttr` 三 helper, **别只 grep 字面量**
-     — 常量键 (如 `MetricsMappingAttrKey` / `attrA2A*`) 是盲区, 自审当场漏掉、靠独立 agent 才揪出
+- **业务接 observability**（权威文档 [doc/v2/observability.md](doc/v2/observability.md)）：本包用
+  OpenTelemetry，只依赖 OTel API；TracerProvider / MeterProvider / 导出器 / 采样 / Resource 归应用配置
+  （不传用全局的，没配时全是 no-op）。
+  - **优先用 `ctx, opts := obs.Install(ctx, agentOpts...)`**——一次接上业务级钩子（agent / chat /
+    execute_tool span 与 GenAI 指标）和编排级钩子（节点 / 工作流 span 与框架事件指标），拿不到 opts 就拿不到
+    ctx。opts 里已配的 `WithHooks`、ctx 上已有的编排钩子都被包进 observability 里面，不会被顶掉。
+  - **业务自己也有钩子时交给 `obs.AgentHooks(业务钩子…)` / `obs.OrchHooks(业务编排钩子…)` 包在里面，别自己用
+    `NewChainHooks` / `NewChainOrchHooks` 串**：链在后面的钩子开始失败（鉴权拒绝、HITL 闸门抛中断）时交回开始之前的
+    ctx，框架随后不再调（agent 级）或拿开始之前的 ctx 调（节点 / 图）结束钩子，observability 的 span 永远收不了尾、
+    `crew.agent.active` 永久 +1。包在里面时它当场收尾（`observability/wrap.go`，决策见 observability-callback.md 决策 7）。
+  - agent 建一次、ctx 每请求另备的拓扑（a2a/server）两半各装各的：`WithHooks(obs.AgentHooks())` +
+    `agent_v2.WithCtxOrchHooks(ctx, obs.OrchHooks())`。⚠️ 漏装编排那半不报错，节点 span 与框架指标静默缺失；
+    框架在首次 `OnAgentEnd` 发现「编排钩子一次没跑过」时 warn 一次（判据是编排钩子自己跑过没有，不是 ctx）。
+  - 身份属性：`crew.run.id`（= RunID）+ `gen_ai.conversation.id`（业务 opt-in
+    `compose_v2.WithThreadIDCtx(ctx, convID)`，不推不记）+ `gen_ai.provider.name`（模型客户端
+    `openai.WithSystem` → `Message.Metadata.System`，deepseek / qwen 默认已填）+ `gen_ai.response.model`。
+  - 结局用 `crew.outcome`（success / error / timeout / cancelled / blocked）区分，span status 只在 error /
+    timeout 标 Error——取消与等人答复不是错误。**取消只按调用方 ctx（与软取消）判**：ctx 还活着、错误链上却有
+    `context.Canceled`（errgroup 连带取消、业务自己的子 ctx）是失败，记成 cancelled 会把失败藏起来。
+  - 挂起的任务被放弃时调 `obs.CleanupSession(sid)`；不调也不会无界增长（超过一天的挂起记录被顺手清掉），
+    `obs.PendingInterrupts()` 可监控。
+- **属性与指标名**集中在 `observability/semconv.go`：`gen_ai.*` 照 OTel GenAI 语义约定（Development 状态，
+  Go 的 semconv 包不再生成，所以自己定义）；框架自己的维度一律 `crew.*`。改名只改这一处，并同步
+  doc/v2/observability.md 的表。
+- **基数与降本**走 OTel SDK（`sdkmetric.NewView` + `AggregationDrop` 关指标、`WithCardinalityLimit` 限基数），
+  本包不另做一套开关。
+- **内容采集默认关**（`WithContentRecording(true)` 打开，配 `WithRedactPatterns` 脱敏、`WithMaxContentChars`
+  截断）；大内容不进指标。写进 span 的一切文本（内容、错误信息、事件字符串）**先脱敏再截断**，JSON 先还原
+  `\uXXXX` 转义再脱敏——反过来都会漏。
+- **component span kind**：业务工具实现 `tool.Categorizer` → 工具 span 记 `crew.tool.category`；GraphAgent 节点
+  用 `compose_v2.WithNodeComponent("retrieval")` 声明 → 节点 span 按 GenAI 操作名命名（retrieval / embeddings）。
+  graph_loop 进节点时 `WithComponentKind` 总是 set（含空），component 只作用声明它的那层。
+- **跨进程**：A2A 两端经 `Message.metadata` 传 W3C trace context（`obs.InjectToMetadata` / `ExtractFromMetadata`）。
+- 三方对照决策见 `doc/description/three-way-comparison/observability-callback.md`（callback 协议）+
+  `observability-trace-spec.md`（对照 OTel GenAI 语义约定：对得上的、偏离的、没做的）。
 
 ## 交付纪律
 

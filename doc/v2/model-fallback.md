@@ -543,7 +543,7 @@ if gated {
 3. **[已决] 不加 `agent_v2` 语法糖**——装饰器已在 model 层够用，加 `WithFallbackModels` 反模糊「这是 model 层能力」的边界（grep 确认无此 API，定案不加）。
 4. **[已决] onSwitch 独立回调**——已实现 `WithFallbackHook`（§7），不塞进 hook 体系（切换早于 agent/orch hook 触发时机）。
 5. **[已决] 全员 cooldown 抛哨兵**——`ErrAllMembersUnavailable`（`fallback/fallback.go`，`errors.Is` 可判）。
-6. **[已实现] 观测 metric**——`failover.total` = `gen_ai_failovers{reason,from}`（候选切换）+ `member.tripped` = `gen_ai_member_tripped{member,reason}`（候选断路器熔断，closed→open 边缘，含"全员挂光"——failover 计不到最后一个候选熔断）。均 sink-gated（`observability/metric.go` + `fallback/event.go`，业务接 observability + 用 fallback 自动采集，边缘检测 `circuit_breaker.go` RecordFailure 返回值）。
+6. **[已实现] 观测 metric**——候选切换记 `crew.fallback.failovers{crew.failover.reason, crew.failover.from}`、候选断路器熔断记 `crew.fallback.member_trips{crew.fallback.member, crew.fallback.reason}`（closed→open 边缘，含"全员挂光"——failover 计不到最后一个候选熔断）；`from` / `member` 记候选下标。均 sink-gated（事件定义在 `fallback/event.go`，`observability/orch_hooks.go` 的 `recordEventMetric` 转成指标，业务接 observability 的编排钩子 + 用 fallback 自动采集，边缘检测 `circuit_breaker.go` RecordFailure 返回值）。
 7. **[已决] 全失败取 first_error**——主候选原始错误诊断价值最高（`fallback/fallback.go`，§0 落地偏离第 2 条，对齐 LangChain `fallbacks.py:215`）。
 8. **[已接受] 半开探测在请求热路径**（断路器固有代价）——某候选 trip 后 cooldown 到期的第一个请求会先探测（含 retry 耗尽）再切健康候选，latency 偏高。代价是**每 cooldown 周期一次**（cooldown 窗口内 `Allow()=false` 直接 skip `circuit_breaker.go:91-92`；到期时 half-open 只放行**单次探测**、并发的其他 `Allow()` 仍返 false 防 thundering herd `circuit_breaker.go:94-102`）。AutoCompact/ReactiveCompact 同款接受；高频长 session + 主 model 长期不可用时可评估后台探测。第一版接受。
 

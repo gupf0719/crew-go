@@ -2,10 +2,10 @@ package agent_v2_test
 
 // 工具调用失败在 hook 边界的可见性回归（issue-95 finding 3）。
 //
-// **承重语义**：`observability` 按 `!out.Result.Success` 判 status=error 并 fire
-// `gen_ai_tool_errors`（24 个 framework auto-fire metric 之一）。若 toolsNode 构造
+// **承重语义**：`observability` 按 `!out.Result.Success` 把工具 span 标成 Error、给
+// `gen_ai.execute_tool.duration` 带上 `error.type`。若 toolsNode 构造
 // `ToolCallResult` 时硬编码 `Success: true`，业务工具 `tool.Failure()` 明确声明的失败
-// 就在边界被抹平 → 那个 metric 对工具失败**恒为 0**，业务照 metric 协议建的告警永不响。
+// 就在边界被抹平 → 工具失败在 trace / 指标上**永远看不到**，业务照它建的告警永不响。
 //
 // sanity-revert：把 basic_builder.go 里读 annotation 还原 Success/Error/ErrorCode 那段
 // 删掉（退回硬编码 `Success: true`）→ 本文件 BizFailure / FrameworkRejection 两条 fail。
@@ -87,7 +87,7 @@ func TestToolFailureVisibility_BizFailure(t *testing.T) {
 	r := got[0]
 	if r.Success {
 		t.Errorf("业务工具返回 tool.Failure 时 OnToolEnd 应收到 Success=false, got true\n" +
-			"  → observability 按 !Success 计 gen_ai_tool_errors，恒 true 意味着该 metric 对工具失败恒为 0")
+			"  → observability 按 !Success 记工具失败，恒 true 意味着工具失败永远记不上")
 	}
 	if r.ErrorCode != "rate_limited" {
 		t.Errorf("ErrorCode: want %q, got %q（结构化错误信息在 hook 边界丢失）", "rate_limited", r.ErrorCode)

@@ -8,7 +8,7 @@ import "crew-go/model"
 // 复用）；删一个 = 删掉它。core model 包与编排层只认 model.ChatModel 接口，不感知
 // Preset——增删 provider 不触碰任何中心登记表 / switch，影响面只在构造点。
 type Preset struct {
-	// System 是 provider 身份标识（gen_ai.system observability attr），如
+	// System 是 provider 身份标识（gen_ai.provider.name observability attr），如
 	// "qwen" / "deepseek" / "dashscope"。填进每条响应的 Message.Metadata.System。
 	System string
 	// BaseURL 是该 provider 的 OpenAI 兼容 endpoint（chat/completions 的前缀）。

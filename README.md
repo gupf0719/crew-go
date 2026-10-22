@@ -50,7 +50,7 @@ crew-go/
 ├── a2a/           A2A 协议：消费远程 agent（RemoteAgent）/ 暴露 server / 服务发现（registry）/ ZK binding（独立 module）
 ├── agui/          AG-UI 前端协议适配（agent 事件流 → SSE 推前端，接 CopilotKit 等生态）
 ├── decision/      决策模型客户端与路由决策方（子包 jev / bailian 分别接 TypeSafe 的 Jev 与阿里云百炼）
-├── observability/ OpenTelemetry trace + 30 metric 埋点（接 AgentHooks + OrchHooks）
+├── observability/ OpenTelemetry trace + GenAI 语义约定指标（obs.Install 一次接上两条钩子链）
 ├── redis/         Store + Checkpointer 的 Redis 后端实现（独立 go module）
 └── sql/           Store + Checkpointer 的 SQL（MySQL/PG）后端实现（独立 go module）
 ```
@@ -83,7 +83,7 @@ schema ← model / tool / hook / skill / mcp / prompt / store ← compose_v2 ←
 - [AG-UI 前端接入 agui](doc/v2/agui.md)（agent 事件流→AG-UI 标准协议 SSE / 接 CopilotKit 生态前端 / HITL Resume 闭环 / StateSnapshot opt-in）
 - [带置信度的路由决策 route-decider](doc/v2/route-decider.md)（RouteDecider 升级链 / Jev 与百炼两家决策模型接入 / 门槛怎么定 / 中文路由实测）
 - [生命周期 hook hooks](doc/v2/hooks.md) + [流式 SSE hooks-and-streaming](doc/v2/hooks-and-streaming.md)
-- [可观测 observability-implementation-guide](doc/v2/observability-implementation-guide.md)（trace 埋点 / component span kind / 30 metric / CS-OSS Monitor 接入）
+- [可观测 observability](doc/v2/observability.md)（OpenTelemetry：span 树 / GenAI 语义约定属性与指标 / A2A 跨进程传播）
 - [v2 业务用法 usage-guide](doc/v2/usage-guide.md)（compose_v2 底层图引擎使用）
 
 **设计 / 架构**

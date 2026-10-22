@@ -8,11 +8,11 @@ import (
 
 // ────────────────────────────────────────────────────────────
 // route_decision event — RoutingAgent 的升级链定出最终目标时 fire，每次路由恰好一条,
-// observability 路由到 MetricRouteDecisionsTotal Counter.
+// observability 路由到 crew.route.decisions 计数.
 //
 // 设计源头:
-//   - crew-go 自定义 — 走 EventSink + observability.routeEventToMetric 路由 fire
-//     MetricRouteDecisionsTotal{agent_name, target=branch_name/"__fallback__"/"__none__"}
+//   - crew-go 自定义 — 走 EventSink + observability 的 recordEventMetric 记指标
+//     crew.route.decisions{gen_ai.agent.name, crew.route.target=branch_name/"__fallback__"/"__none__"}
 //
 // 设计核心:
 //   - **升级链定出目标后 fire** — decisionRouter 在返回目标之前发，不管最终由决策方、
@@ -24,9 +24,8 @@ import (
 //     OnNodeEvent 的业务看升级率、置信度分布，不进指标标签
 // ────────────────────────────────────────────────────────────
 
-// RouteDecisionEventType 是 compose_v2.Event.Type 字符串. observability/hooks.go::
-// routeEventToMetric 按此值识别 route_decision event 反序列化 Action 后 fire
-// MetricRouteDecisionsTotal.
+// RouteDecisionEventType 是 compose_v2.Event.Type 字符串. observability 的 OnNodeEvent
+// 按此值识别 route_decision event，取 Action 记 crew.route.decisions.
 const RouteDecisionEventType = "route_decision"
 
 // RouteDecisionAction 是 compose_v2.Event.Metadata["action"] 内的结构化字段——业务订阅
@@ -77,7 +76,7 @@ func RouteDecisionOf(ev Event) (*RouteDecisionAction, bool) {
 // action 为 nil 时不发。
 //
 // 框架只在 RoutingAgent 的升级链里调它。业务自写的 Router 函数想让自己的决策也进
-// MetricRouteDecisionsTotal，可以在返回目标之前自己调一次：
+// crew.route.decisions，可以在返回目标之前自己调一次：
 //
 //	agent_v2.EmitRouteDecisionEvent(ctx, &agent_v2.RouteDecisionAction{
 //	    AgentName: "support", Target: target,

@@ -55,7 +55,7 @@ type resumePrep struct {
 // 9 编排走同一 code path, 未来协议改 (e.g., R29 视角 4/5 forward graphNS to abort)
 // 一次改 helper 覆盖 9 编排, 不再漏修.
 //
-// **P0 observability fix** (gen_ai_resumes counter): commonResumePrep 内 push
+// **P0 observability fix** (crew.resumes counter): commonResumePrep 内 push
 // WithResumePhase(ctx, rcfg.action) 让 observability 的 OnAgentStart 通过
 // GetResumePhase 识别 Resume 路径 + action label fire counter. Abort 路径额外
 // fire 一对 OnAgentStart / OnAgentEnd 让 observability 完整记录 abort 事件
@@ -114,7 +114,7 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 	}
 
 	// P0 observability: push Resume action 到 ctx — observability OnAgentStart
-	// 通过 GetResumePhase 识别 + fire MetricResumesTotal{action=continue/replan/abort}.
+	// 通过 GetResumePhase 识别 + 记 crew.resumes{crew.resume.action=continue/replan/abort}.
 	ctx = WithResumePhase(ctx, rcfg.action)
 
 	// 3. ResumeActionAbort: helper 处理整路径
@@ -141,11 +141,9 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		}
 
 		// **audit MED fix**：补 push sid——Abort 分支在下方 WithSession（step 6）之前就
-		// return，不在此 push 则下面 OnAgentStart/End 的 ctx 无 sid → observability 用
-		// GetSessionID(ctx)="" 建**孤儿 session**（现造独立 traceID，与被 abort 的 run
-		// 断链）+ 该 span 缺 gen_ai.request.id（前端无法 join 回原 run）+ interrupt→resume
-		// duration 从空 session 读 interruptStartNanos 恒 0（下方"含 resume duration"承诺
-		// 失效）+ active.sessions gauge 泄漏 ""。用 WithSessionIDCtx 而非 WithSession：此处
+		// return，不在此 push 则下面 OnAgentStart/End 的 ctx 无 sid → observability 的 span
+		// 缺 crew.run.id（无法 join 回原 run），按 (sid, ns, agent) 记的挂起记录也取不到（等待时长
+		// 不记、记录留到过期）。用 WithSessionIDCtx 而非 WithSession：此处
 		// session 尚未初始化（step 5）可能 nil。全 9 编排共用本 helper，单一根因。
 		ctx = compose_v2.WithSessionIDCtx(ctx, sessionID)
 

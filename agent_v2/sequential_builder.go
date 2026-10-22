@@ -77,8 +77,8 @@ var (
 
 // GetSequentialAgentStep 从 compose_v2.ChannelManager 读最后一步 step index — agent_v2 layer
 // compose_v2.Run/Resume 完成后 update 顶层 hook.AgentInfo.Round 让 OnAgentEnd 拿到真实步数
-// (Sub-5 audit Round 2 视角 G HIGH fix: 跟 BasicAgent 同款 pattern,业务接 obs.AgentHooks()
-// 后 MetricAgentRounds Histogram 跨编排都有真值).
+// (Sub-5 audit Round 2 视角 G HIGH fix: 跟 BasicAgent 同款 pattern,业务钩子在 OnAgentEnd
+// 读到的轮次跨编排都是真值).
 func GetSequentialAgentStep(cm *compose_v2.ChannelManager) int32 {
 	if cm == nil {
 		return 0

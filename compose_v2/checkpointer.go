@@ -881,18 +881,18 @@ func GetSessionID(ctx context.Context) string {
 }
 
 // WithThreadIDCtx push 跨 run 会话 id (thread id) 到 ctx——observability 读出作
-// gen_ai.session.id span attr，用来聚类同一个会话的多次 Run / 多轮 turn。
+// gen_ai.conversation.id span attr，用来聚类同一个会话的多次 Run / 多轮 turn。
 //
 // thread id 是业务的会话 / 对话标识，**跨多次 agent Run 稳定**（如多轮聊天 app
 // 里浏览器侧持久的会话 id）；而 GetSessionID（= RunID）是单次 run 标识。两者职责
 // 不同——一个会话含多次 run。
 //
 // **threadID 必须跨 run 稳定**：若传"每次 run 都新建的 id"（= 等于 RunID），会让
-// gen_ai.session.id ≡ gen_ai.request.id，退化成假区分——这种场景别 push（保持不 emit）。
+// gen_ai.conversation.id ≡ crew.run.id，退化成假区分——这种场景别 push（保持不 emit）。
 //
 // **框架不自动注入**（会话 id 是业务概念，框架不知道哪些 run 属同一会话），业务在
 // Run 入口按需 push。空则 observability 不 emit
-// gen_ai.session.id（不造无意义的 = request.id 重复）。
+// gen_ai.conversation.id（不造无意义的 = crew.run.id 重复）。
 //
 // 在业务钩子里推（推在钩子拿到的 ctx 上、再把它返回）不生效——会话 ID 是对话的身份、取框架的，采纳时会
 // 告警，见 [CallHook]。

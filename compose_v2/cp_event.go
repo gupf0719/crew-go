@@ -23,8 +23,7 @@ import (
 //     按 event.Type 分发处理 *CpAction
 //   - **零开销 sink nil / cfg.emitCpEvent=false**: 业务不订阅时不付任何代价
 //
-// observability/hooks.go OnNodeEvent 消费侧 D2 真接入时 case event.Type
-// 反序列化加 CS-OSS Monitor 自定义 attr.
+// observability 的 OnNodeEvent 取 *CpAction 记 crew.checkpoint.operations / .operation.duration.
 // ────────────────────────────────────────────────────────────
 
 // CpEventType 是 compose_v2.Event.Type 字符串.

@@ -1,10 +1,10 @@
 # LangGraph 可观测性设计调研 (trace + metrics)
 
-> **目的**: crew-go OTel trace + Prometheus-style metric 集成 (Sub-5 已落地 2026-05) 的 LangGraph 侧调研参考. 本文基于本地 `/Users/gupengfei/program/go/src/langgraph/` + `langgraph-bb/` 真实源码精读, 给出 file:line 证据.
+> **目的**: crew-go OpenTelemetry trace + 指标集成（Sub-5 2026-05 落地，2026-10 改成标准 OTel）的 LangGraph 侧调研参考. 本文基于本地 `/Users/gupengfei/program/go/src/langgraph/` + `langgraph-bb/` 真实源码精读, 给出 file:line 证据.
 >
 > ⚠️ **风格特例说明**: 兄弟 three-way-comparison 文档都是**单文档含三方对照表** (如 `interrupt-resume.md` / `checkpoint-storage.md`). 本主题拆 2 文档 (本 + `observability-eino.md`) 单方面深度调研是**例外**, 原因:
 > - **三方设计差异过大**: LangGraph (callback + LangSmith 强绑 + Python contextvars) vs eino (Handler 接口 + 无后端 + Go context chain), 不像 Interrupt/Resume 那样有共同语义可以正面对照
-> - **crew-go OTel/Prom 实施已落地** (Sub-5, 跨 Round 2-8 audit): `observability/` 包 9 个 non-test 文件 ~4800 行: `hooks.go` ~1430 行 (OTel span emit) + `metric.go` ~740 行 (28 metric name + 15 label const) + `observability.go` ~1190 行 (Prom-style + OTLP) + `exporter.go` ~440 行 (OTLP gRPC) + `config.go` + `propagation.go` + `id.go` + `metrics_mapping.go` (metric name→CS-OSS 映射) + `a2a_span.go` (A2A span 桥接). 协议层基础: `hook.Hooks` 8 方法 (ISSUE-82 修, 9→8) + `compose_v2.OrchestrationHooks` 5 方法
+> - **crew-go 的实现已落地**：`observability/` 包按 OpenTelemetry API 实现（SDK 由应用配），属性与指标按 GenAI 语义约定（键名集中在 `semconv.go`）；业务级钩子 `agent_hooks.go` + 编排级钩子 `orch_hooks.go` + 包装层 `wrap.go` + A2A 跨进程传播 `a2a.go`。协议层基础：`hook.Hooks` 8 方法 + `compose_v2.OrchestrationHooks` 5 方法。设计与用法见 [doc/v2/observability.md](../../v2/observability.md)，字段逐项对照见 [observability-trace-spec.md](observability-trace-spec.md)
 >
 > crew-go 综合决策矩阵见 [observability-eino.md §8](observability-eino.md#8-跨文档启示综合-langgraph--eino--crew-go-决策矩阵).
 
@@ -118,15 +118,15 @@ Scalar 值自动转 span metadata (敏感字段 `key/token/secret/password/auth`
 ### LLM / Tool 属性
 **不在 langgraph 实现**——由下游 `langchain-core` 的 `ChatModel.invoke` / `BaseTool.run` callback 决定 (token_usage / model_name / latency 字段都来自 langchain-core, LangGraph 透传不加工)。
 
-### CS-OSS spec 新维度对照 (2026-05 spec 更新)
+### OTel GenAI 约定维度对照
 
-monitor-agent 团队最新 `AI_TRACE_SPEC.md` 增加了 LangGraph **不直接对齐**的维度——LangGraph 走 LangSmith client 自家协议 (不走 OTel SDK):
+LangGraph 走 LangSmith client 自家协议（不走 OTel SDK），下面几个 GenAI 约定的维度在它那里没有直接对应：
 
-| CS-OSS 维度 | LangGraph 处理 | crew-go 对齐 |
+| GenAI 约定维度 | LangGraph 处理 | crew-go |
 |---|---|---|
-| `gen_ai.operation.name` 8 种 (agent / workflow / chat / tool / **embedding** / **retrieval** / **rerank** / **guardrail**) | LangGraph 用 langchain-core callback `serialized.id` (BaseChatModel / Tool / Retriever / Embedder 等 class path) 暗示, 业务侧 OTel adapter 想对齐 CS-OSS 时需自管 | adapter 按 hook 类型直接 set (embedding/retrieval/rerank/guardrail 业务上报独立 span) |
-| `gen_ai.status` 5 态 (success/error/cancelled/blocked/timeout) | LangGraph `run.status` 6 态 (`pending`/`running`/`success`/`error`/`interrupted`/`cancelled`)——业务侧 OTel adapter 自管映射 | adapter 在 OnError 按 err 类型自动分类映射 |
-| span attr 默认上限 | LangSmith client 协议无 span attr 数限 (业务塞多少就上报多少) | crew-go 自家 `observability/` 模块 `Config.MaxSpanAttributes=128` 默认对齐 OTel 通用 (CS-OSS spec 默认 15 但 collector 端不 enforce, monitor-agent 自家 SDK 写死 10 silent drop 不可用) |
+| `gen_ai.operation.name`（chat / execute_tool / invoke_agent / invoke_workflow / retrieval / embeddings …） | langchain-core callback 的 `serialized.id`（BaseChatModel / Tool / Retriever / Embedder 等类路径）暗示，接 OTel 要自己映射 | 按钩子类型直接定：OnModelStart → chat、OnToolStart → execute_tool、BasicAgent → invoke_agent、编排 → invoke_workflow；GraphAgent 节点声明组件类型 → retrieval / embeddings |
+| 结局（span status 只有 Unset / Error 有用） | `run.status` 6 态（`pending`/`running`/`success`/`error`/`interrupted`/`cancelled`），接 OTel 要自己映射 | `crew.outcome` 五态（success / error / timeout / cancelled / blocked），status 只在 error / timeout 标 Error |
+| span 属性数量上限 | LangSmith client 协议不限 | 交给应用配的 OTel SDK（`SpanLimits`），本包不另设 |
 
 ## 4. Metrics 入口 + 指标列表
 

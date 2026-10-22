@@ -273,8 +273,8 @@ marker 那套连同 `markAgentPreamble` / `splitAgentPreamble` 一并删除。�
   `filtered.instructions, filtered.input`，不是原始值。
 - **「完整请求」这个视图属于 trace，不属于 hook**。OTel GenAI semconv 定义
   `gen_ai.system_instructions` 时明写「provider 分开给的就分开记，混在历史里的才记进 input.messages」——
-  标准的立场是按实际形状记，不是为观测者伪造一个合并视图。⚠️ 我们下游的 `AI_TRACE_SPEC` **没有**
-  这个字段，真要在 trace 里暴露前言得先对照拍板（CLAUDE.md 有规约）。
+  标准的立场是按实际形状记，不是为观测者伪造一个合并视图。observability 打开内容采集时正是这么记的：前言单独记成
+  `gen_ai.system_instructions`，对话流记进 `gen_ai.input.messages`。
 
 ### 补调研：保护到腾不出空间时怎么办
 

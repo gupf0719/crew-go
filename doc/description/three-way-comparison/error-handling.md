@@ -613,7 +613,6 @@ gorilla CookieStore 30 天开着（凭据缓存，有界寿命本身是安全要
 | **net/http**（HTTP/1、HTTP/2）、**gin** | 只记日志：net/http 用 64KB 固定缓冲 `runtime.Stack`；gin 逐帧读源码行打印、无上限。客户端只得到断连 / 没有正文的 500 | handler 没有错误返回通道 | 日志是唯一出口 | — |
 | **grpc 恢复中间件** | v1：`status.Errorf(codes.Internal, "%v", p)`，无栈、不记日志。v2 默认：`PanicError{Panic; Stack}`（64KB），Error() 含栈 | — | — | grpc-go 把非 status 错误转成 `Unknown`、原样用 `err.Error()` 作消息（`FromContextError`，本地 v1.83.1 核过）⟹ v2 默认**把栈发给客户端**；同一个函数用 `errors.Is(err, context.Canceled)` 判成 `Canceled`——panic 值若经 Unwrap 露出 ctx 错，就被当成取消 |
 | **OTel 语义约定**（本地 2026-06-17 版） | 「异常记在 span 事件」（`exception` 事件 + `exception.stacktrace`）已标**废弃**，改为「异常记成日志，必须关联到对应 span 的上下文」；Go 的 stacktrace 指定为 `runtime.Stack` / `debug.Stack` 的返回值 | — | — | otel-go 的 `RecordError(..., WithStackTrace(true))` 是可选项，栈在调用它的那一刻取、上限 2KB——对已返回的错误调用时取到的不是 panic 处 |
-| **monitor-agent（CS-OSS Monitor）** | AI_TRACE_SPEC 对异常只定了 `error.type` / `error.message`；接入文档限 attribute value 默认 512 字符、span 属性默认 15 个；只有 `gen_ai_content` 有 1MB 独立上限 | — | — | `exception.stacktrace` 放 span 属性或事件属性都会被截到 512 字符（两三帧） |
 
 **交给模型 / 前端 / 对端的文本**：调研的 agent 框架都不带 traceback。LangGraph ToolNode 默认只把参数校验错误交给模型、
 其余往上抛，开了 handle_tool_errors 也只用 `repr(e)`；OpenAI Agents SDK 从 2026-09-21（#5112）起默认交给模型的是固定文本、
@@ -631,7 +630,7 @@ Codex 的工具任务 panic 变成 Fatal 结束本轮，消息只有 panic 信�
 | 栈放哪儿 | **挂在错误上 + 兜底点记日志**，两者都要 | 只记日志的前提（没有错误返回通道）我们不成立；只挂错误的前提（调用方拿到错误会自己处理）也不成立——AgentAsTool 把子 agent 的错转成工具失败、AutoCompact 失败只记 WARN、fan-out 多分支失败只返一个，这些路径把错误吃掉只留文本 |
 | 错误文本放不放栈 | **不放**，与原来逐字相同 | 错误文本会交给 agui 前端（RUN_ERROR）、a2a 对端（failed 状态）、AgentAsTool 转给模型的工具失败、span 的 `error.message`。errgroup 改成含栈的唯一理由（重新 panic 后崩溃打印只有 Error()）我们不成立；含栈的那几家都是不记日志的通用库，grpc v2 的代价已实证 |
 | 上限 | **不另设**，用 `debug.Stack` | 运行时只打 100 帧；栈只进内存里的错误对象和一条日志 |
-| span / 存档 | **都不进** | 存档没有错误字段；span 的 `error.message` 仍是不含栈的错误文本。OTel 已把异常从 span 事件挪到日志，CS-OSS Monitor 的普通属性又只有 512 字符。以后要在 trace 界面直接看栈，可行的只有 `error` 事件 + `gen_ai_content`，按 spec「不默认采集」做成开关 |
+| span / 存档 | **都不进** | 存档没有错误字段；span 的 `error.message` 仍是不含栈的错误文本。OTel 已把异常从 span 事件挪到日志（GenAI 约定的 `gen_ai.client.operation.exception` 也是日志事件）。以后要在 trace 界面直接看栈，要接 Logs API 记一条关联到 span 的异常日志，按「不默认采集」做成开关 |
 | 类型放哪儿 | **一个内部小包 `internal/panicerr`**（只依赖标准库），`compose_v2.PanicError` 是它的类型别名 | eino（`internal/safe`）与 conc（`panics`）都是「全仓一份实现」；mcp / schedule / model/openai 在 compose_v2 之下或完全独立，也能挂同一个类型 |
 | panic 值经 Unwrap 露出来 | **不露**：`PanicError` 不实现 Unwrap，作为并列的第二条分支挂上（多分支 `Unwrap() []error`），各兜底点原来用 `%w` 还是 `%v` 照旧 | errgroup / conc 露出来的前提是调用方不靠错误类型判控制流；我们靠（中断、ctx 错、软取消、陈旧写回）。露出来会把「某处 panic 了一个中断」变成真中断。代价：单层 `errors.Unwrap` 对挂了记录的错误返 nil（仓内无此用法，判断一律 errors.Is / errors.As） |
 | 持锁区里的兜底点 | `ApplyAll`（业务 reducer）、`Restore`（业务 UnmarshalJSON）当场只挂记录、标「待补记」，由 `compose_v2.Run` 出口在锁外补记 | 它们的 defer 跑在 cm 写锁里，日志 handler 是业务代码；提交区另有机械哨兵不许加调用 |

@@ -33,6 +33,7 @@ import (
 	"crew-go/agent_v2"
 	"crew-go/example/envloader"
 	"crew-go/example/llmtrace"
+	"crew-go/example/otelsetup"
 	"crew-go/model"
 	"crew-go/observability"
 	"crew-go/schema"
@@ -59,7 +60,7 @@ func main() {
 		name     = flag.String("name", "", "agent 名（默认 = service）")
 		port     = flag.Int("port", 0, "server 监听端口（0 = 随机）")
 		useLLM   = flag.Bool("llm", false, "用真 qwen（需 .env QWEN_API_KEY）；默认确定性 model")
-		obsTrace = flag.String("obs-trace-endpoint", "", "OTLP gRPC TraceService endpoint（如 127.0.0.1:5317）；空 = 不上报 trace")
+		obsTrace = flag.String("obs-trace-endpoint", "", "OTLP gRPC 地址（如 127.0.0.1:4317）；空 = 不导出 trace")
 	)
 	flag.Parse()
 	if *zkEP == "" {
@@ -81,28 +82,26 @@ func main() {
 		m = &fixedModel{answer: fmt.Sprintf("我是 %s（确定性 demo agent），内部代号 SECRET-7741。", agentName)}
 	}
 
-	// ── 2. observability（先建——agent + executor 都要接；endpoint 为空则不上报，失败 silent
-	// 不阻塞）。RecordMessageContent=true 让 agent span 记真实 input/output 正文（默认只记 count）。──
-	var obs *observability.Observability
-	if o, e := observability.New(observability.Config{
-		Resource:             observability.Resource{AppName: "zk-server-" + *service, EnvName: "dev", IP: localIP(), SDKVersion: "v"},
-		TraceEndpoint:        *obsTrace,
-		RecordMessageContent: true,
-	}); e != nil {
-		log.Printf("observability init 失败（server 跑但不上报 trace）: %v", e)
-	} else if o != nil {
-		obs = o
-		defer obs.Close()
+	// ── 2. observability（先建——agent 与 executor 都要接）。配了地址就装 OTel SDK 导出 trace；
+	// 打开内容采集，让 agent span 记真实输入 / 输出。──
+	if *obsTrace != "" {
+		shutdown, err := otelsetup.Setup(ctx, otelsetup.Config{ServiceName: "zk-server-" + *service, TraceEndpoint: *obsTrace, Insecure: true})
+		if err != nil {
+			log.Printf("OTel SDK 装配失败（server 照跑，不导出 trace）: %v", err)
+		} else {
+			defer func() { _ = shutdown(context.Background()) }()
+		}
 	}
+	obs := observability.New(observability.WithContentRecording(true))
 
-	// ── 3. 起 agent——接 obs.AgentHooks() 让 server 内部 ReAct agent span 上报（挂 a2a_server
-	// span 下，带真实 input=query / output=应答）；只接 executor obs 的话 a2a_server 下是空的。──
+	// ── 3. 起 agent——接 obs.AgentHooks() 让 server 内部 ReAct agent 的 span 挂在 a2a server span 下
+	// （带真实 input=query / output=应答）；只接 executor 的 obs 的话 a2a server span 下是空的。──
 	agOpts := []agent_v2.Option{
 		agent_v2.WithName(agentName),
 		agent_v2.WithDescription(agentName + "（a2a_zk_server 注册的 agent）"),
 		agent_v2.WithModel(m),
 	}
-	if obs != nil {
+	{
 		// ⚠️ **这里是 Install 覆盖不了的那一档**：agent 建一次、ctx 由 a2a server 每个
 		// 请求各自带，两个安装点结构上分开。所以两半各装各的——业务级在这儿，编排级
 		// 走下面的 HTTP middleware。漏装任何一半都不报错，只是数据少一截。
@@ -110,11 +109,8 @@ func main() {
 	}
 	ag := agent_v2.NewBasicAgent(agOpts...)
 
-	// ── 4. executor 接 obs（a2a_server span）──
-	var execOpts []server.ExecutorOption
-	if obs != nil {
-		execOpts = append(execOpts, server.WithExecutorObservability(obs))
-	}
+	// ── 4. executor 接 obs（a2a server span）──
+	execOpts := []server.ExecutorOption{server.WithExecutorObservability(obs)}
 
 	// ── 3. 暴露 A2A server（监听本机内网 IP，让别处可达——非 127.0.0.1）──
 	ip := localIP()
@@ -125,10 +121,9 @@ func main() {
 	baseURL := "http://" + ln.Addr().String()
 	a2aHandler := server.Handler(ag, baseURL, append(execOpts, server.WithOwnerResolver(func(context.Context) string { return "demo" }))...)
 	// ── 编排级 hook 的另一半：每个请求把它 push 进 ctx ──
-	// 漏了这一层，compact/cp/fanout/node/skill 共 8 个 metric 全不 fire、node 与 graph
-	// 的 span 也不建——**而且不报错**。executor 会自动把它与内部流式桥 chain（不互斥）。
-	// 这个 example 此前就漏了它，是「装一半」的活样本。
-	if obs != nil {
+	// 漏了这一层，节点 / 工作流 span 与压缩、存档、扇出等框架指标都不记——**而且不报错**。
+	// executor 会自动把它与内部流式桥串起来（不互斥）。
+	{
 		inner := a2aHandler
 		a2aHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			inner.ServeHTTP(w, r.WithContext(agent_v2.WithCtxOrchHooks(r.Context(), obs.OrchHooks())))

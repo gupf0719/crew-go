@@ -1111,7 +1111,7 @@ IsSubAgentMemoryScope   → IsSubAgentStoreScope
 - [`usage-guide.md`](usage-guide.md) —— 在 §3 HITL 后插入新 §"Store 业务用法"（Get/Put/Search 速记 + ctx 注入 + WithStoreMemory helper 范式）
 - [`orchestration-patterns.md`](orchestration-patterns.md) —— §2.3 BasicAgent options 表 `WithMemory(cfg)` 行改 `WithStoreMemory(...)` + §4.5 "ParallelAgent + Memory 协议" 改 "ParallelAgent + StoreMemory 协议" + §11 "横切能力：Memory / Skill / ..." 改 "StoreMemory / Skill / ..." + §11.1 "Memory（跨 Run 长期记忆）"改 "StoreMemory（跨 Run 长期记忆）"
 - [`hitl-resume.md`](hitl-resume.md) —— Memory.Read HITL gate 描述改 StoreMemory hook
-- [`observability-implementation-guide.md`](observability-implementation-guide.md) —— Memory 引用同步改名
+- `observability-implementation-guide.md`（后被 [`observability.md`](observability.md) 取代）—— Memory 引用同步改名
 - 新建 [`store.md`](store.md)（**本文档**）
 
 **`doc/description/`**（R3 audit 新增项——R1 漏列）：

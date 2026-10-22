@@ -277,7 +277,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	// audit² 改: hook 调用 panic 由本函数 outer recover defer (line 122)
 	// 兜底转 retErr 返业务, 不让 Run goroutine crash.
 	// P0 observability: push retErr 让 observability OnAgentEnd 识别 InterruptError 路径
-	// fire MetricInterruptTotal Counter + 记录 interrupt 时间戳到 sess 让 Resume 算 duration.
+	// 记 crew.interrupts 计数 + 记录 interrupt 时间戳到 sess 让 Resume 算 duration.
 	defer func() {
 		// panic 兜底: 本 defer 比顶部 recoverToErr 先跑,
 		// 在闭包内直接 recover() 设 retErr 让 OnAgentEnd/observability 看到框架自身 panic
@@ -310,7 +310,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	// （input 没真消费 LLM）。
 	finalMsgs, lastRound, err := a.runGraph(ctx, &cfg, session, input)
 	// Sub-5 audit HIGH-1 fix: update info.Round 让 OnAgentEnd defer 拿到最后一轮真值.
-	// 之前 info.Round 永远是 init 时 0 → observability MetricAgentRounds Histogram sum=0.
+	// 之前 info.Round 永远是 init 时 0 → 业务钩子在 OnAgentEnd 读到的轮次恒为 0.
 	// info 指针 defer 内闭包捕获 — 这里 mutate 字段, defer 跑时读到新值.
 	info.Round = lastRound
 	// **软降落之后仍然报错**——见 [withFinalRound] 的 godoc。
@@ -3044,7 +3044,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			return nil, fmt.Errorf("tools: %d 个 tool_call 配了 %d 个调用 ctx: %w", len(toolCalls), len(callCtxs), compose_v2.ErrRunAborted)
 		}
 		// Phase 2 Sub-5f: fire fanout event (N>=2 时, EmitFanoutEvent 内部判).
-		// observability/hooks.go::OnNodeEvent 识别 → fire MetricFanoutBranches Histogram.
+		// observability 的 OnNodeEvent 识别 → 记 crew.fanout.branches 直方图.
 		EmitFanoutEvent(ctx, FanoutKindToolCalls, len(toolCalls))
 		// 执行闸认的已解锁集：这一批开始前已提交的那份（tools 节点从 channel 读出来放进 ctx），并发分支之前取一次。
 		var revealedAtEntry revealedNames
@@ -3196,7 +3196,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				// args 静默执行错误 input).
 				if jerr := json.Unmarshal([]byte(tc.Function.Arguments), &args); jerr != nil {
 					// finding 3: 框架级拒绝也是**失败的 tool call**（工具压根没跑起来）→
-					// 同样标记让 gen_ai_tool_errors 计到。对比 approval 的 tool_denied
+					// 同样标记让 observability 把工具 span 记成失败。对比 approval 的 tool_denied
 					// **不标**——那是用户的主动决定、不是错误，计进错误率会污染告警。
 					msg := fmt.Sprintf("tool_call.Arguments JSON 解析失败: %v", jerr)
 					return outcome{toolMsg: failedToolResult(tc.ID, tc.Function.Name, "invalid_arguments", msg)}
@@ -3418,7 +3418,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				toolMsg.Annotations = map[string]any{TruncatedOriginalBytesAnnotation: origBytes}
 			}
 			// issue-95 finding 3: 业务工具声明的失败经 annotation 跨层带到 toolsNode 的
-			// hook fire 层——否则 OnToolEnd 恒收到 Success=true，gen_ai_tool_errors 恒 0。
+			// hook fire 层——否则 OnToolEnd 恒收到 Success=true，工具 span 永远不会记成失败。
 			if toolErr != nil {
 				// 失败的 final_output 算不算一次失败的尝试由 toolsNode 在 OnToolEnd 之后统一判（见
 				// finalOutputRetryAnnotation 的 godoc），这里只带上失败信息。
@@ -3763,8 +3763,8 @@ func streamOrGenerate(ctx context.Context, llm model.ChatModel, in []*schema.Mes
 		// finalModel response model name (跨 provider 集成验证 fix) — observability
 		// gen_ai.request.model / response.model 用. 聚合捕获, finalize 设 out.Metadata.Model.
 		finalModel string
-		// finalSystem provider 名 (gen_ai.system) — model client 透传, 聚合捕获,
-		// finalize 设 out.Metadata.System 让 OnModelEnd emit gen_ai.system span attr.
+		// finalSystem provider 名 (gen_ai.provider.name) — model client 透传, 聚合捕获,
+		// finalize 设 out.Metadata.System 让 OnModelEnd 记 gen_ai.provider.name span attr.
 		finalSystem string
 		// onlyChunk / chunkCount：流里只有一个片段时整条采用它（见循环之后）。
 		onlyChunk  *schema.Message

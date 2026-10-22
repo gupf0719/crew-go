@@ -761,7 +761,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 
 	// 四编排 review RT-H1 fix：Run-level EventSink 兜底——ConditionalEdge cond fn
 	// 跑在 Run-level ctx（不在任何 node scope），其内 framework event 此前 GetEventSink
-	// 恒 nil 静默丢（违背 CLAUDE.md auto-fire 契约；嵌套时借父图 node sink 才 fire——
+	// 恒 nil 静默丢（框架靠这些事件自动记的指标随之缺失；嵌套时借父图 node sink 才 fire——
 	// 同一逻辑两形态行为不一致）。
 	// node 入口 withEventSink 会遮蔽本 sink（node 内 event 不双 fire），仅 cond fn /
 	// 未来 out-of-node emitter 落到这里。nodeID "" 标"非节点 framework 级 event"
@@ -2644,8 +2644,8 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 	// 框架自己要往节点 ctx 上挂的东西，收在一处——**hook 之前铺一次**；hook 返回的 ctx 经
 	// [CallHook] 采纳，执行状态取这里铺好的（见下方 OnNodeStart 之后那段）。
 	//
-	// ISSUE-96 侧面 6：这些必须**先于 OnNodeStart** 进 ctx——观测层拿实例身份给
-	// span registry / chunk buffer 分槽；答案兑付账本要覆盖 hook 相位的提问（那一层
+	// ISSUE-96 侧面 6：这些必须**先于 OnNodeStart** 进 ctx——观测层在 OnNodeStart 里读实例身份
+	// （节点 span 的 crew.node.instance）；答案兑付账本要覆盖 hook 相位的提问（那一层
 	// 框架一维身份都不给、业务只能自填常量 ID，最容易撞）。
 	// parent 链让子层判定看得见祖先已提交的兑付（本节点若是嵌套图的宿主，图内节点的
 	// 账本经此链上溯到这里、再到更外层——见 answerLedger godoc「parent 链」）。

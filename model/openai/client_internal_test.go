@@ -3,7 +3,7 @@ package openai
 import "testing"
 
 // TestConvertResponse_System 验 WithSystem 把 provider 名填进 Message.Metadata.System
-// (gen_ai.system observability span attr 的数据来源)。白盒测未导出的 convertResponse。
+// (gen_ai.provider.name observability span attr 的数据来源)。白盒测未导出的 convertResponse。
 func TestConvertResponse_System(t *testing.T) {
 	c := NewClient("k", "m", WithSystem("dashscope"))
 	resp := &openaiResponse{

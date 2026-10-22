@@ -19,24 +19,17 @@
 //     `agent_v2.WithCtxOrchHooks(r.Context(), obs.OrchHooks())`——a2asrv 的 detached ctx 是
 //     context.WithoutCancel（values 保留），一路流到执行；executor 自动把业务 hooks 与内部
 //     流式桥 **chain**（不互斥，不会被顶掉）。
-//   - **跨语言 trace 串联**：server 用 WithExecutorObservability(obs) 启用——从入站
-//     Message.metadata 提取 remote CS-OSS trace context（x-traceid 等）+ 建
-//     gen_ai.a2a_server span，内部 agent/model/tool span 挂其下、用 remote traceID 串到
-//     client（client 侧 a2a.WithObservability 注入 metadata）。符合跨语言协议（trace 走
-//     message.metadata 非 HTTP header，Java/Python/Go 互通）；fail-open（无 trace metadata
-//     时 server 自起新 trace 不影响业务）。
-//   - gen_ai.session.id：executor 自动 push ThreadID = A2A ContextID（ctx 未设时）——A2A 同
-//     context 多 task 的会话在 trace 里聚类。gen_ai.request.id = 每 task 的 RunID（框架自动）。
+//   - **跨进程 trace 串联**：server 用 WithExecutorObservability(obs) 启用——从入站
+//     Message.metadata 取出 W3C trace context 作父 + 建 SERVER span，内部 agent / model / tool span
+//     挂在它下面、跟 client 同一条 trace（client 侧 a2a.WithObservability 负责注入）。没有 trace
+//     metadata 时 server 自起新 trace，不影响业务。
+//   - gen_ai.conversation.id：executor 自动 push ThreadID = A2A ContextID（ctx 未设时）——A2A 同
+//     context 多 task 的会话在 trace 里聚类。crew.run.id = 每 task 的 RunID（框架自动）。
 //     **注意 ThreadID 不止观测**：served HandoffAgent 的持久转交也按 ThreadID 存——同
 //     ContextID 的后续 task 续接上次转交后的 active agent（这是 A2A contextID 语义的正确
 //     映射，详见 Execute 内注释）。
-//   - sessions 防泄漏：长跑 server 每 task 一个 sid——**session 由 executor 创建并在
-//     conclude 自动清理**（最终态 CleanupSession，input-required 留待续发 Resume 复用），
-//     业务**不要**在 served agent 的 AgentHooks.OnAgentEnd 里调 obs.CleanupSession：它在
-//     agent goroutine 内、先于 conclude 跑，会提前删 session → conclude 收尾 a2a_server
-//     span 时 o.session 重建空 session、LoadAndDelete miss → a2a_server span 静默丢 + 空
-//     session 反泄漏。（a2a server 场景 session 所有权属 executor；business 自管的顶层
-//     session 才需自己 OnAgentEnd CleanupSession——见 observability 包 godoc。）
+//   - 挂起记录：每 task 一个 sid，executor 在任务到终态时调 obs.CleanupSession 丢掉这个 sid 还没续跑的
+//     挂起记录（input-required 留着，续发 Resume 时用来算等待时长）。
 //
 // **局限（明确）**：
 //   - 跨进程 Resume 不支持：taskID↔RunSession 映射 + cp 都 in-process，server 重启后
@@ -118,9 +111,9 @@ type taskKey struct {
 // ExecutorOption 配置 Executor。
 type ExecutorOption func(*Executor)
 
-// WithExecutorObservability 注入 observability 启用 a2a 跨语言 trace：server 侧从入站
-// Message.metadata 提取 remote CS-OSS trace context + 建 gen_ai.a2a_server span，
-// 内部 agent/model/tool span 挂其下（同一 trace 串到 client）。
+// WithExecutorObservability 注入 observability 启用 a2a 跨进程 trace：server 侧从入站
+// Message.metadata 取出 W3C trace context 作父 + 建 SERVER span，内部 agent / model / tool span
+// 挂在它下面（跟 client 同一条 trace）。
 func WithExecutorObservability(obs *observability.Observability) ExecutorOption {
 	return func(e *Executor) {
 		if obs != nil {
@@ -224,18 +217,14 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 	return func(yield func(a2atypes.Event, error) bool) {
 		inputMsg := inputMessage(execCtx)
 
-		// a2a 跨语言 trace：从入站 Message.metadata 提取 remote CS-OSS trace context
-		//（协议——走 message.metadata 非 HTTP header）+ push 进 ctx，让 sessionByIDSeeded
-		// 用 remote traceID seed，server 整棵 span 树串到 client 的 trace。fail-open：
-		// 缺失/非法 → IsValid()=false → 不 seed，server 自起新 trace（不影响业务）。
+		// a2a 跨进程 trace：从入站 Message.metadata 取出远端的 trace context（W3C traceparent 等）作父，
+		// server 的整棵 span 树串到 client 的 trace 上。缺失或格式不对时原样返回 ctx，server 自起新 trace。
 		if e.obs != nil && execCtx.Message != nil {
-			if tc := observability.ExtractFromMetadata(execCtx.Message.Metadata); tc.IsValid() {
-				ctx = observability.WithTraceContext(ctx, tc)
-			}
+			ctx = e.obs.ExtractFromMetadata(ctx, execCtx.Message.Metadata)
 		}
 
 		// 会话线程身份：A2A ContextID 是跨 task 的会话线程标识——push 成 ThreadID。两个消费者
-		// （cross-verify 确认全集）：(1) 观测——trace 带 gen_ai.session.id（跨 run 会话聚类）；
+		// （cross-verify 确认全集）：(1) 观测——trace 带 gen_ai.conversation.id（跨 run 会话聚类）；
 		// (2) **HandoffAgent 持久转交**——served HandoffAgent 的
 		// active agent 按 ThreadID 存（handoff.md §5.2 会话维度），同 ContextID 的下一个 task
 		// 从上次转交后的 agent 续接（不 push 时按 per-task RunID 各自从 initial 起步）。
@@ -404,18 +393,13 @@ func (e *Executor) runStreaming(
 ) {
 	runCtx, cancel := context.WithCancel(compose_v2.WithCheckpointerCtx(ctx, e.cp))
 	defer cancel()
-	// a2a 跨语言 trace：push sid（= st.sess.RunID）让 server span + 后续内部 agent span
-	// 同 session（StartA2AServerSpan 内 o.session(ctx) 需 sid + ctx 的 remote TraceContext
-	// seed）。agent.Run 内部也 WithSession 同 sid，重复 push 同值无害。
+	// push sid（= st.sess.RunID）：agent.Run 内部也会 WithSession 同一个 sid，重复 push 同值无害。
 	runCtx = compose_v2.WithSessionIDCtx(runCtx, st.sess.RunID)
-	// 建 a2a_server span（覆盖整个 agent 执行到终态，conclude End）。nil-safe：obs==nil 时
-	// StartA2AServerSpan nil receiver 返 no-op 句柄（End 安全）。operation 固定 message_stream：
-	// executor 总以流式消费 agent（chunk 转 artifact）。**已知协议保真限制**：跨语言 client 用
-	// 同步 message/send 调本 server 时，a2asrv ExecutorContext 不暴露请求方法（send vs stream，
-	// SDK 在 RPC 层按消费方式区分），故同步调用的 server span 也被标 message_stream——span
-	// 拓扑/trace 串联不受影响，仅 operation attr 与协议名不完全对应。建完内部 agent span 自动
-	// 挂 a2a_server span 下（见 observability seed）。
-	srvSpan := e.obs.StartA2AServerSpan(runCtx, "message_stream", string(execCtx.ContextID), string(execCtx.TaskID))
+	// a2a server span 覆盖整个 agent 执行到终态（conclude 收尾）；agent 拿返回的 runCtx 跑，它的 span 挂在下面。
+	// e.obs 为 nil 时返回 no-op 句柄。operation 固定 message_stream：executor 总以流式消费 agent；
+	// a2asrv 的 ExecutorContext 不暴露请求方法，同步 message/send 调进来的也标成 message_stream。
+	var srvSpan *observability.A2AServerSpan
+	runCtx, srvSpan = e.obs.StartA2AServerSpan(runCtx, "message_stream", string(execCtx.ContextID), string(execCtx.TaskID))
 	// 注册 cancelRun 让 Cancel 能停本在途 run（避免它自己并发跑 abort）
 	e.mu.Lock()
 	st.cancelRun = cancel
@@ -508,24 +492,18 @@ func (e *Executor) runStreaming(
 // abort），此处在 Resume 已返回（<-done 之后）独占 abort 清 cp + 清条目，**不**发终态（Cancel
 // 已发 canceled）——保证任一 sid 同时至多一个 agent.Resume。
 func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext, yield func(a2atypes.Event, error) bool, st *taskState, r runResult, srvSpan *observability.A2AServerSpan) {
-	// a2a_server span 生命周期收尾（协议：覆盖 agent 执行到终态）。srvSpan 总非 nil
-	//（StartA2AServerSpan obs==nil 时返 no-op 句柄），End nil-safe。errMsg 留空脱敏。
-	spanStatus, spanErrType := "success", ""
-	// executor own session 生命周期：st.sess 由 executor（acquire/NewRunSession）创建，
-	// 故清理也是 executor 职责——**a2a server 场景 business 不该在 served agent 的
-	// OnAgentEnd 调 CleanupSession**（它在 agent goroutine 内、先于本 conclude，会提前删
-	// session → 本 conclude 的 srvSpan.End 经 o.session(ctx) 重建空 session、LoadAndDelete
-	// miss → a2a_server span 静默丢 + 重建空 session 反泄漏，见 executor godoc 约束）。
-	// 下面 cleanupSession defer 注册在 srvSpan.End defer 之前 → LIFO 让 End 先跑（session
-	// 活时 span 正常 enqueue），再清 session。input-required（keepPending）不清——留 session
-	// 给续发 Resume 复用，续发最终态再清。
+	// a2a server span 收尾（覆盖 agent 执行到终态）。srvSpan 总非 nil（e.obs 为 nil 时是 no-op 句柄）。
+	// 错误详情不写进 span，只记类型。
+	spanStatus, spanErrType := observability.OutcomeSuccess, ""
+	// st.sess 由 executor 创建，挂起记录也由它清：到终态时丢掉这个 sid 还没续跑的挂起记录；
+	// input-required（keepPending）不清——续发 Resume 时用它算等待时长，续发到终态再清。
 	cleanupSession := false
 	defer func() {
 		if cleanupSession && e.obs != nil {
 			e.obs.CleanupSession(st.sess.RunID)
 		}
 	}()
-	defer func() { srvSpan.End(spanStatus, spanErrType, "") }()
+	defer func() { srvSpan.End(spanStatus, spanErrType) }()
 
 	// owner 在 Execute 入口已 push 进 ctx——conclude 恒跑在那条 ctx 链下游。
 	tkey := taskKey{owner: compose_v2.GetOwner(ctx), taskID: execCtx.TaskID}
@@ -561,7 +539,7 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 	// 被取消：在途 Resume 此刻已返回 → 独占 abort 清 cp（detached ctx：runCtx 可能已被 Cancel 取消），
 	// 不发终态（Cancel 已发 canceled）。
 	if canceled {
-		spanStatus = "cancelled"
+		spanStatus = observability.OutcomeCancelled
 		// push sid 让 abort Resume 的 OnAgentStart 复用本 task session（不漏建 sid-less "" session）；
 		// 本 task 的 session 由下面 cleanupSession defer 清（canceled → keepPending=false → cleanupSession=true）。
 		rctx := compose_v2.WithSessionIDCtx(compose_v2.WithCheckpointerCtx(context.WithoutCancel(ctx), e.cp), st.sess.RunID)
@@ -574,7 +552,7 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 
 	if r.err != nil {
 		if keepPending {
-			spanStatus = "input_required" // 远程要更多输入，非错误（中间态）
+			spanStatus = observability.OutcomeBlocked // 远程要更多输入，非错误（中间态）
 			// HITL：问题（多 query 编号合并）作 input-required 的 status message
 			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateInputRequired, pendingMessage(qs, "")), nil)
 			return
@@ -582,7 +560,7 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		if notResumable {
 			// 同款脱敏：`ErrCheckpointNotResumable` 的文案含 sid / ns / graphID / 各字段
 			// 计数，那是给服务端日志排查用的，不该跨进程回传给远端对端。
-			spanStatus, spanErrType = "error", "a2a_checkpoint_not_resumable"
+			spanStatus, spanErrType = observability.OutcomeError, "a2a_checkpoint_not_resumable"
 			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
 				agentMsg("the saved state for this session is inconsistent and cannot be resumed")), nil)
 			return
@@ -590,7 +568,7 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		if stale {
 			// 脱敏：`ErrCheckpointStale` 的文案含 session id / ns / epoch token，是内部
 			// 信息，不该跨进程回传给远端对端。
-			spanStatus, spanErrType = "error", "a2a_checkpoint_stale"
+			spanStatus, spanErrType = observability.OutcomeError, "a2a_checkpoint_stale"
 			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
 				agentMsg("this session was concurrently advanced by another run; result was not persisted")), nil)
 			return
@@ -598,7 +576,7 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		if graphConflict {
 			// 同款脱敏：`ErrGraphIDConflict` 的文案含 sid / ns / 两张图的 GraphID。它重跑必然撞同一个
 			// 槽（接线错误），对端换一个会话才走得通。
-			spanStatus, spanErrType = "error", "a2a_graph_id_conflict"
+			spanStatus, spanErrType = observability.OutcomeError, "a2a_graph_id_conflict"
 			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
 				agentMsg("the saved state for this session belongs to a different agent; start a new session")), nil)
 			return
@@ -606,12 +584,22 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		if notPersisted {
 			// 档没写成（存储出错）：没有可以续的东西，引擎已经尽力清掉槽里更早的那份。脱敏：文案里有
 			// 后端的错误原文与 sid，不跨进程回传给远端对端。
-			spanStatus, spanErrType = "error", "a2a_checkpoint_not_persisted"
+			spanStatus, spanErrType = observability.OutcomeError, "a2a_checkpoint_not_persisted"
 			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
 				agentMsg("this run's state could not be saved, so it cannot be resumed; start a new task")), nil)
 			return
 		}
-		spanStatus, spanErrType = "error", "a2a_agent_error"
+		spanStatus, spanErrType = observability.OutcomeError, "a2a_agent_error"
+		// 跟 agent span 同一个口径：执行 ctx 已结束时按 ctx 判（到期是超时，取消不是失败）；ctx 还活着时错误链上
+		// 的软取消是取消、DeadlineExceeded 是超时，context.Canceled 不算（那是别处被连带取消，这次执行失败了）。
+		switch {
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			spanStatus, spanErrType = observability.OutcomeTimeout, "timeout"
+		case ctx.Err() != nil || errors.Is(r.err, compose_v2.ErrSoftCanceled):
+			spanStatus, spanErrType = observability.OutcomeCancelled, ""
+		case errors.Is(r.err, context.DeadlineExceeded):
+			spanStatus, spanErrType = observability.OutcomeTimeout, "timeout"
+		}
 		// 非中断 error，或中断但 query 列表空（不该发生，AllQueries 保证非空——防御性走 failed）
 		yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
 			agentMsg(fmt.Sprintf("agent %q run failed: %v", e.agent.Name(), r.err))), nil)

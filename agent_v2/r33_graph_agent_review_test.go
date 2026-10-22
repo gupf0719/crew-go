@@ -306,7 +306,7 @@ func countRouteDecisions(rec *r33EventRecorder) int {
 //
 // route_decision 在 ConditionalEdge cond fn 内 fire——cond fn 跑在 Run-level ctx
 // （不在 node scope），修前 GetEventSink 恒 nil → 顶层 RoutingAgent.Run 时 event
-// 静默丢、MetricRouteDecisionsTotal 永远 0（违背 auto-fire 契约）；嵌套时借父图
+// 静默丢、crew.route.decisions 永远 0（框架该自动记的指标静默缺失）；嵌套时借父图
 // node sink 才 fire——同一逻辑两形态不一致。
 // 修后 compose_v2.Run 入口 push Run-level EventSink 兜底。
 // sanity-revert：删 Run-level sink push → 顶层 0 event → fail。

@@ -26,7 +26,7 @@ per-Run 的 `RunID`、`cp.ThreadID` 在 `SaveNS` 里被 auto-fill 成 `sessionID
 `agui/handler.go:165` 把 AG-UI 的 `in.ThreadID` push 进去，**框架自己就在注入**。
 
 但那个值只被 observability 消费（`GetThreadID` 读出作
-`gen_ai.session.id`，`observability/observability.go:868`）、`a2a/server/executor.go:148` 做
+`gen_ai.conversation.id`，OTel 重写前叫 `gen_ai.session.id`）、`a2a/server/executor.go:148` 做
 push 前守卫、以及 handoff 的持久转交用
 （`store.NS("__handoff_active__", name, threadID)`，`agent_v2/handoff_agent.go:605`）——**不进 cp**。
 
@@ -138,7 +138,7 @@ compose_v2.WithThreadIDCtx(ctx, "conv_42")      ← 会话身份唯一声明入�
    ┌────┼─────────┬──────────────┐
    ▼    ▼         ▼              ▼
 observability  handoff      历史层(新)      cp ✗ 不消费
-gen_ai.session.id  store ns   按会话组织     只管单次 Run 断点续跑
+gen_ai.conversation.id  store ns   按会话组织     只管单次 Run 断点续跑
 
 
 channel state（basicMessagesCh）── 唯一真相源（完整、归属恒定、框架管）

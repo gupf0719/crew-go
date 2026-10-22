@@ -64,7 +64,7 @@
 **Phase 3 — 决策门（先定产品意图，别凭引用计数下沉）**
 
 两类灰区，下沉前**必须先决策**：
-1. **observability 事件契约**：`CompactionAction`/`FanoutAction`/`RouteDecisionAction` + 一串 enum。**【决策 2026-06：收敛 internal（B）】**（2026-06-29 §四补改判：不做） —— 业务 0 消费（唯一 consumer 是 `observability/hooks.go` metric 适配器，example/a2a 只取 `chunk`）+ 弱 `map[string]any` 契约 + OTel 标准侧（压缩仅布尔 span 属性 `gen_ai.conversation.compacted`、fanout/route 标准无对应、6 框架 hook 全纯观测）→ 移 `crew-go/internal/`（observability 经模块内访问、业务挡住）+ 撤 godoc"业务订阅"措辞。真有业务订阅诉求时做成 proper typed 事件（eino 式），非现弱 map。
+1. **observability 事件契约**：`CompactionAction`/`FanoutAction`/`RouteDecisionAction` + 一串 enum。**【决策 2026-06：收敛 internal（B）】**（2026-06-29 §四补改判：不做） —— 业务 0 消费（唯一 consumer 是 `observability/orch_hooks.go` 的 `recordEventMetric`，example/a2a 只取 `chunk`）+ 弱 `map[string]any` 契约 + OTel 标准侧（压缩仅布尔 span 属性 `gen_ai.conversation.compacted`、fanout/route 标准无对应、6 框架 hook 全纯观测）→ 移 `crew-go/internal/`（observability 经模块内访问、业务挡住）+ 撤 godoc"业务订阅"措辞。真有业务订阅诉求时做成 proper typed 事件（eino 式），非现弱 map。
 2. **"声明但零 caller"**：`SoftCancel` 族 / `RunSubAgent` / `AutoCompactRun`/`MicroCompactRun`/`ReactiveCompactRun` / `NewSharedChildSession` / `IsPromptTooLongError`。**【决策 2026-06：KEEP-PUBLIC】** —— 有意的公开扩展点，"0 example"是缺 demo 非过度暴露；**补 example 而非藏 internal**（文档即契约，藏了文档 stale）。（2026-09-18 核验：example 未补，已进中心 backlog；`RunSubAgent` 已有 example 调用。）
 
 ### 建议执行序

@@ -201,6 +201,11 @@ frontier 缩小 + 依赖 branchIdx 索引差异化 payload）——本 finding �
 
 ## finding 3（**MED，CONFIRMED**）✅ **已修**（2026-07-17，`bca57e8`）——原记 LOW「疑 by-design」，实证后判定**不是 by-design**：OnToolEnd 硬编码 Success:true → `gen_ai_tool_errors` metric 对业务级失败恒 0
 
+> 注（2026-10-22）：下文的 `observability/hooks.go`、`gen_ai_tool_errors`、`MetricToolErrorTotal` 是旧观测实现的文件与指标。
+> OTel 重写后工具失败记在工具 span 的 status / `error.type` 与 `gen_ai.execute_tool.duration` 的 `error.type` 维度上，
+> 观测侧哨兵是 `observability/observability_test.go` 的 `TestToolFailure_ErrorType`；框架侧哨兵
+> `agent_v2/tool_failure_visibility_test.go` 不变。
+
 `agent_v2/basic_builder.go:470` 构造传给 `OnToolEnd` 的 `ToolCallResult` 时 `Success: true`
 硬编码，`Error`/`ErrorCode` 字段也不填（只传 `r.Content`）。
 
@@ -244,7 +249,7 @@ annotation 不导出——框架同时是生产者和消费者，业务读失败
   同样是失败的 tool call，错误码本就在 content 文本里
 - `tool_denied`（审批拒绝）→ **不标记**：那是用户的主动决定、不是错误，计进错误率会污染告警
 
-**回归**（`agent_v2/tool_failure_visibility_test.go` 5 条 + `observability/tool_error_metric_e2e_test.go` 2 条）：
+**回归**（`agent_v2/tool_failure_visibility_test.go` 5 条 + 当时的观测侧端到端 2 条，OTel 重写后换成 `TestToolFailure_ErrorType`）：
 业务失败 / 成功不受影响 / 框架拒绝 / hook 不改写时 content 原样（回写不变式）/ hook 改写
 真生效；再加**真端到端**——跑真 BasicAgent + `tool.Failure` → 断言 `gen_ai_tool_errors` 真 +1。
 

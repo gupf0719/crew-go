@@ -201,7 +201,7 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	}
 	// Sub-5 audit Round 2/3 fix: GraphAgent 包任意 compose_v2.Graph 为 Agent, 业务自定义
 	// DAG 无统一 "round" 语义 (业务可能是 N 节点串行 / fanout / 循环等). info.Round 保持
-	// 0 是 by-design — 业务想看节点执行数走 MetricNodeExecutionTotal{node=...}.
+	// 0 是 by-design — 业务想看节点执行数走 crew.node.executions{crew.node.id=...}.
 	info := &hook.AgentInfo{Name: g.Name(), Type: "graph", Round: 0}
 
 	// 8-method 协议：OnAgentStart 整个调用 1 次, Run 入口 fire (GraphAgent 非 ReAct 循环).
@@ -328,7 +328,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	}
 	// Sub-5 audit Round 2/3 fix: GraphAgent 包任意 compose_v2.Graph 为 Agent, 业务自定义
 	// DAG 无统一 "round" 语义 (业务可能是 N 节点串行 / fanout / 循环等). info.Round 保持
-	// 0 是 by-design — 业务想看节点执行数走 MetricNodeExecutionTotal{node=...}.
+	// 0 是 by-design — 业务想看节点执行数走 crew.node.executions{crew.node.id=...}.
 	info := &hook.AgentInfo{Name: g.Name(), Type: "graph", Round: 0}
 	prep, newCtx, err := commonResumePrep(ctx, "graph agent", g.Name(), sessionID, opts, info, hooks, nil /* GraphAgent 无静态子列表，历史配置只能来自 ctx */)
 	if err != nil {

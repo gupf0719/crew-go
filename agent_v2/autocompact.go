@@ -61,7 +61,7 @@ type AutoCompactConfig struct {
 	//
 	// ⚠️ **它不是「零成本」**（这里曾这么写）：早退点在压缩事件的 Before emit 与 After
 	// defer **之后**，所以跳过的那些轮照样各发一对事件 ⟹ 接了 observability 的业务会看到
-	// `gen_ai_compacts{outcome=true}` 每轮 +1、ratio 恒 1.0。见 `doc/code/todo.md` 同名条目。
+	// `crew.compactions{crew.outcome=success}` 每轮 +1、ratio 恒 1.0。见 `doc/code/todo.md` 同名条目。
 	MinCompactableTokens int
 
 	// MaxReductionRatio 摘要相对原文的最大占比；摘要 token > early * 此比例时判定

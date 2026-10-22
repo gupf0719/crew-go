@@ -241,7 +241,7 @@ func (p *ParallelAgent) Run(ctx context.Context, session *RunSession, input *sch
 	}
 	// Sub-5 audit Round 2/3 fix: ParallelAgent 是 branch fan-out 单次执行, 无 "round"
 	// 概念 (区别于 BasicAgent.ReAct 循环 / SequentialAgent.step / LoopAgent.iteration).
-	// info.Round 保持 0 是 by-design — 业务想看 fanout branch 数走 MetricFanoutBranches.
+	// info.Round 保持 0 是 by-design — 业务想看 fanout branch 数走 crew.fanout.branches.
 	info := &hook.AgentInfo{Name: p.Name(), Type: "parallel", Round: 0}
 	// audit³ D1 fix: OnAgentStart Run top-level fire (跟 PlanAgent 对齐)
 	agentIn := &hook.AgentInput{Messages: []*schema.Message{input}}
@@ -308,7 +308,7 @@ func (p *ParallelAgent) Resume(ctx context.Context, sessionID string, opts ...Re
 	}
 	// Sub-5 audit Round 2/3 fix: ParallelAgent 是 branch fan-out 单次执行, 无 "round"
 	// 概念 (区别于 BasicAgent.ReAct 循环 / SequentialAgent.step / LoopAgent.iteration).
-	// info.Round 保持 0 是 by-design — 业务想看 fanout branch 数走 MetricFanoutBranches.
+	// info.Round 保持 0 是 by-design — 业务想看 fanout branch 数走 crew.fanout.branches.
 	info := &hook.AgentInfo{Name: p.Name(), Type: "parallel", Round: 0}
 	prep, newCtx, err := commonResumePrep(ctx, "parallel agent", p.Name(), sessionID, opts, info, hooks, p.historySubs())
 	if err != nil {

@@ -41,7 +41,7 @@ func TestQwenTestClient_DashScopeGenerate(t *testing.T) {
 			t.Error("generate token total=0")
 		}
 	}
-	// 验 gen_ai.system (provider, gap 2) + response model (gap 1) 透传到 Metadata
+	// 验 gen_ai.provider.name (provider, gap 2) + response model (gap 1) 透传到 Metadata
 	if resp.Metadata != nil {
 		if resp.Metadata.System != "dashscope" {
 			t.Errorf("generate Metadata.System = %q; want dashscope (WithSystem 透传)", resp.Metadata.System)
@@ -106,7 +106,7 @@ func TestQwenTestClient_DashScopeStream(t *testing.T) {
 			t.Error("stream token total=0")
 		}
 	}
-	// gap 1/2: stream chunk 也透传 provider (gen_ai.system) + response model
+	// gap 1/2: stream chunk 也透传 provider (gen_ai.provider.name) + response model
 	if system != "dashscope" {
 		t.Errorf("stream Metadata.System = %q; want dashscope", system)
 	}

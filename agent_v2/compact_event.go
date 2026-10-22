@@ -18,7 +18,7 @@ import (
 //     nil.
 //   - **加 Layer 字段**: 区分 4 层 (Micro/Auto/Reactive/Store——Store 留 Phase 2).
 //   - **走 compose_v2.EventSink.Send**: 跟现有 chunk/reset_stream 同协议, 不引
-//     入新 hook 接口. observability/hooks.go OnNodeEvent 消费侧已 ready.
+//     入新 hook 接口. observability 的 OnNodeEvent 消费它（span 事件 + crew.compaction* 指标）.
 //   - **仅观测**: 业务订阅 event 看到压缩前后完整状态, 不能改写. 真改写靠现有
 //     Config 内独立钩子 (如 AutoCompactConfig.Model 业务自定义).
 //
@@ -26,8 +26,8 @@ import (
 // 区分靠 Action.Layer (micro/auto/reactive/store) + Action.Type (before/after/generate).
 // ────────────────────────────────────────────────────────────
 
-// CompactionEventType 是 compose_v2.Event.Type 字符串. observability/hooks.go
-// OnNodeEvent 按此值识别 compaction event 反序列化 Action 加 span attr.
+// CompactionEventType 是 compose_v2.Event.Type 字符串. observability 的
+// OnNodeEvent 按此值识别 compaction event，把 Action 展开成 span 事件属性.
 const CompactionEventType = "compaction"
 
 // hasEventSink 报告 ctx 是否挂了 compose_v2.EventSink。压缩各层用它作为 fire event
@@ -226,9 +226,8 @@ type CompactionGenerateAction struct {
 //
 // **零开销路径**: ctx 内无 EventSink 时立刻 return (业务不订阅 event 流时不付任何代价).
 //
-// observability/hooks.go OnNodeEvent 反序列化 Metadata["action"].(*CompactionAction)
-// 后按 Layer + Type 分发加 span attr (Phase 2 D2 trace 实施时接入, HIGH-1 阶段
-// 业务可自行订阅 OnNodeEvent 消费此 event).
+// observability 的 OnNodeEvent 取 Metadata["action"].(*CompactionAction)，按 Layer + Type
+// 展开成 span 事件属性，After 事件再记 crew.compaction* 指标；业务也可自行订阅 OnNodeEvent 消费.
 func EmitCompactionEvent(ctx context.Context, action *CompactionAction) {
 	if action == nil {
 		return

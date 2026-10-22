@@ -243,7 +243,8 @@ func NSSubtreeSeparator() string {
 //	SplitNS("a//b")      → ErrInvalidNS（不允许连续分隔符）
 //	SplitNS("a#x")       → ErrInvalidNS（fanout idx 必须是合法整数）
 //
-// 生产里目前只有 skill fork 的递归检测用它按段比较；存档清理的子树判定走 [IsNSInSubtree]。
+// 生产里 skill fork 的递归检测用它按段比较、observability 用它取嵌套图的工作流名；存档清理的子树判定走
+// [IsNSInSubtree]。
 // 解析失败调用方应降级（如 "从 root 重跑"）而非 panic。
 //
 // ⚠️ v1 时代描述"ResumeRouting 祖先 prefix 推导", v2 已删 IsResumeTarget 自检
@@ -353,7 +354,7 @@ func ValidateNodeIDForNS(nodeID string) error {
 //
 // `a#0`（fan-out 实例）、`a@1`（重访实例）与 `a` 是**同一个节点的不同执行**：各有各的
 // 存档，各自在成功或终局失败时清自己的子树。[ParentNS] 把它们挂在 `a` 下面，那是为了
-// 按节点归组（观测层沿它找父 span），不是所有权。
+// 按节点归组，不是所有权。
 //
 // 按归组删的话，一次执行的清理会连带删掉兄弟执行还挂着的存档——同一次节点执行里对
 // 同一个名字调两次，第一次成功时把第二次的挂起档删了（实测：模型每次换 tool_call ID 时
@@ -382,7 +383,7 @@ func IsNSInSubtree(root, ns string) bool {
 //	ParentNS("a/b#1/c")     = "a/b#1"   // fan-out 分支内子图，剥 /c
 //	ParentNS("a/b/c")       = "a/b"     // 三层子图，剥 /c
 //
-// 用于 Checkpoint.ParentNS 字段自动填充与观测层按节点归组找父 span。⚠️ 它是**归组**关系，
+// 用于 Checkpoint.ParentNS 字段自动填充。⚠️ 它是**归组**关系，
 // 不是所有权：`a#0` 挂在 `a` 下面，但不属于 `a` 那次执行的子树（见 [IsNSInSubtree]）。
 func ParentNS(ns string) string {
 	if ns == "" {

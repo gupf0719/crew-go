@@ -7,18 +7,17 @@
 // 前提：zk 里已有对应 service 的 agent 注册（别人跑着 server）、且你知道它的 service name。
 //
 // 两种调用形态：
-//   - 默认（agent 形态）：RemoteAgent 直接 ra.Run，无需 LLM，span 树 host→a2a_client→a2a_server。
+//   - 默认（agent 形态）：RemoteAgent 直接 ra.Run，无需 LLM，span 树 host → a2a client → a2a server。
 //   - -as-tool（AgentAsTool 形态，RemoteAgent 主用法）：真 qwen host 把远程 agent 当 tool、由
-//     host LLM 决定调用，span 树多 model 节点 + a2a_client 落 child ns（需 .env QWEN_API_KEY）。
+//     host LLM 决定调用，span 树多 model 节点 + a2a client span 落 child ns（需 .env QWEN_API_KEY）。
 //
 // 跑（需可达 ZK）：
 //
 //	go run -tags integration ./example/a2a/zk_client -zk 127.0.0.1:2181 -service code-svc -q "帮我查代号"
 //	go run -tags integration ./example/a2a/zk_client -zk 127.0.0.1:2181 -service code-svc -q "查代号" -as-tool
 //
-// 传 -obs-trace-endpoint 时 trace 上报到该 collector（对齐 plan_chat_web 范式）：注入跨语言
-// trace context 到 A2A metadata + 打印 traceID 供在监控控制台搜跨进程 trace。不传 endpoint 时
-// 不上报（调用照常）。
+// 传 -obs-trace-endpoint 时把 trace 以 OTLP 发给该 collector：W3C trace context 写进 A2A metadata，
+// 打印 trace ID 供在后端搜跨进程 trace。不传时不导出（调用照常）。
 package main
 
 import (
@@ -26,7 +25,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"strings"
 	"time"
 
@@ -37,6 +35,7 @@ import (
 	"crew-go/compose_v2"
 	"crew-go/example/envloader"
 	"crew-go/example/llmtrace"
+	"crew-go/example/otelsetup"
 	"crew-go/hook"
 	"crew-go/observability"
 	"crew-go/schema"
@@ -51,7 +50,7 @@ func main() {
 		agentName  = flag.String("agent-name", "", "只发现指定 agentName 的实例（同一 service 注册多个 agent 时精确路由；空 = 该 service 下所有 agentName 聚合，selector 选一个）")
 		query      = flag.String("q", "你好", "发给远程 agent 的消息")
 		asTool     = flag.Bool("as-tool", false, "AgentAsTool 形态：真 qwen host 把远程 agent 当 tool、由 LLM 决定调用（RemoteAgent 主用法，需 .env QWEN_API_KEY）；默认 agent 形态直接 ra.Run")
-		obsTrace   = flag.String("obs-trace-endpoint", "", "OTLP gRPC TraceService endpoint（如 127.0.0.1:5317）；空 = 不上报 trace")
+		obsTrace   = flag.String("obs-trace-endpoint", "", "OTLP gRPC 地址（如 127.0.0.1:4317）；空 = 不导出 trace")
 	)
 	flag.Parse()
 	if *zkEndpoint == "" || *service == "" {
@@ -82,34 +81,29 @@ func main() {
 			in.InstanceID, in.AgentName, in.BaseURL, in.Status, in.Transport, in.AgentCardURL)
 	}
 
-	// ── 3. 接 observability（-obs-trace-endpoint 为空则不上报）。New 失败 silent
-	// fallback——不阻塞调用（对齐 plan_chat_web）。──
-	var obs *observability.Observability
-	if o, e := observability.New(observability.Config{
-		Resource:             observability.Resource{AppName: "zk-client", EnvName: "dev", IP: localIP(), SDKVersion: "v"},
-		TraceEndpoint:        *obsTrace,
-		RecordMessageContent: true,
-	}); e != nil {
-		log.Printf("observability init 失败（调用继续，不上报 trace）: %v", e)
-	} else if o != nil {
-		obs = o
-		defer obs.Close()
+	// ── 3. 接 observability：配了地址就装 OTel SDK 导出 trace；没配时 span 是 no-op，调用照常。──
+	if *obsTrace != "" {
+		shutdown, err := otelsetup.Setup(ctx, otelsetup.Config{ServiceName: "zk-client", TraceEndpoint: *obsTrace, Insecure: true})
+		if err != nil {
+			log.Printf("OTel SDK 装配失败（调用继续，不导出 trace）: %v", err)
+		} else {
+			defer func() { _ = shutdown(context.Background()) }()
+		}
 	}
+	obs := observability.New(observability.WithContentRecording(true))
 
 	opts := []a2a.RemoteOption{a2a.WithName("zk_remote")}
 	if *agentName != "" {
 		opts = append(opts, a2a.WithDiscoveryAgentName(*agentName))
 	}
-	if obs != nil {
-		opts = append(opts, a2a.WithObservability(obs))
-	}
+	opts = append(opts, a2a.WithObservability(obs))
 	sel := registry.NewRoundRobinSelector()
 
 	// ── 4. 调用——两种形态 ──
 	var final *schema.Message
 	if *asTool {
 		// 4a. AgentAsTool 形态（RemoteAgent 主用法）：真 qwen host 把远程 agent 当 tool，由 host
-		// 的 LLM 决定调用。span 树多 model 节点 + a2a_client 落在 child ns（host agent span 在
+		// 的 LLM 决定调用。span 树多 model 节点 + a2a client span 落在 child ns（host agent span 在
 		// parent ns、经 RunSubAgent push child ns，验证 child ns 上溯找父 span）。需 .env QWEN_API_KEY。
 		envloader.Load()
 		remoteTool, err := a2a.NewRemoteAgentToolFromService(ctx, dir, *ns, *service, sel, opts...)
@@ -130,17 +124,15 @@ func main() {
 		// ⚠️ 用 Install 一次接上**两条**链——这里曾只接 AgentHooks()，
 		// 于是 compact/cp/fanout/node/skill 共 8 个 metric 全不 fire、node 与 graph
 		// 的 span 也不建，而且**不报错**（漏装是静默的，见 Install 的 godoc）。
-		runCtx := ctx
-		if obs != nil {
-			runCtx, hostOpts = obs.Install(runCtx, hostOpts...)
-		}
+		runCtx, hostOpts := obs.Install(ctx, hostOpts...)
 		host := agent_v2.NewBasicAgent(hostOpts...)
 		sess := agent_v2.NewRunSession()
 		runCtx = compose_v2.WithSessionIDCtx(runCtx, sess.RunID)
-		if obs != nil {
-			if tid := obs.TraceIDFor(sess.RunID); tid != "" {
-				fmt.Printf("✓ trace traceID=%s（AgentAsTool 形态，监控控制台搜跨进程 trace）\n", tid)
-			}
+		// 开一个根 span 包住整次调用，拿它的 trace ID 去后端搜跨进程 trace。
+		runCtx, root := obs.Tracer().Start(runCtx, "zk_client as_tool")
+		defer root.End()
+		if tid := observability.TraceIDFromContext(runCtx); tid != "" {
+			fmt.Printf("✓ trace ID=%s（AgentAsTool 形态，在 trace 后端搜跨进程 trace）\n", tid)
 		}
 		callCtx, cancel := context.WithTimeout(runCtx, 120*time.Second)
 		defer cancel()
@@ -150,26 +142,22 @@ func main() {
 		}
 		final = agent_v2.FinalMessage(events)
 	} else {
-		// 4b. agent 形态：RemoteAgent 直接 Run（无需 LLM）。手建顶层 host span 让 a2a_client span
-		// 有父挂载 + 注入 metadata（input=query / output=应答，client 视角）。
-		runCtx := ctx
-		var endHost func(*schema.Message)
-		if obs != nil {
-			sess := agent_v2.NewRunSession()
-			runCtx = compose_v2.WithSessionIDCtx(ctx, sess.RunID)
-			ah := obs.AgentHooks()
-			info := &hook.AgentInfo{Name: "zk_client_host", Type: "base"}
-			runCtx, _ = ah.OnAgentStart(runCtx, info, &hook.AgentInput{Messages: []*schema.Message{schema.UserMessage(*query)}})
-			endHost = func(out *schema.Message) {
-				var outMsgs []*schema.Message
-				if out != nil {
-					outMsgs = []*schema.Message{out}
-				}
-				ah.OnAgentEnd(runCtx, info, &hook.AgentOutput{Messages: outMsgs})
+		// 4b. agent 形态：RemoteAgent 直接 Run（无需 LLM）。手建顶层 host span，让 a2a client span
+		// 有父可挂（input=query / output=应答，client 视角）。
+		sess := agent_v2.NewRunSession()
+		runCtx := compose_v2.WithSessionIDCtx(ctx, sess.RunID)
+		ah := obs.AgentHooks()
+		info := &hook.AgentInfo{Name: "zk_client_host", Type: "base"}
+		runCtx, _ = ah.OnAgentStart(runCtx, info, &hook.AgentInput{Messages: []*schema.Message{schema.UserMessage(*query)}})
+		endHost := func(out *schema.Message) {
+			var outMsgs []*schema.Message
+			if out != nil {
+				outMsgs = []*schema.Message{out}
 			}
-			if tid := obs.TraceIDFor(sess.RunID); tid != "" {
-				fmt.Printf("✓ trace traceID=%s（监控控制台搜此 ID 看跨进程 trace）\n", tid)
-			}
+			ah.OnAgentEnd(runCtx, info, &hook.AgentOutput{Messages: outMsgs})
+		}
+		if tid := observability.TraceIDFromContext(runCtx); tid != "" {
+			fmt.Printf("✓ trace ID=%s（在 trace 后端搜此 ID 看跨进程 trace）\n", tid)
 		}
 		ra, err := a2a.NewRemoteAgentFromService(runCtx, dir, *ns, *service, sel, opts...)
 		if err != nil {
@@ -179,9 +167,7 @@ func main() {
 		defer cancel()
 		events, runErr := ra.Run(callCtx, agent_v2.NewRunSession(), schema.UserMessage(*query))
 		final = agent_v2.FinalMessage(events)
-		if endHost != nil {
-			endHost(final) // host span output = 远程应答（final nil 时 output 空，仍 fire 收尾）
-		}
+		endHost(final) // host span output = 远程应答（final nil 时 output 空，仍收尾）
 		if runErr != nil {
 			log.Fatalf("✗ RemoteAgent.Run: %v", runErr)
 		}
@@ -191,22 +177,4 @@ func main() {
 		log.Fatal("✗ 远程调用无 final message（A2A wire 链路问题）")
 	}
 	fmt.Printf("\n=== 远程应答 ===\n%s\n", final.Content)
-}
-
-// localIP 取本机首个非 loopback IPv4（observability.Config.Resource.IP 必填，上报标识）。
-func localIP() string {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return "127.0.0.1"
-	}
-	for _, addr := range addrs {
-		ipnet, ok := addr.(*net.IPNet)
-		if !ok || ipnet.IP.IsLoopback() {
-			continue
-		}
-		if ipv4 := ipnet.IP.To4(); ipv4 != nil {
-			return ipv4.String()
-		}
-	}
-	return "127.0.0.1"
 }

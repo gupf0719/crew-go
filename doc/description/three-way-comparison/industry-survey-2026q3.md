@@ -310,6 +310,8 @@ completed run」。
 
 > 两处前提更正：`gen_ai.usage.type` 我们其实不发（发的是 `gen_ai_token_type`，与 OTel 对齐）；
 > metric 名整套是我们自己的词表，与 OTel **零重叠**，所以 OTel 的 metric 变更对我们结构性无影响。
+> （2026-10 改成标准 OTel 后这两句不再成立：token 指标按 GenAI 约定发 `gen_ai.client.inference.usage.*` +
+> `gen_ai.token.modality`，约定的指标变更要跟进，见 [observability-trace-spec.md](observability-trace-spec.md)。）
 
 ## 六、其余可迁移发现（按价值排序）
 

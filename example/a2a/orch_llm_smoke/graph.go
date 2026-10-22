@@ -12,7 +12,7 @@ import (
 
 // buildCodeGraph 构造最小自定义图：单节点 NodeFunc 内经 agent_v2.RunSubAgent 调 RemoteAgent
 // （一站式 push graphNS + child session + storeScope，对齐 CLAUDE.md "GraphAgent 提示" 推荐
-// 范式；直接 ra.Run 不 push 父 ns、a2a_client span 不落 child ns），包成 GraphAgent。
+// 范式；直接 ra.Run 不 push 父 ns、a2a client span 不落 child ns），包成 GraphAgent。
 func buildCodeGraph(ra *a2a.RemoteAgent) (*compose_v2.Graph, *agent_v2.GraphAgent) {
 	inputCh := compose_v2.LastValue[*schema.Message]("__a2a_orch_input__")
 	outputCh := compose_v2.LastValue[*schema.Message]("__a2a_orch_output__")

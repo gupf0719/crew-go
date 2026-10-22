@@ -117,7 +117,7 @@ for _, q := range []string{"北京天气？", "明天呢？", "刚才问的是�
 | **长对话上下文压缩**（4 层）| [context-compaction.md](v2/context-compaction.md) |
 | **跨 Run 长期记忆** | [store.md](v2/store.md) |
 | **Skill 系统** | [orchestration-patterns.md §11](v2/orchestration-patterns.md) |
-| **可观测**（trace/metric 接入 CS-OSS Monitor）| [observability-implementation-guide.md](v2/observability-implementation-guide.md) |
+| **可观测**（OpenTelemetry trace / 指标）| [observability.md](v2/observability.md) |
 | **生命周期 hook / 流式 SSE** | [hooks.md](v2/hooks.md) + [hooks-and-streaming.md](v2/hooks-and-streaming.md) |
 | **底层图引擎**（compose_v2 channel-based）| [usage-guide.md](v2/usage-guide.md) + [channel-engine.md](v2/channel-engine.md) |
 | **完整 API 速查** | [migration-history.md](v2/migration-history.md) |

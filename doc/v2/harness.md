@@ -127,7 +127,7 @@ harness 是横切层，误配的典型表现不是崩溃，而是**某个能力�
 |---|---|---|
 | 结构化输出 `WithOutputSchema` | 改的是主循环**产出的形态**（最终答复是 typed JSON），不是支撑长跑 | [structured-output.md](structured-output.md) |
 | 模型故障切换 `fallback` | model 层装饰器，对 9 编排透明；解的是 provider 不可用不是长跑上下文 | [model-fallback.md](model-fallback.md) |
-| observability | 让长跑**看得见**而非让它**跑得下去**；本仓单独成体系 | [observability-implementation-guide.md](observability-implementation-guide.md) |
+| observability | 让长跑**看得见**而非让它**跑得下去**；本仓单独成体系 | [observability.md](observability.md) |
 
 ⚠️ **`example/harness/` 目录的归类比本文宽**：`structured_smoke` 演示的结构化输出按上表不算
 harness（`durability_smoke` 则对应 §2 首行 cp 的落盘时机，是表内的）。以本文为准。

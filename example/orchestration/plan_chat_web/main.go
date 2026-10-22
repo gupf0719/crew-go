@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -24,6 +23,7 @@ import (
 	"crew-go/compose_v2"
 	"crew-go/example/envloader"
 	"crew-go/example/llmtrace"
+	"crew-go/example/otelsetup"
 	"crew-go/example/scenarios"
 	"crew-go/hook"
 	"crew-go/model"
@@ -170,13 +170,10 @@ func main() {
 	flag.BoolVar(&featPromptTemplate, "feat-prompt-template", false, "演示 PromptTemplate：chat_entry sysPrompt 参数化模板")
 	flag.BoolVar(&featToolSearch, "feat-tool-search", false, "演示 ToolSearch：scenario 重型工具 deferred，LLM 调 tool_search 揭示后才可用")
 	flag.BoolVar(&featApproval, "feat-approval", false, "演示 Approval：敏感工具（ask_coder）执行前审批（复用 ask_user HITL 中断链）")
-	// iter-5-O: observability 上报配置 — 业务真生产部署用. 传 endpoint 让
-	// trace + metric push 到 CS-OSS Monitor collector, 不传则不上报 (本地开发).
-	appName := flag.String("obs-app-name", "crew-go", "observability Resource AppName (业务真生产覆盖)")
-	envName := flag.String("obs-env-name", "test", "observability Resource EnvName (prod/test/dev)")
-	sdkVer := flag.String("obs-sdk-version", "crew-go-1.0.0", "observability Resource SDKVersion")
-	obsTrace := flag.String("obs-trace-endpoint", "", "OTLP gRPC TraceService endpoint, 如 127.0.0.1:5317 (空 = 不上报 trace)")
-	obsMetrics := flag.String("obs-metrics-endpoint", "", "OTLP gRPC MetricsService endpoint, 如 127.0.0.1:5318 (空 = 不上报 metric)")
+	// OpenTelemetry 导出配置：传 OTLP gRPC 地址就把 trace / 指标发给 collector，不传则不导出（本地开发）。
+	serviceName := flag.String("obs-service-name", "plan_chat_web", "OTel Resource 的 service.name")
+	obsTrace := flag.String("obs-trace-endpoint", "", "OTLP gRPC 地址，如 127.0.0.1:4317（空 = 不导出 trace）")
+	obsMetrics := flag.String("obs-metrics-endpoint", "", "OTLP gRPC 地址，如 127.0.0.1:4317（空 = 不导出指标）")
 	cwin := flag.Int("compaction-window", 32000, "AutoCompact 模拟 ModelContextWindow（mock demo 调小可看 4 层压缩事件）")
 	// TTL `default_ttl` 设计:
 	// session 完成后保留 N 分钟让前端能查 history, 超期由后台 sweeper 清防 OOM。
@@ -214,31 +211,21 @@ func main() {
 		}
 	}
 
-	// 启 observability — 业务真生产推 trace + metric 到 CS-OSS Monitor collector.
-	// endpoint 为空 → exporter=nil 不上报. 初始化失败 silent fallback 不阻塞业务主流程.
-	obs, err := observability.New(observability.Config{
-		Resource: observability.Resource{
-			AppName:    *appName,
-			EnvName:    *envName,
-			IP:         localIP(),
-			SDKVersion: *sdkVer,
-		},
-		TraceEndpoint:   *obsTrace,
-		MetricsEndpoint: *obsMetrics,
-		// AI_TRACE_SPEC.md §Events: SDK 默认**不**采集 prompt/response/tool input/output 内容
-		// (PII 防泄漏). demo 显式开 RecordMessageContent=true 让业务在监控 Trace 详情看完整
-		// gen_ai_content (agent_input / agent_output / prompt / response / tool_input /
-		// tool_output 6 个 event 填真 JSON 不只 size 元数据).
-		// 真生产业务自己判: 内容含 PII / 用户敏感 → 不开或配 RedactPatterns 脱敏.
-		RecordMessageContent: true,
-	})
-	if err != nil {
-		log.Printf("[plan_chat_web] observability init failed (业务跑但不上报): %v", err)
-	} else if obs != nil {
-		defer obs.Close()
-		log.Printf("[plan_chat_web] observability OK (AppName=%s, EnvName=%s, TraceEndpoint=%q, MetricsEndpoint=%q)",
-			*appName, *envName, *obsTrace, *obsMetrics)
+	// 应用配 OTel SDK（导出器 / Resource），observability 用全局 provider。装配失败不挡业务：照常跑，只是不导出。
+	if shutdownOTel, err := otelsetup.Setup(context.Background(), otelsetup.Config{
+		ServiceName: *serviceName, TraceEndpoint: *obsTrace, MetricsEndpoint: *obsMetrics, Insecure: true,
+	}); err != nil {
+		log.Printf("[plan_chat_web] OTel SDK 装配失败（业务照常跑，不导出）: %v", err)
+	} else {
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = shutdownOTel(ctx)
+		}()
+		log.Printf("[plan_chat_web] OTel OK (service.name=%s, trace=%q, metrics=%q)", *serviceName, *obsTrace, *obsMetrics)
 	}
+	// demo 打开内容采集，在 trace 里能看到模型 / 工具的输入输出；生产按是否含个人信息决定，配 WithRedactPatterns 脱敏。
+	obs := observability.New(observability.WithContentRecording(true))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -279,10 +266,6 @@ func main() {
 // running / interrupted slot 即使久未活动也不删 (业务挂着等 Resume), 防误清正在
 // 用的 session。
 //
-// **obs.sessionState 由 HTTP handler defer obs.CleanupSession 在每次请求退出时
-// unconditional 清** (跟业界独立 trace 一致) — sweeper 不负责 obs 清理, 只清
-// runs map slot.
-//
 // 生命周期跟 process 一致 (demo 单进程不需要显式 stop)。
 func runSweeper(ttl, interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -308,27 +291,6 @@ func runSweeper(ttl, interval time.Duration) {
 			log.Printf("[plan_chat_web] sweeper 清 %d 过期 session", cleared)
 		}
 	}
-}
-
-// localIP 返本机非 loopback IPv4 地址 (业务真生产 observability Resource.IP 用).
-//
-// 拿不到 (无网卡 / 全 loopback) 时 fallback "127.0.0.1" 占位 (业务部署容器 Pod
-// 通常 POD_IP env var 注入更准, demo 用本地 IP 够看).
-func localIP() string {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return "127.0.0.1"
-	}
-	for _, addr := range addrs {
-		ipnet, ok := addr.(*net.IPNet)
-		if !ok || ipnet.IP.IsLoopback() {
-			continue
-		}
-		if ipv4 := ipnet.IP.To4(); ipv4 != nil {
-			return ipv4.String()
-		}
-	}
-	return "127.0.0.1"
 }
 
 // makeChatHandler 为每个请求构造独立的 sink + hooks（每次连接重建以绑定新 sink）；
@@ -397,15 +359,11 @@ func makeChatHandler(chatModel model.ChatModel, obs *observability.Observability
 		observer := &hookAdapter{sink: sink}
 		intHook := &interruptHook{flag: &slot.interrupt}
 
-		// 业务 hooks 链: SSE 推送 + interrupt + observability (真生产 push 到 collector)
-		// CLAUDE.md "业务接 observability" 协议: 必同时接 AgentHooks + OrchHooks —
-		// 漏接 OrchHooks 时 Compact/Cp/Fanout/Node/Skill 8 metric 全漏 fire.
-		var hooks hook.Hooks = hook.NewChainHooks(observer, intHook)
-		var orch agent_v2.OrchestrationHooks = orchSSE
-		if obs != nil {
-			hooks = hook.NewChainHooks(observer, intHook, obs.AgentHooks())
-			orch = agent_v2.NewChainOrchHooks(orchSSE, obs.OrchHooks())
-		}
+		// 业务钩子（SSE 推送 + interrupt）交给 observability 包在里面：两条都要接，漏接 OrchHooks 时节点 / 工作流
+		// span 与压缩、存档、扇出等框架指标都不记。别自己用 NewChainHooks 串——业务钩子开始一侧失败（比如
+		// interruptHook 抛中断）时，包在里面 observability 才能当场收掉刚开的 span。
+		var hooks hook.Hooks = obs.AgentHooks(observer, intHook)
+		var orch agent_v2.OrchestrationHooks = obs.OrchHooks(orchSSE)
 
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -422,34 +380,17 @@ func makeChatHandler(chatModel model.ChatModel, obs *observability.Observability
 		defer cancel()
 		ctx = compose_v2.WithCheckpointerCtx(ctx, slot.cp)
 
-		// CLAUDE.md "业务接 observability" 协议:
-		//   1. compose_v2.WithSessionIDCtx push sid → metric/trace 带 gen_ai.request.id
-		//   2. defer obs.CleanupSession unconditional — **每次 HTTP 请求 (含 HITL Run /
-		//      Resume / Abort) 都各自独立 trace**, 跟业界 LangSmith
-		//      标准一致 (一次 invocation = 一个 trace, 通过 thread_id attr 关联多 trace).
-		//      之前"interrupted 不清让 Resume 共享 TraceID"的设计造成两个 graph span 同
-		//      rootSpanID 冲突, 监控后端 dedup 丢一条 root span (Resume 段 root 覆盖 Run
-		//      段 root, 时间轴显示"相对耗时 >100%" 不对). 改回业界标准独立 trace,
-		//      监控 UI 未来加 thread_id 跨 trace 关联展示 (LangSmith Conversation View
-		//      同款) 解决"HITL 闭环看两 trace 体验差"诉求 — 这是监控 UI 层问题, SDK
-		//      不 hack 绕过.
-		//   3. SSE 推 trace_started event 含 OTLP TraceID, 让前端能复制到监控平台跳转 trace.
-		//      TraceID 格式 `{appname}^^{32hex}|{millis}` 跟 SID (UUID = RunID) 是两套 ID
-		//      不能混 — 直接 echo 给前端避免业务搜错.
-		if obs != nil {
-			ctx = compose_v2.WithSessionIDCtx(ctx, slot.sess.RunID)
-			defer obs.CleanupSession(slot.sess.RunID)
-			// TraceIDFor lazy-create sessionState + 本次 HTTP 请求内后续 hook fire 拿同
-			// traceID. 跨 HTTP 请求 (Run → Resume) sessionState 已被前一请求 defer 清,
-			// Resume 调 TraceIDFor 新建 sessionState 新 traceID — 跟业界独立 trace 一致.
-			// audit fix HIGH-D4: sampled=false (SamplingRatio<1.0 抽到的 0% 路径) 时
-			// traceID 为空, 仅在非空时推 SSE 让前端区分"有 trace 可跳"vs"已采样掉".
-			if traceID := obs.TraceIDFor(slot.sess.RunID); traceID != "" {
-				sink.send("trace_started", map[string]any{
-					"session_id": slot.sess.RunID,
-					"trace_id":   traceID,
-				})
-			}
+		// 每个 HTTP 请求（Run / Resume / Abort 各一次）一个 trace：在这里开请求 span，agent 的 span 挂在
+		// 它下面；同一个任务的多次请求（Run 与续跑）靠 crew.run.id 关联（session_id 就是 RunID）。trace ID
+		// 推给前端，方便到后端里搜。没配 SDK 时 span 是 no-op、trace ID 为空，不推。
+		ctx = compose_v2.WithSessionIDCtx(ctx, slot.sess.RunID)
+		ctx, reqSpan := obs.Tracer().Start(ctx, "plan_chat_web "+r.URL.Path)
+		defer reqSpan.End()
+		if traceID := observability.TraceIDFromContext(ctx); traceID != "" {
+			sink.send("trace_started", map[string]any{
+				"session_id": slot.sess.RunID,
+				"trace_id":   traceID,
+			})
 		}
 
 		go func() {

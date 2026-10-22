@@ -286,7 +286,7 @@ func isToolSearchCall(m *schema.Message) bool {
 // **为什么需要跨层带**：makeToolsFn 手上有完整的 `tool.Result{Success, Error{Code,Message}}`，
 // 但它只把错误**格式化成 content 字符串**（`[code] message`）返回 `[]*schema.Message`；
 // toolsNode 拿到的就只剩 message，结构化信息已经没了 → 构造 `schema.ToolCallResult` 时
-// 只能硬编码 `Success: true`。而 observability 正是按 `!Success` 计 `gen_ai_tool_errors`
+// 只能硬编码 `Success: true`。而 observability 正是按 `!Success` 把工具 span 记成失败（`error.type`）
 // ——生产方恒 true ⟹ 该 metric 对工具失败**恒为 0**（framework 内部生产者/消费者拧着）。
 //
 // **不导出**：框架同时是生产者和消费者；业务读失败信息走 `OnToolEnd` 的
@@ -334,7 +334,7 @@ func markToolFailure(m *schema.Message, code, message string) *schema.Message {
 // 吗」——拒绝的语义是后者。
 //
 // ⚠️ 但「不算失败」≠「算成功」：拒绝目前在观测上被记成 `Success=true` 并计入
-// `gen_ai_tool_call_duration` 的成功样本，即「用户拒绝了这次转账」与「转账成功了」
+// `gen_ai.execute_tool.duration` 的成功样本，即「用户拒绝了这次转账」与「转账成功了」
 // **在 span 与 metric 上无法区分**。正解是给它第三档（outcome=denied，span 留 Unset
 // 加一个 `crew.*` 属性），不是把它翻成失败。见 doc/code/todo.md。
 func failedToolResult(tcID, toolName, code, message string) *schema.Message {
@@ -490,7 +490,7 @@ var (
 // (不是 compose_v2.Run 入口初始 Round=0).
 //
 // Sub-5 audit HIGH-1 fix: 之前 agent_v2/basic_agent.go::compose_v2.Run defer OnAgentEnd
-// 用 compose_v2.Run 入口 info{Round: 0} → observability MetricAgentRounds Histogram sum=0
+// 用 compose_v2.Run 入口 info{Round: 0} → 业务钩子在 OnAgentEnd 读到的轮次恒为 0
 // 业务监控失真. 本 helper 让 agent_v2 layer 能从 graph state 拿真 round 数.
 //
 // cm 为 nil 时返 0 (业务防御性调用安全).
@@ -909,9 +909,8 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			}
 			// **issue-95 finding 3 fix**：还原工具调用失败的结构化信息。此前这里硬编码
 			// `Success: true` —— 业务工具 `tool.Failure(code,msg)` 明确声明的失败在 hook
-			// 边界被抹平，而 observability 按 `!Success` 计 `gen_ai_tool_errors`，导致这个
-			// framework auto-fire metric 对工具失败恒为 0（业务照 metric 建告警，工具挂了
-			// 看不见）。makeToolsFn 经 annotation 把 code/message 带过来（见常量 godoc）。
+			// 边界被抹平，而 observability 按 `!Success` 把工具 span 记成失败，导致工具失败
+			// 在 trace 与指标上恒看不到（业务照它建告警，工具挂了看不见）。makeToolsFn 经 annotation 把 code/message 带过来（见常量 godoc）。
 			//
 			// **Output 对失败也保持 = r.Content（即 `[code] msg`）**：下方 hook 改写回写会按
 			// `(ErrorCode, Error)` 重算 content，两者必须重合，否则 hook 什么都不改也会把

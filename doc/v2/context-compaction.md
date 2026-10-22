@@ -781,8 +781,8 @@ func AdjustIndexToPreserveAPIInvariants(messages []*schema.Message, start int) i
 **不调 LLM、不烧断路器**，严格优于修复前每轮一次无效调用。
 
 ⚠️ 但它**不是「零成本」**：早退点在压缩事件的 emit 之后，跳过的那些轮照样各发一对
-before/after 事件 ⟹ 接了 observability 的业务会看到 `gen_ai_compacts{outcome=true}`
-每轮 +1、`compact.ratio` 恒 observe 1.0——而 ratio 恒 1.0 正好把「压缩效果在退化」这个
+before/after 事件 ⟹ 接了 observability 的业务会看到 `crew.compactions{crew.outcome=success}`
+每轮 +1、`crew.compaction.ratio` 恒记 1.0——而 ratio 恒 1.0 正好把「压缩效果在退化」这个
 信号抹平。要不要改成跳过时不发事件见 `doc/code/todo.md`。
 
 **二、摘要没比原文小够**（`MaxReductionRatio`，默认 0.8）。LLM 可能不遵循指令原样复述、
@@ -950,12 +950,12 @@ agent.Run(ctx, sess, input)
 
 ### observability 自动桥接 (零业务代码)
 
-业务接 `observability.New(cfg).OrchHooks()` 后 (CLAUDE.md "可观测性" §):
-- `compaction` event 自动 emit **3 个** metric: `compact.{total,duration,ratio}` (per-layer label
-  label `crew_compact_layer={micro|auto|reactive}`，metric 名 `gen_ai_compacts` / `gen_ai_compact_duration` / `gen_ai_compact_ratio`——**metric label 用下划线**，点号那套是 trace span attr)。注: `cp.{save.total,size.bytes}` 由**独立的
-  `cp` event** 桥接 (需 opt-in `WithEmitCpEvent`)，**不**是 compaction event 触发
-- `history.compact` event **当前 observability 侧不自动桥接 metric** (`OnNodeEvent` switch 无
-  `HistoryCompactEventType` case)——业务想统计 history 压缩需自定义 OrchHook 消费 `HistoryCompactAction`
+业务接 `obs.OrchHooks()`（或 `obs.Install`）后（见 [observability.md](observability.md)）：
+- `compaction` event 自动记 3 个指标：`crew.compactions`（按 `crew.compact.layer` 与 `crew.outcome`）、`crew.compaction.duration`、
+  `crew.compaction.ratio`（按层），并在节点 span 上记 `crew.compaction` 事件（按层与阶段展开成 `crew.compact.*` 属性）。注：存档指标
+  `crew.checkpoint.*` 由**独立的** `cp` event 桥接（需 opt-in `WithEmitCpEvent`），**不**是 compaction event 触发
+- `history.compact` event 只记成节点 span 上的 `crew.history.compact` 事件、不转指标——业务想统计 history 压缩需自定义 OrchHook
+  消费 `HistoryCompactAction`
 
 业务**不用写**自定义 OrchHook — `observability.OrchHooks()` 已封装。
 自定义 OrchHook 仅在业务想自加 label / 自定 metric / 推到非 OTel sink 时用。

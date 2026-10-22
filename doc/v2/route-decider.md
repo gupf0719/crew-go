@@ -243,7 +243,7 @@ if errors.As(err, &undecided) {
 | `ClassifierFailure` | classifier 那一档没给出可用结果时的原因：它返回的错误、它没给出目标，或它给的目标不是候选分支，截断到 300 个字符。只在 classifier 失败后转兜底时有值 |
 | `Escalations` | 这次路由里没被采纳的决策方，按执行顺序，每条带原因与那一档的判断，含影子档的记录（`Shadow` 为 true，见 §2.8）；非有限的置信度记为 0，非有限的分数被丢掉 |
 
-`gen_ai_route_decisions` 指标只读 `AgentName` 与 `Target`，这次没有新增指标或标签。
+`crew.route.decisions` 指标只读 `AgentName` 与 `Target`，这次没有新增指标或标签。
 升级率、置信度分布这类统计，业务订阅 `OnNodeEvent` 自己算，写法见 §4.5。
 
 ### 2.8 影子档

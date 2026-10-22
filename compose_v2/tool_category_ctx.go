@@ -18,7 +18,7 @@ import "context"
 //     派发的那件实例），WithToolCategoryLookup push ctx（恒推，免得嵌套子 agent 继承调用方的）
 //   - agent_v2/basic_builder.go::toolsNode 在 OnToolStart 之前 GetToolCategoryLookup
 //     查 ti.Name 对应 category 填 ti.Extra["category"]
-//   - observability/hooks.go::OnToolStart 读 ti.Extra["category"] 路由 spanKind
+//   - observability 的 OnToolStart 读 ti.Extra["category"] 记 crew.tool.category
 // ────────────────────────────────────────────────────────────────────────
 
 // toolCategoryLookupKey ctx 键.

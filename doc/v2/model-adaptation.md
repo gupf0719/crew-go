@@ -22,7 +22,7 @@
 ```go
 // Preset 声明一个 OpenAI 兼容 provider 的默认配置（纯数据）。
 type Preset struct {
-    System       string         // provider 身份（gen_ai.system 观测标识）: "qwen"/"deepseek"/"zhipu"
+    System       string         // provider 身份（gen_ai.provider.name 观测标识）: "qwen"/"deepseek"/"zhipu"
     BaseURL      string         // OpenAI 兼容 endpoint
     DefaultModel string         // modelName 留空时的默认
     ExtraBody    map[string]any // 默认 wire 扩展字段（顶层 merge）；业务 opts 后值覆盖同 key

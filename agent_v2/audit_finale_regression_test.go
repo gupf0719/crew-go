@@ -83,7 +83,7 @@ func (h *sidCaptureHook) OnAgentStart(ctx context.Context, info *hook.AgentInfo,
 
 // TestResume_Abort_PushesSid 验证 audit MED fix：abort 路径 fire OnAgentStart 时 ctx 带 sid。
 // fix 前 abort 分支在 WithSession 之前 return，OnAgentStart 收到空 sid → observability 用
-// GetSessionID(ctx)="" 建孤儿 session + 缺 gen_ai.request.id + resume duration 漏采。
+// GetSessionID(ctx)="" 建孤儿 session + 缺 crew.run.id + resume duration 漏采。
 // abort 幂等（不需 pending cp——commonResumePrep abort 分支 DeleteSubtree 对不存在 ns 也合法）。
 func TestResume_Abort_PushesSid(t *testing.T) {
 	capHook := &sidCaptureHook{}

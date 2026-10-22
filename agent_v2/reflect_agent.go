@@ -523,7 +523,7 @@ func (r *ReflectAgent) evaluatorReflector(parentSession *RunSession) Reflector {
 	evaluator := r.evaluator
 	return func(ctx context.Context, goal, actorOutput *schema.Message) (*ReflectOpinion, error) {
 		// evaluator sub-agent (observability 标默认 agent span — evaluator component kind 已
-		// 退化删除: CS-OSS/OTel operation.name 无 evaluator, sub-agent invocation 即 invoke_agent).
+		// 退化删除: OTel GenAI 的 operation.name 没有 evaluator, sub-agent invocation 即 invoke_agent).
 		// 评估器是**内部决策 LLM**：产出的是「达标 / 未达标 + 批评」这个判定，不是对话。
 		// 下游（下一轮 actor）只需要结论——不进会话历史，也永不拿到转交能力。
 		evEvents, err := runDecisionAgent(ctx, "evaluator", evaluator, parentSession,

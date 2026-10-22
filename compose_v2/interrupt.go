@@ -734,9 +734,7 @@ type currentToolCallIDKey struct{}
 // WithNodeInstanceID 把当前节点的**实例身份**注入 ctx（ISSUE-96）。
 //
 // 框架在 graph_loop 进节点时调用——**先于 OnNodeStart**，让观测层能把同一 NodeID
-// 的 N 个并发实例分开（span registry / chunk buffer 的 key 都需要这一维，否则 N 个
-// 实例落同一个槽：后开的 span 覆盖先开的、先结束的把后开那个 end 掉、N 路 chunk
-// 编织成一段乱码）。
+// 的 N 个并发实例分开（节点 span 上记 crew.node.instance）。
 //
 // 业务自己包装 graph 执行引擎时可复用；正常用 compose_v2.Run 不需要碰它。
 func WithNodeInstanceID(ctx context.Context, instanceID string) context.Context {

@@ -303,7 +303,7 @@ type sessionKey struct{}
 //
 // 顺带把 ctx 上的 sid 推成 s.RunID（覆盖已有的；RunID 为空时不推）：**任务的身份是 session 的
 // RunID**，ctx 上的 sid 只是它的副本——观测层（OnAgentStart 早于 runGraph，不提前推的话顶层 agent
-// span 落到 sid="" 的孤儿 session、缺 gen_ai.request.id）与嵌套图都读它。覆盖而不是「没有才补」：
+// span 缺 crew.run.id）与嵌套图都读它。覆盖而不是「没有才补」：
 // 长寿的 ctx 上可能钉着上一个任务的 sid（业务按契约 `NextTask` 换了 RunID），「没有才补」的话框架
 // 照旧认那个旧 sid、新任务接着跑被放弃任务的存档（实测）。嵌套位置上的 session 的 RunID 必须等于
 // 所在任务（编排成员拿父 session 本身、并行分支拿 `ForkLane` 派生的、嵌套调用的被调方拿框架给的，

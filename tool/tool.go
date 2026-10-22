@@ -79,14 +79,14 @@ type Categorizer interface {
 // tool kind (未知 category 跳过路由, 保向后兼容业务 typo).
 const (
 	// CategoryRetrieval RAG 检索 tool — vector store / 全文检索 / SQL 查询等.
-	// 值 "retrieval" 对齐 CS-OSS AI_TRACE_SPEC `gen_ai.retrieval.*` + OTel operation.name
+	// 值 "retrieval" 对齐 OTel GenAI 约定的 operation.name
 	// (动作名 retrieval 而非主体名 retriever).
 	CategoryRetrieval = "retrieval"
 	// CategoryEmbedding 向量化 tool — text/image embedding 模型调用.
 	CategoryEmbedding = "embedding"
 	// CategoryGuardrail 安全护栏 tool — PII 检测 / 内容审查 / 输出过滤.
 	CategoryGuardrail = "guardrail"
-	// 注: 无 CategoryEvaluator — CS-OSS/OTel operation.name 无 evaluator, LLM-as-judge
+	// 注: 无 CategoryEvaluator — OTel GenAI 的 operation.name 没有 evaluator, LLM-as-judge
 	// sub-agent 走默认 agent kind (invoke_agent), 不强造 operation.name.
 )
 

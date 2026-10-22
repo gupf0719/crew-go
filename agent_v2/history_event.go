@@ -11,7 +11,7 @@ import (
 //
 // 设计源头:
 //   - crew-go 独有 HistoryCompactor 协议 (config.go::HistoryCompactor func)
-//   - CS-OSS Monitor 无标准语义 — 我们走 framework 自定义 event.Type=history.compact
+//   - OTel GenAI 约定没有对应语义 — 我们走 framework 自定义 event.Type=history.compact
 //
 // 设计核心 (跟 StoreAction / CompactionAction 协议一致):
 //   - **sink-gated (无独立开关)**: caller 用 hasEventSink(ctx) 门 fire, 无独立
@@ -21,8 +21,7 @@ import (
 //   - **零开销 sink nil**: ctx 内无 EventSink 时立刻 return
 //   - **结构化字段**: 业务订阅 OnNodeEvent 按 event.Type 分发处理 *HistoryCompactAction
 //
-// observability/hooks.go OnNodeEvent 消费侧 Phase 2 D2 真接入时 case event.Type
-// 反序列化加 CS-OSS Monitor 自定义 attr (待 D2 实施).
+// observability 的 OnNodeEvent 把它记成节点 span 上的 crew.history.compact 事件（结构化字段不展开）.
 // ────────────────────────────────────────────────────────────
 
 // HistoryCompactEventType 是 compose_v2.Event.Type 字符串.

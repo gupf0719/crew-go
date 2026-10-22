@@ -30,7 +30,7 @@
 | **FuncTool**（函数包成工具）| `example/orchestration/basic_chat`（get_weather）| [quickstart §2](quickstart.md) |
 | **StreamableTool**（流式工具）| — | `tool` 包 godoc（`StreamableTool` 接口）|
 | **MCP 集成**（stdio / HTTP Server）| — | `mcp` 包 godoc（`Hub` / `StdioClient` / `StreamableHTTPClient`）|
-| **Categorizer**（tool span 标 retrieval/embedding/...）| — | [observability-implementation-guide §1](v2/observability-implementation-guide.md) |
+| **Categorizer**（tool span 标 retrieval/embedding/...）| — | [observability.md §2.3](v2/observability.md) |
 
 ## 横切能力
 
@@ -46,7 +46,7 @@
 | **Skill 系统**（activate_skill）| `example/graph/v2_skill_demo`（P1 + P2.A/D/E/C+B）| [orchestration-patterns §11](v2/orchestration-patterns.md) |
 | **生命周期 Hook**（8 method）| `adv_10_hooks_test.go` | [hooks.md](v2/hooks.md) |
 | **流式 SSE 适配** | `example/orchestration/channel_chat_web` | [hooks-and-streaming.md](v2/hooks-and-streaming.md) |
-| **可观测**（trace/metric → CS-OSS Monitor）| `example/observability/observability_demo` | [observability-implementation-guide.md](v2/observability-implementation-guide.md) |
+| **可观测**（OpenTelemetry trace / 指标）| `example/observability/observability_demo` | [observability.md](v2/observability.md) |
 | **Checkpoint + Resume**（cp 持久化）| `nested_smoke`（HITL cp 闭环）| [channel-engine.md](v2/channel-engine.md) |
 | **Redis backend**（Store + Checkpointer）| `example/store/redis_smoke` | [store.md](v2/store.md) + `store/conformance` |
 | **Channel[T] 类型安全**（4 reducer）| `example/graph/v2_typedgraph_demo` | [usage-guide.md](v2/usage-guide.md) |

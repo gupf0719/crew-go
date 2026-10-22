@@ -19,7 +19,7 @@ crew-go 借鉴 LangGraph + eino 设计但不完全照抄——做架构决策时
 | 上下文压缩 / 内容卸载到外部存储 | `context-compaction.md`（⚠️ 只覆盖「卸载去重」一个切口，其余层仍零对照）|
 | NS / Address 寻址模型 | `address-routing.md` |
 | Skill 加载 / 激活 / 子 agent 隔离 | `skill-system.md` |
-| 可观测性 trace + metrics 集成 (OpenTelemetry / Prometheus) | `observability-langgraph.md` + `observability-eino.md` (⚠️ 风格特例: 拆 2 文档单方面深度调研, 不是单文档三方对照; crew-go 决策综合见 `observability-eino.md` §8) |
+| 可观测性 trace + metrics 集成 (OpenTelemetry) | `observability-trace-spec.md`（对照 OTel GenAI 语义约定）+ `observability-callback.md`（钩子协议决策）+ `observability-langgraph.md` / `observability-eino.md` (⚠️ 风格特例: 拆 2 文档单方面深度调研, 不是单文档三方对照; crew-go 决策综合见 `observability-eino.md` §8) |
 
 读文档时重点看：
 1. **三方对照表**：当前问题三方各怎么做，哪个有 corner case 是我们没考虑的
@@ -54,7 +54,7 @@ CLAUDE.md 已加：
 | `agent-interface.md` | Agent 接口 / 嵌入协议 | ✅ 已写 | ISSUE-71（接口合并）|
 | `skill-system.md` | Skill 系统设计（SKILL.md / 激活模式 / 子 agent 隔离）| ✅ 已写 | ISSUE-19, ISSUE-73 |
 | `observability-callback.md` | observability callback / hook 协议层决策（含 metric 分类 / event-driven metric）| ✅ 已写 | Phase 2 Sub-5 |
-| `observability-trace-spec.md` | trace/metric 字段 vs AI_TRACE_SPEC.md（CS-OSS Monitor，含 3 个可补 gap）| ✅ 已写 | Phase 2 Sub-5 |
+| `observability-trace-spec.md` | trace / 指标 vs OpenTelemetry GenAI 语义约定：对得上的、偏离的、没做的与决策 | ✅ 已写（2026-10 按 OTel 重写） | Phase 2 Sub-5 |
 | `error-handling.md` | 错误处理与失败恢复三方对照 | ✅ 已写 | 错误处理对照 |
 | `state-model.md` | 状态 / 数据流模型（channel-based vs 三方）| ✅ 已写 | ISSUE-70 |
 | `store.md` | Store 跨 thread 持久层三方对照 | ✅ 已写 | store PR |

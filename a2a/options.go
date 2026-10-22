@@ -16,7 +16,7 @@ type remoteConfig struct {
 	clientOpts  []a2aclient.FactoryOption    // 透传 a2aclient.NewFromCard（auth interceptor / transport）
 	humanGate   bool                         // input-required 抛 InterruptError 走真人 HITL（默认返问题让 host LLM 自动补）
 	hooks       hook.Hooks                   // 业务级 hook（OnAgentStart/OnAgentEnd 对，对齐 8 编排观测范式）
-	obs         *observability.Observability // a2a 跨语言 trace：client span + 注入 CS-OSS context 到 outbound metadata
+	obs         *observability.Observability // a2a 跨进程 trace：client span + 把 trace context 注入出站 metadata
 	// discoverAgentName 仅 NewRemoteAgentFromService / NewRemoteAgentToolFromService 用：限定只
 	// 发现该 agentName 的实例（空 = 该 serviceName 下所有 agentName 聚合）。对直接 NewRemoteAgent 无效。
 	discoverAgentName string
@@ -41,19 +41,16 @@ func WithDescription(desc string) RemoteOption {
 // 业务用 a2aclient.WithCallInterceptors(&a2aclient.AuthInterceptor{...}) 注入凭证，
 // 或自定义 *http.Client（带 auth-injecting RoundTripper）+ a2aclient.WithJSONRPCTransport(client)。
 //
-// **本 option 仅用于 auth / transport 透传**。跨进程 / 跨语言 trace 串联走
-// WithObservability（trace context 走 A2A Message.metadata + CS-OSS key，符合跨语言
-// 协议）——**不要再用 otelhttp 注 traceparent header**：协议要求 trace 走
-// message.metadata 而非 HTTP header，且跨语言对端（Java）不认 W3C traceparent。
+// 跨进程 trace 串联走 WithObservability（W3C trace context 写进 A2A Message.metadata，传输层不是
+// HTTP 时也能串上）。想要 HTTP 层的 span 可以另外用 otelhttp 包 transport，两者不冲突。
 func WithClientOptions(opts ...a2aclient.FactoryOption) RemoteOption {
 	return func(c *remoteConfig) { c.clientOpts = append(c.clientOpts, opts...) }
 }
 
-// WithObservability 注入 *observability.Observability 启用 a2a 跨语言 trace：client
-// 发请求前建 gen_ai.a2a_client.<name> span（挂当前活跃 agent span，仅有父时建）+ 把
-// 该 span 的 CS-OSS trace context 注入 outbound Message.metadata（x-traceid 等 5 key），
-// 让远端（Go/Python/Java）的 span 树串到本端同一条 trace。不注入时无 a2a trace
-// （仅 WithHooks 的业务观测）。typed-nil 防御同 WithHooks。
+// WithObservability 注入 *observability.Observability 启用 a2a 跨进程 trace：client 发请求前建
+// invoke_agent CLIENT span，把它的 W3C trace context（traceparent / tracestate / baggage）写进出站
+// Message.metadata，远端（server 侧配 WithExecutorObservability）的 span 树挂在它下面、同一条 trace。
+// 不注入时没有 a2a trace（只有 WithHooks 的业务观测）。typed-nil 防御同 WithHooks。
 func WithObservability(obs *observability.Observability) RemoteOption {
 	return func(c *remoteConfig) {
 		if isNilIface(obs) {

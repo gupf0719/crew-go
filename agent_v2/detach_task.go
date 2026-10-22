@@ -59,8 +59,8 @@ import (
 //
 // # 独立任务的生命周期归调用方
 //
-// 它有自己的 RunID：存档在它自己名下，当前任务成功收尾时不会清它；观测层按 sid 分的会话也是它
-// 自己的一份，要自己 `CleanupSession`。
+// 它有自己的 RunID：存档在它自己名下，当前任务成功收尾时不会清它；观测层按 sid 记的挂起记录也是它
+// 自己的一份，放弃它时要自己 `CleanupSession`。
 func DetachTask(ctx context.Context) context.Context {
 	// 所在的任务记进「这一路是从哪些任务里脱离出来的」（compose_v2.DetachedFrom）：在节点执行范围里时
 	// 引擎自己记得到；编排的 agent 级钩子跑在图外，那里的任务只有本包的任务章知道，所以显式交过去

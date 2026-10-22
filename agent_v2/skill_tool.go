@@ -17,7 +17,7 @@ import (
 // ActivateSkillToolName 是框架内置 skill 激活工具的固定名。
 //
 // **Sub-5f 改导出 (audit fix)**: observability 端识别 activate_skill tool 调用 fire
-// MetricSkillActivateTotal Counter, 需要外部包引用 const 不写死字面量 (字面量耦合
+// crew.skill.activations 计数, 需要外部包引用 const 不写死字面量 (字面量耦合
 // 时改 const 易漏改). 业务通过 WithSkills 注入 SkillSource 后框架自动注入此工具,
 // 业务通常不直接调本 const, observability 内部识别用.
 const ActivateSkillToolName = "activate_skill"

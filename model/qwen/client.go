@@ -70,7 +70,7 @@ var testDefaultModel = TestModelCandidates[0]
 // 2026-09-03 全部逐个探活通过（`say OK` 单轮，耗时见注）。同批探活可用但**不入列**的：
 // `deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` / `glm-5.2` / `kimi-k3` /
 // `kimi-k2.7-code` —— dashscope 同一个链接也服务它们、额度各自独立，但本包的
-// `presetDashscope` 把 `gen_ai.system` 标成 `dashscope`、参数按千问调（`enable_thinking`），
+// `presetDashscope` 把 `gen_ai.provider.name` 标成 `dashscope`、参数按千问调（`enable_thinking`），
 // 拿它跑别家模型会让观测面失真。千问候选真的全挂时，它们是现成的应急池。
 var TestModelCandidates = []string{
 	// flash 档（首选：快、便宜）——固定快照在前

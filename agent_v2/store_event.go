@@ -10,7 +10,7 @@ import (
 // store operation event 协议 (Phase 2 D2 sub-1)
 //
 // 设计参考:
-//   - CS-OSS Monitor semantic: gen_ai.operation.name=retrieval + gen_ai.retrieval.documents.count
+//   - 语义参考 OTel GenAI 约定的 retrieval 操作（gen_ai.operation.name=retrieval）
 //   - 通过 EventSink 让 framework 内调 store 操作 (search / put) 时自动 fire event
 //
 // 设计核心:
@@ -21,10 +21,9 @@ import (
 //   - **结构化字段**: action 用 union 类型 (Type=search/put), 业务订阅 OnNodeEvent
 //     按 Type 分发处理 Search/Put 字段
 //
-// ⚠️ **目前没有框架内的消费者**: observability/hooks.go 的 OnNodeEvent 不认
-// *StoreAction (没有类型断言分支, 走通用 toString 返空串), routeEventToMetric 也没有
-// store 分支 — 即接了 observability 也不会落 span attr / metric. 这条事件今天只服务
-// 业务自己在 OrchHooks 里做的 type assert. (原文写的是"消费侧已 ready", 不实.)
+// ⚠️ **框架内没有结构化消费者**: observability 的 OnNodeEvent 只把它记成一个 span 事件
+// （*StoreAction 不是标量，不展开成属性），也不转指标。这条事件今天只服务业务自己在
+// OrchHooks 里做的 type assert.
 // ────────────────────────────────────────────────────────────
 
 // StoreEventType 是 compose_v2.Event.Type 字符串.
@@ -54,8 +53,7 @@ type StoreAction struct {
 	Put *StorePutAction `json:"put,omitempty"`
 }
 
-// StoreSearchAction 对应 store.Search 调用. CS-OSS Monitor 语义对齐
-// gen_ai.operation.name=retrieval + gen_ai.retrieval.documents.count.
+// StoreSearchAction 对应 store.Search 调用，语义上对应 OTel GenAI 约定的 retrieval 操作.
 type StoreSearchAction struct {
 	// NS 是 search 的 namespace prefix (store.Namespace.String() 字符串形式).
 	NS string `json:"ns"`

@@ -268,33 +268,19 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 	}
 	msg := buildMessageFromParts(parts, taskID, contextID)
 
-	// a2a 跨语言 trace（WithObservability 启用）：建 client span（协议——仅当有活跃父
-	// agent span 时才建，无父返 no-op 不注入避免孤立 span）+ 把 CS-OSS trace context
-	// 注入 outbound Message.metadata（走 message.metadata 非 HTTP header，跨语言串联）。
-	// span 生命周期覆盖整个 stream 消费 + 终态（defer End 按 retErr 标 status）。
+	// a2a 跨进程 trace（WithObservability 启用）：建 invoke_agent CLIENT span，把它的 trace context
+	// （W3C traceparent / tracestate / baggage）写进出站 Message.metadata，远端的 span 树挂在它下面。
+	// span 覆盖整个流的消费到终态（defer 按 retErr 收尾；远端要更多输入不算失败）。
 	if a.obs != nil {
-		// span remoteName 用远程 AgentCard.Name（远程声明的真实 agent 名），而非 a.name（host 端
-		// WithName 可能设的本地占位名，如 example 里的 "zk_remote"）——让 trace 一眼看出实际调的
-		// 哪个远程 agent（对齐跨语言 trace 规范 gen_ai.a2a_client.<remoteName>）。a.card 在
-		// NewRemoteAgentFromCard 时必非 nil（拉到 card 才建得了 client）。
-		cliSpan := a.obs.StartA2AClientSpan(ctx, a.card.Name, "message_stream", "jsonrpc", contextID, taskID)
-		if tc := cliSpan.TraceContext(); tc.IsValid() {
-			if msg.Metadata == nil {
-				msg.Metadata = map[string]any{}
-			}
-			observability.InjectToMetadata(msg.Metadata, tc.TraceID, tc.SpanID, tc.AppName, tc.NextIdx, tc.Sampled)
+		// span 用远程 AgentCard.Name（远程声明的真实 agent 名），而非 a.name（host 端 WithName 可能设的
+		// 本地占位名）——trace 上一眼看出实际调的是哪个远程 agent。a.card 在 NewRemoteAgentFromCard 时必非 nil。
+		var cliSpan *observability.A2AClientSpan
+		ctx, cliSpan = a.obs.StartA2AClientSpan(ctx, a.card.Name, "message_stream", "jsonrpc", contextID, taskID)
+		if msg.Metadata == nil {
+			msg.Metadata = map[string]any{}
 		}
-		defer func() {
-			status, errType := "success", ""
-			if retErr != nil {
-				if _, isInt := compose_v2.IsInterrupt(retErr); isInt {
-					status = "input_required" // 远程 input-required + humanGate 抛中断，非错误
-				} else {
-					status, errType = "error", "a2a_remote_error"
-				}
-			}
-			cliSpan.End(status, errType, "") // errMsg 留空——协议安全边界：不记可能含敏感的远程 error detail
-		}()
+		a.obs.InjectToMetadata(ctx, msg.Metadata)
+		defer func() { cliSpan.End(ctx, retErr) }()
 	}
 
 	for ev, e := range a.client.SendStreamingMessage(ctx, &a2atypes.SendMessageRequest{Message: msg}) {

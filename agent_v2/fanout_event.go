@@ -11,15 +11,15 @@ import (
 //
 // 跟 store / compact / cp event 同款 EventSink fire 设计:
 //   - 仅在 fanout 真发生 (Branches >= 2) 时 fire — N=1 是 inline 不算 fanout
-//   - observability/hooks.go::routeEventToMetric 识别 fire MetricFanoutBranches Histogram
+//   - observability 的 OnNodeEvent 识别 → 记 crew.fanout.branches 直方图
 //   - 业务订阅 OnNodeEvent 可看每超步 fanout 分支分布
 //
 // **当前 fire 点**: basic_agent.go::toolsFn 入口 (ISSUE-81 N>=2 goroutine 并发 fanout).
 // **未来扩展**: ParallelAgent / 其他 fan-out 编排可同款 fire 共享 metric (label kind 区分).
 // ────────────────────────────────────────────────────────────
 
-// FanoutEventType 是 compose_v2.Event.Type 字符串. observability/hooks.go OnNodeEvent
-// 按此值识别 fanout event 反序列化 Action 后 fire MetricFanoutBranches.
+// FanoutEventType 是 compose_v2.Event.Type 字符串. observability 的 OnNodeEvent
+// 按此值识别 fanout event，取 Action 记 crew.fanout.branches.
 const FanoutEventType = "fanout"
 
 // FanoutKind 区分 fanout 来源 (将来 ParallelAgent / Plan 等也可 fire 不同 kind).

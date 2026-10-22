@@ -18,7 +18,7 @@ import (
 //     立即 return，连 action/reason payload 都不构造（零开销）。
 //   - **走 compose_v2.EventSink.Send**：fallback 在 model 层，只依赖已 import 的
 //     compose_v2，不反向依赖 observability（那样会循环依赖）。observability 单向
-//     import fallback 消费——见 observability/hooks.go::fireFailoverMetric。
+//     import fallback 消费——见 observability 的 recordEventMetric。
 //   - **仅观测**：业务订阅看到每次候选切换（from/to + 原因），不改控制流。真正的切换
 //     决策在 policy.ShouldFailover。
 // ────────────────────────────────────────────────────────────

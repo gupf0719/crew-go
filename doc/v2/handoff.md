@@ -581,7 +581,7 @@ _ = h.EndConversation(ctx, "conv-T1")
 ## 12. 与现有机制的关系
 
 - **session events 共享 [已实现]**：sub-agent 传 `parentSession` 跑（`agent_v2/handoff_agent.go`），新 active **默认通过 `HistoryFor`（Rewrite 模式，§9）看前接对话做接力决策**（owner-aware：自己原样、前接改写第三人称 user）。注意是 `HistoryFor` 而非 `SelfHistoryCompacted`——后者只看自己（SelfOnly 模式才用）。
-- **ThreadID [已实现/扩展用途]**：`WithThreadIDCtx` 当前是 observability span attr（`gen_ai.session.id`）；模型 B 复用它作持久 active 的 conversation 维度（**注意**：当前 ThreadID 不驱动 cp 加载，模型 B 用它作 store namespace，不依赖 cp 行为）。
+- **ThreadID [已实现/扩展用途]**：`WithThreadIDCtx` 当前是 observability span attr（`gen_ai.conversation.id`）；模型 B 复用它作持久 active 的 conversation 维度（**注意**：当前 ThreadID 不驱动 cp 加载，模型 B 用它作 store namespace，不依赖 cp 行为）。
 - **HITL Resume [已实现]**：transfer 工具与 `ask_user` 正交——sub-agent 中途 `ask_user` 触发 `InterruptError` 挂起走现有 `Resume` 闭环；transfer 是 sub-agent 跑完后的控制权转移，两者不冲突。
 - **嵌套 [已实现]**：HandoffAgent 本身可被 `AgentAsTool` 包装嵌入更外层编排，子 cp 按 graphNS 物理分离。
 

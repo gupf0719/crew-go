@@ -12,7 +12,7 @@ import "context"
 // 设计源头: hook.Hooks 接口的 OnAgentEnd 签名是
 // `OnAgentEnd(ctx, info, output) ctx` —— 没有 err 入参. 但 observability
 // hook 想识别 Run/Resume 是否走 InterruptError 路径以 fire
-// MetricInterruptTotal Counter / 记录 interrupt→resume duration 时, 需要拿到
+// crew.interrupts 计数 / 记录 interrupt→resume duration 时, 需要拿到
 // retErr. 加新 hook method 会破坏所有业务 Hooks 实现 — 改 ctx push 协议是
 // 最小侵入的 backward-compatible 方案.
 
@@ -62,7 +62,7 @@ func WithResumePhase(ctx context.Context, action ResumeAction) context.Context {
 
 // GetResumePhase 从 ctx 读 Resume action.
 //
-//	返 (action, true): 当前是 Resume 路径 (observability 据此 fire MetricResumesTotal{action})
+//	返 (action, true): 当前是 Resume 路径 (observability 据此 记 crew.resumes{crew.resume.action})
 //	返 (Continue, false): Run 路径 (默认值, observability 跳过 resume 计数)
 func GetResumePhase(ctx context.Context) (ResumeAction, bool) {
 	if a, ok := ctx.Value(resumePhaseCtxKey{}).(ResumeAction); ok {

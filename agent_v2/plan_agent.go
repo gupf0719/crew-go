@@ -729,7 +729,7 @@ func (p *PlanAgent) buildPlanGraph(ctx context.Context, session *RunSession, gra
 		executed, _ := compose_v2.Get(chs, planExecutedCh)
 
 		// P1 observability: fire plan_replan event 让 observability fire
-		// MetricPlanReplansTotal Counter — Phase initial (executed 空) vs replan (executed 非空).
+		// crew.plan.replans 计数 — Phase initial (executed 空) vs replan (executed 非空).
 		// 业务关心 plan 质量 / planner 调用频率.
 		phase := PlanReplanPhaseInitial
 		if len(executed) > 0 {

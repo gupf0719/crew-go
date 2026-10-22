@@ -108,7 +108,7 @@ events, _ := ra.Run(ctx, sess, schema.UserMessage("..."))
 | `WithClientOptions(opts...)` | 透传 a2aclient FactoryOption：auth header / 自定义 transport | 鉴权 |
 | `WithHumanGate()` | 远程 input-required 抛 InterruptError 走真人 HITL（默认返追问让 host LLM 自动补）；等人答复的那一问按调用位置记进 host 存档：没拿到答复不联系远端、原样再问，远端任务结束之后再跑发原始请求，几次调用 / 并行分支各续各的，续跑不依赖原 session；引擎钩子 / 条件边里远端要人时报错 | 无 LLM 编排嵌远程 / 人类确认 |
 | `WithHooks(h)` | agent 形态观测（fire OnAgentStart/End 对）| agent 形态嵌编排 |
-| `WithObservability(obs)` | a2a 跨语言 trace：建 `a2a_client` span + 注 CS-OSS context 到 outbound `Message.metadata` | 跨进程 trace 串联 |
+| `WithObservability(obs)` | a2a 跨进程 trace：建 `invoke_agent` CLIENT span，把 W3C trace context（traceparent / tracestate / baggage）写进出站 `Message.metadata` | 跨进程 trace 串联 |
 | `WithDiscoveryAgentName(name)` | **仅 FromService**：限发现指定 agentName（同 service 多 Agent Card 精确路由）| 服务发现 |
 
 ## failover 与 Selector 选型

@@ -310,7 +310,7 @@ func (r *RoutingAgent) Run(ctx context.Context, session *RunSession, input *sche
 	}
 	// Sub-5 audit Round 2/3 fix: RoutingAgent 是单次路由决策 + 转发, 无 "round" 概念.
 	// info.Round 保持 0 是 by-design — 业务关心路由选中哪个 agent 走 trace span 看,
-	// metric 维度走 MetricNodeExecutionTotal{node=routing}.
+	// metric 维度走 crew.node.executions（按 crew.node.id 分）.
 	info := &hook.AgentInfo{Name: r.Name(), Type: "routing", Round: 0}
 	// audit³ D1 fix: OnAgentStart Run top-level fire (跟 PlanAgent 对齐)
 	agentIn := &hook.AgentInput{Messages: []*schema.Message{input}}
@@ -377,7 +377,7 @@ func (r *RoutingAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	}
 	// Sub-5 audit Round 2/3 fix: RoutingAgent 是单次路由决策 + 转发, 无 "round" 概念.
 	// info.Round 保持 0 是 by-design — 业务关心路由选中哪个 agent 走 trace span 看,
-	// metric 维度走 MetricNodeExecutionTotal{node=routing}.
+	// metric 维度走 crew.node.executions（按 crew.node.id 分）.
 	info := &hook.AgentInfo{Name: r.Name(), Type: "routing", Round: 0}
 	prep, newCtx, err := commonResumePrep(ctx, "routing agent", r.Name(), sessionID, opts, info, hooks, r.historySubs())
 	if err != nil {

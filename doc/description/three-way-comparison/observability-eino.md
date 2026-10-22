@@ -1,10 +1,10 @@
 # eino 可观测性设计调研 (trace + metrics)
 
-> **目的**: crew-go OTel trace + Prometheus-style metric 集成 (Sub-5 已落地 2026-05) 的 eino 侧调研参考. 本文基于本地 `/Users/gupengfei/program/go/src/eino/` + `eino-demo/` 真实源码精读, 给出 file:line 证据.
+> **目的**: crew-go OpenTelemetry trace + 指标集成（Sub-5 2026-05 落地，2026-10 改成标准 OTel）的 eino 侧调研参考. 本文基于本地 `/Users/gupengfei/program/go/src/eino/` + `eino-demo/` 真实源码精读, 给出 file:line 证据.
 >
 > ⚠️ **风格特例说明**: 兄弟 three-way-comparison 文档都是**单文档含三方对照表** (如 `interrupt-resume.md` / `checkpoint-storage.md`). 本主题拆 2 文档 (本 + `observability-langgraph.md`) 单方面深度调研是**例外**, 原因:
 > - **三方设计差异过大**: eino (Handler 接口 + 无后端 + Go context chain) vs LangGraph (callback + LangSmith 强绑 + Python contextvars), 不像 Interrupt/Resume 那样有共同语义可以正面对照
-> - **crew-go OTel/Prom 实施已落地** (Sub-5, 跨 Round 2-8 audit): `observability/` 包 9 个 non-test 文件 ~4800 行: `hooks.go` ~1430 行 (OTel span emit) + `metric.go` ~740 行 (28 metric name + 15 label const) + `observability.go` ~1190 行 (Prom-style + OTLP) + `exporter.go` ~440 行 (OTLP gRPC) + `config.go` + `propagation.go` + `id.go` + `metrics_mapping.go` (metric name→CS-OSS 映射) + `a2a_span.go` (A2A span 桥接). 协议层基础: `hook.Hooks` 8 方法 (ISSUE-82 修, 9→8) + `compose_v2.OrchestrationHooks` 5 方法
+> - **crew-go 的实现已落地**：`observability/` 包按 OpenTelemetry API 实现（SDK 由应用配），属性与指标按 GenAI 语义约定（键名集中在 `semconv.go`）；业务级钩子 `agent_hooks.go` + 编排级钩子 `orch_hooks.go` + 包装层 `wrap.go` + A2A 跨进程传播 `a2a.go`。协议层基础：`hook.Hooks` 8 方法 + `compose_v2.OrchestrationHooks` 5 方法。设计与用法见 [doc/v2/observability.md](../../v2/observability.md)，字段逐项对照见 [observability-trace-spec.md](observability-trace-spec.md)
 > - **crew-go 决策综合见本文档 §8** (业务先读 §8 拿三方对照后的决策矩阵, 再回 §1-7 / 姊妹文档 [observability-langgraph.md](observability-langgraph.md) 看证据).
 
 ## 0. 设计哲学一句话
@@ -181,15 +181,15 @@ type CallbackOutput struct {
 
 `Extra map[string]any` 字段是设计的"逃生口"让业务塞 vendor-specific 属性。
 
-### CS-OSS spec 新维度对照 (2026-05 spec 更新)
+### OTel GenAI 约定维度对照
 
-monitor-agent 团队最新 `AI_TRACE_SPEC.md` 增加了 eino **不直接覆盖**的维度——eino 业务侧 OTel adapter 想对齐 CS-OSS 时需自管:
+eino 业务侧的 OTel adapter 想对齐 GenAI 约定时，下面几个维度要自己管：
 
-| CS-OSS 维度 | eino 处理 | crew-go 对齐 |
+| GenAI 约定维度 | eino 处理 | crew-go |
 |---|---|---|
-| `gen_ai.operation.name` 8 种 (agent / workflow / chat / tool / **embedding** / **retrieval** / **rerank** / **guardrail**) | eino 用 Component 类型 (ChatModel / Tool / Embedder / Retriever / Indexer / Loader 等) 暗示, 业务侧 OTel adapter 按 Component 映射 operation.name | adapter 按 hook 类型直接 set (`OnModelStart`→`chat`, `OnToolStart`→`tool`; embedding/retrieval/rerank/guardrail 业务上报独立 span) |
-| `gen_ai.status` 5 态 (success/error/cancelled/blocked/timeout) | eino 只暴露 callback err, 业务 adapter 自管 status 映射 | adapter 在 OnError 按 err 类型自动分: ctx.DeadlineExceeded→timeout, ctx.Canceled→cancelled, InterruptError→blocked, 其他→error |
-| span attr 默认上限 | eino 走通用 OTel SDK `SpanLimits.AttributePerSpanCountLimit=128` 默认 | crew-go 自家 `observability/` 模块 `Config.MaxSpanAttributes=128` 默认对齐 (CS-OSS spec 默认 15 但 collector 端不 enforce, monitor-agent 自家 SDK 写死 10 silent drop 不可用) |
+| `gen_ai.operation.name`（chat / execute_tool / invoke_agent / invoke_workflow / retrieval / embeddings …） | 用 Component 类型（ChatModel / Tool / Embedder / Retriever / Indexer / Loader 等）暗示，adapter 按 Component 映射 | 按钩子类型直接定：OnModelStart → chat、OnToolStart → execute_tool、BasicAgent → invoke_agent、编排 → invoke_workflow；GraphAgent 节点声明组件类型 → retrieval / embeddings |
+| 结局（span status 只有 Unset / Error 有用） | 只暴露 callback err，adapter 自己映射 | `crew.outcome` 五态：调用方 ctx 到期 → timeout、取消 → cancelled、中断 → blocked，其余 → error；status 只在 error / timeout 标 Error |
+| span 属性数量上限 | 走通用 OTel SDK 的 `SpanLimits.AttributePerSpanCountLimit`（默认 128） | 同样交给应用配的 SDK，本包不另设 |
 
 ## 4. Metrics 入口 + 指标列表
 
@@ -311,7 +311,7 @@ crew-go 实施前**建议先 clone eino-ext** 看实际 adapter 设计模式 (�
 - **Handler 链顺序**: eino OnStart 逆序 / OnEnd 正序 (middleware 风格), crew-go ChainHooks 是 append 序串行——Sub-5 落地决定保 append 序简单实现 (multi-handler 时业务自管注册顺序), 不抄 eino middleware 风格 (eino 风格业务侧注册顺序心智负担更高)
 - **TimingChecker 优化接口**: crew-go 当前 hook 全时机 fire (没优化点), 学 eino 加 `Needed(timing) bool` 让 metrics handler 跳无关时机 — 性能优化, 业务 metrics 多的场景值得加
 
-### 业务实施 → [doc/v2/observability-implementation-guide.md](../../v2/observability-implementation-guide.md)
+### 业务实施 → [doc/v2/observability.md](../../v2/observability.md)
 
 crew-go hook 接口对照 + 5 个特有坑 + ISSUE-89/90 实施时机全在实施指南。本 §8 只给跨文档**决策**。
 

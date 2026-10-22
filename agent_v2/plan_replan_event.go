@@ -10,8 +10,8 @@ import (
 //
 // 设计源头:
 //   - plan loop 计数无现成业界标准 metric, crew-go 自定义
-//   - 走 EventSink + observability.routeEventToMetric 路由 fire
-//     MetricPlanReplansTotal Counter (label{agent_name, phase=initial|replan})
+//   - 走 EventSink + observability 的 recordEventMetric 记指标
+//     crew.plan.replans 计数 (label crew.plan.phase=initial|replan)
 //
 // 设计核心:
 //   - **PlanAgent planNode 入口 fire** — 拿 executed 长度区分 initial vs replan

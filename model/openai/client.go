@@ -68,7 +68,7 @@ type Client struct {
 	apiKey    string
 	baseURL   string
 	model     string
-	system    string // provider 名 (gen_ai.system observability attr); WithSystem 注入; 填进每条响应 Metadata.System
+	system    string // provider 名 (gen_ai.provider.name observability attr); WithSystem 注入; 填进每条响应 Metadata.System
 	tools     []openaiTool
 	client    *http.Client
 	extraBody map[string]any // 业务/provider 附加的 wire-level 字段 (DeepSeek thinking 等扩展); 见 WithExtraBody
@@ -106,12 +106,12 @@ func WithHTTPClient(hc *http.Client) ClientOption {
 	return func(c *Client) { c.client = hc }
 }
 
-// WithSystem 设置 model 供应商名 (gen_ai.system — observability trace span attr /
+// WithSystem 设置 model 供应商名 (gen_ai.provider.name — observability trace span attr /
 // 业务 cost metric label)。
 //
 // OpenAI 兼容 provider 复用同一个 openai.Client，各自标识 provider：openai="openai" /
 // deepseek="deepseek" / qwen dashscope="dashscope" 等。填进每条响应的
-// Message.Metadata.System (Generate + Stream 两路)。空则不上报 gen_ai.system。
+// Message.Metadata.System (Generate + Stream 两路)。空则不记 gen_ai.provider.name。
 func WithSystem(system string) ClientOption {
 	return func(c *Client) { c.system = system }
 }
@@ -465,7 +465,7 @@ func (c *Client) convertResponse(resp *openaiResponse) *schema.Message {
 		msg.Metadata = &schema.MessageMetadata{
 			FinishReason: choice.FinishReason,
 			Model:        resp.Model, // observability gen_ai.request.model / response.model
-			System:       c.system,   // observability gen_ai.system (provider)
+			System:       c.system,   // observability gen_ai.provider.name
 		}
 		if resp.Usage != nil {
 			usage := &schema.MessageUsage{
@@ -695,7 +695,7 @@ func (c *Client) handleStreamEvent(ctx context.Context, ev sseEvent, st *streamS
 		msg.Metadata = &schema.MessageMetadata{
 			FinishReason: finishReason,
 			Model:        chunk.Model, // observability gen_ai.request.model / response.model
-			System:       c.system,    // observability gen_ai.system (provider)
+			System:       c.system,    // observability gen_ai.provider.name
 		}
 		// deepseek 格式: usage 附在末尾 content chunk (Round 8 fix)
 		if streamUsage != nil {

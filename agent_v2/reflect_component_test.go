@@ -15,7 +15,7 @@ import (
 //
 // **退化背景**: 原 reflect_agent.go subAgentReflector 在调 evaluator/reflector sub-agent
 // 前 push WithComponentKind(evCtx, "evaluator") 让 observability 标 evaluator agent span.
-// 但 CS-OSS/OTel operation.name 无 evaluator, sub-agent invocation 即 invoke_agent — 已
+// 但 OTel GenAI 的 operation.name 没有 evaluator, sub-agent invocation 即 invoke_agent — 已
 // 退化删除 push, evaluator sub-agent 走默认 agent span.
 //
 // **验真实路径 (非模拟)**: 用真 ReflectAgent + 真 BasicAgent evaluator, capture hook 接

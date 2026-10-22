@@ -162,9 +162,10 @@ func (o *Observability) AgentHooks(inner ...hook.Hooks) hook.Hooks {
 	obs := &agentHooks{o: o}
 	hs := make([]hook.Hooks, 0, len(inner))
 	for _, h := range inner {
-		if !isNilIface(h) {
-			hs = append(hs, h)
+		if isNilIface(h) || isNoOpHooks(h) {
+			continue
 		}
+		hs = append(hs, h)
 	}
 	if len(hs) == 0 {
 		return obs
@@ -182,9 +183,10 @@ func (o *Observability) OrchHooks(inner ...agent_v2.OrchestrationHooks) agent_v2
 	obs := &orchHooks{o: o}
 	hs := make([]agent_v2.OrchestrationHooks, 0, len(inner))
 	for _, h := range inner {
-		if !isNilIface(h) {
-			hs = append(hs, h)
+		if isNilIface(h) || isNoOpOrchHooks(h) {
+			continue
 		}
+		hs = append(hs, h)
 	}
 	if len(hs) == 0 {
 		return obs
@@ -198,6 +200,10 @@ func (o *Observability) OrchHooks(inner ...agent_v2.OrchestrationHooks) agent_v2
 //
 // agent 在一处构造、ctx 在每个请求里另外准备的拓扑（如 a2a/server）收不进一次调用，用 AgentHooks +
 // OrchHooks 两半各装各的。
+//
+// 顶不掉的范围到这两处为止：返回的 opts 之后再接 agent_v2.WithHooks(x) 会整个覆盖业务级钩子（WithHooks 是覆盖写），
+// Run 时传 RunOption agent_v2.WithOrchHooks 会盖过 ctx 上的编排钩子——要加钩子就加在交给 Install 的 opts / ctx 上。
+// 同一个 Observability 装了两层（Install 两次、Install 之外又 WithHooks(obs.AgentHooks())）时只记一份。
 func (o *Observability) Install(ctx context.Context, opts ...agent_v2.Option) (context.Context, []agent_v2.Option) {
 	if o == nil {
 		return ctx, opts
@@ -208,6 +214,23 @@ func (o *Observability) Install(ctx context.Context, opts ...agent_v2.Option) (c
 	// 排在最后：apply 到这里时 c.Hooks 已是业务配的那一份，把它包进来。
 	merged = append(merged, func(c *agent_v2.Config) { c.Hooks = o.AgentHooks(c.Hooks) })
 	return ctx, merged
+}
+
+// isNoOpHooks / isNoOpOrchHooks 认出什么都不做的钩子（agent 默认的 Config.Hooks 就是 NoOpHooks），包进来只多一层调用。
+func isNoOpHooks(h hook.Hooks) bool {
+	switch h.(type) {
+	case hook.NoOpHooks, *hook.NoOpHooks:
+		return true
+	}
+	return false
+}
+
+func isNoOpOrchHooks(h agent_v2.OrchestrationHooks) bool {
+	switch h.(type) {
+	case agent_v2.NoOpOrchestrationHooks, *agent_v2.NoOpOrchestrationHooks:
+		return true
+	}
+	return false
 }
 
 // isNilIface 判 nil 与 typed nil（业务 `var h *MyHooks; obs.AgentHooks(h)`）。

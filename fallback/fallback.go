@@ -481,16 +481,21 @@ func isNilModel(m model.ChatModel) bool {
 	}
 }
 
-// ModelName 返回这次调用起手请求的那个候选的模型名（满足 model.ModelNamer）：断路器没跳开的第一个候选，全都跳开时
-// 是第一个候选。中途切到别的候选时，实际回答的模型看响应里的模型名（gen_ai.response.model）与 failover 事件。
-// 候选没实现 model.ModelNamer 时返回空串。断路器状态只读，不影响放行决策。
+// ModelName 返回这次调用起手请求的那个候选的模型名（满足 model.ModelNamer），按 tryMembers 的选择规则预估：按顺序
+// 第一个「服务端没让等（Retry-After 的门开着）、断路器此刻放行（含半开放一次探测）」的候选；都不满足时是第一个
+// 候选。只读，不占探测名额、不影响放行决策。
+//
+// 是尽力而为的预估：并发调用共用一个 fallback 时，到真正请求那一刻状态可能已经变了（别的调用先占了探测名额）；
+// 中途切到别的候选时也只报起手那个。实际回答的模型看响应里的模型名（gen_ai.response.model）与 failover 事件。
+// 候选没实现 model.ModelNamer 时返回空串。
 func (f *FallbackChatModel) ModelName() string {
 	if f == nil || len(f.members) == 0 {
 		return ""
 	}
 	pick := f.members[0]
+	now := time.Now()
 	for _, mem := range f.members {
-		if !mem.breaker.Tripped() {
+		if _, _, closed := mem.gate.closedUntil(now); !closed && mem.breaker.WouldAllow() {
 			pick = mem
 			break
 		}

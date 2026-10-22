@@ -6,6 +6,11 @@
 
 全系统（编排层 / agent）只依赖 `model.ChatModel` 接口（`Generate` + `Stream` + `WithTools`）。一个 provider = 任何满足该接口的值。**加/删 provider 对核心 `model` 包与编排层零影响**——没有中心登记表 / switch 要动，影响面只在构造点。这是"模型列表频繁增删"低成本的根。
 
+另有几个**可选接口**，实现了框架就多用一层信息，不实现照常能跑：`model.StructuredCapable`（结构化输出能力画像）、
+`model.ModelNamer`（报自己请求的模型名——BasicAgent 用 `model.RequestConfig` 把它交给 `OnModelStart` 的
+`ModelInput.Config`，观测层记成 `gen_ai.request.model`）。新写适配器时两个都实现；包装别的 `ChatModel` 的装饰器要转发
+里面那个的（`fallback` 报起手请求的候选）。
+
 适配分两档：
 
 | 档 | 适用 | 做法 | 成本 |

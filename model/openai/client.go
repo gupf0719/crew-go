@@ -171,6 +171,9 @@ func (c *Client) StructuredCapability(modelName string) model.StructuredCapabili
 	return model.DefaultOpenAICapability()
 }
 
+// ModelName 返回构造时配的模型名（满足 model.ModelNamer；按次的 model.WithModel 覆盖它）。
+func (c *Client) ModelName() string { return c.model }
+
 // WithTools 返回与给定工具绑定的新客户端。
 func (c *Client) WithTools(tools []*schema.ToolInfo) (model.ChatModel, error) {
 	cp := *c

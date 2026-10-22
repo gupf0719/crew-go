@@ -21,10 +21,10 @@
   `invoke_workflow` / `execute_tool`；加载 skill 的工具调用按 skill refinement 命名。
 - 指标按约定：推理时长、首片时长、token 用量（按 `gen_ai.token.modality` 分）、agent / workflow / 工具时长
   与 agent 内调用次数。
-- 偏离两处（§3）：模型请求名不知道时 `chat` span 用响应模型名命名；节点组件 span（retrieval /
+- 偏离两处（§3）：模型客户端不报模型名时 `chat` span 用响应模型名命名；节点组件 span（retrieval /
   embeddings）kind 是 INTERNAL。
-- 没做的（§4）主要是框架拿不到的数据（请求参数里的 seed / top_k、服务端地址、按模态拆分的 token、
-  缓存写入 token）和需要 Logs API 的 GenAI 事件。
+- 没做的（§4）主要是框架拿不到的数据（请求参数里的 seed / top_k、服务端地址、按模态拆分的 token）和需要
+  Logs API 的 GenAI 事件。
 - 框架自己的维度一律 `crew.*`（§5），不往 `gen_ai.*` 里塞约定没有的键。
 
 ## 一、span
@@ -60,10 +60,17 @@ crew-go 的判据：
 
 ### 3.1 `chat` span 的名字
 
-约定：`{gen_ai.operation.name} {gen_ai.request.model}`。框架调模型时拿不到请求的模型名（`ChatModel` 接口不暴露，
-`ModelInput.Config.ModelName` 目前没人填），所以 `gen_ai.request.model` 不记，span 名在结束时改成
-`chat {gen_ai.response.model}`；响应里也没有模型名时就是 `chat`。约定允许框架定自己的命名格式；不把响应模型名
-填进 `gen_ai.request.model`——两者可以不同（别名解析到具体版本），填进去就是错的数据。
+约定：`{gen_ai.operation.name} {gen_ai.request.model}`。请求模型来自 `ModelInput.Config.ModelName`：BasicAgent 用
+`model.RequestConfig` 填——按次的 `model.WithModel` 覆盖优先，没有时取模型客户端实现的可选接口 `model.ModelNamer`
+（内置的 openai 兼容客户端、anthropic 客户端、`fallback` 都实现了）。这时 span 名就是约定的 `chat {请求模型}`。
+
+偏离只剩一种情况：业务自研的 `ChatModel` 没实现 `ModelNamer`、调用方也没按次指定模型时，请求模型不知道，span 名
+在结束时改成 `chat {gen_ai.response.model}`（响应里也没有模型名时就是 `chat`），`gen_ai.request.model` 不记。约定
+允许框架定自己的命名格式；不把响应模型名填进 `gen_ai.request.model`——两者可以不同（别名解析到具体版本），填进去
+就是错的数据。
+
+`ChatModel` 接口本身不加 `ModelName`：它是三个方法的最小接口，业务的包装 / 测试替身都要实现；模型名对发请求不是
+必需的，做成可选接口、包装类转发即可。
 
 ### 3.2 retrieval / embeddings 节点的 span
 
@@ -76,8 +83,8 @@ ID。业务的检索 / 嵌入工具走工具路径：`execute_tool {工具名}` 
 | 约定里的 | 级别 | 为什么没做 |
 |---|---|---|
 | `gen_ai.provider.name`（chat） | Required | 模型客户端填了 `Message.Metadata.System` 才有（openai 兼容客户端用 `WithSystem`，deepseek / qwen 默认已填）；业务自研客户端不填时缺 |
-| `gen_ai.request.model` | Cond. Required | §3.1 |
-| `gen_ai.request.seed` / `top_k` / `frequency_penalty` / `presence_penalty` / `stop_sequences` / `choice.count` | Cond. / Recommended | 不在 `ModelInput.Config` 里，钩子拿不到 |
+| `gen_ai.request.model` | Cond. Required | 客户端实现 `model.ModelNamer` 或按次指定模型时已记；都没有时缺（§3.1） |
+| `gen_ai.request.seed` / `top_k` / `frequency_penalty` / `presence_penalty` / `stop_sequences` / `choice.count` | Cond. / Recommended | `ModelInput.Config` 只带模型名、温度、max_tokens、top_p（按次设了的） |
 | `gen_ai.output.type` | Cond. Required | 结构化输出（`WithOutputSchema`）时可以记 `json`，未接 |
 | `gen_ai.response.id` | Recommended | `MessageMetadata` 没有这个字段 |
 | `server.address` / `server.port` | Recommended | 地址在模型客户端里，钩子看不到 |

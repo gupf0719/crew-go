@@ -102,6 +102,7 @@ type AgentOutput struct {
 // [只读] 观测 / 统计 / 配对锚点字段，框架不消费，改写不生效（by design；tool/model 层是 observation-only）：
 //
 //	OnModelStart input.Tools —— 框架当前不填充（恒 nil）；动态增删工具不走 hook
+//	OnModelStart input.Config —— 本次请求的模型名与按次参数（BasicAgent 按「按次 model.WithModel > 客户端 model.ModelNamer」填），观测用；发请求不读它
 //	OnModelEnd   output.Usage —— LLM 返回的 token 统计，事实值
 //	OnToolStart input.CallId / OnToolEnd output.CallId —— tool_call ↔ tool_result 配对锚点，改它破坏配对（OpenAI 422），仅供观测关联（此字段不应在 tool callback 路径被改写）
 //	OnAgentEnd  output.Messages —— Run/Resume 已返回 events，此 hook 是事后通知（defer）

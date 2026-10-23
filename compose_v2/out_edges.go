@@ -82,6 +82,26 @@ func evalOutEdges(ctx context.Context, g *Graph, from NodeID, chs Channels, ph c
 	return targets, nil
 }
 
+// validateSendTargets 校验成员 from 这次经 SendFrom 发出的投递目标：目标必须是图里注册过的节点（EndNode 与空串照旧
+// 跳过不投递）。跟条件边返回的目标同一条判据、同一个处置——图里没有的节点、起点 sentinel 是图定义错，重跑必然一样
+// ⟹ `%w ErrRunAborted`（不重试 + Run 出口清 cp 子树），算在这个成员名下、在提交之前。
+//
+// 不在这里拦的话，坏目标进了下一超步的 frontier 才炸在「node 未注册」上：那是普通错误（默认可重试），存档里带着这个
+// 跑不动的目标，每次续跑原地再炸（实测）。
+func validateSendTargets(g *Graph, from NodeID, directives []SendDirective) error {
+	for i, d := range directives {
+		if d.Target == "" || d.Target == EndNode {
+			continue
+		}
+		if _, ok := g.nodes[d.Target]; !ok {
+			return fmt.Errorf(
+				"%w: node %q 的第 %d 条 SendFrom 投递目标 %q 不是图里注册过的节点（StartNode 入口 sentinel 也不能作投递目标; graph nodes: %d）",
+				ErrRunAborted, from, i, d.Target, len(g.nodes))
+		}
+	}
+	return nil
+}
+
 // evalMemberOutEdges 算正在执行的成员 m 的出边（视图 = 已提交 + m 自己的写入 ws）。
 //
 // cond 按 [CondFailRerunFrom] **否决**时（[condRejected]），推进 m 这次执行的重做代际：此前按

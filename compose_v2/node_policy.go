@@ -46,8 +46,8 @@ const nodeTimeoutStragglerGrace = 5 * time.Second
 // # 超时之后是什么错
 //
 // 这次尝试以 [*NodeTimeoutError] 失败（外面包着带节点位置的 [*GraphNodeError]）。它**不在错误链上
-// 露出 `context.DeadlineExceeded`**：那个错在本包的语义里是「调用方的 ctx 到期了」——默认重试谓词
-// [IsRetryable] 不重试它、出口把存档标成「等续跑」的挂起。而节点自己超时是**这一次执行失败了**，
+// 露出 `context.DeadlineExceeded`**：错误链上的那个错在本包里被当成「调用方的 ctx 到期了」的标签——出口把存档
+// 标成「等续跑」的挂起、观测记成超时。而节点自己超时是**这一次执行失败了**，
 // 调用方还活着：配了 [WithNodeRetry] 就按谓词重试，重试用完就是一个普通的节点失败（同超步的兄弟
 // 照常跑完、成功的照常提交，续跑只重跑这个节点）。
 //
@@ -97,8 +97,8 @@ func WithNodeRetry(cfg RetryConfig) NodeOption {
 // 节点里也能从 `context.Cause(ctx)` 拿到同类型的值，分清是自己超时还是调用方喊停。
 //
 // **故意不实现 Unwrap**：节点超时时自己返回的错多半包着 `context.DeadlineExceeded`，露在链上的话
-// 「错误链上有 ctx 错」的判据（默认重试谓词、出口的挂起判定）会把它当成调用方的 ctx 到期，配了重试
-// 也一次都不重试。节点自己返回的错留在 Err 里供排查。
+// 「错误链上有 ctx 错」的判据（出口的挂起判定、观测的超时标签）会把它当成调用方的 ctx 到期：存档标成「等续跑」
+// 的挂起而不是失败现场。节点自己返回的错留在 Err 里供排查。
 type NodeTimeoutError struct {
 	// Timeout 是这次尝试的时限。
 	Timeout time.Duration

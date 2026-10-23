@@ -157,6 +157,7 @@ func (l *LoopAgent) Run(ctx context.Context, session *RunSession, input *schema.
 	if input == nil {
 		input = schema.UserMessage("")
 	}
+	input = ownRunInput(input)
 	if l.body == nil {
 		return nil, fmt.Errorf("loop agent %q: body required (call WithBody)", l.Name())
 	}
@@ -197,9 +198,7 @@ func (l *LoopAgent) Run(ctx context.Context, session *RunSession, input *schema.
 		}
 		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, startErr)
 	}
-	if len(agentIn.Messages) > 0 && agentIn.Messages[len(agentIn.Messages)-1] != nil {
-		input = agentIn.Messages[len(agentIn.Messages)-1]
-	}
+	input = adoptHookInput(agentIn, input)
 
 	var finalRef *schema.Message
 	// P0 observability: push retErr 让 observability OnAgentEnd 识别 InterruptError 路径

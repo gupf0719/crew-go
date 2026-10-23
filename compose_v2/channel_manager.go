@@ -111,6 +111,9 @@ type ChannelManager struct {
 	// 嵌套图自己的链（含承载它的那个节点的代际）——从那里交接出去时按 ctx 取会把调用方那一层又算
 	// 进来，挂着的调用里已答的问题换 ID 再问一遍（审计实测）。只活在内存里，每次 Run 入口重算。
 	outerGens []int
+	// outerRegens 与 outerGens 等长：每一层嵌套图在承载它的那次外层执行里**重生过几次**（见 nestedRegenKey）。
+	// 编进同一个 OuterRerunGens 维度（见 outerRerunGensID）。
+	outerRegens []int
 
 	// completedFrontier / deferredSends / completedTargets：PA-H1 部分失败超步的成功
 	// 成员 + 其 SendFrom 指令 + **它们当时算好的出边目标**。失败路径 append（二次中断

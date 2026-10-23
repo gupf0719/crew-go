@@ -116,6 +116,12 @@ func (a *sseAdapter) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, output *
 func (a *sseAdapter) OnToolStart(ctx context.Context, _ *hook.AgentInfo, in *schema.ToolInput) (context.Context, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// 续跑时同一批调用的再次派发（框架标 agent_v2.ToolRedispatchedExtraKey）：上一个 run 已经发过它们的 START / ARGS / END，
+	// 再发就是重开同一个调用、参数追加，前端的参数文本变成两份。结果照常在执行的那一次发（见 OnToolEnd）。按 toolCallId
+	// 记「发过没有」不行：provider 在不同轮次复用同一个 ID 时，后一个调用的 START 会被吞掉、结果挂到前一个头上（审计实测）。
+	if again, _ := in.Extra[agent_v2.ToolRedispatchedExtraKey].(bool); again {
+		return ctx, nil
+	}
 	_ = a.w.WriteEvent(NewToolCallStart(in.CallId, in.Name))
 	if in.ArgumentsJSON != "" {
 		_ = a.w.WriteEvent(NewToolCallArgs(in.CallId, in.ArgumentsJSON))
@@ -167,7 +173,7 @@ func (a *sseAdapter) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, out *sche
 	return ctx, nil
 }
 
-// OnError 把中间错误（model / tool 层）映射为 Custom("error")——供前端观测，不占
+// OnError 把中间错误（model / tool 层）映射为 Custom([CustomEventError])——供前端观测，不占
 // RunError 终态语义（终态 RunError 由 handler 在 Run 返回 error 时发）。
 func (a *sseAdapter) OnError(ctx context.Context, _ *hook.AgentInfo, err *schema.CommError) context.Context {
 	if err == nil {
@@ -175,7 +181,7 @@ func (a *sseAdapter) OnError(ctx context.Context, _ *hook.AgentInfo, err *schema
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	_ = a.w.WriteEvent(NewCustom("error", map[string]any{"code": err.Code, "message": err.Message}))
+	_ = a.w.WriteEvent(NewCustom(CustomEventError, map[string]any{"code": err.Code, "message": err.Message}))
 	return ctx
 }
 
@@ -221,7 +227,7 @@ func (a *sseAdapter) OnNodeEvent(ctx context.Context, _ string, ev agent_v2.Even
 			runID = a.runID
 		}
 		a.closeMsgLocked(runID)
-		_ = a.w.WriteEvent(NewCustom("reset_stream", map[string]any{"run_id": runID, "reason": ev.Content}))
+		_ = a.w.WriteEvent(NewCustom(CustomEventResetStream, map[string]any{"run_id": runID, "reason": ev.Content}))
 	case "state_snapshot":
 		// 业务 opt-in 的结构化 state 同步：节点内
 		//   compose_v2.GetEventSink(ctx).Send(compose_v2.Event{

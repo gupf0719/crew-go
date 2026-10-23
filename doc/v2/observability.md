@@ -283,7 +283,7 @@ trace。
 
 - token 计数只在模型调用成功（`OnModelEnd`）时记，数量为 0 的不记。
 - 口径照约定：输入 token 含缓存读写（cache_read / cache_write 是它的子集）；输出 token 含推理 token（约定要求推理计入
-  输出、输出取计费口径）。`MessageUsage.OutputTokens` 不含 `ThinkTokens`（模型客户端单列），记的时候加回去。缓存写入目前只有
+  输出、输出取计费口径）。`MessageUsage.OutputTokens` 本来就是这个口径（`ThinkTokens` 是它的子集，openai 兼容客户端取 `completion_tokens_details.reasoning_tokens`、Claude 取 `output_tokens_details.thinking_tokens`），原样记。缓存写入目前只有
   `model/anthropic` 报。
 - `gen_ai.token.modality`：供应商只给总数。输入里全是文本时记 `text`；有图片 / 音频 / 文件块时分不出各模态
   各占多少，按约定记 `unknown`。输出同理。cache_read / cache_write 跟输入那一侧、reasoning 跟输出那一侧。

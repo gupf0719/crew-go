@@ -395,6 +395,7 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 	if input == nil {
 		return nil, fmt.Errorf("plan agent %q: input message must not be nil", p.name)
 	}
+	input = ownRunInput(input)
 	if err := resolveRunSession(ctx, &session, p.Name()); err != nil {
 		return nil, err
 	}
@@ -463,10 +464,9 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 
 	// 消费 hook 改写: 业务清空 Messages 时退化空字符串 (与 BasicAgent 同), 业务
 	// 改 Content 时新 content 真透传给 runPlanGraph (planner 看到的 original).
-	effectiveMsg := input
+	effectiveMsg := adoptHookInput(agentIn, input)
 	effectiveContent := ""
 	if len(agentIn.Messages) > 0 && agentIn.Messages[len(agentIn.Messages)-1] != nil {
-		effectiveMsg = agentIn.Messages[len(agentIn.Messages)-1]
 		effectiveContent = effectiveMsg.Content
 	}
 	// 注入 user input 审计事件——在消费**之后**用改写后消息（四编排 review GA-M1

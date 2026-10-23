@@ -309,7 +309,7 @@ func isExecutionKey(key any) bool {
 		graphNSKey, nodeIDKey, nodeVisitKey, nodeInstanceIDKey, nodeInterruptCounterKey,
 		toolCallIdxKey, currentToolCallIDKey, inToolCallKey, withinNodeScopeKey,
 		nodeStateAccessorKey, subCallCounterKey, subCallScopeKey, abnormalNodeExitKey,
-		componentKindKey, eventSinkKey, sendSinkKey, toolCategoryLookupKey, outerRerunGensKey,
+		componentKindKey, eventSinkKey, sendSinkKey, toolCategoryLookupKey, outerRerunGensKey, outerRegensKey,
 		threadIDKey, softCancelCtxKey, detachedKey, detachedFromKey, runAliveKey, signalScopeKey, taskRecipientKeyCtxKey, hookCallKey,
 		exitGraceKey:
 		return true

@@ -181,6 +181,9 @@ func (s *mapStore) Search(_ context.Context, prefix store.Namespace, opts ...sto
 	if limit <= 0 {
 		limit = 10
 	}
+	if err := store.ValidateOffset(cfg.Offset); err != nil { // 负 offset 入口报错，判据同内置后端
+		return nil, err
+	}
 	if err := store.ValidateFilter(cfg.Filter); err != nil { // filter 语义与校验直接复用框架的唯一实现
 		return nil, err
 	}
@@ -240,6 +243,9 @@ func (s *mapStore) ListNamespaces(_ context.Context, opts ...store.ListOption) (
 	limit := cfg.Limit
 	if limit <= 0 {
 		limit = 100
+	}
+	if err := store.ValidateOffset(cfg.Offset); err != nil {
+		return nil, err
 	}
 	if len(cfg.Prefix) > 0 {
 		if err := cfg.Prefix.Validate(); err != nil {

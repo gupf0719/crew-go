@@ -52,7 +52,8 @@ type memberSpec struct {
 	// 这次尝试写的事件等它有了结局才提交给 sess。
 	// 跟 [RunSubAgent] 的差别就在这一项——那条路径建 NewSharedChildSession 做 events 隔离。
 	sess *RunSession
-	// input 是成员这一次的输入。
+	// input 是成员这一次的输入。交给成员的是它的拷贝（cloneCalleeInput）：成员原地改它碰不到编排存的那份，
+	// 也碰不到并发的兄弟成员拿到的那份。
 	input *schema.Message
 	// nsSuffix 派生成员的 cp 命名空间：childNS = JoinNS(parentNS, nsSuffix)。
 	// **必须逐次唯一**——同一个成员被调多次（Loop 每轮 / Plan 每步）时要带上轮次或步序，
@@ -107,7 +108,7 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 		var events []*AgentEvent
 		err := lanes.run(func(s *RunSession) error {
 			var runErr error
-			events, runErr = m.agent.Run(ctx, s, m.input, grants.regrantOpts(m.agent)...)
+			events, runErr = m.agent.Run(ctx, s, cloneCalleeInput(m.input), grants.regrantOpts(m.agent)...)
 			return runErr
 		})
 		if err != nil {
@@ -172,7 +173,7 @@ func runDecisionAgent(ctx context.Context, nsSuffix string, ag Agent, sess *RunS
 	// 同 runMember：决策 LLM 的执行交给它、它的 agent 级钩子有自己的相位
 	subCtx = compose_v2.HandOver(subCtx, nsSuffix)
 	subCtx = shadowNodeGrants(subCtx)
-	return ag.Run(subCtx, sess, input, withRouteGrant(route))
+	return ag.Run(subCtx, sess, cloneCalleeInput(input), withRouteGrant(route))
 }
 
 // decisionCtx 是框架调**内部决策方**时给的 ctx：编排的决策 agent（分类器、评审 / 评估 agent、反馈教练，见

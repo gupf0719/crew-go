@@ -184,8 +184,8 @@ func finishReason(r anthropic.BetaStopReason) string {
 }
 
 // usageOf 把 Anthropic 的用量换成 [schema.MessageUsage] 的口径：Anthropic 的 input_tokens 不含
-// cache 读写，这里 InputTokens 加回两者；output_tokens 含 thinking，这里 OutputTokens 扣掉、
-// ThinkTokens 单列。
+// cache 读写，这里 InputTokens 加回两者；output_tokens 含 thinking（按输出计费），OutputTokens 照原样、
+// ThinkTokens 是其中 thinking 的那部分（子集，同 CachedInputTokens 之于 InputTokens）。
 //
 // 读的是顶层 usage。服务端回退时它只算接着答的那次尝试，被拒的那次在 usage.iterations 里（中途被拒的
 // 按正常价计费），这里不汇总——两次尝试是不同模型、不同价格，加在一起挂在一个模型名下反而失真。
@@ -196,7 +196,7 @@ func usageOf(u anthropic.BetaUsage) *schema.MessageUsage {
 		InputTokens:              clampInt32(input),
 		CachedInputTokens:        clampInt32(u.CacheReadInputTokens),
 		CacheCreationInputTokens: clampInt32(u.CacheCreationInputTokens),
-		OutputTokens:             clampInt32(max(u.OutputTokens-think, 0)),
+		OutputTokens:             clampInt32(u.OutputTokens),
 		ThinkTokens:              clampInt32(think),
 		TotalTokens:              clampInt32(input + u.OutputTokens),
 	}

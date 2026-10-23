@@ -127,11 +127,15 @@ func TestIsControlFlowSignal(t *testing.T) {
 			if got := compose_v2.IsControlFlowSignal(c.err); got != c.want {
 				t.Errorf("IsControlFlowSignal(%v)=%v, want %v", c.err, got, c.want)
 			}
-			// 本表的这几个输入上 IsRetryable 恰是它的否定（nil 除外，nil 两者都 false），
-			// 顺带验证联动不漂移。⚠️ **一般情况下不是否定关系**：IsRetryable 另排
-			// NonRetryable / ErrRunAborted / ErrCheckpointNotResumable 三类。
+			// 中断与普通错上 IsRetryable 恰是它的否定。⚠️ **一般情况下不是否定关系**：IsRetryable 另排
+			// NonRetryable / ErrRunAborted / ErrCheckpointNotResumable 三类；ctx 错是控制流的**标签**，
+			// 但谓词不按它决定要不要再做一次（调用方的 ctx 由 RunWithRetry 的守卫判），所以 ctx 错上两者都为真。
 			if c.err != nil {
-				if wantRetry := !c.want; compose_v2.IsRetryable(c.err) != wantRetry {
+				wantRetry := !c.want
+				if errors.Is(c.err, context.Canceled) || errors.Is(c.err, context.DeadlineExceeded) {
+					wantRetry = true
+				}
+				if compose_v2.IsRetryable(c.err) != wantRetry {
 					t.Errorf("IsRetryable(%v)=%v, want %v", c.err, compose_v2.IsRetryable(c.err), wantRetry)
 				}
 			}

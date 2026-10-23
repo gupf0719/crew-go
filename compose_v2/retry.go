@@ -317,8 +317,10 @@ func SleepWithContext(ctx context.Context, d time.Duration) error {
 // 混用的后果实测过：给模型客户端配 `http.Client{Timeout}`（标准做法）⟹ provider 变慢
 // 时 fallback **永不切换**，正是它最该发挥作用的那个场景。
 //
-// **retry 层的单一真相源**："什么是控制流信号"在此定义一次，[IsRetryable] 据它否决。
-// ⚠️ **fallback 层已不再消费它**：`fallback/policy.go` 的框架 guard 与
+// **它是标签，不是重试判据**："什么是控制流信号"在此定义一次，给出口的挂起判定（shouldStayPending）、span
+// 状态这类「这个错是什么」的地方用。决定「要不要再做一次」的都不调它：[RunWithRetry] 的守卫与 fallback 用
+// [IsRetryFutile]（问调用方 ctx），默认谓词 [IsRetryable] 只认按错误本身就说明了的那几个信号。
+// ⚠️ **fallback 层也不消费它**：`fallback/policy.go` 的框架 guard 与
 // `DefaultFailoverPolicy` 第 1 分类都改调了 [IsRetryFutile]，而那个函数自带一份哨兵
 // 清单 + `ctx.Err()`、**不调用本函数**。所以往这里加第四个哨兵**到不了 fallback**——
 // 两处都要改。
@@ -388,7 +390,11 @@ func IsRetryFutile(ctx context.Context, err error) bool {
 //
 // 四类不重试（对应函数体的四道闸）：
 //
-//   - **控制流信号**（[IsControlFlowSignal]）——重试白跑或有害（副作用再来一遍）
+//   - **按错误本身就认得出的控制流信号**——中断（要等答案）、[ErrCheckpointStale]（重跑只会再造一份副作用）、
+//     [ErrSoftCanceled]（业务说了停）。**调用方的 ctx 结束了这一档不在这里判**：错误链上有
+//     `context.DeadlineExceeded` / `Canceled` 不等于调用方的 ctx 死了——pgx、`http.Client{Timeout}` 这类后端自己的
+//     超时也是这个形状，按错误判会让它们一律不重试（曾经如此，实测只调 1 次）。调用方的 ctx 归 [RunWithRetry] 在调
+//     谓词之前用 [IsRetryFutile] 判；**自己写重试循环时也先问 `IsRetryFutile(ctx, err)`**，再问本函数
 //
 //   - **确定性的 provider HTTP 失败**——同样的请求重发必然同样失败，重试只是浪费
 //     配额 + 拖长 Run。经 [HTTPStatusProvider] 接口按状态码判：400 参数错 / 401 鉴权
@@ -414,7 +420,9 @@ func IsRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if IsControlFlowSignal(err) {
+	// 只认错误本身就说明了的信号；ctx 那一档问的是调用方的 ctx，见上面 godoc
+	var ie *InterruptError
+	if errors.As(err, &ie) || errors.Is(err, ErrCheckpointStale) || errors.Is(err, ErrSoftCanceled) {
 		return false
 	}
 	// provider 用标准状态码明说了「这个请求本身有问题」时，别再发一遍。
@@ -489,9 +497,10 @@ func isDeterministicHTTPFailure(code int) bool {
 //     档没写成（[ErrCheckpointNotPersisted]）→ 立即返。这道 guard 在业务谓词**之前**，谓词写成
 //     什么都吞不掉它们
 //  3. 再问 cfg.ShouldRetry：谓词否决 → 立即返。默认谓词 [IsRetryable]（[SimpleRetry] /
-//     [ExponentialBackoff] 带的就是它）比 guard 多排除三类：错误链上带控制流信号的（按链判，
-//     调用方 ctx 还活着也算——后端内部超时同样不重试）、确定性的 HTTP 失败、[NonRetryable]。
-//     **自定义谓词要自己排除**，返 true 的话它们照样会被重试
+//     [ExponentialBackoff] 带的就是它）比 guard 多排除两类：确定性的 HTTP 失败、[NonRetryable]（外加
+//     guard 已经管了的那几个按错误本身认的信号）。它**不按错误链上的 ctx 错判**：调用方的 ctx 死没死由
+//     上面的 guard 问 ctx，后端自己的超时（pgx、`http.Client{Timeout}`）在调用方还活着时照常重试。
+//     **自定义谓词要自己排除**确定性的失败，返 true 的话它们照样会被重试
 //  4. 限流失败（[IsRateLimited]）另有独立计数：`RateLimitMaxRetries > 0` 且限流失败的
 //     次数超过它 → 立即返
 //  5. 过了上面几关且 attempt < MaxRetries → 等待后重试：服务端给了 Retry-After
@@ -527,10 +536,10 @@ func isDeterministicHTTPFailure(code int) bool {
 // 新内容、拿到的却是对旧内容的回答。续跑时节点也是从头执行到这一问，这个前提在那里早就要满足。
 //
 // fn 里直接跑的嵌套图（[Run]）不在此列：它在失败那次尝试里已经跑完时，存档随成功清掉，后一次尝试从头
-// 再跑它，内容可能重新生成。它问过的问题的兑付对后一次尝试照旧可见，同一个位置再问当场终局失败，对旧
-// 内容的回答不会兑付给新内容。要让重试越过已经跑完的嵌套图：跑完就用 [SaveStepResult] 记下、后面的尝试
-// 跳过它（上行信号的处理见 [Run] 里「嵌套图跑完之后节点又失败」那条），或者经 `agent_v2.RunSubAgent` 调
-// （已完成的调用有记录，重试时直接拿回）。
+// 再跑它——一次重生，内容可能重新生成，里面的提问换新身份（见 [Run] 里「嵌套图跑完之后节点又失败」那条），
+// 用户被问到的是新内容，对旧内容的回答不会兑付给它。不想让它重跑（副作用、重问）：跑完就用 [SaveStepResult]
+// 记下、后面的尝试跳过它（上行信号的处理见 [Run] 里同一条），或者经 `agent_v2.RunSubAgent` 调（已完成的调用有
+// 记录，重试时直接拿回）。
 //
 // **手写的循环没有这些**：循环里每次调用都算新调用、从头跑，每次提问都换一个 ID 重问。
 //

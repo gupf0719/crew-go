@@ -136,11 +136,7 @@ func (c *StdioClient) ListTools(ctx context.Context) ([]ToolSpec, error) {
 	if c.cachedTools != nil {
 		return append([]ToolSpec{}, c.cachedTools...), nil
 	}
-	raw, err := c.rpc(ctx, "tools/list", map[string]any{})
-	if err != nil {
-		return nil, fmt.Errorf("mcp tools/list: %w", err)
-	}
-	tools, err := parseToolsList(raw, c.allowTools)
+	tools, err := listAllTools(ctx, c.rpc, c.allowTools)
 	if err != nil {
 		return nil, err
 	}

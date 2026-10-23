@@ -352,6 +352,12 @@ func WithFreshRun() RunOption {
 //
 // **默认关闭**：不开时框架照常写 Epoch 字段但不读取，行为与引入前完全一致。
 //
+// **新开的 Run 没有基线**：基线是这次 Run 载入（续跑 / auto-load）的那一代；带「新开」信号的 Run
+// （[WithFreshRun]、`agent_v2` 的顶层 Run 恒如此）没有载入，守卫要等本次第一次写成功、基线推到自己写的那一代
+// 之后才生效，第一次写本身不校验。于是默认的 exit 档（只在出口写一次）下新开的 Run 全程不受保护——成功清理时还会
+// 把槽里别人的挂起档一并删掉；sync / async 档从本次第二次写起受保护。同一个 sid 上两个任务并发本身违反「一枚
+// RunID 只服务一个任务」的契约，这个边界正落在那里。
+//
 // **本 RunOption 只作用于直接调 `compose_v2.Run` 的场景**——`agent_v2` 的 9 编排各自
 // 内部拼 `[]compose_v2.RunOption`，不透传业务的 option，那条路要用
 // `WithStaleWriteGuardCtx(ctx)` 开（嵌套子图也靠它继承）。
@@ -438,13 +444,15 @@ func WithResumeFrom(cp *Checkpoint) RunOption {
 // 编号往前挪一位，拿回的是前一遍记下的东西（入口条件边记的路由被照搬，实测）。要按进度跳过，给每一遍
 // 不同的 ns（比如带上工单号）。
 //
-// ⚠️ **嵌套图跑完之后节点又失败**（不是条件边否决，是节点体后面的步骤出错）：续跑时节点重跑，嵌套图
-// 的存档在它成功时已清，于是它**从头再跑**，里面的提问落在跟上一次相同的位置、相同的 ID——调用方累积
-// 传的旧答案会被直接兑付给重跑出来的新内容（实测：只问过「批准 v1」，执行的是「v2 已批准」）。出路：
-// 嵌套图跑完就用 [SaveNodeState] / [SaveStepResult] 记下，续跑时跳过它；或者把它包成 agent 经
-// `agent_v2.RunSubAgent` 调（嵌套调用记完成记录，续跑时拿回、不重跑）。⚠️ 自己跳过的话，那张图做出的
-// 上行信号（转交 / 路由决定）不会再做一次：用 [CaptureSignals] 包住嵌套 Run、把 [Signals] 随记录一起存下，
-// 跳过时 [EmitSignals] 交出，否则续跑后决定静默丢失（实测，`err == nil`；`RunSubAgent` 已经这样做）。
+// **嵌套图跑完之后节点又失败或挂起**（不是条件边否决，是节点体后面的步骤出错、或后面又问了人）：续跑时节点重跑，
+// 嵌套图的存档在它成功时已清，于是它**从头再跑**——一次重生：节点体副作用、草稿会再产一遍，里面的提问换新身份（这张图每跑完一次，
+// 外层节点执行名下记一笔；从头再跑时按记下的次数换 ID，续跑它自己存档的那一遍次数不变），用户被问到的是新内容，
+// 调用方累积传的旧答案不兑付给它（修之前只问过「批准 v1」，执行的是「v2 已批准」，实测）。重生沿外层链往里传，
+// 更里层的提问一起换新。⚠️ 所以节点在嵌套图跑完之后每挂起一次，续跑时那张图的问题就重问一轮（内容可能已经变了，
+// 拿旧答案不安全）；节点体自己的 Ask 身份不变、答案照旧拿回——它问的若依赖嵌套图的产出，同样要先把产出记下来。不想让它重跑：跑完就用 [SaveNodeState] / [SaveStepResult] 记下，续跑时跳过它；或者
+// 把它包成 agent 经 `agent_v2.RunSubAgent` 调（嵌套调用记完成记录，续跑时拿回、不重跑）。⚠️ 自己跳过的话，
+// 那张图做出的上行信号（转交 / 路由决定）不会再做一次：用 [CaptureSignals] 包住嵌套 Run、把 [Signals] 随记录
+// 一起存下，跳过时 [EmitSignals] 交出，否则续跑后决定静默丢失（实测，`err == nil`；`RunSubAgent` 已经这样做）。
 //
 // 要开一个跟当前执行无关的独立运行，先 [DetachExecution]。
 func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (runErr error) {
@@ -539,8 +547,14 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 交给调用方的话会被本图交出的同一个收件人上的信号盖掉——而它是后做的。先收在这儿，排在本图
 	// 的后面交（见 signal.go「钩子里做出的信号」）。
 	endHookSignals := &signalScope{}
+	// recordCompletion 在外层节点执行名下记一笔「这张嵌套图又跑完了一次」（见 nestedRegenKey），Run 入口算出 key 之后
+	// 设好；放在这个 defer 里跟兑付上冒一起，看的是最终的 runErr。
+	var recordCompletion func()
 	defer func() {
 		if runErr == nil {
+			if recordCompletion != nil {
+				recordCompletion()
+			}
 			bubbleConsumedAnswersTo(callerLedger, cm)
 			// 上行信号同理：本图已提交的（含续跑时从存档恢复的）交给调用这张图的那段执行，
 			// 失败 / 停下时不交（见 signal.go）。
@@ -692,6 +706,24 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 放行，err=nil）。
 	cm.outerGens = outerRerunGensFor(hostAcc)
 	ctx = withOuterRerunGens(ctx, cm.outerGens)
+	// 重生次数：这张图（graphPhaseNS：ns 加这次外层执行里的第几遍）在承载它的执行里已经跑完过几次——从头再跑时提问换
+	// 身份，续跑自己存档时次数没变（见 nestedRegenKey）。顶层图没有外层执行，链为空。
+	regen := 0
+	if hostAcc != nil {
+		key := nestedRegenKey(graphPhaseNS)
+		if n, ok := GetStepResult[nestedCompletions](outerCtx, key); ok {
+			regen = int(n)
+		}
+		done := nestedCompletions(regen + 1)
+		recordCompletion = func() {
+			if err := SaveStepResult(outerCtx, key, done); err != nil {
+				slog.WarnContext(outerCtx, "compose_v2: 记下嵌套图跑完失败，外层失败续跑时它重生出来的提问可能沿用旧 ID",
+					"ns", cfg.graphNS, "err", err)
+			}
+		}
+	}
+	cm.outerRegens = outerRegensFor(hostAcc, regen)
+	ctx = withOuterRegens(ctx, cm.outerRegens)
 	// HITL: 注入 ResumeContext 让节点函数可读 user 答案
 	//
 	// **audit Round 9 Bug B4 修复**：caller 提供的 answers 与 cm 当前 pending
@@ -2259,6 +2291,9 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 			for _, sg := range condSignals {
 				signals = putSignal(signals, sg)
 			}
+			if err == nil {
+				err = validateSendTargets(g, id, directives)
+			}
 		}
 		// 成员以「它名下嵌套图的入口被否决」失败：推进产出那份输入的分域的代际
 		applyNestedEntryRejections(ctx, cm, frontier[0], err)
@@ -2385,6 +2420,9 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 				targets, condSignals, err = evalMemberOutEdges(ctx, g, cm, m, ws)
 				for _, sg := range condSignals {
 					signals = putSignal(signals, sg)
+				}
+				if err == nil {
+					err = validateSendTargets(g, m.NodeID, directives)
 				}
 			}
 			applyNestedEntryRejections(ctx, cm, m, err)

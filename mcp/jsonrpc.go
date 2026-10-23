@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -103,15 +104,52 @@ func buildInitializeParams(protocolVersion, clientName, clientVersion string) ma
 	}
 }
 
-// parseToolsList 把 tools/list 的 raw result 解析为 []ToolSpec。
+// maxToolsListPages 是一次 tools/list 最多翻的页数：服务端的 cursor 出了问题（每页都给一个新的）时不至于一直翻下去。
+const maxToolsListPages = 1000
+
+// listAllTools 按 tools/list 的分页把工具拉全：带上一页的 nextCursor 再请求，直到它缺省或为空（MCP 规范：cursor 是
+// 不透明串，到头时不给）。只取第一页的话，服务端一分页，第二页起的工具静默丢失、模型永远看不到。
+//
+// 服务端给回同一个 cursor（会一直翻同一页）或翻过 maxToolsListPages 页时报错，不返回半截列表——半截的工具表会让
+// 缺的那些工具看起来不存在，比报错更难查。
+func listAllTools(ctx context.Context, rpc func(context.Context, string, map[string]any) (json.RawMessage, error), allow []string) ([]ToolSpec, error) {
+	var all []ToolSpec
+	seen := map[string]bool{}
+	params := map[string]any{}
+	for page := 0; ; page++ {
+		if page >= maxToolsListPages {
+			return nil, fmt.Errorf("mcp tools/list: 翻了 %d 页还没到头（服务端的 nextCursor 可能有问题）", maxToolsListPages)
+		}
+		raw, err := rpc(ctx, "tools/list", params)
+		if err != nil {
+			return nil, fmt.Errorf("mcp tools/list: %w", err)
+		}
+		tools, next, err := parseToolsList(raw, allow)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, tools...)
+		if next == "" {
+			return all, nil
+		}
+		if seen[next] {
+			return nil, fmt.Errorf("mcp tools/list: 服务端第 %d 页给回了已经用过的 cursor %q，再翻会一直重复", page+1, next)
+		}
+		seen[next] = true
+		params = map[string]any{"cursor": next}
+	}
+}
+
+// parseToolsList 把 tools/list 一页的 raw result 解析为 []ToolSpec 与下一页的 cursor（没有下一页时为空）。
 // 对 allow 白名单做服务端原始名过滤；allow 为空表示放行全部。
 //
 // annotations 逐个工具宽松地解：一个工具的注解形状不对（字段类型错之类）只丢掉它自己的注解（按没有注解处理，
 // 于是也不算只读）并告警，不让整份列表解析失败——注解只是提示（MCP 规范），一个写错的提示不该让这个 server
 // 的所有工具都用不了。
-func parseToolsList(raw json.RawMessage, allow []string) ([]ToolSpec, error) {
+func parseToolsList(raw json.RawMessage, allow []string) ([]ToolSpec, string, error) {
 	var body struct {
-		Tools []struct {
+		NextCursor string `json:"nextCursor"`
+		Tools      []struct {
 			Name         string          `json:"name"`
 			Description  string          `json:"description"`
 			InputSchema  map[string]any  `json:"inputSchema"`
@@ -120,7 +158,7 @@ func parseToolsList(raw json.RawMessage, allow []string) ([]ToolSpec, error) {
 		} `json:"tools"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, fmt.Errorf("decode tools/list: %w", err)
+		return nil, "", fmt.Errorf("decode tools/list: %w", err)
 	}
 	allowSet := toSet(allow)
 	out := make([]ToolSpec, 0, len(body.Tools))
@@ -138,7 +176,7 @@ func parseToolsList(raw json.RawMessage, allow []string) ([]ToolSpec, error) {
 			Annotations:  parseToolAnnotations(t.Name, t.Annotations),
 		})
 	}
-	return out, nil
+	return out, body.NextCursor, nil
 }
 
 // parseToolAnnotations 解一个工具的 annotations；没有、是 null、或者形状不对时返回 nil（形状不对时告警）。

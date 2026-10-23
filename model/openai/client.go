@@ -471,15 +471,7 @@ func (c *Client) convertResponse(resp *openaiResponse) *schema.Message {
 			System:       c.system,   // observability gen_ai.provider.name
 		}
 		if resp.Usage != nil {
-			usage := &schema.MessageUsage{
-				InputTokens:  int32(resp.Usage.PromptTokens),
-				OutputTokens: int32(resp.Usage.CompletionTokens),
-				TotalTokens:  int32(resp.Usage.TotalTokens),
-			}
-			if resp.Usage.PromptTokensDetails != nil {
-				usage.CachedInputTokens = int32(resp.Usage.PromptTokensDetails.CachedTokens)
-			}
-			msg.Metadata.Usage = usage
+			msg.Metadata.Usage = resp.Usage.toSchema()
 		}
 	}
 
@@ -642,14 +634,7 @@ func (c *Client) handleStreamEvent(ctx context.Context, ev sseEvent, st *streamS
 	// 发 usage-only message; choices 非空时附到该 content message 的 Metadata.
 	var streamUsage *schema.MessageUsage
 	if chunk.Usage != nil {
-		streamUsage = &schema.MessageUsage{
-			InputTokens:  int32(chunk.Usage.PromptTokens),
-			OutputTokens: int32(chunk.Usage.CompletionTokens),
-			TotalTokens:  int32(chunk.Usage.TotalTokens),
-		}
-		if chunk.Usage.PromptTokensDetails != nil {
-			streamUsage.CachedInputTokens = int32(chunk.Usage.PromptTokensDetails.CachedTokens)
-		}
+		streamUsage = chunk.Usage.toSchema()
 	}
 	if len(chunk.Choices) == 0 {
 		if streamUsage != nil {
@@ -944,6 +929,30 @@ type openaiUsage struct {
 	// PromptTokensDetails OpenAI prompt cache 命中 — Cached token 半价计费业务降本核心.
 	// qwen / deepseek 也兼容此字段 (provider 命中 cache 时填). 不命中时为 nil 或 Cached=0.
 	PromptTokensDetails *openaiPromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+	// CompletionTokensDetails 里的 reasoning_tokens 是 CompletionTokens 中推理（思考）的那部分（OpenAI 推理模型、
+	// deepseek-reasoner、qwen 的思考模式都这么报）。
+	CompletionTokensDetails *openaiCompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+// openaiCompletionTokensDetails OpenAI usage.completion_tokens_details 子结构；ReasoningTokens 是 CompletionTokens 的子集。
+type openaiCompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+// toSchema 把 wire 上的用量转成 schema.MessageUsage（Generate 与流式两条路共用这一份）。
+func (u *openaiUsage) toSchema() *schema.MessageUsage {
+	usage := &schema.MessageUsage{
+		InputTokens:  int32(u.PromptTokens),
+		OutputTokens: int32(u.CompletionTokens),
+		TotalTokens:  int32(u.TotalTokens),
+	}
+	if u.PromptTokensDetails != nil {
+		usage.CachedInputTokens = int32(u.PromptTokensDetails.CachedTokens)
+	}
+	if u.CompletionTokensDetails != nil {
+		usage.ThinkTokens = int32(u.CompletionTokensDetails.ReasoningTokens)
+	}
+	return usage
 }
 
 // openaiPromptTokensDetails OpenAI usage.prompt_tokens_details 子结构.

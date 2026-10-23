@@ -29,10 +29,12 @@ package agent_v2
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -503,6 +505,12 @@ type historyWriter struct {
 	// 里进过历史的消息条数。
 	recorded     map[*schema.Message]bool
 	recordedHere map[recordSlotKey]bool
+	// recordedIDs 是进过历史的消息：ID → 那些消息的内容键（inputContentKey），只服务输入侧的「这条输入本 Run 记过没有」
+	// （见 inputRecorded）。输入经过每一层 agent 入口都被拷一份（ownRunInput），叶子记下的是它自己那份，上层手里那份
+	// 指针不同、ID 与内容相同。只看 ID 不够：节点用结构体拷贝派生新输入（`d := *in` 再改内容）时派生的那条带着原话的
+	// ID，按 ID 判就把原话当成记过、一条不剩（审计实测）。产出侧不用它：同一个对象跨轮复用是合法的多次产出（ID 与内容
+	// 都相同），只能按指针加范围判。
+	recordedIDs map[string][]string
 
 	// claimedRootInputs 记「哪些原始输入已经有人认领着要写了」，键是 input 自带的
 	// 身份（见 rootInputID）。
@@ -873,8 +881,39 @@ func (w *historyWriter) markRecorded(slot string, msgs []*schema.Message) {
 		if m != nil {
 			w.recorded[m] = true
 			w.recordedHere[recordSlotKey{msg: m, slot: slot}] = true
+			w.noteRecordedID(m)
 		}
 	}
+}
+
+// noteRecordedID 登记一条进了历史的消息的 ID 与内容键。调用方须持锁。
+func (w *historyWriter) noteRecordedID(m *schema.Message) {
+	if m.ID == "" {
+		return
+	}
+	k := inputContentKey(m)
+	for _, have := range w.recordedIDs[m.ID] {
+		if have == k {
+			return
+		}
+	}
+	w.recordedIDs[m.ID] = append(w.recordedIDs[m.ID], k)
+}
+
+// inputContentKey 是「同一条输入」比对内容的那部分：角色、文本与内容块（不含标注——记历史时会盖归属）。
+func inputContentKey(m *schema.Message) string {
+	var b strings.Builder
+	b.WriteString(string(m.Role))
+	b.WriteByte(0)
+	b.WriteString(m.Content)
+	if len(m.ContentBlocks) > 0 {
+		b.WriteByte(0)
+		// 编不出来就只比文本：内容块里放着编不成 JSON 的东西时，宁可把两条当成同一条（少记）也不报错
+		if raw, err := json.Marshal(m.ContentBlocks); err == nil {
+			b.Write(raw)
+		}
+	}
+	return b.String()
 }
 
 // ensureRecordMaps 惰性初始化两个登记表。调用方须持锁。
@@ -885,9 +924,34 @@ func (w *historyWriter) ensureRecordMaps() {
 	if w.recordedHere == nil {
 		w.recordedHere = make(map[recordSlotKey]bool, 16)
 	}
+	if w.recordedIDs == nil {
+		w.recordedIDs = make(map[string][]string, 16)
+	}
 }
 
-// alreadyRecorded 报这条消息是不是已经进过历史（全局，只读）。
+// inputRecorded 报这条输入是不是已经进过历史（全局，只读）：同一个指针，或同一个消息 ID 且内容相同（见 recordedIDs）。
+func (w *historyWriter) inputRecorded(m *schema.Message) bool {
+	if m == nil {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.recorded[m] {
+		return true
+	}
+	if m.ID == "" {
+		return false
+	}
+	k := inputContentKey(m)
+	for _, have := range w.recordedIDs[m.ID] {
+		if have == k {
+			return true
+		}
+	}
+	return false
+}
+
+// alreadyRecorded 报这条消息是不是已经进过历史（全局，只读，按指针——服务产出，见 recorded）。
 func (w *historyWriter) alreadyRecorded(m *schema.Message) bool {
 	if m == nil {
 		return false
@@ -914,6 +978,7 @@ func (w *historyWriter) claimRecordHere(slot string, m *schema.Message) bool {
 	}
 	w.recordedHere[k] = true
 	w.recorded[m] = true
+	w.noteRecordedID(m)
 	return true
 }
 
@@ -950,7 +1015,7 @@ func recordedInThisRun(ctx context.Context, input *schema.Message) bool {
 	if w == nil {
 		return false
 	}
-	return w.alreadyRecorded(input)
+	return w.inputRecorded(input)
 }
 
 // claimSharedRootInput 报「这一层该不该把这条共享的原始输入记进历史」。

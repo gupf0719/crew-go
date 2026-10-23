@@ -398,10 +398,10 @@ func inferenceLabels(provider, requestModel, responseModel string) []attribute.K
 }
 
 // outputTokens 是 GenAI 约定口径的输出 token：包含推理 token（约定要求 reasoning.output_tokens 计入
-// output_tokens，output_tokens 取计费口径——推理 token 按输出计费）。本仓的 MessageUsage.OutputTokens 不含
-// ThinkTokens（模型客户端单列），这里加回去。
+// output_tokens，output_tokens 取计费口径——推理 token 按输出计费）。MessageUsage.OutputTokens 本来就是这个口径
+// （ThinkTokens 是它的子集），原样用。
 func outputTokens(u *schema.MessageUsage) int32 {
-	return u.OutputTokens + u.ThinkTokens
+	return u.OutputTokens
 }
 
 func addTokens(ctx context.Context, c metric.Int64Counter, n int32, opt metric.AddOption) {

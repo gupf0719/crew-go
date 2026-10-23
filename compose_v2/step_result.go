@@ -231,6 +231,43 @@ func outerRerunGensFor(host *nodeStateAccessor) []int {
 	return append(append(make([]int, 0, len(parent)+1), parent...), host.cm.effectiveRerunGen(host))
 }
 
+// outerRegensKey 携带外层「重生次数」链，与 outerRerunGensKey 等长（见 ChannelManager.outerRegens）。
+type outerRegensKey struct{}
+
+func withOuterRegens(ctx context.Context, regens []int) context.Context {
+	return context.WithValue(ctx, outerRegensKey{}, regens)
+}
+
+// outerRegensFor 是一张图的重生次数链：承载它的那次执行所在那张图的链，再加这张图在那次执行里重生过的次数。
+func outerRegensFor(host *nodeStateAccessor, regen int) []int {
+	if host == nil {
+		return nil
+	}
+	parent := host.cm.outerRegens
+	return append(append(make([]int, 0, len(parent)+1), parent...), regen)
+}
+
+// nestedRegenKey 是外层节点执行名下记「这张嵌套图跑完过几次」的步骤记录键（graphPhaseNS：ns 加同一次执行里的第几遍）。
+//
+// 节点里直接跑的嵌套图跑完之后节点又失败或挂起（不是条件边否决）：续跑时节点重跑，嵌套图的存档在它成功时已清，于是它从头
+// 再跑——是一次**重生**，里面的提问是新内容上的新问题。只按位置算 ID 的话它们落在上一次的 ID 上，调用方累积传的旧答案
+// 被直接兑付给新内容（实测：只问过「批准 v1」，执行的是「v2 已批准」）。所以嵌套图每跑完一次就在外层执行名下记一笔，
+// 下一次从头跑时按记下的次数换身份；续跑它自己存档的那一遍次数没变、ID 不变。记录随外层节点「没成」的出口存档落盘，
+// 外层节点成功之后不可达（同节点私有态）。
+//
+// 计数存成私有类型 nestedCompletions（compose_v2 自己注册）：存成裸 int 的话只有业务或别的包碰巧注册过 int 时才存得进
+// 节点私有态，只用 compose_v2 的业务上每次都存不进去、修复静默失效（审计实测，包内测试文件注册了 int 所以测不出来）。
+func nestedRegenKey(graphPhaseNS string) string {
+	return "\x00graph-completions\x00" + graphPhaseNS
+}
+
+// nestedCompletions 是一张嵌套图在承载它的那次外层执行里跑完过的次数（见 nestedRegenKey）。
+type nestedCompletions int
+
+func init() {
+	RegisterValueType[nestedCompletions]("compose_v2.nestedCompletions")
+}
+
 // outerRerunGensOf 是 ctx 上的外层代际链（ctx 所在那张图的）。
 func outerRerunGensOf(ctx context.Context) []int {
 	gens, _ := ctx.Value(outerRerunGensKey{}).([]int)
@@ -238,13 +275,15 @@ func outerRerunGensOf(ctx context.Context) []int {
 }
 
 // outerRerunGensID 把 ctx 上的外层代际链编成 InterruptSite 的那一维：全为 0 时是空串（从没被
-// 否决过的外层不改变 ID），否则从外到里用点号连起来（元组，不求和：内层图重跑时自己的代际从 0
-// 数起，求和会让「外层没重做、内层重做过一次」与「外层重做过一次、内层没有」撞成同一个值）。
+// 否决过、从没重生过的外层不改变 ID），否则从外到里用点号连起来（元组，不求和：内层图重跑时自己的代际从 0
+// 数起，求和会让「外层没重做、内层重做过一次」与「外层重做过一次、内层没有」撞成同一个值）。每一层的重生次数
+// （见 nestedRegenKey）不为 0 时接在那一层后面，写成「代际~次数」。
 func outerRerunGensID(ctx context.Context) string {
 	gens := outerRerunGensOf(ctx)
+	regens, _ := ctx.Value(outerRegensKey{}).([]int)
 	zero := true
-	for _, g := range gens {
-		if g != 0 {
+	for i, g := range gens {
+		if g != 0 || (i < len(regens) && regens[i] != 0) {
 			zero = false
 			break
 		}
@@ -255,6 +294,9 @@ func outerRerunGensID(ctx context.Context) string {
 	parts := make([]string, len(gens))
 	for i, g := range gens {
 		parts[i] = strconv.Itoa(g)
+		if i < len(regens) && regens[i] != 0 {
+			parts[i] += "~" + strconv.Itoa(regens[i])
+		}
 	}
 	return strings.Join(parts, ".")
 }

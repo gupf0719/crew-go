@@ -210,6 +210,9 @@ type Config struct {
 	// 角色追加的提示（后台任务通知、重复调用提醒、inline skill 正文，见 IsFrameworkNote）同样跳过；
 	// 每轮都跑（含 Resume 后的轮）。用于"分类后裁工具"等场景（RoutingAgent classifier 分类 →
 	// filter 返子集是典型用法）。与 ToolSearch（LLM 主动搜解锁）正交可叠加。
+	// **执行侧同样拦**：模型照样发了调被裁掉的业务工具的 tool_call（凭上文记得的名字）时，工具不执行，模型收到
+	// [ToolNotAvailableErrCode] 失败结果；判的是产出这一批 tool_call 的那一轮交给模型的工具（随存档走，续跑时不重算回调）。
+	// 软降落轮摘掉的工具（含框架工具）同理。
 	ToolFilter func(ctx context.Context, input *schema.Message) []string
 
 	// ToolMiddlewares 包住每次**业务**工具调用（观测 / 短路 / 挂起）。先注册的最外。
@@ -443,6 +446,9 @@ func WithToolMiddleware(mws ...ToolMiddleware) Option {
 // 没配 WithOutputSchema 时照常按 fn 的白名单 bind，只是 tool_choice=none 关掉了工具调用；配了时工具
 // **只剩 `final_output`**（框架那件），fn 的白名单不生效。那一轮模型硬调的工具一律不执行。典型
 // 用法：RoutingAgent classifier 分类意图后只开相关工具子集。详见 Config.ToolFilter。
+//
+// 裁掉的工具在执行侧同样拦：模型硬调时不执行，拿到 [ToolNotAvailableErrCode] 失败结果——模型能调的就是这一轮交给
+// 它的那些。
 func WithToolFilter(fn func(ctx context.Context, input *schema.Message) []string) Option {
 	return func(c *Config) {
 		if fn == nil {
@@ -910,6 +916,10 @@ func WithSkillBodyMaxChars(n int) Option {
 //
 // **框架工具恒豁免**：`final_output` 装的是最终答案本身、`activate_skill` 的正文另有
 // `WithSkillBodyMaxChars` 管，截它们只会把事情弄坏。
+//
+// **截在工具返回那一刻，钩子之后不再截**：`OnToolEnd` 看到的是截过的结果；钩子改写的 `Result`（[消费]档）原样进消息流，
+// 改得再大也不截——这个上限管的是工具产出，不是对钩子的硬保证。开了它之后 MicroCompact 卸载出去的也是截过的那份
+// （带截断标记）。
 //
 // 用法：
 //

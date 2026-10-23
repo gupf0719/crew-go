@@ -184,6 +184,7 @@ func (s *SequentialAgent) Run(ctx context.Context, session *RunSession, input *s
 	if input == nil {
 		input = schema.UserMessage("")
 	}
+	input = ownRunInput(input)
 	if len(s.steps) == 0 {
 		return nil, fmt.Errorf("sequential agent %q: no steps; call AddStep", s.Name())
 	}
@@ -229,9 +230,7 @@ func (s *SequentialAgent) Run(ctx context.Context, session *RunSession, input *s
 		}
 		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, startErr)
 	}
-	if len(agentIn.Messages) > 0 && agentIn.Messages[len(agentIn.Messages)-1] != nil {
-		input = agentIn.Messages[len(agentIn.Messages)-1]
-	}
+	input = adoptHookInput(agentIn, input)
 
 	// hook OnAgentEnd 兜底——所有退出路径触发
 	// P0 observability: push retErr 让 observability OnAgentEnd 识别 InterruptError 路径

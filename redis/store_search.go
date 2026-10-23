@@ -36,6 +36,9 @@ func (s *Store) Search(ctx context.Context, namespacePrefix store.Namespace, opt
 	if cfg.Limit <= 0 {
 		cfg.Limit = 10
 	}
+	if err := store.ValidateOffset(cfg.Offset); err != nil {
+		return nil, err
+	}
 
 	if err := store.ValidateFilter(cfg.Filter); err != nil {
 		return nil, err

@@ -33,6 +33,9 @@ func (s *Store) Search(ctx context.Context, namespacePrefix store.Namespace, opt
 		cfg.Limit = 10
 	}
 
+	if err := store.ValidateOffset(cfg.Offset); err != nil {
+		return nil, err
+	}
 	// 静态校验 (op 名 + 范围 op 的 filter 值类型), 与客户端过滤后端同一份判据
 	if err := store.ValidateFilter(cfg.Filter); err != nil {
 		return nil, err

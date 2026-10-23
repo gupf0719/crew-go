@@ -138,8 +138,8 @@ bld.AddSubgraphNode("enrich", sub, compose_v2.WithSubgraphNodeOptions(compose_v2
   也不看调用方那时死没死（时限是先到的）。
 
 这次尝试以 `*NodeTimeoutError` 失败（外面包着带节点位置的 `*GraphNodeError`）。它**不在错误链上露出
-`context.DeadlineExceeded`**：那个错在本包的语义里是「调用方的 ctx 到期了」——默认重试谓词 `IsRetryable` 不重试它、
-出口把存档标成等续跑的挂起。节点自己超时是这一次执行失败了：配了重试就按谓词重试（默认谓词会重试），用完就是一个
+`context.DeadlineExceeded`**：错误链上的那个错在本包里被当成「调用方的 ctx 到期了」的标签——出口把存档标成等续跑的
+挂起、观测记成超时。节点自己超时是这一次执行失败了：配了重试就按谓词重试（默认谓词会重试），用完就是一个
 普通的节点失败——同超步的兄弟照常跑完、成功的照常提交，存档是失败现场，续跑只重跑这个节点。节点返回的原始错误在
 `NodeTimeoutError.Err` 里。
 
@@ -337,7 +337,7 @@ ag := agent_v2.NewBasicAgent(agent_v2.WithName("support"), agent_v2.WithModel(m)
 | 编译期 vs 运行期断点 | 取并集 | 编译期的是图的一部分（闸门），不该被一次调用关掉；运行期的是调试时加的 | 运行期整体替换编译期 |
 | 没有 checkpointer 的断点 | 嵌套图停下时报错；GraphAgent 在 Run 入口报错；直接调 `compose_v2.Run` 的顶层不限（调用方自己留快照续） | 停下之后无档可续：嵌套图续跑必然活锁，GraphAgent 的 Resume 必然失败、重跑又停在第一个断点 | 照停（活锁 / 永远停在第一个断点）、静默忽略（接受了却不生效） |
 | 节点超时 | 协作式：取消 ctx、等返回、失效可见、迟到成功丢弃 | Go 不能安全中止 goroutine；放弃等待会让副作用与存档写发生在无人能拦的时刻，还要给每个写入口加栅栏 | 超时后放弃 goroutine、靠栅栏挡迟到写 |
-| 超时错误的形状 | `*NodeTimeoutError`，不在链上露出 `DeadlineExceeded` | 节点超时是一次执行失败，不是调用方 ctx 到期；露出来会被默认谓词判成不可重试、被出口判成挂起 | 直接返回 `ctx.Err()` 的包装 |
+| 超时错误的形状 | `*NodeTimeoutError`，不在链上露出 `DeadlineExceeded` | 节点超时是一次执行失败，不是调用方 ctx 到期；露出来会被出口判成挂起（存档标「等续跑」而不是失败现场） | 直接返回 `ctx.Err()` 的包装 |
 | 节点重试 | 节点体外套 `RunWithRetry`，每次尝试一个投递收集器 | 复用已有的「同一次调用」语义（编号退回、账本分层、信号按尝试收、嵌套图续跑）；投递收集器不分开的话失败尝试的投递会漏进结果 | 在节点里手写循环（编号不退回，答过的问题重问） |
 | 只读的声明者 | 工具实例自声明（布尔），没声明按有副作用 | 只读性是审批要的唯一信息；fail-closed 防「加了危险工具忘了声明就静默绕过」 | 按工具名单、按工具类别枚举、借 trace 类别 |
 | MCP 注解 | 默认不认，`WithTrustedClient` 逐 server 显式信任 | 注解是 server 自报的提示；认了的话一个 server 给写操作标只读就绕过了审批 | 默认信任 |

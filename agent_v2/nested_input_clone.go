@@ -3,10 +3,12 @@ package agent_v2
 import (
 	"reflect"
 
+	"crew-go/hook"
 	"crew-go/schema"
 )
 
-// cloneCalleeInput 给嵌套调用的被调方一份输入的深拷贝。
+// cloneCalleeInput 给被调起的 agent 一份输入的深拷贝：嵌套调用的被调方、编排的成员与内部决策 agent、转交的候选都拿
+// 它（各 agent 的 Run 入口另经 ownRunInput 再拷一份自己的）。
 //
 // 被调方的钩子可以原地改写它拿到的消息（`OnAgentStart` 的 `input.Messages` 是[消费]档，框架
 // 把改写喂给下游）。交出去的若是调用方手里那条——最常见的写法就是把从 channel 里读出来的那条
@@ -52,6 +54,37 @@ import (
 // 钩子更没有理由改它。
 //
 // 新增字段时 `TestCloneCalleeInput_FieldCoverage` 会红，逼着这里跟上。
+// ownRunInput 返回这次运行自己持有的那份输入：调用方交来的消息的独立拷贝（见 cloneCalleeInput），没有消息 ID
+// 时在拷贝上补一个。各 agent 的 Run 入口都经它。
+//
+// 拷贝：本 agent 的 OnAgentStart 钩子、编排存进 channel 的那份、交给成员的那份，都碰不到调用方手里那条——
+// 调用方的消息不该被它调起的 agent 原地改掉（并发扇出时同一条消息被几个 agent 同时改，是数据竞争）。
+//
+// 补 ID：共享历史视图下「同一条原始输入只记一份」按消息 ID 认。成员拿到的都是拷贝，各自的指针不同，没有 ID
+// 时没有别的东西能认出它们是同一条（曾按指针兜底，交拷贝之后并行的三个分支记了三份，实测）。ID 补在这次运行
+// 自己的那份上，随存档走，续跑时也认得出；调用方那条不长出 ID。
+func ownRunInput(m *schema.Message) *schema.Message {
+	c := cloneCalleeInput(m)
+	if c != nil && c.ID == "" {
+		c.ID = newUUID()
+	}
+	return c
+}
+
+// adoptHookInput 取 OnAgentStart 钩子处理过的输入：钩子把最后一条换掉了就用它（没换就是入口那份）。钩子换上的是它
+// 自己的对象（多半是新构造、没有消息 ID 的，比如脱敏），采纳的是它的拷贝、没有 ID 时补一个——同 ownRunInput：之后的
+// 原地改碰不到钩子的对象；共享历史视图按 ID 认同一条原始输入，没有 ID 的话转交的每一跳入口各补一个、各记一份（实测）。
+// 各 agent 的 Run 入口都经它。
+func adoptHookInput(in *hook.AgentInput, input *schema.Message) *schema.Message {
+	if in == nil || len(in.Messages) == 0 || in.Messages[len(in.Messages)-1] == nil {
+		return input
+	}
+	if got := in.Messages[len(in.Messages)-1]; got != input {
+		return ownRunInput(got)
+	}
+	return input
+}
+
 func cloneCalleeInput(m *schema.Message) *schema.Message {
 	if m == nil {
 		return nil

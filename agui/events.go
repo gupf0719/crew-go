@@ -74,17 +74,38 @@ func (b *baseEvent) setTimestampMs(ms int64) { b.Timestamp = ms }
 
 // ── Run 生命周期 ──
 
+// 这个适配层自己起的名字都带厂商前缀 `crew.`（AG-UI：CUSTOM 事件名与元数据键是应用空间，生产方 SHOULD 给自己
+// 起的加厂商或应用前缀，免得两方扩展同一条流时撞名；不带前缀的名字留给协议自己将来用）。
+const (
+	// CustomEventError 是模型 / 工具层的中间错误（观测用，不是终态；终态是 RUN_ERROR）。value: {code, message}。
+	CustomEventError = "crew.error"
+	// CustomEventResetStream 通知前端丢弃某条消息已经收到的片段（流中途重试、OnModelEnd 钩子改写了答复）。
+	// value: {run_id, reason}。
+	CustomEventResetStream = "crew.reset_stream"
+	// MetadataKeyApprovalOptions 是工具审批中断 metadata 里的四个选项（approve / approve_always / approve_always_tool / deny）。
+	MetadataKeyApprovalOptions = "crew.options"
+	// MetadataKeyToolName 是工具审批中断 metadata 里要审批的工具名。
+	MetadataKeyToolName = "crew.toolName"
+)
+
+// ProtocolVersion 是这个适配层说的 AG-UI 协议版本（`MAJOR.MINOR`），在每个 RUN_STARTED 上声明。
+const ProtocolVersion = "1.0"
+
 // RunStartedEvent —— 一次 agent run 开始。
 type RunStartedEvent struct {
 	baseEvent
 	ThreadID string `json:"threadId"`
 	RunID    string `json:"runId"`
+	// ProtocolVersion 是生产方自己说的协议版本，不是回显输入里的那个（AG-UI 1.0：实现了这个版本的生产方 MUST 在
+	// RUN_STARTED 上声明；缺省表示版本化之前的生产方）。
+	ProtocolVersion string `json:"protocolVersion,omitempty"`
 }
 
 // NewRunStarted 构造 RUN_STARTED。threadID 是会话聚类 ID（对应 AG-UI thread），
-// runID 是本次运行 ID。
+// runID 是本次运行 ID；protocolVersion 填 [ProtocolVersion]。
 func NewRunStarted(threadID, runID string) *RunStartedEvent {
-	return &RunStartedEvent{baseEvent: baseEvent{EventType: EventTypeRunStarted}, ThreadID: threadID, RunID: runID}
+	return &RunStartedEvent{baseEvent: baseEvent{EventType: EventTypeRunStarted}, ThreadID: threadID, RunID: runID,
+		ProtocolVersion: ProtocolVersion}
 }
 
 // RunFinishedOutcomeType 区分 run 结束的形态（成功 / 中断 / 取消）。

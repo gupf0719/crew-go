@@ -445,8 +445,8 @@ func TestMetrics_ReActRun(t *testing.T) {
 	}
 }
 
-// TestTokenUsage_GenAISemantics：token 按 GenAI 约定的口径记——输出 token 包含推理 token（本仓 OutputTokens 不含
-// ThinkTokens，要加回去），推理 / 缓存读 / 缓存写各自是输出或输入的子集。
+// TestTokenUsage_GenAISemantics：token 按 GenAI 约定的口径记——输出 token 包含推理 token（MessageUsage.OutputTokens 本来
+// 就含，ThinkTokens 是其中那部分，不另外相加），推理 / 缓存读 / 缓存写各自是输出或输入的子集。
 func TestTokenUsage_GenAISemantics(t *testing.T) {
 	h := newHarness(t)
 	ah := h.obs.AgentHooks()
@@ -456,7 +456,7 @@ func TestTokenUsage_GenAISemantics(t *testing.T) {
 	out := schema.AssistantMessage("ok")
 	out.Metadata = &schema.MessageMetadata{Model: "claude-x", System: "anthropic"}
 	ah.OnModelEnd(mctx, info, &schema.ModelOutput{Message: out, Usage: &schema.MessageUsage{
-		InputTokens: 100, CachedInputTokens: 60, CacheCreationInputTokens: 30, OutputTokens: 20, ThinkTokens: 5, TotalTokens: 125}})
+		InputTokens: 100, CachedInputTokens: 60, CacheCreationInputTokens: 30, OutputTokens: 25, ThinkTokens: 5, TotalTokens: 125}})
 	ah.OnAgentEnd(ctx, info, &hook.AgentOutput{})
 	chat := h.span(t, "chat claude-x")
 	for key, want := range map[attribute.Key]string{

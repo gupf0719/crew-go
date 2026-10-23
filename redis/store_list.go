@@ -25,6 +25,9 @@ func (s *Store) ListNamespaces(ctx context.Context, opts ...store.ListOption) ([
 	if cfg.Limit <= 0 {
 		cfg.Limit = 100
 	}
+	if err := store.ValidateOffset(cfg.Offset); err != nil {
+		return nil, err
+	}
 
 	// prefix / suffix 自身需合法 (非空时才校验)
 	if len(cfg.Prefix) > 0 {

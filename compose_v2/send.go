@@ -43,7 +43,8 @@ import (
 //     两条同值 payload → `ErrRunAborted`、worker 零执行）；换成 Append/Sum 则累积 N 份，
 //     也不是「同一份」。
 type SendDirective struct {
-	// Target 目标节点 ID——必须已在 graph 注册（caller 保证）
+	// Target 目标节点 ID——必须已在 graph 注册。图里没有的节点、起点 sentinel 让发出它的节点以 ErrRunAborted 失败
+	// （图定义错，重跑必然一样：不重试、清档，同条件边返回坏目标）；EndNode 与空串跳过不投递。
 	Target NodeID
 
 	// Payload 是一批 ChannelWrite，framework 在下一超步入口归并进**共享** channel 状态——

@@ -215,6 +215,7 @@ func (p *ParallelAgent) Run(ctx context.Context, session *RunSession, input *sch
 	if input == nil {
 		input = schema.UserMessage("")
 	}
+	input = ownRunInput(input)
 	if len(p.branches) == 0 {
 		return nil, fmt.Errorf("parallel agent %q: no branches; call AddBranch", p.Name())
 	}
@@ -258,9 +259,7 @@ func (p *ParallelAgent) Run(ctx context.Context, session *RunSession, input *sch
 		}
 		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, startErr)
 	}
-	if len(agentIn.Messages) > 0 && agentIn.Messages[len(agentIn.Messages)-1] != nil {
-		input = agentIn.Messages[len(agentIn.Messages)-1]
-	}
+	input = adoptHookInput(agentIn, input)
 
 	var finalRef *schema.Message
 	// P0 observability: push retErr 让 observability OnAgentEnd 识别 InterruptError 路径

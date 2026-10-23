@@ -48,7 +48,17 @@ func (m *streamingModel) WithTools(_ []*schema.ToolInfo) (model.ChatModel, error
 var _ model.ChatModel = (*streamingModel)(nil)
 
 // parseSSE 把 SSE 响应文本解析成事件列表（每个 data 行的 JSON 对象）。
+//
+// 开流之前被拒的请求没有事件流，响应体是 JSON {"code", "message"}（见 SSEWriter.Reject）：解析成一条 RUN_ERROR 形状的
+// 记录（带 "rejected": true），让「请求被拒、原因码是 X」的断言两种形态都能写。真实线上形态（HTTP 状态码、不开流）
+// 由 TestHandler_RejectBeforeStream_HTTPStatus 钉。
 func parseSSE(raw string) []map[string]any {
+	var rejected map[string]any
+	if json.Unmarshal([]byte(strings.TrimSpace(raw)), &rejected) == nil && rejected["code"] != nil && !strings.Contains(raw, "data: ") {
+		rejected["type"] = "RUN_ERROR"
+		rejected["rejected"] = true
+		return []map[string]any{rejected}
+	}
 	var events []map[string]any
 	for _, line := range strings.Split(raw, "\n") {
 		if !strings.HasPrefix(line, "data: ") {
@@ -573,15 +583,11 @@ func TestHandler_HITL_Cancelled(t *testing.T) {
 	if !foundCancelledOutcome {
 		t.Errorf("取消路径期望一条带 cancelled outcome 的 RUN_FINISHED，got %v", eventTypes(ev2))
 	}
-	// 取消语义走 Custom("cancelled")（官方 CUSTOM 合规）。
-	foundCancel := false
+	// 取消的唯一信号是 outcome：协议不让 CUSTOM 事件承载标准事件的语义（曾另发一条 Custom("cancelled")，已删）。
 	for _, ev := range ev2 {
 		if ev["type"] == "CUSTOM" && ev["name"] == "cancelled" {
-			foundCancel = true
+			t.Errorf("不该再发 Custom(cancelled)：%v", eventTypes(ev2))
 		}
-	}
-	if !foundCancel {
-		t.Errorf("cancelled abort 期望 Custom(name=cancelled) 携带取消语义，got %v", eventTypes(ev2))
 	}
 	if !contains(eventTypes(ev2), "RUN_FINISHED") {
 		t.Errorf("cancelled abort 期望 RUN_FINISHED 终态，got %v", eventTypes(ev2))

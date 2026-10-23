@@ -371,14 +371,20 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		return messages, nil
 	}
 
-	// emit Before event — 仅在 trigger 命中后 fire (不在 shouldTrigger
-	// 跳过路径 fire).
+	// 压缩事件只在**真要调摘要模型**时成对发出：Before 在断路器复查通过、调 Generate 之前那一刻发（emitBefore），
+	// After 经下面的 defer 覆盖之后所有退出路径（含 panic / error / 成功）。可压缩区太小、没有可摘的、断路器已熔断这些
+	// 跳过都不发——跟 shouldTrigger 的跳过一致：这一轮没有压缩。曾经 Before 在这里就发，跳过的轮次照样各发一对，
+	// observability 的 crew.compactions{crew.outcome=success} 每轮 +1、crew.compaction.ratio 恒 1.0，把「压缩效果在退化」的信号抹平。
 	//
 	// Sub-5d audit fix: 测 inputTokens + startNanos 让 After event 自带 InputTokens +
 	// DurationMs (OTel self-contained — observability 端 fire metric 单 event 即得完整数据).
 	var inputTokens int
 	var compactStartNanos int64
-	if hasEventSink(ctx) {
+	beforeEmitted := false
+	emitBefore := func() {
+		if !hasEventSink(ctx) {
+			return
+		}
 		inputTokens = compose_v2.EstimateTokens(messages)
 		compactStartNanos = time.Now().UnixNano()
 		EmitCompactionEvent(ctx, &CompactionAction{
@@ -390,11 +396,16 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 				Trigger:     "threshold",
 			},
 		})
-		// emit After event via defer — 覆盖所有退出路径 (含 panic / error / 成功).
-		// 注: defer 注册在 Before fire 之后, 跟 panic recover defer LIFO 关系:
+		beforeEmitted = true
+	}
+	{
+		// emit After event via defer — 覆盖所有退出路径 (含 panic / error / 成功)，只在 Before 发过时发.
+		// 注: 跟 panic recover defer LIFO 关系:
 		//   After defer 后注册 → 先跑; panic recover 先注册 → 后跑.
-		//   After defer 内读 named return out/err 拿到 panic recover 已经设的值.
 		defer func() {
+			if !beforeEmitted {
+				return
+			}
 			afterAction := &CompactionAfterAction{
 				Messages:     out,
 				Kept:         len(out),
@@ -604,6 +615,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		// 会误命中为 sub-agent ask_user 准备的答案当成"摘要 LLM 特殊指令"。strip
 		// ResumeContext 对齐 R14 audit 对 PlanAgent fork mode 隔离思路。
 		summarizeCtx := compose_v2.StripResumeContext(ctx)
+		emitBefore() // 真要调摘要模型了：这一轮算一次压缩（见 emitBefore 的说明）
 		r, e := cfg.Model.Generate(summarizeCtx, callInput)
 		// emit Generate event — primary phase attempt=1 (AutoCompactRun
 		// 内部不 retry, retry 由 caller modelFn 包围). 失败 attempt 也 emit 让业务可观测.

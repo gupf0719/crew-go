@@ -173,6 +173,12 @@ func bumpHistoryReceipt(ctx context.Context) {
 }
 
 // producedHistoryHere 报「这次调用的范围内有没有产生过历史记录」。
+//
+// 边界补记据它判「输入归不归里面那个 agent 管」：里面记过东西 ⟹ 边界不插手。代价（已知取舍）：业务自研的外壳 agent
+// 改写了输入再委派给框架的 BasicAgent 时，BasicAgent 记的是改写后的那条，边界见范围里有记录就不补——用户原话在整条
+// 历史里一份都没有，下一轮模型看到的会话里用户从没说过这句话（外壳原样透传时正常一份）。这道范围判据不能放松：它同时
+// 挡着「OnAgentStart 脱敏之后边界又把钩子之前的原文写进历史」。外壳要留原话，就在委派之前自己记一笔，或把改写放进
+// BasicAgent 的钩子里做。
 func producedHistoryHere(ctx context.Context) bool {
 	r := historyReceiptFrom(ctx)
 	return r != nil && r.n.Load() > 0

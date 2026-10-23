@@ -354,6 +354,7 @@ backend opt-in. 业务跨 backend 切换前**必查**此矩阵:
 | `ErrStoreNotConfigured` | `WithStoreMemory` helper 内部 hook 调 `store.FromContext(ctx)` 拿到 nil（业务忘 `WithStore`）| fail-fast（业务忘配 WithStore）|
 | `ErrUnsupportedFilterOp` | `Search` 的 `filter` 含不支持 op（如 `$or`/`$nor`）| fail-fast（业务 filter 写错）|
 | `ErrFilterTypeMismatch` | `$gt`/`$gte`/`$lt`/`$lte` 的 **filter 值**不是数值（`{"age": {"$gt": "abc"}}`）——静态判定、空 namespace 也报（`store.ValidateFilter`）。**存的值**类型对不上**不是错误**：那一行不命中（type bracketing，2026-09-03 拍板，三个内置后端一致；理由与真库实测见 [three-way store.md](../description/three-way-comparison/store.md)「filter 类型不匹配语义」）| fail-fast（业务 filter 写错）|
+| `ErrNegativeOffset` | `WithOffset` / `WithListOffset` 给了负数——Search 与 ListNamespaces 入口判（`store.ValidateOffset`，各后端共用这一份；曾经 in-memory 切片越界 panic、SQLite 当 0、PG / MySQL 各报各的错）| fail-fast（调用方算错了页码）|
 
 PoC InMemoryStore 实现以上全部 sentinel；后端实现可加自己的（如 `ErrRedisConnRefused`）但**必须先返此层 sentinel 再 wrap**（业务 `errors.Is` 不被打破）。
 

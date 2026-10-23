@@ -183,7 +183,7 @@ func TestStream_DeltasThenFinalChunk(t *testing.T) {
 	}
 	md := last.Metadata
 	if md == nil || md.FinishReason != "tool_calls" || md.Usage == nil ||
-		md.Usage.InputTokens != 10 || md.Usage.OutputTokens != 30 || md.Usage.ThinkTokens != 10 {
+		md.Usage.InputTokens != 10 || md.Usage.OutputTokens != 40 || md.Usage.ThinkTokens != 10 {
 		t.Errorf("Metadata = %+v / Usage = %+v", md, md.Usage)
 	}
 

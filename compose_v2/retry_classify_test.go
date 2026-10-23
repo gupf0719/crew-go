@@ -109,9 +109,6 @@ func TestIsRetryable_ControlFlowStillWins(t *testing.T) {
 	if compose_v2.IsRetryable(wrapped) {
 		t.Fatal("包着 InterruptError 的错误必须判不可重试——控制流优先级被 HTTP 分类打乱")
 	}
-	if compose_v2.IsRetryable(context.Canceled) {
-		t.Fatal("context.Canceled 必须不可重试")
-	}
 }
 
 // TestIsRateLimited 验证 429 识别。

@@ -1885,3 +1885,98 @@ func TestMCP_NoDirectErrorMethodCallInLogs(t *testing.T) {
 			"对 Error() 的 panic 自己兜住）：\n  %s", strings.Join(hits, "\n  "))
 	}
 }
+
+// ignoreCtxFactory 是**建连接时不看 ctx** 的工厂：第 1 次直接给 first，第 2 次先等 gate（故意只等 gate、
+// 不 select ctx.Done()）再给 second。
+//
+// 为什么不能用 seqFactory：它的 gate 是 `select { gate; ctx.Done() }`，而 Hub.Close 会取消重连尝试的
+// ctx ⟹ 放行 gate 与取消是竞态，多数时候走 ctx 分支、连接根本建不出来，于是**根本到不了 goOnline**，
+// 下面那条不变量就测不到（第 6 类炸弹：fixture 没搭对 ⟹ 测出「缺陷不存在」）。业务工厂建连接时不检查
+// ctx 是真实世界的常态，这个形状不是人为的。
+type ignoreCtxFactory struct {
+	mu            sync.Mutex
+	n             int
+	gate          chan struct{}
+	first, second mcp.Client
+}
+
+func (f *ignoreCtxFactory) New(context.Context) (mcp.Client, error) {
+	f.mu.Lock()
+	f.n++
+	n := f.n
+	f.mu.Unlock()
+	if n == 1 {
+		return f.first, nil
+	}
+	<-f.gate
+	return f.second, nil
+}
+
+func (f *ignoreCtxFactory) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.n
+}
+
+// TestHub_ReconnectFinishingAfterClose_DiscardsNewClient：重连在 Hub.Close 之后才连上时，那个新连接
+// 必须被关掉、不能挂到已关闭的 server 上。
+//
+// 守的是 `server.goOnline` 开头的 `if s.closed { discard }` 早退。缺它的话：Close 已经把 server 标死、
+// 已有连接也关了，而重连循环随后把一个**活着的**连接写进 `s.client` 并标 online ⟹ 那个连接**永远没人
+// 关**（Hub 已经关完了，不会再有第二次 Close 去捡它），stdio 型就是一个留在系统里的子进程；而 Hub 的
+// 状态还会报 online，调用方照 `Status` 判断会以为这个 server 可用。
+//
+// ⚠️ 这条不变量**有时间窗**，所以 fixture 要把窗口撑开：工厂卡在第 2 次建连接上 → Close 进到
+// `bg.Wait()`（它在等重连循环退出）→ 这时才放行工厂 ⟹ goOnline 必然发生在 s.closed 之后。
+// 断言选在「新连接被关了没」上——那是只有早退才给的那个量（Close 关的是**掉线前**那个连接，
+// 数它的次数抓不到这个 bug）。
+func TestHub_ReconnectFinishingAfterClose_DiscardsNewClient(t *testing.T) {
+	var broken atomic.Bool
+	first := &memClient{name: "dev", tools: specs("run"), onCall: func(_ context.Context, name string, _ map[string]any) (*mcp.CallResult, error) {
+		if broken.Load() {
+			return nil, errDown
+		}
+		return &mcp.CallResult{Content: []mcp.Block{{Type: "text", Text: "ok"}}}, nil
+	}}
+	second := &memClient{name: "dev", tools: specs("run")}
+	f := &ignoreCtxFactory{gate: make(chan struct{}), first: first, second: second}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("dev", f.New))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// 打掉连接 → 标离线 → 重连循环起来，卡在工厂第 2 次建连接上
+	broken.Store(true)
+	wantFailure(t, call(t, h, "mcp_dev_run"), mcp.ErrCodeServerUnavailable, "")
+	waitFor(t, "重连尝试开始", func() bool { return f.count() >= 2 })
+
+	closed := make(chan error, 1)
+	go func() { closed <- h.Close() }()
+
+	// 等 Close 真的把 server 标死（调用返「已关闭」即 s.closed 已置）——**必须等到这一步再放行工厂**，
+	// 否则连接可能在 closed 之前就挂上去了，那条早退根本不参与，用例恒真。
+	waitFor(t, "Close 已把 server 标死", func() bool {
+		out, err := h.Toolkit().Call(context.Background(), "mcp_dev_run", map[string]any{"q": "x"})
+		return err == nil && out != nil && out.Error != nil && strings.Contains(out.Error.Message, "已关闭")
+	})
+	close(f.gate) // 现在才放行：goOnline 必然在 s.closed 之后发生
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close 挂住了——重连循环的 bg.Done 没被等到")
+	}
+
+	waitFor(t, "Close 之后连上的那个连接被关掉", func() bool { return second.closed.Load() >= 1 })
+	if n := second.closed.Load(); n != 1 {
+		t.Errorf("Close 之后才连上的连接应被关掉恰好 1 次，实际 %d 次——0 次 = 它挂在了已关闭的 server 上、"+
+			"永远没人关（stdio 型是一个留在系统里的子进程）", n)
+	}
+	if st := statusOf(t, h, "dev"); st.State != mcp.ServerOffline {
+		t.Errorf("Hub 已关闭，server 状态应是离线，实际 %v——重连把它标回 online 了，"+
+			"调用方照 Status 判断会以为这个 server 还能用", st.State)
+	}
+}

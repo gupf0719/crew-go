@@ -126,6 +126,9 @@ func TestSetup_IdentityColumnsCompareBytes(t *testing.T) {
 		name    string
 		setup   func(*databasesql.DB) error
 		pattern string
+		// inlineIndex 表示该方言把索引内联进 CREATE TABLE、没有独立的 CREATE INDEX 语句
+		// （MySQL 没有 CREATE INDEX IF NOT EXISTS，history 的 MySQL 建表就是这样）。
+		inlineIndex bool
 	}{
 		{
 			"store/PG",
@@ -133,6 +136,7 @@ func TestSetup_IdentityColumnsCompareBytes(t *testing.T) {
 				return agentSQL.NewStore(db, agentSQL.Postgres{}).Setup(context.Background())
 			},
 			`ns\s+TEXT COLLATE "C" NOT NULL,\s+data_key\s+TEXT COLLATE "C" NOT NULL,`,
+			false,
 		},
 		{
 			"store/MySQL",
@@ -140,6 +144,7 @@ func TestSetup_IdentityColumnsCompareBytes(t *testing.T) {
 				return agentSQL.NewStore(db, agentSQL.MySQL{}).Setup(context.Background())
 			},
 			`ns\s+VARBINARY\(2048\) NOT NULL,\s+data_key\s+VARBINARY\(1020\) NOT NULL,`,
+			false,
 		},
 		{
 			"checkpointer/PG",
@@ -147,6 +152,7 @@ func TestSetup_IdentityColumnsCompareBytes(t *testing.T) {
 				return agentSQL.NewCheckpointer(db, agentSQL.Postgres{}).Setup(context.Background())
 			},
 			`sid\s+TEXT COLLATE "C" NOT NULL,\s+ns\s+TEXT COLLATE "C" NOT NULL,\s+parent_ns\s+TEXT COLLATE "C" NOT NULL DEFAULT '',(?s).*graph_id\s+TEXT COLLATE "C" NOT NULL DEFAULT '',`,
+			false,
 		},
 		{
 			"checkpointer/MySQL",
@@ -154,6 +160,23 @@ func TestSetup_IdentityColumnsCompareBytes(t *testing.T) {
 				return agentSQL.NewCheckpointer(db, agentSQL.MySQL{}).Setup(context.Background())
 			},
 			`sid\s+VARBINARY\(1020\) NOT NULL,\s+ns\s+VARBINARY\(2048\) NOT NULL,\s+parent_ns\s+VARBINARY\(2048\) NOT NULL DEFAULT '',(?s).*graph_id\s+VARBINARY\(1020\) NOT NULL DEFAULT '',`,
+			false,
+		},
+		{
+			"history/PG",
+			func(db *databasesql.DB) error {
+				return agentSQL.NewHistoryStore(db, agentSQL.Postgres{}).Setup(context.Background())
+			},
+			`owner\s+TEXT COLLATE "C" NOT NULL,\s+conv_id\s+TEXT COLLATE "C" NOT NULL,`,
+			false,
+		},
+		{
+			"history/MySQL",
+			func(db *databasesql.DB) error {
+				return agentSQL.NewHistoryStore(db, agentSQL.MySQL{}).Setup(context.Background())
+			},
+			`owner\s+VARBINARY\(1020\) NOT NULL,\s+conv_id\s+VARBINARY\(1020\) NOT NULL,`,
+			true,
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -163,7 +186,9 @@ func TestSetup_IdentityColumnsCompareBytes(t *testing.T) {
 			}
 			defer db.Close()
 			mock.ExpectExec(c.pattern).WillReturnResult(sqlmock.NewResult(0, 0))
-			mock.ExpectExec("CREATE INDEX").WillReturnResult(sqlmock.NewResult(0, 0))
+			if !c.inlineIndex {
+				mock.ExpectExec("CREATE INDEX").WillReturnResult(sqlmock.NewResult(0, 0))
+			}
 			if err := c.setup(db); err != nil {
 				t.Errorf("Setup 的建表语句里身份列不是按字节比较的类型 / 排序规则: %v", err)
 			}

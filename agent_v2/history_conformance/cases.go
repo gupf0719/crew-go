@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"crew-go/agent_v2"
 	"crew-go/schema"
@@ -493,5 +494,90 @@ func checkJSONTypedAnnotations(t *testing.T, anns map[string]any) {
 	}
 	if obj, ok := anns["crew_custom_object"].(map[string]any); !ok || obj["k"] != "v" {
 		t.Errorf("对象标注读回成 %T(%v), want map[string]any{k: v}", anns["crew_custom_object"], anns["crew_custom_object"])
+	}
+}
+
+// portableAlphabets 是长度上限用例的两档字符：ASCII 每个 1 字节；4 字节字符按 MySQL 的字节列宽算正好
+// 顶满可移植上限。照 store/conformance 同名变量的形状——列宽若被误写成「255 字节」，ASCII 那档照样绿，
+// 只有 4 字节那档会红。
+var portableAlphabets = []struct{ name, fill, last1, last2 string }{
+	{"ASCII", "k", "1", "2"},
+	{"4 字节字符", "😀", "😁", "😂"},
+}
+
+// PortableKeyLen 是 HistoryKey 两个维度各自的可移植长度上限，单位是**字符**。
+//
+// 由最窄的内置后端定：MySQL 的 `owner VARBINARY(1020)` / `conv_id VARBINARY(1020)`（见
+// sql.HistoryStore 的建表语句），按一个字符最多 4 字节算就是 255 个。两列加上 `id BIGINT`（8 字节）
+// 组成索引 `(owner, conv_id, id)`，1020+1020+8 = 2048 字节，在 InnoDB 的 3072 字节索引上限内。
+//
+// **从最弱的实现归纳是对的**（CLAUDE.md：从最强的归纳才错）——PG 的 `TEXT` 与 SQLite 的 `TEXT` 都没有
+// 长度上限，照它们定会让可移植性假高。
+const PortableKeyLen = 255
+
+// testLongKeys：两个维度各自到可移植上限、且**只差最后一个字符**的两条会话不能塌成一条流。
+//
+// 为什么这条值得有：CLAUDE.md 自己说过 `ConvID` **常直接来自 wire**，业务控制不住它长什么样。后端把列
+// 宽写窄、或把两个维度拼成一个主键时，症状是两场对话的消息混进同一条流——而历史层的写是**旁路**
+// （失败吞 + warn，不打断主链路），所以线上看到的是「模型开始串台 / 忘上一轮」，不是一个报错。
+//
+// ⚠️ **SQLite 与 in-memory 后端恒过这条**（TEXT 无长度上限、map 键是 Go string）。它的价值在于业务
+// 自研后端与真 PG / MySQL 上会红，以及把上限写进 HistoryKey 的 godoc。别因为它在 SQLite 上绿就以为
+// 这个维度已经验过了。
+func testLongKeys(t *testing.T, factory HistoryStoreFactory) {
+	for _, a := range portableAlphabets {
+		t.Run(a.name, func(t *testing.T) {
+			// 两个维度分别跑：后端可能只把其中一列写窄（owner 与 conv_id 的列宽是分开声明的）。
+			for _, dim := range []struct {
+				name string
+				keys func(prefix, l1, l2 string) (agent_v2.HistoryKey, agent_v2.HistoryKey)
+			}{
+				{"Owner 到上限", func(p, l1, l2 string) (agent_v2.HistoryKey, agent_v2.HistoryKey) {
+					return agent_v2.HistoryKey{Owner: p + l1, ConvID: "c"},
+						agent_v2.HistoryKey{Owner: p + l2, ConvID: "c"}
+				}},
+				{"ConvID 到上限", func(p, l1, l2 string) (agent_v2.HistoryKey, agent_v2.HistoryKey) {
+					return agent_v2.HistoryKey{Owner: "o", ConvID: p + l1},
+						agent_v2.HistoryKey{Owner: "o", ConvID: p + l2}
+				}},
+			} {
+				t.Run(dim.name, func(t *testing.T) {
+					hs := factory()
+					prefix := strings.Repeat(a.fill, PortableKeyLen-1)
+					k1, k2 := dim.keys(prefix, a.last1, a.last2)
+
+					// fixture 自检：长度真到上限了，而且两个 key 真的只差最后一个字符。
+					for _, c := range []struct{ label, s string }{
+						{"k1.Owner", k1.Owner}, {"k1.ConvID", k1.ConvID},
+					} {
+						if n := utf8.RuneCountInString(c.s); n != PortableKeyLen && n != 1 {
+							t.Fatalf("fixture 没搭对：%s 长度 %d，应为 %d 或 1", c.label, n, PortableKeyLen)
+						}
+					}
+					if k1 == k2 {
+						t.Fatal("fixture 没搭对：两个 key 应只差最后一个字符，实际相等")
+					}
+
+					mustAppend(t, hs, k1, schema.UserMessage("属于 k1"))
+					mustAppend(t, hs, k2, schema.UserMessage("属于 k2"))
+
+					for _, c := range []struct {
+						label string
+						key   agent_v2.HistoryKey
+						want  string
+					}{{"k1", k1, "属于 k1"}, {"k2", k2, "属于 k2"}} {
+						got := mustLoad(t, hs, c.key)
+						if len(got) != 1 {
+							t.Fatalf("%s 应有 1 条消息，实际 %d 条——两条会话塌成一条流了"+
+								"（key 长 %d 字符 / %d 字节，被截断或拼成了同一个主键）",
+								c.label, len(got), PortableKeyLen, len(c.key.Owner)+len(c.key.ConvID))
+						}
+						if got[0].Content != c.want {
+							t.Errorf("%s 读到 %q，期望 %q——两条会话串了", c.label, got[0].Content, c.want)
+						}
+					}
+				})
+			}
+		})
 	}
 }

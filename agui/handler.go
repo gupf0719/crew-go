@@ -1235,7 +1235,9 @@ func (h *handler) warnClientMessages(ctx context.Context, rep clientMessageRepor
 //     上次带着错退出）⟹ 该开新会话，别重发续跑；
 //   - `graph_id_conflict`：这个会话的存档属于另一张图（接线错误）⟹ 别重试，开新会话；
 //   - `checkpoint_save_failed`：这次的档没写成（存储出错），没有可以续的东西 ⟹ 开新会话；
-//   - `run_aborted`：终局失败，重跑必然一样（业务违反协议、参数非法）⟹ 该停，别重试；
+//   - `run_aborted`：终局失败——框架判定本次重跑或续跑都走不通、并已清掉存档 ⟹ 该停，别重试；
+//     （**别在这里枚举它的来源**：2026-10-23 对账时这里写的「业务违反协议、参数非法」已覆盖不住，
+//     判据见 `compose_v2.ErrRunAborted` 的 godoc）
 //   - `agent_error`：其余，可能是瞬时的 ⟹ 原样重来是合理选项。
 //
 // 顺序跟 handleOutcome 的专属分支一致：档没写成多数时候同时带着 ErrRunAborted，因写档撞上身份冲突

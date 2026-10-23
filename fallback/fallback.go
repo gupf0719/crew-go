@@ -481,29 +481,94 @@ func isNilModel(m model.ChatModel) bool {
 	}
 }
 
-// ModelName 返回这次调用起手请求的那个候选的模型名（满足 model.ModelNamer），按 tryMembers 的选择规则预估：按顺序
-// 第一个「服务端没让等（Retry-After 的门开着）、断路器此刻放行（含半开放一次探测）」的候选；都不满足时是第一个
-// 候选。只读，不占探测名额、不影响放行决策。
+// ModelName 返回这次调用起手请求的那个候选的模型名（满足 model.ModelNamer）。
 //
 // 是尽力而为的预估：并发调用共用一个 fallback 时，到真正请求那一刻状态可能已经变了（别的调用先占了探测名额）；
 // 中途切到别的候选时也只报起手那个。实际回答的模型看响应里的模型名（gen_ai.response.model）与 failover 事件。
-// 候选没实现 model.ModelNamer 时返回空串。
+// 候选没实现 model.ModelNamer 时返回空串。只读，不占探测名额、不影响放行决策。
 func (f *FallbackChatModel) ModelName() string {
-	if f == nil || len(f.members) == 0 {
+	if f == nil {
 		return ""
 	}
-	pick := f.members[0]
-	now := time.Now()
-	for _, mem := range f.members {
-		if _, _, closed := mem.gate.closedUntil(now); !closed && mem.breaker.WouldAllow() {
-			pick = mem
-			break
-		}
+	i := f.startIndex(time.Now())
+	if i < 0 {
+		return "" // 一个候选都没有：没有可报的模型名
 	}
-	if n, ok := pick.model.(model.ModelNamer); ok {
+	if n, ok := f.members[i].model.(model.ModelNamer); ok {
 		return n.ModelName()
 	}
 	return ""
+}
+
+// startIndex 预估下一次调用会起手请求哪个候选，**跟 tryMembers 走同一套选法**：[nextMember] 挑、门与断路器筛，
+// 筛掉的按 tryMembers 的同一套分档置 done / deferred 再挑下一个。
+//
+// # 为什么必须复用 nextMember 而不是自己写一遍
+//
+// 这里曾经自己写过一个循环（「按顺序第一个门开着且断路器放行的，都不满足时取第一个」），它**漏掉了选法里
+// 「都要等时等最早能再请求的那个」这一档**：首选 Retry-After=30m、备选 2m 时它报首选，而 tryMembers 睡 2 分钟
+// 之后起手请求的是**备选**。在那之前还错过一轮——只看 breaker.Tripped()，门关着时报首选、cooldown 过后的半开
+// 探测期报备选，两种都跟实际请求的对不上（`806c3a3` 修的就是它）。
+//
+// **同一条判据被审出两个反例，就不该再补第三个分支**（CLAUDE.md「必须与 X 保持一致 = 设计债的自白」）：选法只
+// 该有一份，放在 nextMember 里，这里跟着它走。tryMembers 的挑法以后再改，这里自动跟上。
+//
+// 与 tryMembers 的唯一差别是**不判调用方期限**（exceedsDeadline）：那需要 ctx，而 model.ModelNamer 不带 ctx。
+// 期限很紧时 tryMembers 会把推迟中的候选全标 done、一个都不请求，所以分叉恒为「报了一个谁也没请求的候选」，
+// 那次调用注定失败、span 上带着错，此时报「最早能用的那个」无害。
+//
+// # ⚠️ 终止性依赖「两处同钟」——改这里之前先读这段
+//
+// 循环靠「每次迭代把一个候选移出『此刻可请求集』」终止：门关着时置 deferred 且 readyAt = until，而
+// [gate.closedUntil] 报 closed 的充要条件就是 until > now，所以下一次 nextMember 不会再以 wait==0 返回它。
+// **这条推理成立的前提是 closedUntil 与 nextMember 拿的是同一个 now**（两次比较的操作数完全相同，于是必然
+// 同答案；跟单调钟 / 墙钟 / 时钟回拨都无关）。
+//
+// 把 `nextMember(states, now)` 改成 `nextMember(states, time.Now())`（看着像「用最新时间更准」）会**死循环**：
+// 某个候选的门在取 now 与读活钟之间刚好到期 ⟹ nextMember 给 wait==0、closedUntil(冻结的 now) 仍报 closed
+// ⟹ 反复 defer。审计实测：既有全部 fallback 用例照样全绿，而 ModelName 在每次模型调用前被 observability
+// 调用 ⟹ 整个 Run 卡死且出不来（活钟只会越过越远）。
+//
+// tryMembers **不等价**：它两处都用活钟、同向单调，所以安全。安全的是「两处同钟」，不是「冻结」或「活钟」
+// 本身——混用才死。
+func (f *FallbackChatModel) startIndex(now time.Time) int {
+	// 一个候选都没有 ⟹ **没有下标可报**，返 -1 让调用方显式判。
+	//
+	// ⚠️ 这和下面「全都有结局了」那条 return 0 **不是同一件事**，所以不能共用一个返回值：全熔断时报首选
+	// 仍然有意义（cooldown 过后下一次调用会先去半开探测它，那就是真正起手请求的那个），而候选为空时
+	// `f.members[0]` 直接越界。曾经两者都返 0，越界风险全押在调用方的 len 守卫上——第二个调用方出现时
+	// 就是 index out of range。
+	//
+	// len 的判据也只留这一份：ModelName 不再自己判（那是同一个判据的第二份拷贝，CLAUDE.md
+	// 「必须与 X 保持一致」那条规约）。
+	if len(f.members) == 0 {
+		return -1
+	}
+	states := make([]memberState, len(f.members))
+	for {
+		i, wait, ok := nextMember(states, now)
+		if !ok {
+			return 0 // 全都有结局了（全熔断）：tryMembers 此时返 ErrAllMembersUnavailable，报首选
+		}
+		if wait > 0 {
+			return i // 都要等：tryMembers 睡完 wait 之后起手请求的就是它
+		}
+		mem := f.members[i]
+		if until, _, closed := mem.gate.closedUntil(now); closed {
+			// 同 tryMembers：熔断中时探测名额在设门的那个调用手里，按熔断跳过；否则推迟到 T。
+			if mem.breaker.Tripped() {
+				states[i].done = true
+			} else {
+				states[i].deferred, states[i].readyAt = true, until
+			}
+			continue
+		}
+		if !mem.breaker.WouldAllow() {
+			states[i].done = true
+			continue
+		}
+		return i
+	}
 }
 
 // StructuredCapability 让 FallbackChatModel 满足 `model.StructuredCapable`——

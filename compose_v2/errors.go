@@ -43,10 +43,23 @@ type NonRetryable interface {
 	NonRetryable()
 }
 
-// MaxIterationsError 表示循环超过了其迭代限制——典型 LoopAgent 触顶 maxIterations
-// 或 Graph 触顶 maxVisit 时使用。
+// MaxIterationsError 表示循环超过了其**迭代深度**限制——典型 LoopAgent 触顶 maxIterations、
+// Graph 触顶 maxVisit、BasicAgent 跑满 maxRounds 时使用。
 //
 // errors.As / errors.Is 友好——caller 用 `var e *MaxIterationsError` 解析具体值。
+//
+// # Iterations 是「第几次迭代触顶的」，不是别的量
+//
+// 各处抛出时填的都是**迭代计数**，但**计数基准按抛出方**：Graph 的 maxVisit 填 `visits[id]`，
+// 也就是**被拒的那一次访问**（= maxVisit+1）；BasicAgent 的 Run / Resume 出口填本 agent 自己**已跑满的
+// 轮数**（= maxRounds+1）。同一次 BasicAgent 跑满会同时经过这两处（引擎先拒、出口再包一层），
+// 而出口**重铸**了一个自己的 MaxIterationsError 挂在外层，所以 `errors.As` 取到的是**轮数**、跟错误正文
+// 里那句「跑满 N 轮」一致（引擎的原错误仍经 `%w` 留在链上，诊断不丢）。
+//
+// ⚠️ **扇出宽度失控不用这个类型**，用 [MaxWidthError]：宽度（一个超步里的并发成员数）与深度（同一节点
+// 被反复访问的轮数）是**两个正交维度**（`graph_loop.go` 那两段注释原话），而 `Iterations` 这个名字里没有
+// 「宽度」的意思。曾经两者共用它、`Iterations` 一个装宽度一个装深度，调用方 `errors.As` 之后**分不出
+// 拿到的是哪个量**——CLAUDE.md 「用 X 来做 Y 而 X 的名字里没有 Y 的意思」那条判别式的实例。
 type MaxIterationsError struct {
 	Iterations int
 }
@@ -58,6 +71,34 @@ func (e *MaxIterationsError) Error() string {
 
 // NonRetryable 实现 [NonRetryable]——预算耗尽属「重放代价已知是最大值」那一类。
 func (e *MaxIterationsError) NonRetryable() {}
+
+// MaxWidthError 表示一个超步的 fan-out **宽度**超过了 maxFrontierWidth（见 WithMaxFrontierWidth）。
+//
+// 它与 [MaxIterationsError] 是**两个正交维度**：宽度是「一个超步里有多少并发成员」，深度是「同一节点被
+// 回边反复访问多少轮」。节点在自己的 NodeFunc 里 SendFrom 自己 N(≥2) 次时宽度逐超步相乘，业务终止条件
+// 写错就是指数爆炸——而深度每超步只 +1，等 maxVisit 触顶时进程早已 OOM。
+//
+// 所以它要有自己的类型：共用 MaxIterationsError 的话，`Iterations` 一个装宽度一个装深度，调用方
+// `errors.As` 之后分不出拿到的是哪个量，而两者的处置完全不同（宽度失控查业务的终止条件 / 深度触顶是
+// 预算耗尽）。
+//
+// # 它是终局的，[MaxIterationsError] 不是
+//
+// 抛出点一并 `%w` 上 [ErrRunAborted]（深度那条没有）：存进档的 `CurrentFrontier` 就是那个超限的
+// frontier 本身，而续跑闸门按内容判 ⟹ 不清档的话 auto-load 会捡起它、**节点一次没跑就在同一道闸上
+// 再爆**，那个 (sid, ns) 槽从此是死的。深度触顶不是这个形状：它的 frontier 是正常的，续跑（调大预算）
+// 走得下去。所以 `errors.Is(err, ErrRunAborted)` 对宽度为真、对深度为假。
+type MaxWidthError struct {
+	Width int
+}
+
+// Error 返人类可读错误信息。
+func (e *MaxWidthError) Error() string {
+	return fmt.Sprintf("扇出宽度超限：%d", e.Width)
+}
+
+// NonRetryable 实现 [NonRetryable]——宽度失控是业务的终止条件写错了，重跑必然一样。
+func (e *MaxWidthError) NonRetryable() {}
 
 // MaxRoundsError 表示代理超过了其最大允许轮数. **预留 typed 供业务自定义抛**——
 // framework 生产路径不抛 (BasicAgent ReAct 触顶走 `WithMaxVisit(maxRounds * 2)` →
@@ -95,11 +136,32 @@ func (e *MaxRoundsError) NonRetryable() {}
 // 父图 Run 出口 defer 同样 `errors.Is` 命中 → 父 cp 子树一并清 → 逐层向上，不需要每层
 // 显式协调。
 //
-// **来源都是「重跑必然同样失败」这一类**（不是「瞬时故障」）：
-//   - cond fn 的 `CondFailAbort` 档（含 cond 抛 InterruptError 的协议违规拒绝）
+// # 来源：别找清单，用判据加 grep
+//
+// **判据**：凡是「重跑或续跑都走不通」的失败。两种形状——业务代码违反框架协议（重跑必然同样失败），
+// 以及矛盾/爆炸会随存档反复复现（写不写取决于数据，但留档续跑必然再撞同一个）。都不是瞬时故障。
+//
+// ⚠️ **下面是举例，不是全集**。全集这么取——`grep -rn "ErrRunAborted" --include="*.go" . | grep -v
+// _test` 之后**逐条看**。⚠️ 别再往后接 `grep -E "%w|Unwrap"` 收窄：那要求两者在**同一行**，而多行
+// `fmt.Errorf` 的参数在下一行（宽度、单写入者、cond 返回未注册 target 三处都这么写）——实测那样只找到
+// 10 个、漏掉一半多。
+//
+// 2026-10-23 一次多行感知的对账数出 **27 个 wrap / Unwrap 点，横跨 compose_v2 / agent_v2 / a2a 三个包
+// 的 10 个文件**，而当时仓里**三份**写着「全部来源」的清单（这里、[MustPropagate] 的 godoc、
+// `doc/description/three-way-comparison/error-handling.md`）**一份都不完整**——漏的包括 `out_edges.go`
+// 的「cond 返回未注册 target」和 agent_v2 / a2a 整两家（转交目标非法、session 的任务身份对不上、
+// tool_call 与调用 ctx 个数不符……）。枚举式清单在这个位置注定漂：加 wrap 点的人改的是另一个文件。
+// （顺带一条自证：这段话第一版把数字写成「13」、grep 写成收窄版——**当场又错了一次**，因为那条 grep
+// 漏掉了多行调用。所以这里给的是**取法加它的坑**，不是数字。）
+//
+// 举例（按类目）：
+//   - cond fn 两档：`CondFailAbort`（含 cond 抛 InterruptError 的协议违规拒绝）、返回未注册 /
+//     不可路由的 target
 //   - **业务抛的中断请求形状非法**——由 `validateInterrupt` 统一判定（typed-nil /
 //     Query 与 Queries 同时填 / 一条 query 都没有 / InterruptID 为空 / 同一批内撞 ID /
 //     Queries 含 nil 元素）
+//   - **扇出宽度失控**——一个超步的 frontier 宽度超过 `WithMaxFrontierWidth`（[MaxWidthError]）。
+//     理由同下面那条：存进档的 frontier 就是那个超限的 frontier，留档续跑只会在同一道闸上再爆
 //   - **单写入者冲突**——同一超步两个成员（或成员与 SendFrom payload）写同一个 [LastValue]
 //     channel，或两个成员都对同一个上行信号的收件人做了决定、业务经 [JoinSignals] 合并的几路
 //     给出了不同的决定（[SignalConflictError]）。这一类的理由不是「重跑必然一样」（写不写可能
@@ -309,7 +371,9 @@ func (e *GraphNodeError) Unwrap() error { return e.Err }
 // 这条分叉的代价实测过：子 agent 返 `ErrRunAborted` 经 `AgentAsTool` 被转成
 // `tool.Failure` + `err=nil` ⟹ 模型看到一段错误文本、重试同一个工具 ⟹ 子 agent 再跑、
 // 再 abort ⟹ 循环到 `maxRounds` ⟹ **业务最终拿到的是 `MaxIterationsError`，跟真实原因
-// 毫无关系**。而 `ErrRunAborted` 的定义就是「重跑必然一样」，让模型绕过它是保证浪费。
+// 毫无关系**。而 `ErrRunAborted` 说的是「重跑或续跑都走不通」（**不是**「重跑必然一样」——它有
+// 两种来源，另一种是「矛盾会随存档反复复现」，见那个哨兵的 godoc），让模型绕过它是保证浪费；
+// 更要紧的是出口已经把存档清掉了，吞成工具失败等于让模型去重跑一个**状态已经不存在**的调用。
 //
 // # 判据：失败的是任务，还是代码
 //
@@ -319,8 +383,9 @@ func (e *GraphNodeError) Unwrap() error { return e.Err }
 //     让模型绕过一个**编程错误**，结果是业务拿到一个貌似合理的答案、
 //     **永远不知道自己配错了**。
 //
-// `ErrRunAborted` 的全部来源都属后者（cond 的 `CondFailAbort` 档 + `validateInterrupt`
-// 的五条协议校验）。
+// `ErrRunAborted` 属后者——**别在这里重复它的来源清单**（那份清单连同这句话在 2026-10-23 的对账里
+// 一起被证伪：当时这里写「全部来源 = cond 的 CondFailAbort 档 + validateInterrupt 五条」，而实际是
+// 27 个 wrap / Unwrap 点、横跨三个包）。判据与取全集的办法都在 [ErrRunAborted] 自己的 godoc 里。
 //
 // # 不在集合里的：[ErrNoPendingCheckpoint]
 //

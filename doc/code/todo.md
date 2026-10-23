@@ -37,6 +37,160 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
 - ~~AG-UI 标准审批答案被当成拒绝（`{"approved":true}`、`Yes.` 都落进拒绝分支，实测）~~ 已修（2026-10-19，`fix/approval-answers`）
 - ~~中断时根 cp 写失败，agui / a2a 仍当成正常挂起（实测：用户答完续跑找不到存档，工具 0 次执行）~~ 已修（2026-10-19，`fix/interrupt-not-persisted`）
 
+**`a8f088b`（宽度失控变终局）的 commit-level audit（2026-10-23，1 个单视角 agent，带探针）**
+
+4 项下游后果逐条过完，**没有一条在宽度失控这个场景下是行为性错误**；两条 finding 都在教学面、已修
+（`MustPropagate` godoc 的两句 + `agui` 的 code 说明括号——顺带机械对账发现 `ErrRunAborted` 的 wrap 点
+实际有 **27 个、横跨 compose_v2 / agent_v2 / a2a 三个包的 10 个文件**，而仓里三份写着「全部来源」的
+清单一份都不完整，于是三处一律改成「判据 + 取法」不再枚举）。以下是它复现出来的 pre-existing 事实，
+**不是这次改动带出来的**，登记备查：
+
+- 🟢 **abort 清掉兄弟分支的挂起档时，返回值里一个字都没提**（已复现）：父图 `X(问 Q1) → {A(子图,问 Q2),
+  B(子图,宽度失控)}`，A 与 B 同超步。对照组（B 以普通业务错失败）留 3 份档、`ListPending`=2、同 sid 再
+  Run **接着问 Q2**（Q1 的答案靠 `ConsumedAnswers` 保住）；实验组 0 份档、再 Run **重新问 Q1**、X 的副作用
+  在用户再答一次之后重放。范围恰好是 `IsNSInSubtree(rootNS, ·)`（顶层 rootNS 为空 ⟹ 整个 session 子树），
+  **没有跨 session、没有绕过 `#`/`@` 兄弟执行的排除规则**——代价与单写入者冲突那条逐字相同，
+  `compose_v2/channel.go` 的 godoc 已经认过这笔账。唯一的缺口是**可见性**：A 的 Q2 在 abort 之前已被
+  `recordInterruptBatch` 记进 cm，然后随档一起丢，而错误正文只有 `node "B": subgraph "B": …`，运维唯一
+  线索是 `cp subtree purged ... deleted=2` 那条 INFO。要不要在错误正文里补一句「另有 N 条挂起被丢弃」
+  是取舍 | `compose_v2/graph_loop.go` Run 出口 | ⬜ OPEN（可见性，非正确性）
+- 🟢 **abort 退出时会话历史少记用户那句原话**（已复现，对所有 abort 来源一致）：`LeavesResumableCheckpoint`
+  是**纯按哨兵判**（`err != nil && !errors.Is(err, ErrRunAborted)`），所以 GraphAgent 顶层持有历史时，
+  对照组记 2 条 `[子任务请求][我的原话]`、实验组只记 1 条——**用户原话缺席，而嵌套调用留下的派生输入还在**。
+  cond abort / 协议违规逐字相同（代码级确定）。⚠️ **但宽度失控是唯一一个「同样的输入换批数据可能本来就
+  该成功」的 abort 来源**，于是「用户重发同一句话」在它身上比在协议违规上现实得多，那时历史里会留下第一次
+  尝试的孤儿派生记录而原话永远缺席。要不要为它破例是个设计判断 | `compose_v2/retry.go` 的
+  `LeavesResumableCheckpoint` + `agent_v2/history_slot.go` | ⬜ OPEN
+- 🔵 **`a2a/server` 没有 `ErrRunAborted` 专属分支**（pre-existing 不对称）：agui 有 `run_aborted` code，
+  a2a 只给 `NotResumable` / `stale` / `graphConflict` / `notPersisted` 开了专属脱敏分支，abort 落通用失败
+  分支（`keepPending=false` 正确、不留「一直问同一个问题」的退化；原文回传含 nodeID 与 ns，不含 sid /
+  epoch / GraphID，没触碰其余分支特意脱敏的那几样）| `a2a/server/executor.go` | 🔵 OPEN
+- **未查（留给下一轮）**：持久后端（`sql` / `redis`）各自 `DeleteSubtree` 的前缀删除实现——范围判据共享
+  `IsNSInSubtree`，但只在 in-memory 上复现过；`settleHistoryOnPause` 的另 10 个边界位置（只验了
+  `graph_agent.go` 那条，其余按同一谓词推断一致）；`fallback` 层对宽度失控的处置（它消费 `IsRetryFutile`
+  不是 `MustPropagate`）。
+
+**`a3d7218`（宽度劈出 MaxWidthError）的 commit-level audit（2026-10-23，2 个单视角 agent）**
+
+- 「错误链语义」视角 **0 finding**：出口新引入的 `errors.Join` 在 16 个下游判据 × 6 种内层错误上与
+  老形态（单链 `%w`）**逐项相同**。结构性理由：闸是 `errors.As(err, &mie)`，所以树里本来就有一个
+  `*MaxIterationsError`、它本来就实现 `NonRetryable` ⟹ 这次 join **没往树里加任何新类型 / 新哨兵 /
+  新 ctx 错**，CLAUDE.md 记的那个事故形态（join 引入一条带 ctx 错的分支 ⟹ `IsControlFlowSignal` 翻转）
+  **没有可翻转的维度**。它带回的两条 LOW 都已修（指路话指向同义重复 / `withFinalRound` godoc 的
+  「经 `%w`」在出口这一跳已是 `errors.Join`）。
+- 「新类型能到哪些消费方」视角：宽度失控的**产生点全仓只有 1 处**（子图 / `SendFrom` /
+  `AddSubgraphNode` / `RunWithRetry` 包住的嵌套运行全部收敛到同一个超步循环），按类型分流的 21 个
+  `errors.As` 消费点逐个核过，**没有「原来按 MaxIterationsError 分类、现在落错兜底」的地方**；三条
+  教学面漏列已修。它找到的宽度存档那条见下。
+- ~~🟡 **宽度失控留毒档**~~ **已修（2026-10-23）**（agent B 的 Finding 4，**预存**——劈分前共用
+  `MaxIterationsError` 时同样没有 `ErrRunAborted`，同一个形状）：实测 Run1 宽度失控留下
+  `Status=failed` + 128 条 `CurrentFrontier` 的档，而续跑闸门按内容判（`HasResumableWork`，不读
+  Status）⟹ 同 sid 再 Run **节点一次没跑**就在同一道闸以同一个 Width 再爆，那个 (sid, ns) 槽从此是
+  死的，且每次重爆都往持久后端写一遍那份（默认 maxWidth=10000 时上万条）frontier；逃生舱
+  `WithFreshRun` 存在但要靠调用方知道。修法：抛出点一并 `%w ErrRunAborted`（出口清子树 + 不重试 +
+  `MustPropagate` 不被吞）。⚠️ 理由**不是**「重跑必然一样」（扇出几路取决于运行时数据），是**这个
+  爆炸会随存档反复复现**——同单写入者冲突那条的立论。顺带 `observability` 的 `errorTypeOf` 把宽度那条
+  判据提到 `run_aborted` 之前（它是唯一自己带哨兵的 typed error，排后面就只剩处置、读不到原因）。
+  哨兵 `TestWidthOverflow_IsTerminalAndLeavesNoPoisonedCheckpoint` —— **断言选在只有 abort 才给的三样
+  上**（档被清 / 第二次 Run 真跑节点 / MustPropagate），不断言 `IsRetryable`：`MaxWidthError` 本来就
+  实现 `NonRetryable`，那条在变异下不红（第 4 类炸弹「双层防护遮蔽」）。两条变异各自红。
+- 🟢 **BasicAgent 出口那个 `switch` 没有 `default`**（预存，agent A 登记）：末轮错误不是
+  `MaxIterationsError` 时（嵌套图冒上来的宽度错、普通工具错）出口既不重铸也不改文案，把 `maxRounds`
+  当保险丝用的调用方在这些组合下看不到熔断。**未复现**可达性（BasicAgent 自己的四节点图不经 frontier
+  扇出）。要不要补 default 是另一个视角的问题 | `agent_v2/basic_agent.go` Run / Resume 出口 | ⬜ OPEN
+- 🟢 **`agui` / `a2a/server` 把两个 `NonRetryable` 类型都归进「可能瞬时、重来合理」的桶**（预存，
+  **本次改动前后同一个桶**）：`agui/handler.go` 的 `agentErrorCode` 5 条分支全是哨兵判据，两个 typed
+  error 都落 `default: "agent_error"`，而本表给 `agent_error` 的语义是「其余，可能瞬时，重来是合理
+  选项」——跟 `NonRetryable` 正好相反；`a2a/server/executor.go` 只分 stale / not-resumable。**宽度那半已随
+  「宽度失控 `%w ErrRunAborted`」解决**（两处都有 `run_aborted` 分支），**深度那半仍开着**；它对两个
+  类型本来是对称的，不是这次改动带出来的 |
+  `agui/handler.go`、`a2a/server/executor.go` | ⬜ OPEN
+
+**review-v7 修复轮自审新发现（2026-10-22，3 个单视角 agent 审 `af7c45a` 自己的改动）**
+
+预存缺陷（不是那次改动引入的，各自独立）：
+- ~~**业务 Client 返回的 error 的方法 panic 照旧冲出 `RemoteTool.Call`，还会把 `Hub.Close` 永久挂住**~~
+  **已修（2026-10-23）**：真入口只有**直接调 `.Error()`** 一种，修法就是传 error 值而不是调它
+  （`markOffline` 的日志 + 同包另外 4 处），并把 `go s.reconnectLoop(stale)` 提到日志之前让
+  `bg.Add(1)` 与它之间不夹任何代码。哨兵
+  `TestHub_BusinessErrorMethodPanic_ContainedAndCloseNotStuck`（panic 不冲出 + Close 在看门狗内返回）
+  + 机械哨兵 `TestMCP_NoDirectErrorMethodCallInLogs`（扫全包禁止 `logKeyErr, x.Error()` 形状）。
+  ⚠️ **实测纠正两条此前的判断**（go1.26）：① `fmt.Errorf("…%w", err)` / `fmt.Sprintf("%v", err)` /
+  `slog` 传 error 值都**安全**——内部经 fmt，而 fmt 对 `Error()` 的 panic 自己兜住、渲染成
+  `%!v(PANIC=Error method: …)`，对 typed-nil 更是直接打 `<nil>` 连 `Error()` 都不调，且 `errors.Is` /
+  `errors.As` 照常成立。所以原先登记的「隐式入口（`fmt.Errorf` 的 `%w`）」**不存在**，探针里那个 panic
+  其实来自 `markOffline`。② `statusLocked()` / `statusQueue.push()` 只把 `s.lastErr` 存进结构体 / append，
+  **不调它的方法**，所以不存在「持 `s.mu` 时 panic 导致锁永久持有」；业务 status hook 那条由
+  `callStatusHook` 的 recover 兜。③ `Start` / `reconnectLoop` 的日志当前安全，只因为它们的 err 先被
+  `connect` 的 `fmt.Errorf("%s: initialize: %w", …)` 包装过——那是间接事实，所以也一并改成传值，并用机械
+  哨兵钉住（有人改了 `connect` 不包装，它们立刻会变成新入口）。
+  ⚠️ 一条如实声明：「`go reconnectLoop` 提到日志之前」**没有哨兵钉得住**（日志已安全 ⟹ 挪回去无行为差异，
+  实测变异不红），靠的是那处注释。
+- ~~**`compose_v2.MaxIterationsError.Iterations` 在三条路上不是同一个量**~~ **已修（2026-10-23）**：
+  ① 真正的语义错是**宽度冒充迭代**——`graph_loop.go` 的 maxWidth 填 `len(frontier)`（宽度），而代码自己的
+  注释写着宽度与深度是「两个正交维度」。新增专属类型 `MaxWidthError{Width}`（同样实现 `NonRetryable`），
+  宽度改用它；调用方从此分得出拿到的是哪个量，两者处置不同（宽度 ⟹ 查业务的终止条件 / 深度 ⟹ 预算耗尽）。
+  ② BasicAgent 的 Run / Resume 出口**重铸**一个自己的 `MaxIterationsError` 挂外层，于是 `errors.As` 取到
+  的是本 agent 跑满的轮数、跟正文「跑满 N 轮」一致（引擎的原错误经 `errors.Join` 留在链上）。
+  ③ `MaxIterationsError` 的 godoc 写明「Iterations 是第几次迭代触顶的、计数基准按抛出方」+ 指向
+  `MaxWidthError`。哨兵 `TestSoftLanding_IterationsIsOwnRoundCount`（断言载荷与正文里的数字**相等**，
+  不钉常量）+ `TestVisitCount_CompoundSelfFanoutIsBounded` 改用专属类型并加「不该同时命中
+  MaxIterationsError」的反向断言（**行为契约不变**，只换类型且钉得更准）。两条变异都红。
+- ~~`fallback.startIndex` 在 `len(members)==0` 时返回越界下标 0~~ **已修（2026-10-23）**：候选为空返 -1，
+  与「全熔断报首选 0」分开（后者仍有意义：cooldown 过后下一次调用会先半开探测首选）；`len` 的判据只留
+  `startIndex` 一份，`ModelName` 改按 `i < 0` 判。哨兵
+  `TestStartIndex_EmptyMembersVsAllTripped`（两个子用例分别钉两种情形的下标）。
+
+哨兵/文档缺口：
+- `mcp` 的 `WithSerialCalls` godoc 只举了「超时、调用方取消」两个例子，而统辖句是「请求发出之后没等到
+  结果」——panic 也落在里面。`connectionUntrusted` 的 godoc 已写明，那处 option godoc 没同步。
+
+**review-v7 未实施项（2026-10-22，审计见 [doc/review/review-v7.md](../review/review-v7.md)）**
+
+拍板类（需要设计决策，不是补哨兵能解决的）：
+- **软降落轮遇上不守 `tool_choice=none` 的 provider 时，一个收尾答复都不交付**（review-v7 H-02）。
+  整批被拦 ⟹ 回 model 节点 ⟹ 撞 `maxVisit` ⟹ 图失败 ⟹ postamble 不跑 ⟹ `FinalMessage == nil`。
+  `maxVisit = maxRounds+1` 没给「整批被拦之后再来一次真正无工具的轮次」留格子。两个方向：整批被拦
+  （**没有任何工具真执行**）时走出口边收尾，或留一格无工具轮。**已修的只是可观测性那半**（错误正文
+  现在点出软降落 + `round_budget_exhausted` + FinalMessage 可能为 nil，哨兵
+  `TestSoftLanding_HardToolCallErrorMentionsSoftLanding`）。
+  ⚠️ 曝光面大小取决于**qwen / deepseek 到底强制不强制执行 none**——那个至今只核过官方文档、没有真 key
+  实测（`b3583bd` 自述），而 qwen 是本仓默认测试模型。**先验这一件再决定做哪个方向。**
+- 同一条路上，业务 `OnToolStart` 里的 HITL 确认会**问一个注定答不成的问题**（用户答完只换来
+  `MaxIterationsError` + 无答复）。既有用例 `TestSoftLanding_HardToolCallNotExecutedAfterResume` 把它当
+  fixture 而不是问题。
+
+补哨兵类（实现正确、缺防回归；review-v7 H-04 剩余）：
+- ~~`crew.node.instance`（扇出实例维）零断言~~ / ~~`StartA2AServerSpan` 没有一条验行为~~ /
+  ~~`crew.tool.category` 白名单零断言~~ **已修（2026-10-23）**：
+  `TestNodeInstance_FanoutSpansAreDistinct`（真实 SendFrom 扇出图）/
+  `TestA2AServerSpan_NestsUnderRemoteParent`（TraceID + 父 SpanID + SpanKind 三条各管一种退化，
+  补上「消费 extract 结果」那半）/ `TestToolCategory_WhitelistOnly`（白名单内外各一条）。三条变异都红。
+  ⚠️ 实测厘清：`inst` 参与的早退判据防的是**同一个 Observability 装两层**，**不是**扇出（扇出的实例
+  并发跑、各有自己的 ctx，`handleFrom` 取到 nil、早退不成立）。所以那条用例里「span 个数 == 2」的断言
+  在当前 fixture 下**不承重**（变异时属性断言先红），用例注释已写明。**仍开着**：要钉死「装两层 + 扇出」
+  那个组合（instance 维塌掉 ⟹ 第二个实例 span 整个不建，而 assertAllEnded 只比数量抓不到），得再搭一层
+  Observability，形状见 `TestTwoInstancesStacked_EachComplete`。
+- ~~mcp 两条已实现但无哨兵的不变量~~ **2026-10-23 处理完，但结局是一条修、一条如实降级**：
+  - `goOnline` 的 `s.closed` 早退 ✅ **已配哨兵**
+    `TestHub_ReconnectFinishingAfterClose_DiscardsNewClient`。fixture 的关键是**工厂建连接时不看
+    ctx**（`ignoreCtxFactory`）：既有的 `seqFactory` gate 是 `select{gate, ctx.Done()}`，而 Close 会
+    取消重连尝试的 ctx ⟹ 放行与取消是竞态、多数时候连接根本建不出来、**到不了 goOnline**，用例恒真
+    （第 6 类炸弹）。断言选在「Close 之后才连上的那个连接被关了没」——Close 关的是**掉线前**那个，
+    数它抓不到。变异（删早退）→ 红在「等不到：Close 之后连上的那个连接被关掉」。
+  - `markOffline` 的 `bg.Add(1)` 必须在 `s.mu` 内 ⚠️ **测不住，降级为注释保护**（原记「挪出去
+    `-race` 直接报竞争」**已证伪**）：实测把 `bg.Add(1)` 挪到 `s.mu.Unlock()` 之后，「掉线与 Close
+    并发、Close 返回后掉线前那个连接必须已关」这个探针跑 **1200 轮 `-race` 一次没红**。窗口只隔一个
+    `Unlock`，要命中得让 Close 在那一瞬间跑完 `shutdown` + `bg.Wait()`。它跟 `go s.reconnectLoop` 紧跟
+    `Add` 那条同一档（review-v7 已记那条测不住），都靠 `markOffline` 里那段注释；而危害还被上面刚钉住
+    的 `goOnline` 早退兜了一层（Close 之后连上的连接会被关掉）。**不为它写哨兵**——写一条在变异下不红
+    的用例，比没有用例更坏。
+- ~~`agent_v2/history_conformance` 没有长 key 用例，`HistoryKey` godoc 也没声明可移植上限~~
+  **已修（2026-10-23）**：加 `LongKeys` 用例（两个维度 × 两档字符，`PortableKeyLen = 255` 由最窄的
+  MySQL 列宽定）+ `HistoryKey` godoc 写明上限、各后端超限时的不同表现、以及「写是旁路所以症状是模型
+  忘上一轮而不是报错」。⚠️ SQLite 与 in-memory 恒过这条；用一个截断型坏后端验过它会红（失败信息点出
+  「两条会话塌成一条流」）。
+
 **P0：先拍板，拍完即修（安全 / 正确性）**
 - ~~approve_always 规则不分 agent（沙箱子 agent 里答的「一直允许」放行父 agent 的同名生产工具）——先定「一直允许」管 agent 还是任务~~ 已修（2026-10-20，`fix/approval-rule-owner`）
 - ~~a2a 默认配置下，host 端 LLM 能替人批准远端工具~~ 已修（2026-10-20，`fix/a2a-remote-approval`）

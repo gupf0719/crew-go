@@ -1707,3 +1707,316 @@ func TestNilObservability_NoPanic(t *testing.T) {
 		t.Error("nil 实例的挂起记录数应是 0")
 	}
 }
+
+// TestLastAssistant_SkipsUnresolvedCallsRecord：agent span 的输出内容不把**框架合成的记账文本**当最终答复。
+//
+// 背景：上一轮留下悬空 tool_call 时，preamble 会把那一轮洗成一条记账文本（「此前发起过以下工具调用，但历史中
+// 没有它们的结果：…」，带 agent_v2.UnresolvedCallsRecordAnnotation）。它是「assistant + 零 tool_call」，
+// **长得正像一条最终答复**，所以凡是框架挑一条消息代表「最终答复」的地方都必须跳过它。
+//
+// ⚠️ 这条**必须单独存在**：出事的路径是「模型在产出任何 assistant 之前就失败 / 中断」，而那恰好是有人看
+// trace 排障的时候——他会读到一句框架中文记账，以为那就是 agent 的答复。改用原来那套测试的说法：把
+// lastAssistantMessage 里的跳过 revert 掉，全仓 `go test ./...` 照样全绿（本轮实测仍然如此，故补回）。
+func TestLastAssistant_SkipsUnresolvedCallsRecord(t *testing.T) {
+	h := newHarness(t, observability.WithContentRecording(true))
+	ah := h.obs.AgentHooks()
+	info := &hook.AgentInfo{Name: "a", Type: "base"}
+	ctx, _ := ah.OnAgentStart(context.Background(), info, &hook.AgentInput{})
+	record := schema.AssistantMessage("此前发起过以下工具调用，但历史中没有它们的结果：get_weather")
+	record.Annotations = map[string]any{agent_v2.UnresolvedCallsRecordAnnotation: true}
+	ah.OnAgentEnd(ctx, info, &hook.AgentOutput{Messages: []*schema.Message{
+		schema.AssistantMessage("北京今天晴"),
+		record,
+	}})
+	out := strAttr(t, h.span(t, "invoke_agent a"), observability.AttrOutputMessages)
+	if strings.Contains(out, "此前发起过") {
+		t.Errorf("框架合成的记账文本被当成最终答复上报了：%.160s", out)
+	}
+	if !strings.Contains(out, "北京今天晴") {
+		t.Errorf("应取记账文本之前的那条真答复，got %.160s", out)
+	}
+}
+
+// TestContent_RedactedBeforeTruncated：写进**内容属性**的文本跟错误信息一样「先脱敏再截断」，而且截断不切坏
+// UTF-8。
+//
+// ⚠️ 姊妹用例 TestErrorMessage_RedactedBeforeTruncated 钉的是错误路径（errText），内容路径（text / jsonText）
+// 此前**没有**哨兵：TestContent_RecordedAndRedacted 用默认 16384 + 短文本（顺序不承重），TestContent_Truncated
+// 不配脱敏规则——两个轴各测一半，交叉点空着。反过来（先截断再脱敏）的后果：敏感串跨在截断点上时正则匹配不到，
+// **前半段明文进 gen_ai.input.messages**。
+//
+// 顺带钉 truncate 的字符边界：按字节切会让属性含非法 UTF-8，OTLP 后端丢属性甚至整条 span（既有
+// TestContent_Truncated 只数「长」的出现次数，按字节切照过）。
+func TestContent_RedactedBeforeTruncated(t *testing.T) {
+	const max = 64
+	h := newHarness(t,
+		observability.WithContentRecording(true),
+		observability.WithMaxContentChars(max),
+		observability.WithRedactPatterns(regexp.MustCompile(`1[3-9]\d{9}`)))
+	// 手机号正好跨在截断点上：前 max-4 个汉字之后紧跟手机号，先截断就只剩「1381」这个匹配不上正则的残段。
+	input := strings.Repeat("长", max-4) + "13812345678 尾巴"
+	m := &scriptModel{}
+	if _, err := runWeatherAgent(t, h, m, tool.NewToolkit(), input); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	in := strAttr(t, h.span(t, "invoke_agent weather_agent"), observability.AttrInputMessages)
+	if strings.Contains(in, "1381") {
+		t.Errorf("跨截断点的手机号漏进了内容属性（先截断再脱敏就会这样）：%.200s", in)
+	}
+	// ⚠️ 这个断言的形式是实测定下来的，两种「看起来更自然」的写法都**不承重**（truncate 换成
+	// s[:max] 时照样绿）：
+	//   - utf8.ValidString(in)：内容经 json 编码进属性，编码会把非法字节换掉，编码结果永远合法；
+	//   - strings.ContainsRune(in, utf8.RuneError)：json 把非法字节转义成**字面六个字符** \ufffd，
+	//     而不是 U+FFFD 这个码点，所以按码点找也找不到。
+	// 会变的量是那个字面子串本身。
+	if strings.Contains(in, `\ufffd`) {
+		t.Errorf("截断切在字符中间（按字节切就会这样），内容里出现了替换字符：%.200s", in)
+	}
+}
+
+// TestCompactionMetric_OnlyAfterCounts：只有 after 事件计一次 crew.compactions——before / generate / retry 都
+// 不计。
+//
+// ⚠️ 一次压缩会连发 before + after（AutoCompact 还有 generate），放开那道闸门就是**压缩次数静默翻倍**，
+// 全程 err == nil、只在仪表盘上错。老 suite 对事件→指标映射有 6 条专钉，重写后只剩一条（而那条只钉「装两层
+// 不重复记」），MetricCompactions 本身 0 处断言。
+func TestCompactionMetric_OnlyAfterCounts(t *testing.T) {
+	h := newHarness(t)
+	oh := h.obs.OrchHooks()
+	ctx, _ := oh.OnNodeStart(context.Background(), "model")
+	send := func(a *agent_v2.CompactionAction) {
+		oh.OnNodeEvent(ctx, "model", agent_v2.Event{Type: agent_v2.CompactionEventType,
+			Metadata: map[string]any{"action": a}})
+	}
+	send(&agent_v2.CompactionAction{Layer: agent_v2.CompactionLayerAuto, Type: agent_v2.CompactionActionBefore,
+		Before: &agent_v2.CompactionBeforeAction{InputTokens: 1000}})
+	send(&agent_v2.CompactionAction{Layer: agent_v2.CompactionLayerAuto, Type: agent_v2.CompactionActionAfter,
+		After: &agent_v2.CompactionAfterAction{}})
+	oh.OnNodeEnd(ctx, "model", nil)
+
+	rm := h.collect(t)
+	if n := sumInt(t, rm, observability.MetricCompactions, map[string]string{"crew.compact.layer": "auto", "crew.outcome": "success"}); n != 1 {
+		t.Errorf("一次压缩（before + after 两个事件）应只计 1 次 crew.compactions，got %d", n)
+	}
+}
+
+// TestInterrupt_CheckpointNotPersisted_IsErrorNotBlocked：**档没写成的中断不算 blocked**——它是失败。
+//
+// compose_v2.ErrCheckpointNotPersisted 表示「Run 出口要写的那份存档没写成」，于是那个中断**续不上**：
+// 前端照常请用户回答，答完却找不到档。把它记成 blocked 的后果是运维视角里它跟「正常等人答复」一模一样
+// （outcome=blocked、span status 不标 Error），而实际上这个任务已经废了。
+//
+// ⚠️ 这条判据是本次 observability 重写**新加**的（`handle.go` 里 IsInterrupt 之外那半），此前没有哨兵：
+// 实测去掉 `!errors.Is(err, ErrCheckpointNotPersisted)` 这一截，`go test ./observability/` 全绿。
+// 连带后果不止 outcome 一处——那条路还会多计一次 crew.interrupts 并留下一条永不被取走的挂起记录
+// （PendingInterrupts() 永久 +1），所以这里一并断言。
+func TestInterrupt_CheckpointNotPersisted_IsErrorNotBlocked(t *testing.T) {
+	h := newHarness(t)
+	ah := h.obs.AgentHooks()
+	info := &hook.AgentInfo{Name: "a", Type: "base"}
+	ctx, _ := ah.OnAgentStart(context.Background(), info, &hook.AgentInput{})
+	ie := &compose_v2.InterruptError{Reason: "ask", Query: &compose_v2.AskQuery{
+		InterruptID: "iid-1", Question: "继续吗",
+	}}
+	// 中断 + 档没写成：两个哨兵并列挂在同一个错误上（Run 出口就是这么交出来的）。
+	err := fmt.Errorf("save cp: %w: %w", compose_v2.ErrCheckpointNotPersisted, ie)
+	ah.OnAgentEnd(agent_v2.WithEndError(ctx, err), info, &hook.AgentOutput{})
+
+	span := h.span(t, "invoke_agent a")
+	if got := strAttr(t, span, observability.AttrOutcome); got == "blocked" {
+		t.Errorf("档没写成的中断续不上，是失败而不是 blocked——运维看到 blocked 会以为在正常等人答复")
+	} else if got != "error" {
+		t.Errorf("crew.outcome=%s 应=error", got)
+	}
+	if span.Status().Code != codes.Error {
+		t.Errorf("档没写成是失败，span status 应标 Error，got %v", span.Status())
+	}
+	if n := h.obs.PendingInterrupts(); n != 0 {
+		t.Errorf("档没写成的中断不该留下挂起记录（它续不上），PendingInterrupts()=%d", n)
+	}
+}
+
+// TestNodeInstance_FanoutSpansAreDistinct：扇出实例维 `crew.node.instance` 两件事都钉住 ——
+// ① 写成属性让 trace 上分得出哪条是哪个实例；② **参与「同一实例不重开 span」的判据**。
+//
+// 实测厘清了一件事：`inst` 参与的那个早退判据（`cur.instance == inst`）防的是**同一个 Observability
+// 装了两层**（函数 godoc 原话），**不是**扇出——扇出的两个实例并发跑、各有自己的 ctx，`handleFrom(ctx)`
+// 取到的 cur 为 nil，早退条件根本不成立。所以变异 `inst := ""` 之后 span 仍是 2 个，红的是属性断言。
+//
+// ⚠️ 下面「span 个数 == 2」那条断言因此**在这个 fixture 下不承重**（变异时属性那条先红）。保留它是因为
+// 它防的是「装两层 + 扇出」的组合——那个组合下 instance 维一旦塌掉，第二个实例的 span 才会被判成已开过
+// 而整个不建，而 harness 的 assertAllEnded 只比 started/ended 的数量、抓不到。要钉死那个组合得再搭一层
+// Observability（形状见 TestTwoInstancesStacked_EachComplete），本轮没做。
+func TestNodeInstance_FanoutSpansAreDistinct(t *testing.T) {
+	h := newHarness(t)
+	in := compose_v2.LastValue[*schema.Message]("in")
+	out := compose_v2.Append[string]("out")
+	bld := compose_v2.NewBuilder()
+	compose_v2.WithChannel(bld, in)
+	compose_v2.WithChannel(bld, out)
+	// 扇出节点：对同一个 target 投两次 ⟹ 下一超步同一 nodeID 两个实例（引擎按 SendFrom 推 instance ID）。
+	bld.AddNode("spread", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		compose_v2.SendFrom(ctx,
+			compose_v2.SendDirective{Target: "fan"},
+			compose_v2.SendDirective{Target: "fan"})
+		return nil, nil
+	})
+	bld.AddNode("fan", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		return []compose_v2.ChannelWrite{compose_v2.Write(out, []string{compose_v2.GetCurrentInstanceID(ctx)})}, nil
+	})
+	bld.AddEdge(compose_v2.StartNode, "spread")
+	bld.AddEdge("fan", compose_v2.EndNode)
+	g, err := bld.Compile()
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	ga := agent_v2.NewGraphAgent(g,
+		agent_v2.WithGraphAgentName("fanout_agent"),
+		agent_v2.WithGraphAgentHooks(h.obs.AgentHooks()),
+		agent_v2.WithGraphInputWriter(func(m *schema.Message) []compose_v2.ChannelWrite {
+			return []compose_v2.ChannelWrite{compose_v2.Write(in, m)}
+		}),
+		agent_v2.WithGraphOutputReader(func(chs compose_v2.Channels) *schema.Message {
+			got, _ := compose_v2.Get(chs, out)
+			return schema.AssistantMessage(strings.Join(got, ","))
+		}))
+	ctx := agent_v2.WithCtxOrchHooks(context.Background(), h.obs.OrchHooks())
+	if _, err := ga.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("go")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	h.assertAllEnded(t)
+
+	spans := h.spansNamed("node fan")
+	if len(spans) != 2 {
+		t.Fatalf("同一 nodeID 扇出两个实例应各有一个 span，实际 %d 个——instance 维没进「同一实例不重开」"+
+			"的判据时第二个实例会被判成已开过、整个不建；全部 span：%v", len(spans), names(h.spans()))
+	}
+	seen := map[string]bool{}
+	for _, s := range spans {
+		inst := strAttr(t, s, observability.AttrNodeInstance)
+		if inst == "" {
+			t.Errorf("扇出实例的 span 应带 %s，got 空", observability.AttrNodeInstance)
+		}
+		if seen[inst] {
+			t.Errorf("两个实例的 %s 相同（%q）——trace 上分不出哪条是哪个", observability.AttrNodeInstance, inst)
+		}
+		seen[inst] = true
+	}
+}
+
+// TestA2AServerSpan_NestsUnderRemoteParent：server span 挂在**远端父**下、kind 是 Server，内层 agent
+// span 再挂在它下面——跨进程 trace 是一棵树。
+//
+// ⚠️ inject / extract 那半有 TestPropagation_RoundTrip 钉着，**消费 extract 结果的那半**此前一条用例
+// 都没有（StartA2AServerSpan 只在 TestNilObservability_NoPanic 里被调过一次、nil 接收者）。
+// 变异「用 context.Background() 起 span」或「改成 SpanKindInternal」都不会让任何既有用例变红，
+// 而后果是跨进程 trace 断成两棵树。断言挑的是 TraceID 相等 + 父 SpanID + SpanKind，三者各管一种退化。
+func TestA2AServerSpan_NestsUnderRemoteParent(t *testing.T) {
+	h := newHarness(t)
+	// 模拟对端：起一个 span 并把 trace context 注入 metadata。
+	clientCtx, clientSpan := h.obs.Tracer().Start(context.Background(), "remote_caller")
+	md := map[string]any{}
+	h.obs.InjectToMetadata(clientCtx, md)
+	clientSpan.End()
+
+	// server 侧：extract → 起 server span → 内层 agent span
+	srvCtx := h.obs.ExtractFromMetadata(context.Background(), md)
+	srvCtx, ss := h.obs.StartA2AServerSpan(srvCtx, "message/send", "ctx-1", "task-1")
+	ah := h.obs.AgentHooks()
+	info := &hook.AgentInfo{Name: "inner", Type: "base"}
+	innerCtx, _ := ah.OnAgentStart(srvCtx, info, &hook.AgentInput{})
+	ah.OnAgentEnd(innerCtx, info, &hook.AgentOutput{})
+	ss.End(observability.OutcomeSuccess, "")
+	h.assertAllEnded(t)
+
+	want := clientSpan.SpanContext().TraceID()
+	srv := h.span(t, "a2a.server message/send")
+	if srv.SpanContext().TraceID() != want {
+		t.Errorf("server span 不在远端父的 trace 里：got %s want %s——跨进程 trace 断成两棵树了",
+			srv.SpanContext().TraceID(), want)
+	}
+	if srv.Parent().SpanID() != clientSpan.SpanContext().SpanID() {
+		t.Errorf("server span 的父应是远端那个 span，got %s", srv.Parent().SpanID())
+	}
+	if srv.SpanKind() != trace.SpanKindServer {
+		t.Errorf("server span 的 kind 应是 Server，got %v", srv.SpanKind())
+	}
+	inner := h.span(t, "invoke_agent inner")
+	if inner.SpanContext().TraceID() != want || inner.Parent().SpanID() != srv.SpanContext().SpanID() {
+		t.Errorf("内层 agent span 应挂在 server span 下、同一棵 trace，got trace=%s parent=%s",
+			inner.SpanContext().TraceID(), inner.Parent().SpanID())
+	}
+}
+
+// TestToolCategory_WhitelistOnly：`crew.tool.category` 只放行 retrieval / embedding / guardrail。
+//
+// ⚠️ 业务 tool.Categorizer 返的是**任意字符串**，放开白名单就是**指标与属性基数无上限**（每个新值一个
+// 新的时间序列）。新 suite 只钉了 skill 那个分支，白名单本身零断言——变异「任意非空都放行」后全绿。
+// 断言用一个白名单外的值，钉「属性不出现」。
+func TestToolCategory_WhitelistOnly(t *testing.T) {
+	run := func(t *testing.T, category string) sdktrace.ReadOnlySpan {
+		t.Helper()
+		h := newHarness(t)
+		ah := h.obs.AgentHooks()
+		info := &hook.AgentInfo{Name: "a", Type: "base"}
+		ctx, _ := ah.OnAgentStart(context.Background(), info, &hook.AgentInput{})
+		in := &schema.ToolInput{Name: "t", CallId: "c1", Extra: map[string]any{"category": category}}
+		tctx, _ := ah.OnToolStart(ctx, info, in)
+		ah.OnToolEnd(tctx, info, &schema.ToolOutput{CallId: "c1", Result: &schema.ToolCallResult{Success: true, Output: "ok"}})
+		ah.OnAgentEnd(ctx, info, &hook.AgentOutput{})
+		return h.span(t, "execute_tool t")
+	}
+
+	t.Run("白名单内的记下来", func(t *testing.T) {
+		if got := strAttr(t, run(t, "retrieval"), observability.AttrToolCategory); got != "retrieval" {
+			t.Errorf("白名单内的 category 应记成属性，got %q", got)
+		}
+	})
+	t.Run("白名单外的不记", func(t *testing.T) {
+		span := run(t, "业务随便写的一个类别")
+		for _, kv := range span.Attributes() {
+			if kv.Key == observability.AttrToolCategory {
+				t.Errorf("白名单外的 category 被记进了 %s（值 %q）——业务返任意字符串就是基数无上限",
+					observability.AttrToolCategory, kv.Value.AsString())
+			}
+		}
+	})
+}
+
+// TestErrorType_FrameworkTypedErrorsEachGetOwnValue：`error.type` 是**低基数**维度，框架认得的错误各给一个
+// 固定名、其余统一 `_OTHER`（GenAI 约定的兜底值）。这张表钉的是「每个框架 typed error 都有自己的值」——
+// 2026-10-23 把扇出宽度失控从 MaxIterationsError 劈成 MaxWidthError 时，分类函数没跟上、宽度静默落进
+// `_OTHER`（而 `_OTHER` 在看板上读成「框架不认得、是业务自己的错」），而当时 errorTypeOf 的**5 条分支一条
+// 用例都没有**，所以没人发现。新增这类错误时在这张表里加一行。
+func TestErrorType_FrameworkTypedErrorsEachGetOwnValue(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     error
+		errType string
+	}{
+		{"终局失败", fmt.Errorf("节点 n: %w", compose_v2.ErrRunAborted), "run_aborted"},
+		{"档没写成", fmt.Errorf("出口: %w", compose_v2.ErrCheckpointNotPersisted), "checkpoint_not_persisted"},
+		{"图身份冲突", fmt.Errorf("载入: %w", compose_v2.ErrGraphIDConflict), "graph_id_conflict"},
+		{"没有可续的档", fmt.Errorf("续跑: %w", compose_v2.ErrNoPendingCheckpoint), "no_pending_checkpoint"},
+		{"深度触顶", fmt.Errorf("节点 n 访问次数超限: %w", &compose_v2.MaxIterationsError{Iterations: 7}), "max_iterations"},
+		// 生产形态：宽度失控**自己带着** ErrRunAborted（见 MaxWidthError godoc）。所以这一行同时钉住
+		// **次序**——宽度那条判据必须排在 run_aborted 之前，否则全落进那个桶、再也读不到原因。
+		{"宽度失控（带终局哨兵，生产形态）",
+			fmt.Errorf("扇出宽度超限: %w: %w", &compose_v2.MaxWidthError{Width: 4096}, compose_v2.ErrRunAborted),
+			"max_width"},
+		{"终局失败但没有更具体的名字", fmt.Errorf("协议违规: %w", compose_v2.ErrRunAborted), "run_aborted"},
+		{"业务自己的错", errors.New("下游 500"), "_OTHER"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t)
+			oh := h.obs.OrchHooks()
+			ctx, _ := oh.OnGraphStart(context.Background())
+			oh.OnGraphEnd(ctx, c.err)
+			sp := h.span(t, "invoke_workflow root")
+			if s := strAttr(t, sp, observability.AttrErrorType); s != c.errType {
+				t.Errorf("error.type=%s 应=%s（低基数维度，每个框架 typed error 一个自己的值）", s, c.errType)
+			}
+		})
+	}
+}

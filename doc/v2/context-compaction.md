@@ -978,7 +978,7 @@ agent := agent_v2.NewBasicAgent(
     // history.compact event 随 WithHistoryCompactor 自动发
 )
 // 接 observability 后压缩 event 自动转 metric/span:
-//   obs := observability.New(cfg)
+//   obs := observability.New()   // 或 New(observability.WithTracerProvider(tp), ...)
 //   events, _ := agent.Run(agent_v2.WithCtxOrchHooks(ctx, obs.OrchHooks()), sess, input)
 ```
 

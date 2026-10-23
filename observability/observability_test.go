@@ -1982,3 +1982,36 @@ func TestToolCategory_WhitelistOnly(t *testing.T) {
 		}
 	})
 }
+
+// TestErrorType_FrameworkTypedErrorsEachGetOwnValue：`error.type` 是**低基数**维度，框架认得的错误各给一个
+// 固定名、其余统一 `_OTHER`（GenAI 约定的兜底值）。这张表钉的是「每个框架 typed error 都有自己的值」——
+// 2026-10-23 把扇出宽度失控从 MaxIterationsError 劈成 MaxWidthError 时，分类函数没跟上、宽度静默落进
+// `_OTHER`（而 `_OTHER` 在看板上读成「框架不认得、是业务自己的错」），而当时 errorTypeOf 的**5 条分支一条
+// 用例都没有**，所以没人发现。新增这类错误时在这张表里加一行。
+func TestErrorType_FrameworkTypedErrorsEachGetOwnValue(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     error
+		errType string
+	}{
+		{"终局失败", fmt.Errorf("节点 n: %w", compose_v2.ErrRunAborted), "run_aborted"},
+		{"档没写成", fmt.Errorf("出口: %w", compose_v2.ErrCheckpointNotPersisted), "checkpoint_not_persisted"},
+		{"图身份冲突", fmt.Errorf("载入: %w", compose_v2.ErrGraphIDConflict), "graph_id_conflict"},
+		{"没有可续的档", fmt.Errorf("续跑: %w", compose_v2.ErrNoPendingCheckpoint), "no_pending_checkpoint"},
+		{"深度触顶", fmt.Errorf("节点 n 访问次数超限: %w", &compose_v2.MaxIterationsError{Iterations: 7}), "max_iterations"},
+		{"宽度失控", fmt.Errorf("扇出宽度超限: %w", &compose_v2.MaxWidthError{Width: 4096}), "max_width"},
+		{"业务自己的错", errors.New("下游 500"), "_OTHER"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t)
+			oh := h.obs.OrchHooks()
+			ctx, _ := oh.OnGraphStart(context.Background())
+			oh.OnGraphEnd(ctx, c.err)
+			sp := h.span(t, "invoke_workflow root")
+			if s := strAttr(t, sp, observability.AttrErrorType); s != c.errType {
+				t.Errorf("error.type=%s 应=%s（低基数维度，每个框架 typed error 一个自己的值）", s, c.errType)
+			}
+		})
+	}
+}

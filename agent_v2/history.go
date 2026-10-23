@@ -73,6 +73,23 @@ type HistoryStore interface {
 }
 
 // HistoryKey 定位一条会话。
+//
+// # 可移植的长度上限：两个维度各 255 个字符
+//
+// 内置 SQL 后端里最窄的是 MySQL（`owner VARBINARY(1020)` / `conv_id VARBINARY(1020)`），按一个字符最多
+// 4 字节算就是 **255 个字符**；两列加 `id BIGINT` 组成索引 `(owner, conv_id, id)`，1020+1020+8 = 2048
+// 字节，在 InnoDB 的 3072 字节索引上限内。PG 的 `TEXT` 与 SQLite 的 `TEXT` 没有长度上限，但**照它们定会
+// 让可移植性假高**（CLAUDE.md：从最弱的实现归纳是对的，从最强的归纳才错）。
+//
+// ⚠️ **ConvID 常直接来自 wire**（`compose_v2.WithThreadIDCtx` 声明的那个，a2a 侧就是对端给的
+// ContextID），业务控制不住它长什么样。超上限时各后端的表现**不一样**：MySQL 严格模式（默认）报
+// `Data too long for column 'owner'` ⟹ 整批 Append 失败；PG 约 2704 字节撞 btree 索引行上限；SQLite
+// 照样成功。而历史层的写是**旁路**（失败吞 + warn，不打断主链路），所以线上症状是「同一个长 ConvID 在
+// SQLite 上历史正常、搬到 MySQL 后模型开始忘上一轮」，不是一个报错。要接外来的 ConvID，自己先截或哈希。
+//
+// 这条上限由 `agent_v2/history_conformance` 的 LongKeys 用例钉住（两个维度 × 两档字符各一遍）。
+// ⚠️ SQLite 与 in-memory 后端**恒过**那条用例，别因为它绿就以为这个维度验过了——它是给业务自研后端与
+// 真 PG / MySQL 的。
 type HistoryKey struct {
 	// Owner 是数据归属方（租户 / 用户）。**必填、无默认值。**
 	//

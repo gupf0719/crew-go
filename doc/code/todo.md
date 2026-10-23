@@ -97,9 +97,11 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
   `tool.Categorizer` 返任意字符串，指标 / 属性基数无上限。
 - mcp 两条已实现但无哨兵的不变量：`goOnline` 的 `s.closed` 早退（缺它会泄漏一个永不关闭的新连接）、
   `markOffline` 的 `bg.Add(1)` 必须在 `s.mu` 内（挪出去 `-race` 直接报竞争）。探针写法见 review-v7。
-- `agent_v2/history_conformance` 没有长 key 用例（最长的 key 只有个位数字符），而 `ConvID` 常直接来自
-  wire：超 1020 字节时 MySQL 严格模式整批 Append 失败、PG 约 2704 字节撞 btree 索引行上限、SQLite 照样
-  成功。`HistoryKey` godoc 也没声明可移植上限。
+- ~~`agent_v2/history_conformance` 没有长 key 用例，`HistoryKey` godoc 也没声明可移植上限~~
+  **已修（2026-10-23）**：加 `LongKeys` 用例（两个维度 × 两档字符，`PortableKeyLen = 255` 由最窄的
+  MySQL 列宽定）+ `HistoryKey` godoc 写明上限、各后端超限时的不同表现、以及「写是旁路所以症状是模型
+  忘上一轮而不是报错」。⚠️ SQLite 与 in-memory 恒过这条；用一个截断型坏后端验过它会红（失败信息点出
+  「两条会话塌成一条流」）。
 
 **P0：先拍板，拍完即修（安全 / 正确性）**
 - ~~approve_always 规则不分 agent（沙箱子 agent 里答的「一直允许」放行父 agent 的同名生产工具）——先定「一直允许」管 agent 还是任务~~ 已修（2026-10-20，`fix/approval-rule-owner`）

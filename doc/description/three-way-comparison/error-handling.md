@@ -747,10 +747,13 @@ Codex 的 `Fatal` 消费点：`return Err(CodexErr::Fatal(message))`，**直接�
 Codex 的 spawn 失败之所以是后者，是因为那些失败是 agent 数量上限、模型名非法之类的
 **运营性失败**——不是协议违规。
 
-而我们的 `ErrRunAborted` 的**全部来源**都是后一类里没有的东西：`CondFailAbort` +
-`validateInterrupt` 五条（typed-nil `*InterruptError` / `Query` 与 `Queries` 同时填 /
-一条 query 都没有 / `InterruptID` 为空 / 同批撞 ID）——**全是业务代码违反框架协议**。
-按 Codex 自己的判据，这是 `Fatal` 那一档。
+而我们的 `ErrRunAborted` 的来源都是后一类里没有的东西——**按类目说**（权威清单在
+`compose_v2/errors.go` 的 `ErrRunAborted` godoc，它自己记着「按类目写、别数个数」的理由：
+这里原先枚举的「五条」在写下之后就被加过三次，而个数写在清单之外、加一条时没人会想起改它）：
+`CondFailAbort` 档 / 业务抛的中断请求形状非法（由 `validateInterrupt` 统一判） / 单写入者冲突
+（channel 与上行信号两种） / 扇出宽度失控。**全是业务代码的错，不是运营性失败**——要么违反框架
+协议，要么把终止条件写错，重跑都走不通（宽度与单写入者那两条的理由另有一层：矛盾/爆炸会随存档
+反复复现，见 godoc）。按 Codex 自己的判据，这是 `Fatal` 那一档。
 
 ## 结论与代价
 

@@ -89,7 +89,7 @@ agent := agent_v2.NewBasicAgent(agent_v2.WithToolkit(hub.Toolkit()), ...)
 | 其余连接错误（写出之后断开、HTTP 5xx、stdio 子进程中途退出……） | `server_unavailable` | 该能力暂时不可用（X 连接出错），这次调用没拿到结果，不确定是否已执行 | 掉线 |
 | server 返回 `isError` | `internal_error` | 第一个非空文本块（没有则 "mcp tool call failed"） | 不变 |
 | `CallTool` 返回 `(nil, nil)` | `internal_error` | X 返回了空结果 | 不变 |
-| 成功 | — | 有 `structuredContent` 时 `Output` 是解出来的值（BasicAgent 用 `tool.OutputText` 编成 JSON 交给模型），否则各内容块按原顺序整理成文本、块间空一行：text 原样；嵌入资源（resource）取出正文、前面标 `[资源 URI]`；资源链接写成 `[资源链接 名字 URI]`；图片、音频、二进制资源只写一行说明（类型、MIME、字节数、URI），字节不交给模型 | — |
+| 成功 | — | 有 `structuredContent` 时 `Output` 是解出来的值（数字是 `json.Number`，大整数不失真；BasicAgent 用 `tool.OutputText` 编成 JSON 交给模型），否则各内容块按原顺序整理成文本、块间空一行：text 原样；嵌入资源（resource）取出正文、前面标 `[资源 URI]`；资源链接写成 `[资源链接 名字 URI]`；图片、音频、二进制资源只写一行说明（类型、MIME、字节数、URI），字节不交给模型；base64 不规范也不让调用失败（URL-safe、缺 padding 照认，解不了就在说明里写「base64 解不了」）；空的文本资源写「（空）」 | — |
 
 「没有发出」只认 `ErrNotSent`，不从错误形状推断：推断错了，模型会把一个已执行的写操作当成没执行、再做一遍。
 `StreamableHTTPClient` 用 `httptrace` 判：trace 生效了（`GetConn` 到过）而请求头、请求体都没写出才算没发出（请求 ctx

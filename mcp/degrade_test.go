@@ -1180,7 +1180,8 @@ func TestStreamableHTTP_ErrorResponsesClassified(t *testing.T) {
 			mcp.ErrCodeServerUnavailable, "HTTP 401", false, "s3cret-token"},
 		{"非 2xx 的 JSON-RPC 错误交给模型前抹掉 token", 400, `{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad token Bearer s3cret-token"}}`,
 			tool.ErrCodeInternal, "bad token <redacted>", true, "s3cret-token"},
-		{"200 但 image 的 base64 坏了", 200, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"image","data":"!!!","mimeType":"image/png"}]}}`,
+		// 二进制块的 base64 坏了不算解析失败（只写说明，见 content_text_test.go），这里用 content 不是数组
+		{"200 但 content 的形状不对", 200, `{"jsonrpc":"2.0","id":1,"result":{"content":"不是数组"}}`,
 			tool.ErrCodeInternal, "解析不了", true, ""},
 		{"200 但不是 JSON", 200, "event: message\ndata: {}\n\n", tool.ErrCodeInternal, "解析不了", true, ""},
 		{"200 的 JSON-RPC 错误交给模型前抹掉 token", 200, `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"denied for s3cret-token"}}`,

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -194,14 +195,26 @@ func parseToolAnnotations(toolName string, raw json.RawMessage) *ToolAnnotations
 
 // parseCallResult 把 tools/call 的 raw result 解析为 CallResult。
 // 协议要点：优先使用 structuredContent；content 是内容块列表。
+//
+// structuredContent 里的数字解成 json.Number（UseNumber）：解成 float64 的话，超过 2^53 的整数（雪花 ID 之类）
+// 交给模型时已经变了样，而且编成 JSON 后看起来仍是一个精确的整数（1234567890123456789 → 1234567890123456800），
+// 模型拿它调下一个工具就静默出错。json.Number 编 JSON 时原样输出。
 func parseCallResult(raw json.RawMessage) (*CallResult, error) {
 	var body struct {
 		IsError           bool              `json:"isError"`
 		Content           []json.RawMessage `json:"content"`
-		StructuredContent any               `json:"structuredContent"`
+		StructuredContent json.RawMessage   `json:"structuredContent"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return nil, fmt.Errorf("decode tools/call: %w", err)
+	}
+	var structured any
+	if len(body.StructuredContent) > 0 {
+		dec := json.NewDecoder(bytes.NewReader(body.StructuredContent))
+		dec.UseNumber()
+		if err := dec.Decode(&structured); err != nil {
+			return nil, fmt.Errorf("decode tools/call structuredContent: %w", err)
+		}
 	}
 	blocks := make([]Block, 0, len(body.Content))
 	for _, item := range body.Content {
@@ -213,7 +226,7 @@ func parseCallResult(raw json.RawMessage) (*CallResult, error) {
 	}
 	return &CallResult{
 		IsError:    body.IsError,
-		Structured: body.StructuredContent,
+		Structured: structured,
 		Content:    blocks,
 	}, nil
 }
@@ -231,28 +244,40 @@ func decodeBlock(raw json.RawMessage) (Block, error) {
 		Resource *struct {
 			URI      string `json:"uri"`
 			MimeType string `json:"mimeType"`
-			Text     string `json:"text"`
-			Blob     string `json:"blob"` // base64
+			Text     *string `json:"text"` // 有这个键就是文本资源（空文件的 text 是空串）
+			Blob     string  `json:"blob"` // base64
 		} `json:"resource"`
 	}
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return Block{}, fmt.Errorf("decode content block: %w", err)
 	}
+	textResource := false
 	if r := b.Resource; r != nil {
-		b.URI, b.Text, b.Data = r.URI, r.Text, r.Blob
+		b.URI, b.Data = r.URI, r.Blob
+		if r.Text != nil {
+			b.Text, textResource = *r.Text, true
+		}
 		if r.MimeType != "" {
 			b.MimeType = r.MimeType
 		}
 	}
-	block := Block{Type: b.Type, Text: b.Text, Mime: b.MimeType, URI: b.URI, Name: b.Name}
+	block := Block{Type: b.Type, Text: b.Text, Mime: b.MimeType, URI: b.URI, Name: b.Name, textResource: textResource}
 	if b.Data != "" {
-		data, err := base64.StdEncoding.DecodeString(b.Data)
-		if err != nil {
-			return Block{}, fmt.Errorf("decode block base64: %w", err)
-		}
-		block.Data = data
+		// 解不了不让整次调用失败：二进制内容本来就不交给模型，解码只为说明里的大小；为它报错的话，同一次结果里的
+		// 文本也丢了，还会被报成「可能已执行」引着模型重试有副作用的工具。不规范的 base64（URL-safe、缺 padding）也认。
+		block.Data, block.undecodable = decodeBase64(b.Data)
 	}
 	return block, nil
+}
+
+// decodeBase64 按标准、无 padding、URL-safe、URL-safe 无 padding 依次试；都不行时 undecodable 为 true。
+func decodeBase64(s string) (data []byte, undecodable bool) {
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if d, err := enc.DecodeString(s); err == nil {
+			return d, false
+		}
+	}
+	return nil, true
 }
 
 func toSet(values []string) map[string]struct{} {

@@ -114,6 +114,11 @@ type Block struct {
 	Mime string `json:"mimeType,omitempty"`
 	URI  string `json:"uri,omitempty"`
 	Name string `json:"name,omitempty"`
+
+	// textResource：这是文本资源（resource.text 有这个键，可能是空串——空文件），不是二进制。
+	textResource bool
+	// undecodable：data / blob 的 base64 解不了，Data 为空。
+	undecodable bool
 }
 
 // FirstText 返回 blocks 中首个 text 块的内容，无则空串。

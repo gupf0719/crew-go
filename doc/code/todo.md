@@ -62,8 +62,10 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
   `graph_loop.go` 的 `Iterations: visits[id]`）、Resume 那道闸给 `round`=3。`withFinalRound` 的 godoc 教
   调用方「当预算用：`errors.As(&mie)` 之后读」，而同一个诊断给两个数。若语义是「这个预算烧了几轮」，
   引擎那条该由 BasicAgent 重铸成 `lastRound`（引擎的原错误仍留在链上）。
-- `fallback.startIndex` 在 `len(members)==0` 时返回越界下标 0，当前唯一调用方 `ModelName` 的守卫兜住了；
-  第二个调用方出现时就是 index out of range。返 -1 或一句 godoc 即可。
+- ~~`fallback.startIndex` 在 `len(members)==0` 时返回越界下标 0~~ **已修（2026-10-23）**：候选为空返 -1，
+  与「全熔断报首选 0」分开（后者仍有意义：cooldown 过后下一次调用会先半开探测首选）；`len` 的判据只留
+  `startIndex` 一份，`ModelName` 改按 `i < 0` 判。哨兵
+  `TestStartIndex_EmptyMembersVsAllTripped`（两个子用例分别钉两种情形的下标）。
 
 哨兵/文档缺口：
 - `mcp` 的 `WithSerialCalls` godoc 只举了「超时、调用方取消」两个例子，而统辖句是「请求发出之后没等到

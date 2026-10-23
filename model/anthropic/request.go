@@ -108,6 +108,19 @@ func (c *Client) buildRequest(ctx context.Context, messages []*schema.Message, o
 		}
 		params.CacheControl = cc
 	}
+	if cp := c.compaction; cp != nil {
+		edit := anthropic.BetaCompact20260112EditParam{}
+		if cp.TriggerTokens > 0 {
+			edit.Trigger = anthropic.BetaInputTokensTriggerParam{Value: cp.TriggerTokens}
+		}
+		if cp.Instructions != "" {
+			edit.Instructions = param.NewOpt(cp.Instructions)
+		}
+		params.ContextManagement = anthropic.BetaContextManagementConfigParam{
+			Edits: []anthropic.BetaContextManagementConfigEditUnionParam{{OfCompact20260112: &edit}},
+		}
+		betas = append(betas, anthropic.AnthropicBetaCompact2026_01_12)
+	}
 	if c.fallbacks {
 		params.Fallbacks = anthropic.BetaFallbacksParamUnion{OfDefault: constant.ValueOf[constant.Default]()}
 		betas = append(betas, anthropic.AnthropicBetaServerSideFallback2026_07_01)

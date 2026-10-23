@@ -57,11 +57,16 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
   哨兵钉住（有人改了 `connect` 不包装，它们立刻会变成新入口）。
   ⚠️ 一条如实声明：「`go reconnectLoop` 提到日志之前」**没有哨兵钉得住**（日志已安全 ⟹ 挪回去无行为差异，
   实测变异不红），靠的是那处注释。
-- **`compose_v2.MaxIterationsError.Iterations` 在三条路上不是同一个量**（同一个 `maxRounds=2` 实测）：
-  BasicAgent 软降落奏效那条给 `lastRound`=3（轮数）、引擎 `maxVisit` 那条给 `visits[id]`=4（访问计数，
-  `graph_loop.go` 的 `Iterations: visits[id]`）、Resume 那道闸给 `round`=3。`withFinalRound` 的 godoc 教
-  调用方「当预算用：`errors.As(&mie)` 之后读」，而同一个诊断给两个数。若语义是「这个预算烧了几轮」，
-  引擎那条该由 BasicAgent 重铸成 `lastRound`（引擎的原错误仍留在链上）。
+- ~~**`compose_v2.MaxIterationsError.Iterations` 在三条路上不是同一个量**~~ **已修（2026-10-23）**：
+  ① 真正的语义错是**宽度冒充迭代**——`graph_loop.go` 的 maxWidth 填 `len(frontier)`（宽度），而代码自己的
+  注释写着宽度与深度是「两个正交维度」。新增专属类型 `MaxWidthError{Width}`（同样实现 `NonRetryable`），
+  宽度改用它；调用方从此分得出拿到的是哪个量，两者处置不同（宽度 ⟹ 查业务的终止条件 / 深度 ⟹ 预算耗尽）。
+  ② BasicAgent 的 Run / Resume 出口**重铸**一个自己的 `MaxIterationsError` 挂外层，于是 `errors.As` 取到
+  的是本 agent 跑满的轮数、跟正文「跑满 N 轮」一致（引擎的原错误经 `errors.Join` 留在链上）。
+  ③ `MaxIterationsError` 的 godoc 写明「Iterations 是第几次迭代触顶的、计数基准按抛出方」+ 指向
+  `MaxWidthError`。哨兵 `TestSoftLanding_IterationsIsOwnRoundCount`（断言载荷与正文里的数字**相等**，
+  不钉常量）+ `TestVisitCount_CompoundSelfFanoutIsBounded` 改用专属类型并加「不该同时命中
+  MaxIterationsError」的反向断言（**行为契约不变**，只换类型且钉得更准）。两条变异都红。
 - ~~`fallback.startIndex` 在 `len(members)==0` 时返回越界下标 0~~ **已修（2026-10-23）**：候选为空返 -1，
   与「全熔断报首选 0」分开（后者仍有意义：cooldown 过后下一次调用会先半开探测首选）；`len` 的判据只留
   `startIndex` 一份，`ModelName` 改按 `i < 0` 判。哨兵

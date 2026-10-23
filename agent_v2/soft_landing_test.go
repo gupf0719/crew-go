@@ -849,3 +849,39 @@ func TestSoftLanding_BudgetMessageSkipsInterrupt(t *testing.T) {
 		t.Errorf("前端会按中断请用户回答 %q，正文却说预算耗尽、FinalMessage 可能为 nil：%v", got.Query.Question, err)
 	}
 }
+
+// TestSoftLanding_IterationsIsOwnRoundCount：预算耗尽时 `errors.As` 取出的 `Iterations` 是**本 agent 跑满
+// 的轮数**，跟错误正文里那句「跑满 N 轮」是同一个数。
+//
+// ⚠️ 同一次跑满会**经过两个抛出点**：引擎的 maxVisit 先拒（它填 `visits[id]` = maxRounds+2，也就是被拒
+// 的那一次访问），出口再包一层。不在出口重铸的话 `errors.As` 取到的是引擎那个数，于是**同一个诊断给
+// 两个数**——正文说「跑满 3 轮」而载荷是 4。`withFinalRound` 的 godoc 正是教调用方「当预算用：
+// errors.As(&mie) 之后读」。
+//
+// 断言挑的是「载荷与正文里的数字相等」而不是「载荷等于某个常量」：后者在改了 maxRounds 的默认值或
+// maxVisit 公式之后要跟着改，而前者钉的是两者**一致**这个契约本身。
+func TestSoftLanding_IterationsIsOwnRoundCount(t *testing.T) {
+	var n atomic.Int32
+	const maxRounds = 2
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("sl"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))),
+		agent_v2.WithMaxRounds(maxRounds))
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+	if err == nil {
+		t.Fatal("fixture 没搭对：软降落轮硬调工具、整批被拦，应以错误收尾")
+	}
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(err, &mie) {
+		t.Fatalf("应能 errors.As 出 MaxIterationsError，实际 %v", err)
+	}
+	// 跑满 = 访问了 maxRounds+1 次 model 节点
+	if want := maxRounds + 1; mie.Iterations != want {
+		t.Errorf("Iterations=%d 应是本 agent 跑满的轮数 %d（引擎 maxVisit 填的是 %d，被拒的那次访问）"+
+			"——不重铸就会取到引擎那个数，跟正文里「跑满 %d 轮」对不上",
+			mie.Iterations, want, maxRounds+2, want)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("跑满 %d 轮", mie.Iterations)) {
+		t.Errorf("载荷 Iterations=%d 与正文里的轮数应是同一个数，实际正文：%v", mie.Iterations, err)
+	}
+}

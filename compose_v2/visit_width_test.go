@@ -128,11 +128,25 @@ func TestVisitCount_CompoundSelfFanoutIsBounded(t *testing.T) {
 	defer cancel()
 
 	err = compose_v2.Run(ctx, g, compose_v2.NewChannelManager())
-	var mie *compose_v2.MaxIterationsError
-	if !errors.As(err, &mie) {
-		t.Fatalf("宽度指数爆炸应被 MaxIterationsError 拦住，got %v（执行了 %d 次）\n"+
+	// 钉的**行为契约不变**：宽度指数爆炸必须被拦住。换的只是类型——宽度与深度是两个正交维度，
+	// 曾经共用 MaxIterationsError（`Iterations` 一个装宽度一个装深度，调用方 errors.As 之后分不出拿到
+	// 的是哪个量），现在宽度有自己的 [compose_v2.MaxWidthError]。用专属类型断言比原来**更准**：
+	// 深度触顶再也不会误命中这条。
+	var mwe *compose_v2.MaxWidthError
+	if !errors.As(err, &mwe) {
+		t.Fatalf("宽度指数爆炸应被 MaxWidthError 拦住，got %v（执行了 %d 次）\n"+
 			"  没拦住 = 宽度无界，默认 maxVisit=100 时是 2^100 次执行，OOM 先到",
 			err, ran.Load())
+	}
+	if mwe.Width <= 2000 {
+		t.Errorf("MaxWidthError.Width=%d 应大于宽度上限 2000——它要装的是触顶时的宽度", mwe.Width)
+	}
+	// 宽度失控不该被当成深度触顶：两个维度各有自己的类型，调用方据此分流处置
+	// （宽度 ⟹ 查业务的终止条件；深度 ⟹ 预算耗尽）。
+	var mie *compose_v2.MaxIterationsError
+	if errors.As(err, &mie) {
+		t.Errorf("宽度失控不该同时命中 MaxIterationsError（Iterations=%d）——那正是两个维度共用一个类型"+
+			"的老问题", mie.Iterations)
 	}
 	// 拦在宽度上限量级，而不是等指数涨到天上
 	if got := ran.Load(); got > 8000 {

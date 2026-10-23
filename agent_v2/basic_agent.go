@@ -348,10 +348,15 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 			//
 			// **链上有中断的不碰**：a2a/server 与 agui 会走中断分支把问题呈现给用户请他作答，而同一个错误的头条
 			// 说「预算耗尽、FinalMessage 可能为 nil」是自相矛盾的（审计实测业务钩子 errors.Join 两者的形态）。
+			// **重铸一个自己的 MaxIterationsError 挂在外层**：errors.As 取链上第一个，于是调用方读到的
+			// Iterations 是**本 agent 跑满的轮数**（= maxRounds+1），跟上面正文里那句「跑满 %d 轮」一致。
+			// 不重铸的话取到的是引擎 maxVisit 填的 visits[id]（= maxRounds+2，被拒的那次访问），同一个
+			// 诊断给两个数。引擎的原错误经 errors.Join 留在链上，诊断不丢。
 			err = fmt.Errorf("basic agent %q: 轮次预算耗尽（跑满 %d 轮），本次 Run 以错误收尾、没有交付答复"+
 				"（FinalMessage 可能为 nil）。软降落轮（tool_choice=none）里模型硬调的工具不执行，模型仍硬调就会走到这里"+
 				"——provider 或业务的 ChatModel 不强制执行 none 是常见原因之一；真正的错误见下: %w",
-				a.config.Name, lastRound, err)
+				a.config.Name, lastRound,
+				errors.Join(&compose_v2.MaxIterationsError{Iterations: int(lastRound)}, err))
 		}
 	}
 	if err != nil {
@@ -513,10 +518,12 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 		case errors.As(runErr, &mie) && !isInterruptErr(runErr):
 			// 判据与文案同 Run 那处（理由见那里）。续跑时撞的多是 model 节点开头「一个预算至多一个软降落轮」
 			// 那道闸，顶层 Run 上撞的是引擎 maxVisit。
+			// 重铸同 Run 那处（理由见那里）。
 			runErr = fmt.Errorf("basic agent %q: 轮次预算耗尽（跑满 %d 轮），本次续跑以错误收尾、没有交付答复"+
 				"（FinalMessage 可能为 nil）。软降落轮（tool_choice=none）里模型硬调的工具不执行，模型仍硬调就会走到这里"+
 				"——provider 或业务的 ChatModel 不强制执行 none 是常见原因之一；真正的错误见下: %w",
-				a.config.Name, info.Round, runErr)
+				a.config.Name, info.Round,
+				errors.Join(&compose_v2.MaxIterationsError{Iterations: int(info.Round)}, runErr))
 		}
 	}
 

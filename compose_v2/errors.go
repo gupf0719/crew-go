@@ -81,6 +81,13 @@ func (e *MaxIterationsError) NonRetryable() {}
 // 所以它要有自己的类型：共用 MaxIterationsError 的话，`Iterations` 一个装宽度一个装深度，调用方
 // `errors.As` 之后分不出拿到的是哪个量，而两者的处置完全不同（宽度失控查业务的终止条件 / 深度触顶是
 // 预算耗尽）。
+//
+// # 它是终局的，[MaxIterationsError] 不是
+//
+// 抛出点一并 `%w` 上 [ErrRunAborted]（深度那条没有）：存进档的 `CurrentFrontier` 就是那个超限的
+// frontier 本身，而续跑闸门按内容判 ⟹ 不清档的话 auto-load 会捡起它、**节点一次没跑就在同一道闸上
+// 再爆**，那个 (sid, ns) 槽从此是死的。深度触顶不是这个形状：它的 frontier 是正常的，续跑（调大预算）
+// 走得下去。所以 `errors.Is(err, ErrRunAborted)` 对宽度为真、对深度为假。
 type MaxWidthError struct {
 	Width int
 }
@@ -134,6 +141,8 @@ func (e *MaxRoundsError) NonRetryable() {}
 //   - **业务抛的中断请求形状非法**——由 `validateInterrupt` 统一判定（typed-nil /
 //     Query 与 Queries 同时填 / 一条 query 都没有 / InterruptID 为空 / 同一批内撞 ID /
 //     Queries 含 nil 元素）
+//   - **扇出宽度失控**——一个超步的 frontier 宽度超过 `WithMaxFrontierWidth`（[MaxWidthError]）。
+//     理由同下面那条：存进档的 frontier 就是那个超限的 frontier，留档续跑只会在同一道闸上再爆
 //   - **单写入者冲突**——同一超步两个成员（或成员与 SendFrom payload）写同一个 [LastValue]
 //     channel，或两个成员都对同一个上行信号的收件人做了决定、业务经 [JoinSignals] 合并的几路
 //     给出了不同的决定（[SignalConflictError]）。这一类的理由不是「重跑必然一样」（写不写可能

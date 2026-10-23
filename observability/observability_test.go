@@ -1999,7 +1999,12 @@ func TestErrorType_FrameworkTypedErrorsEachGetOwnValue(t *testing.T) {
 		{"图身份冲突", fmt.Errorf("载入: %w", compose_v2.ErrGraphIDConflict), "graph_id_conflict"},
 		{"没有可续的档", fmt.Errorf("续跑: %w", compose_v2.ErrNoPendingCheckpoint), "no_pending_checkpoint"},
 		{"深度触顶", fmt.Errorf("节点 n 访问次数超限: %w", &compose_v2.MaxIterationsError{Iterations: 7}), "max_iterations"},
-		{"宽度失控", fmt.Errorf("扇出宽度超限: %w", &compose_v2.MaxWidthError{Width: 4096}), "max_width"},
+		// 生产形态：宽度失控**自己带着** ErrRunAborted（见 MaxWidthError godoc）。所以这一行同时钉住
+		// **次序**——宽度那条判据必须排在 run_aborted 之前，否则全落进那个桶、再也读不到原因。
+		{"宽度失控（带终局哨兵，生产形态）",
+			fmt.Errorf("扇出宽度超限: %w: %w", &compose_v2.MaxWidthError{Width: 4096}, compose_v2.ErrRunAborted),
+			"max_width"},
+		{"终局失败但没有更具体的名字", fmt.Errorf("协议违规: %w", compose_v2.ErrRunAborted), "run_aborted"},
 		{"业务自己的错", errors.New("下游 500"), "_OTHER"},
 	}
 	for _, c := range cases {

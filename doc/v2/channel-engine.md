@@ -1238,7 +1238,7 @@ nil ⟹ cleanup 走成功分支 `purgeExitSlot(reason="success")`。实测后果
 // compose_v2/errors.go
 var ErrNoSubgraphCheckpoint = errors.New("...")  // 嵌套子图找不到 cp
 type MaxIterationsError struct{ Iterations int }  // **迭代深度**触顶：`graph_loop.go::Run` 的 maxVisit / LoopAgent / BasicAgent 跑满 maxRounds 时实际抛（BasicAgent 的 Run / Resume 出口**重铸**一个自己的挂外层，于是 errors.As 取到的是本 agent 的轮数）
-type MaxWidthError      struct{ Width int }       // **扇出宽度**失控：`graph_loop.go::Run` 的 maxFrontierWidth 触顶时抛。与上面是两个正交维度，故各有自己的类型——共用一个 `Iterations` 的话调用方 errors.As 之后分不出拿到的是哪个量
+type MaxWidthError      struct{ Width int }       // **扇出宽度**失控：`graph_loop.go::Run` 的 maxFrontierWidth 触顶时抛，**一并 `%w ErrRunAborted`**（终局：存进档的 CurrentFrontier 就是那个超限的 frontier，留档续跑只会在同一道闸再爆）。与上面是两个正交维度，故各有自己的类型——共用一个 `Iterations` 的话调用方 errors.As 之后分不出拿到的是哪个量
 type MaxRoundsError      struct{ Rounds int }     // ReAct round 耗尽——typed 但生产路径不抛, 预留供业务自定义
 
 // compose_v2/checkpointer.go

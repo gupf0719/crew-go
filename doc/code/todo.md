@@ -49,6 +49,18 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
   `AddSubgraphNode` / `RunWithRetry` 包住的嵌套运行全部收敛到同一个超步循环），按类型分流的 21 个
   `errors.As` 消费点逐个核过，**没有「原来按 MaxIterationsError 分类、现在落错兜底」的地方**；三条
   教学面漏列已修。它找到的宽度存档那条见下。
+- ~~🟡 **宽度失控留毒档**~~ **已修（2026-10-23）**（agent B 的 Finding 4，**预存**——劈分前共用
+  `MaxIterationsError` 时同样没有 `ErrRunAborted`，同一个形状）：实测 Run1 宽度失控留下
+  `Status=failed` + 128 条 `CurrentFrontier` 的档，而续跑闸门按内容判（`HasResumableWork`，不读
+  Status）⟹ 同 sid 再 Run **节点一次没跑**就在同一道闸以同一个 Width 再爆，那个 (sid, ns) 槽从此是
+  死的，且每次重爆都往持久后端写一遍那份（默认 maxWidth=10000 时上万条）frontier；逃生舱
+  `WithFreshRun` 存在但要靠调用方知道。修法：抛出点一并 `%w ErrRunAborted`（出口清子树 + 不重试 +
+  `MustPropagate` 不被吞）。⚠️ 理由**不是**「重跑必然一样」（扇出几路取决于运行时数据），是**这个
+  爆炸会随存档反复复现**——同单写入者冲突那条的立论。顺带 `observability` 的 `errorTypeOf` 把宽度那条
+  判据提到 `run_aborted` 之前（它是唯一自己带哨兵的 typed error，排后面就只剩处置、读不到原因）。
+  哨兵 `TestWidthOverflow_IsTerminalAndLeavesNoPoisonedCheckpoint` —— **断言选在只有 abort 才给的三样
+  上**（档被清 / 第二次 Run 真跑节点 / MustPropagate），不断言 `IsRetryable`：`MaxWidthError` 本来就
+  实现 `NonRetryable`，那条在变异下不红（第 4 类炸弹「双层防护遮蔽」）。两条变异各自红。
 - 🟢 **BasicAgent 出口那个 `switch` 没有 `default`**（预存，agent A 登记）：末轮错误不是
   `MaxIterationsError` 时（嵌套图冒上来的宽度错、普通工具错）出口既不重铸也不改文案，把 `maxRounds`
   当保险丝用的调用方在这些组合下看不到熔断。**未复现**可达性（BasicAgent 自己的四节点图不经 frontier
@@ -56,8 +68,9 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
 - 🟢 **`agui` / `a2a/server` 把两个 `NonRetryable` 类型都归进「可能瞬时、重来合理」的桶**（预存，
   **本次改动前后同一个桶**）：`agui/handler.go` 的 `agentErrorCode` 5 条分支全是哨兵判据，两个 typed
   error 都落 `default: "agent_error"`，而本表给 `agent_error` 的语义是「其余，可能瞬时，重来是合理
-  选项」——跟 `NonRetryable` 正好相反；`a2a/server/executor.go` 只分 stale / not-resumable。⚠️ 它对两个类型
-  **对称**，不是这次改动带出来的 |
+  选项」——跟 `NonRetryable` 正好相反；`a2a/server/executor.go` 只分 stale / not-resumable。**宽度那半已随
+  「宽度失控 `%w ErrRunAborted`」解决**（两处都有 `run_aborted` 分支），**深度那半仍开着**；它对两个
+  类型本来是对称的，不是这次改动带出来的 |
   `agui/handler.go`、`a2a/server/executor.go` | ⬜ OPEN
 
 **review-v7 修复轮自审新发现（2026-10-22，3 个单视角 agent 审 `af7c45a` 自己的改动）**

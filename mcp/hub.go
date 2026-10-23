@@ -334,10 +334,10 @@ func (h *Hub) Start(ctx context.Context) error {
 		if offline {
 			if p.fromSnapshot {
 				slog.WarnContext(ctx, "mcp: server 启动时连不上，按快照注册它的工具，后台重连",
-					logKeyServer, s.name, logKeyTools, len(p.specs), logKeyErr, results[i].err.Error())
+					logKeyServer, s.name, logKeyTools, len(p.specs), logKeyErr, results[i].err)
 			} else {
 				slog.WarnContext(ctx, "mcp: server 启动时连不上且没有快照，本会话不注册它的工具，后台重连",
-					logKeyServer, s.name, logKeyErr, results[i].err.Error())
+					logKeyServer, s.name, logKeyErr, results[i].err)
 			}
 			reconnect = append(reconnect, s)
 		}

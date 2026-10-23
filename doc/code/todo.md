@@ -37,6 +37,39 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
 - ~~AG-UI 标准审批答案被当成拒绝（`{"approved":true}`、`Yes.` 都落进拒绝分支，实测）~~ 已修（2026-10-19，`fix/approval-answers`）
 - ~~中断时根 cp 写失败，agui / a2a 仍当成正常挂起（实测：用户答完续跑找不到存档，工具 0 次执行）~~ 已修（2026-10-19，`fix/interrupt-not-persisted`）
 
+**`a8f088b`（宽度失控变终局）的 commit-level audit（2026-10-23，1 个单视角 agent，带探针）**
+
+4 项下游后果逐条过完，**没有一条在宽度失控这个场景下是行为性错误**；两条 finding 都在教学面、已修
+（`MustPropagate` godoc 的两句 + `agui` 的 code 说明括号——顺带机械对账发现 `ErrRunAborted` 的 wrap 点
+实际有 **27 个、横跨 compose_v2 / agent_v2 / a2a 三个包的 10 个文件**，而仓里三份写着「全部来源」的
+清单一份都不完整，于是三处一律改成「判据 + 取法」不再枚举）。以下是它复现出来的 pre-existing 事实，
+**不是这次改动带出来的**，登记备查：
+
+- 🟢 **abort 清掉兄弟分支的挂起档时，返回值里一个字都没提**（已复现）：父图 `X(问 Q1) → {A(子图,问 Q2),
+  B(子图,宽度失控)}`，A 与 B 同超步。对照组（B 以普通业务错失败）留 3 份档、`ListPending`=2、同 sid 再
+  Run **接着问 Q2**（Q1 的答案靠 `ConsumedAnswers` 保住）；实验组 0 份档、再 Run **重新问 Q1**、X 的副作用
+  在用户再答一次之后重放。范围恰好是 `IsNSInSubtree(rootNS, ·)`（顶层 rootNS 为空 ⟹ 整个 session 子树），
+  **没有跨 session、没有绕过 `#`/`@` 兄弟执行的排除规则**——代价与单写入者冲突那条逐字相同，
+  `compose_v2/channel.go` 的 godoc 已经认过这笔账。唯一的缺口是**可见性**：A 的 Q2 在 abort 之前已被
+  `recordInterruptBatch` 记进 cm，然后随档一起丢，而错误正文只有 `node "B": subgraph "B": …`，运维唯一
+  线索是 `cp subtree purged ... deleted=2` 那条 INFO。要不要在错误正文里补一句「另有 N 条挂起被丢弃」
+  是取舍 | `compose_v2/graph_loop.go` Run 出口 | ⬜ OPEN（可见性，非正确性）
+- 🟢 **abort 退出时会话历史少记用户那句原话**（已复现，对所有 abort 来源一致）：`LeavesResumableCheckpoint`
+  是**纯按哨兵判**（`err != nil && !errors.Is(err, ErrRunAborted)`），所以 GraphAgent 顶层持有历史时，
+  对照组记 2 条 `[子任务请求][我的原话]`、实验组只记 1 条——**用户原话缺席，而嵌套调用留下的派生输入还在**。
+  cond abort / 协议违规逐字相同（代码级确定）。⚠️ **但宽度失控是唯一一个「同样的输入换批数据可能本来就
+  该成功」的 abort 来源**，于是「用户重发同一句话」在它身上比在协议违规上现实得多，那时历史里会留下第一次
+  尝试的孤儿派生记录而原话永远缺席。要不要为它破例是个设计判断 | `compose_v2/retry.go` 的
+  `LeavesResumableCheckpoint` + `agent_v2/history_slot.go` | ⬜ OPEN
+- 🔵 **`a2a/server` 没有 `ErrRunAborted` 专属分支**（pre-existing 不对称）：agui 有 `run_aborted` code，
+  a2a 只给 `NotResumable` / `stale` / `graphConflict` / `notPersisted` 开了专属脱敏分支，abort 落通用失败
+  分支（`keepPending=false` 正确、不留「一直问同一个问题」的退化；原文回传含 nodeID 与 ns，不含 sid /
+  epoch / GraphID，没触碰其余分支特意脱敏的那几样）| `a2a/server/executor.go` | 🔵 OPEN
+- **未查（留给下一轮）**：持久后端（`sql` / `redis`）各自 `DeleteSubtree` 的前缀删除实现——范围判据共享
+  `IsNSInSubtree`，但只在 in-memory 上复现过；`settleHistoryOnPause` 的另 10 个边界位置（只验了
+  `graph_agent.go` 那条，其余按同一谓词推断一致）；`fallback` 层对宽度失控的处置（它消费 `IsRetryFutile`
+  不是 `MustPropagate`）。
+
 **`a3d7218`（宽度劈出 MaxWidthError）的 commit-level audit（2026-10-23，2 个单视角 agent）**
 
 - 「错误链语义」视角 **0 finding**：出口新引入的 `errors.Join` 在 16 个下游判据 × 6 种内层错误上与

@@ -57,9 +57,23 @@ func newRemoteTool(s *server, name string, spec ToolSpec) *RemoteTool {
 //
 // 默认不认：MCP 规范明说工具注解是提示、不能凭不受信任的 server 的注解做决定——认了的话，一个 server
 // 给写操作标上只读，就绕过了审批的只读放行档。两个声明自相矛盾（只读又有破坏性）时按有副作用处理。
+//
+// 注册之后又连上拉过清单时，最近一次拉到的那份也要声明只读：注册时那份可能来自快照（上一次运行存下的），server 现在
+// 可能已经把它改成有副作用、或去掉了只读声明；工具定义按会话冻结（发给模型的那份不变），审批看的是 server 现在怎么说。
+// 任何一份不说只读就不放行，最近的清单里已经没有这个工具时同样不放行。
 func (t *RemoteTool) ReadOnly() bool {
-	a := t.annotations
-	if !t.trustAnnotations || a == nil || a.ReadOnlyHint == nil || !*a.ReadOnlyHint {
+	if !t.trustAnnotations || !annotationsReadOnly(t.annotations) {
+		return false
+	}
+	if cur, listed := t.srv.listedAnnotations(t.sourceName); listed && !annotationsReadOnly(cur) {
+		return false
+	}
+	return true
+}
+
+// annotationsReadOnly 报一份注解是不是声明了只读（readOnlyHint=true 且没有同时声明 destructiveHint=true）。
+func annotationsReadOnly(a *ToolAnnotations) bool {
+	if a == nil || a.ReadOnlyHint == nil || !*a.ReadOnlyHint {
 		return false
 	}
 	return a.DestructiveHint == nil || !*a.DestructiveHint

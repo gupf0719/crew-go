@@ -890,12 +890,15 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			return nil, fmt.Errorf("basic agent %q: 轮次预算 %d 轮已用完、软降落轮也已用过，不再调用模型（要接着跑，调大这个 agent 的轮次预算再续跑）: %w",
 				name, maxRounds, &compose_v2.MaxIterationsError{Iterations: round})
 		}
-		// 这一轮是不是软降落轮（轮次预算的最后一轮，见下面软降落那段）：只在这里按 round 判一次，写进 basicFinalRoundCh
-		// 交给 tools 节点。round 随存档走，重放定下的那一轮时算出同一个值。
+		// 这一轮是不是软降落轮（轮次预算的最后一轮，见下面软降落那段）：只在这里判一次，写进 basicFinalRoundCh 交给 tools
+		// 节点。要调模型时按 round 与本次的预算算；交出记录里那份答复时（下面）改用记录里的值。
 		finalRound := maxRounds > 0 && round >= maxRounds
 		// 这次执行里那次模型调用的记录（见 agent_v2 的 modelCallRecord）。定下了的（这一轮上一次已经处理完、只是那次
 		// 执行在提交之前作废了）不再处理：不调模型、钩子不触发、不重记会话历史，交出定下的写入与决定。
 		rec, hasRec := modelCallOf(ctx)
+		if hasRec {
+			finalRound = rec.FinalRound // 交出的是记录里那份答复：按它生成时是不是软降落轮（见 modelCallRecord.FinalRound）
+		}
 		if hasRec && rec.Final {
 			compose_v2.EmitSignals(ctx, rec.Signals)
 			noteHistoryRecorded(ctx, modelHistoryRecords(rec.Notes, rec.Inter, rec.Boundary, rec.Out, rec.Late))
@@ -1049,7 +1052,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				}
 				// 模型调用成功那一刻记下原样：OnModelEnd 因为要等人或被叫停停下时，续跑沿用这一份（见 modelCallRecord）。
 				// 记在交给 OnModelEnd 之前——存下的字节是钩子改写之前当场序列化的。
-				saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Out: out, Compaction: memo.out, Boundary: boundary})
+				saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Out: out, Compaction: memo.out, Boundary: boundary, FinalRound: finalRound})
 				keepRecord = false
 			}
 
@@ -1145,7 +1148,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		//
 		// 定下这一轮（见 modelCallRecord），在记会话历史之前：重放时据它跳过记历史——这次执行之后作废的话，续跑时
 		// 历史里已经有这一份。
-		saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Late: late, Out: out, Compaction: memo.out, Boundary: boundary, Final: true, Signals: sigs})
+		saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Late: late, Out: out, Compaction: memo.out, Boundary: boundary, Final: true, Signals: sigs, FinalRound: finalRound})
 		keepRecord = true
 		compose_v2.EmitSignals(ctx, sigs)
 		recordHistory(ctx, historyOwner(ctx, name), name, modelHistoryRecords(notes, inter, boundary, out, late))

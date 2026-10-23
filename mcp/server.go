@@ -449,6 +449,22 @@ func (s *server) setListedLocked(specs []ToolSpec) {
 	}
 }
 
+// listedAnnotations 返回最近一次拉到的清单里工具 source 的注解；listed 为 false 表示从没连上拉过清单（只有注册时那份）。
+// 拉到的清单里已经没有这个工具时返回 (nil, true)。
+func (s *server) listedAnnotations(source string) (a *ToolAnnotations, listed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listedNames == nil {
+		return nil, false
+	}
+	for _, sp := range s.listed {
+		if sp.Name == source {
+			return sp.Annotations.clone(), true
+		}
+	}
+	return nil, true
+}
+
 // driftLocked 比较最近一次拉到的清单与本会话注册的工具：注册了但已经没有的、新加的、定义变了的。调用方持 s.mu。
 func (s *server) driftLocked() (missing, added, changed []string) {
 	reg := make(map[string]struct{}, len(s.registered))
@@ -537,8 +553,11 @@ func validateSpecs(specs []ToolSpec) error {
 }
 
 // sameSpec 判两份定义发给模型时是否一样（描述与参数 schema）。
+// sameSpec 比较两份工具定义。注解也比：发给模型的那份定义不随它变，但审批的只读放行看它（见 RemoteTool.ReadOnly），
+// server 改了注解要在漂移告警里看得见。
 func sameSpec(a, b ToolSpec) bool {
-	return a.Description == b.Description && reflect.DeepEqual(normalizeSchema(a.InputSchema), normalizeSchema(b.InputSchema))
+	return a.Description == b.Description && reflect.DeepEqual(normalizeSchema(a.InputSchema), normalizeSchema(b.InputSchema)) &&
+		reflect.DeepEqual(a.Annotations, b.Annotations)
 }
 
 // normalizeSchema 把 nil schema 换成注册时用的默认值，免得「没给」与「给了默认值」被当成不同。

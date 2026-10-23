@@ -4,6 +4,7 @@ package observability_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -113,6 +114,14 @@ func (m *twoToolsModel) Stream(ctx context.Context, msgs []*schema.Message, opts
 // TestToolReplayed_DurationRecordedOnce：同一批里 a 跑完、b 问人挂起；续跑时 a 从工具账重放（不再执行）、OnToolEnd 再触发
 // 一次。a 的时长样本只记一次，重放那次的 span 标 crew.tool.replayed，不算进 agent 的调用次数。
 func TestToolReplayed_DurationRecordedOnce(t *testing.T) {
+	for _, layers := range []int{1, 2} {
+		t.Run(fmt.Sprintf("layers=%d", layers), func(t *testing.T) { testToolReplayed(t, layers) })
+	}
+}
+
+// testToolReplayed 跑一遍「a 跑完、b 挂起、续跑」；layers=2 时同一个 Observability 装两层（Install 两次），重放那次的计数
+// 也只退一次。
+func testToolReplayed(t *testing.T, layers int) {
 	h := newHarness(t)
 	var aRuns atomic.Int32
 	tk := tool.NewToolkit()
@@ -133,6 +142,9 @@ func TestToolReplayed_DurationRecordedOnce(t *testing.T) {
 		agent_v2.WithModel(&twoToolsModel{}),
 		agent_v2.WithToolkit(tk),
 	)
+	if layers == 2 {
+		ctx, opts = h.obs.Install(ctx, opts...)
+	}
 	ag := agent_v2.NewBasicAgent(opts...)
 	sess := agent_v2.NewRunSession()
 	runCtx := compose_v2.WithSessionIDCtx(ctx, sess.RunID)
@@ -165,6 +177,18 @@ func TestToolReplayed_DurationRecordedOnce(t *testing.T) {
 	}
 	if n := histCount(t, rm, observability.MetricExecuteToolDuration, map[string]string{"gen_ai.tool.name": "tool_b"}); n != 1 {
 		t.Errorf("tool_b 的时长样本=%d 应=1", n)
+	}
+	// 续跑那次 agent 调用里真正执行的只有 tool_b（tool_a 是重放）
+	agents := h.spansNamed("invoke_agent batcher")
+	if len(agents) != 2 {
+		t.Fatalf("Run + Resume 应各一个 agent span，got %d", len(agents))
+	}
+	resumed := agents[1]
+	if resumed.StartTime().Before(agents[0].StartTime()) {
+		resumed = agents[0]
+	}
+	if v, ok := attrOf(resumed, "crew.agent.tool_calls"); !ok || v.AsInt64() != 1 {
+		t.Errorf("续跑那次 agent 的 crew.agent.tool_calls=%v 应=1（重放的不算）", v.AsInt64())
 	}
 }
 

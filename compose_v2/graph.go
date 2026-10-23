@@ -445,7 +445,8 @@ func WithChannel[T any](b *GraphBuilder, ch *Channel[T]) *GraphBuilder {
 // WithMaxVisit 设单节点最大访问**轮数**（防死循环）。
 //
 // 计的是**深度**：一个超步里同一节点有多少并发实例不计入（fan-out 宽度由业务的
-// SendFrom 决定，不归它管）。宽度的兜底是 WithMaxFrontierWidth。
+// SendFrom 决定，不归它管）。宽度的兜底是 [GraphBuilder.WithMaxFrontierWidth]，
+// 它返的是 [MaxWidthError]；这道闸返 [MaxIterationsError]。
 func (b *GraphBuilder) WithMaxVisit(n int) *GraphBuilder {
 	b.maxVisit = n
 	return b
@@ -453,9 +454,12 @@ func (b *GraphBuilder) WithMaxVisit(n int) *GraphBuilder {
 
 // WithMaxFrontierWidth 设单个超步的最大并发成员数（默认 10000）。
 //
+// 触顶时返的是 `%w [MaxWidthError]`（`Width` = 触顶那一刻的宽度）——**不是**
+// [MaxIterationsError]，那个只装迭代深度。宽度与深度是两个正交维度，各有自己的类型。
+//
 // **为什么宽度要单独兜底**：maxVisit 计的是深度、一个超步至多 +1，所以它拦不住宽度。
 // 节点在自己的 NodeFunc 里 SendFrom 自己 N(≥2) 次时，宽度**逐超步相乘**——业务终止
-// 条件写错就是 N^超步数 的指数爆炸，进程会在 MaxIterationsError 冒出来之前先 OOM
+// 条件写错就是 N^超步数 的指数爆炸，进程会在 maxVisit 那道闸冒出来之前先 OOM
 // （实测 N=2、maxVisit=6 时执行 63 次；默认 maxVisit=100 则是 2^100）。
 //
 // 默认 10000 对正常 map-reduce 足够宽松（一个分支通常对应一次 LLM 调用，上万并发已

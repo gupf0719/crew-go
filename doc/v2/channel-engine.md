@@ -86,7 +86,7 @@ compose_v2/
 ├── retry.go                RetryConfig + SimpleRetry + ExponentialBackoff + RunWithRetry[T]
 ├── hooks.go                OrchestrationHooks 接口（5 回调）+ NoOp/ChainOrchHooks + WithOrchHooks ctx 透传（业务级 hook.Hooks 在 hook 包，非此文件）
 ├── recording_hooks.go      RecordingHooks test helper
-├── errors.go               1 sentinel + 3 typed error（ErrNoSubgraphCheckpoint / MaxIterationsError / MaxRoundsError / GraphNodeError）
+├── errors.go               哨兵 + typed error（ErrNoSubgraphCheckpoint 等 / MaxIterationsError 深度 / MaxWidthError 宽度 / MaxRoundsError / GraphNodeError）
 └── subgraph.go             AddSubgraphNode 头等子图节点
 
 # 7 个低阶编排 builder（BasicAgentBuilder / SequentialAgentBuilder / … / HandoffAgentBuilder）
@@ -1232,12 +1232,15 @@ nil ⟹ cleanup 走成功分支 `purgeExitSlot(reason="success")`。实测后果
 
 ### 11.2 5 类典型错误（Stage 5 C3 补）
 
-4 个 sentinel + 2 个 typed error：
+哨兵（找不到子图存档 / 没有可续的档 / 图身份冲突）+ typed error（迭代深度 / 扇出宽度 / ReAct 轮次）——
+**按类目写、别数个数**：个数写在清单之外的那一行，加一条时几乎必然忘改（`compose_v2/errors.go` 的
+`ErrRunAborted` godoc 记着同一条教训，那里的「共几条」在三处写出过三个互不相同的数）。
 
 ```go
 // compose_v2/errors.go
 var ErrNoSubgraphCheckpoint = errors.New("...")  // 嵌套子图找不到 cp
-type MaxIterationsError struct{ Iterations int }  // `compose_v2/graph_loop.go::Run` LoopAgent / Graph maxVisit 触顶时**实际抛** (按符号自查; errors.As 解析 Iterations)
+type MaxIterationsError struct{ Iterations int }  // **迭代深度**触顶：`graph_loop.go::Run` 的 maxVisit / LoopAgent / BasicAgent 跑满 maxRounds 时实际抛（BasicAgent 的 Run / Resume 出口**重铸**一个自己的挂外层，于是 errors.As 取到的是本 agent 的轮数）
+type MaxWidthError      struct{ Width int }       // **扇出宽度**失控：`graph_loop.go::Run` 的 maxFrontierWidth 触顶时抛，**一并 `%w ErrRunAborted`**（终局：存进档的 CurrentFrontier 就是那个超限的 frontier，留档续跑只会在同一道闸再爆）。与上面是两个正交维度，故各有自己的类型——共用一个 `Iterations` 的话调用方 errors.As 之后分不出拿到的是哪个量
 type MaxRoundsError      struct{ Rounds int }     // ReAct round 耗尽——typed 但生产路径不抛, 预留供业务自定义
 
 // compose_v2/checkpointer.go

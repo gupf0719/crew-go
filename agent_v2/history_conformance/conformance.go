@@ -97,6 +97,7 @@ func RunHistoryStoreTests(t *testing.T, factory HistoryStoreFactory) {
 	t.Run("EmptyConversation", func(t *testing.T) { testEmptyConversation(t, factory) })
 	t.Run("EmptyAppend", func(t *testing.T) { testEmptyAppend(t, factory) })
 	t.Run("LoadSnapshotIsolation", func(t *testing.T) { testLoadSnapshotIsolation(t, factory) })
+	t.Run("LongKeys", func(t *testing.T) { testLongKeys(t, factory) })
 	t.Run("Concurrent", func(t *testing.T) { testConcurrent(t, factory) })
 	t.Run("LoadLimitReturnsLatest", func(t *testing.T) { testLoadLimitReturnsLatest(t, factory) })
 	t.Run("PagingCoversAllOnce", func(t *testing.T) { testPagingCoversAllOnce(t, factory) })

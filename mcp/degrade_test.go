@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
 	"os"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -1588,5 +1591,392 @@ func TestStreamableHTTP_RedactEdges(t *testing.T) {
 	}
 	if strings.Contains(st.Err.Error(), "sk-PATH-SECRET-1234567") && strings.Contains(st.Err.Error(), "Cannot POST") {
 		t.Errorf("响应体里回显的 URL 路径秘密没抹：%v", st.Err)
+	}
+}
+
+// TestHub_ClientCallToolPanic_IsFailureNotPanic 钉住 [mcp.RemoteTool.Call] 的契约在业务 Client panic 时
+// 也成立：只在调用方 ctx 结束时返回 error，其余失败（panic 在内）一律以 tool.Failure 交回模型。
+//
+// ⚠️ 这条**必须单独存在**：panic 不兜的话它穿过 RemoteTool.Call 与 tool.Toolkit.Call（那一层不 recover），
+// 直到 agent_v2 外层兜底转成 error ⟹ 一个 server 的 bug 拖垮整个 Run，而「按 server 降级」的全部意义就是
+// 不让这件事发生。实测过：把 server.callClient 的 recover 去掉，全套 mcp 测试照样全绿。
+//
+// 同时钉「panic 不标掉线」：panic 是调用方代码的 bug，连接可能好着，标掉线会把一个工具的 bug 升级成整个
+// server 的降级（后续调用全部快速失败）。
+func TestHub_ClientCallToolPanic_IsFailureNotPanic(t *testing.T) {
+	c := &memClient{
+		name:  "s",
+		tools: specs("boom", "fine"),
+		onCall: func(_ context.Context, name string, _ map[string]any) (*mcp.CallResult, error) {
+			if name == "boom" {
+				panic("业务 Client 炸了")
+			}
+			return &mcp.CallResult{Content: []mcp.Block{{Type: "text", Text: "ok"}}}, nil
+		},
+	}
+	h := mcp.NewHub(mcp.WithClient(c))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+
+	byName := map[string]*mcp.RemoteTool{}
+	for _, tl := range h.Tools() {
+		byName[tl.Name()] = tl
+	}
+	boom, fine := byName["mcp_s_boom"], byName["mcp_s_fine"]
+	if boom == nil || fine == nil {
+		t.Fatalf("期望注册 mcp_s_boom 与 mcp_s_fine，实际 %v", slices.Sorted(maps.Keys(byName)))
+	}
+
+	res, err := func() (r *tool.Result, e error) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				t.Fatalf("panic 冲出了 RemoteTool.Call：%v（契约要求转成 tool.Failure）", rec)
+			}
+		}()
+		return boom.Call(context.Background(), map[string]any{"q": "x"})
+	}()
+	if err != nil {
+		t.Errorf("panic 应转成 tool.Failure 而不是 error，got err=%v", err)
+	}
+	if res == nil || res.Error == nil || res.Error.Code != tool.ErrCodeInternal {
+		t.Errorf("期望 tool.Failure(%s)，got %+v", tool.ErrCodeInternal, res)
+	}
+
+	// panic 不做健康降级：同一个 server 的另一件工具照常调得通。
+	//
+	// ⚠️ 这两条断言在**固定实例**（WithClient）上**恒真**，钉不住「不标掉线」那个决定——markOffline
+	// 第一行就是 `if s.factory == nil { return false }`，对固定实例是结构性 no-op。真正钉它的是下面那条
+	// 用 WithClientFactory 的姊妹用例（审计实测：panic 分支插入 markOffline，本用例照样 PASS）。
+	if res, err := fine.Call(context.Background(), map[string]any{"q": "x"}); err != nil || res == nil || res.Error != nil {
+		t.Errorf("panic 把 server 标成掉线了：后续调用 res=%+v err=%v", res, err)
+	}
+	if st := h.Status(); len(st) != 1 || st[0].State != mcp.ServerOnline {
+		t.Errorf("panic 之后 server 状态应仍是 online，got %+v", st)
+	}
+}
+
+// TestHub_ClientCallToolPanic_NonSerialKeepsConnection：**非串行**的 factory server 上 panic 只毁掉这一次
+// 调用——不做健康降级、也不换连接（没有重叠风险，panic 是代码 bug 而不是连接坏了）。
+//
+// 这条与下一条是一对，分开钉 connectionUntrusted 的两种答案。用 factory 而不是固定实例：markOffline 对
+// 固定实例是 no-op，拿它验不出「标没标掉线」。
+func TestHub_ClientCallToolPanic_NonSerialKeepsConnection(t *testing.T) {
+	var built atomic.Int32
+	newC := func(context.Context) (mcp.Client, error) {
+		built.Add(1)
+		var boom atomic.Bool
+		return &memClient{name: "s", tools: specs("t"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+			if boom.CompareAndSwap(false, true) {
+				panic("炸了")
+			}
+			return &mcp.CallResult{Content: []mcp.Block{{Type: "text", Text: "ok"}}}, nil
+		}}, nil
+	}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("s", newC))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	tl := h.Tools()[0]
+	if res, _ := tl.Call(context.Background(), map[string]any{}); res == nil || res.Error == nil {
+		t.Fatalf("fixture 没搭对：第一次应被兜成失败结果")
+	}
+	time.Sleep(120 * time.Millisecond) // 给重连（若发生）时间
+	if st := h.Status(); len(st) != 1 || st[0].State != mcp.ServerOnline {
+		t.Errorf("非串行 server 上 panic 不该标掉线，got %+v", st)
+	}
+	if n := built.Load(); n != 1 {
+		t.Errorf("非串行 server 上 panic 不该换连接，工厂建了 %d 个", n)
+	}
+}
+
+// TestHub_ClientCallToolPanic_SerialResetsConnection：**串行** factory server 上 panic 之后必须换连接。
+//
+// panic 不带 ErrNotSent ⟹ 按既有规则「请求可能已发出、结果不明」⟹ 旧连接那边可能还在执行，下一个调用
+// 发给它就让硬件上同时有两个操作，而 WithSerialCalls 的全部意义就是至多一个。
+//
+// ⚠️ 这条是 af7c45a 的回归哨兵：那次只跳过了健康降级，连带把这一维也跳过了。实测后果（本用例在修复前红）：
+// 工厂只建 1 个连接、硬件并发峰值 2，而 err == nil。既有哨兵一条都钉不住它。
+func TestHub_ClientCallToolPanic_SerialResetsConnection(t *testing.T) {
+	var built atomic.Int32
+	var mu sync.Mutex
+	var clients []*memClient
+	newC := func(context.Context) (mcp.Client, error) {
+		built.Add(1)
+		var boom atomic.Bool
+		c := &memClient{name: "cam", tools: specs("shoot"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+			if boom.CompareAndSwap(false, true) {
+				// 请求已写出、硬件已开始执行，解码响应时炸了——那边还在动，而我们不知道结果
+				panic("解码响应炸了")
+			}
+			return &mcp.CallResult{Content: []mcp.Block{{Type: "text", Text: "ok"}}}, nil
+		}}
+		mu.Lock()
+		clients = append(clients, c)
+		mu.Unlock()
+		return c, nil
+	}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("cam", newC, mcp.WithSerialCalls()))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Close()
+	tl := h.Tools()[0]
+	if res, _ := tl.Call(context.Background(), map[string]any{}); res == nil || res.Error == nil {
+		t.Fatalf("fixture 没搭对：第一次应被兜成失败结果")
+	}
+	time.Sleep(150 * time.Millisecond) // 等后台重连
+	_, _ = tl.Call(context.Background(), map[string]any{})
+
+	if n := built.Load(); n < 2 {
+		t.Fatalf("串行 server 上 panic 后应换连接（旧连接那边可能还在执行），工厂只建了 %d 个", n)
+	}
+	// 承重的断言是「第二次调用没有发给那条状态不明的旧连接」。
+	//
+	// ⚠️ 不要断言「硬件并发峰值 <= 1」：模拟「硬件还在动」要让 panic 那次永不收尾，于是它永久占着
+	// 一个槽，换连接之后峰值必然是 2——那个量在 bug 发生与修复后都是 2，不承重（第一版就写错了，实测
+	// 修复后照样红）。旧连接收到几次调用才会随这个 bug 变。
+	mu.Lock()
+	first := clients[0]
+	mu.Unlock()
+	if got := len(first.calls()); got != 1 {
+		t.Errorf("第二次调用被发给了那条状态不明的旧连接：它累计收到 %d 次（应只有 panic 那一次）", got)
+	}
+}
+
+// nilMethodErr 的 Error() 是**值接收者** ⟹ *nilMethodErr 也有 Error()，而对 typed-nil 指针调它会解引用
+// nil。这是 CLAUDE.md 点名的 typed-nil 陷阱：`err != nil` 为真，调它的方法却 panic。业务自定义 Client
+// 返回这样的 error 完全可能（`var e *myErr; return nil, e`）。
+type nilMethodErr struct{ msg string }
+
+func (e nilMethodErr) Error() string { return e.msg }
+
+func typedNilError() error {
+	var e *nilMethodErr
+	return e // 作为 error 非 nil
+}
+
+// TestHub_BusinessErrorMethodPanic_ContainedAndCloseNotStuck：业务 Client 返回的 **error 的方法** panic
+// 时，① 不冲出 RemoteTool.Call（契约：只在调用方 ctx 结束时返回 error，其余一律 tool.Failure），
+// ② 不把 Hub.Close 挂死。
+//
+// 真入口只有一个：markOffline 里原先的 `slog.Warn(…, cause.Error())`。它夹在 bg.Add(1) 与
+// go reconnectLoop 之间，panic 留下一个「Add 了却没有 Done」的 WaitGroup ⟹ Close 的 bg.Wait() 永久挂住。
+// 两层后果这条用例各有一个断言。
+//
+// ⚠️ 断言必须同时有「panic 没冲出」**和**「Close 在看门狗内返回」：panic 之前失败结果就已经算好了，
+// 只看返回值看不出 Close 已经废了。
+//
+// 顺带钉 ctx 路径的错误链：那条路按契约**可以**返回 error（调用方 ctx 结束了），但 ctx 的原因与业务 error
+// 都得留在链上，而且读它的文本不许 panic（`fmt.Errorf("%w")` 本来就安全——fmt 自己兜住 Error() 的 panic；
+// 这条断言防的是有人把它改成手工拼接或 `%s`，那会断链）。
+func TestHub_BusinessErrorMethodPanic_ContainedAndCloseNotStuck(t *testing.T) {
+	// cancelDuringCall 在 CallTool **执行期间**取消调用方 ctx。⚠️ 提前取消的话 call 在排队那一步
+	// （select on waitCtx.Done()）就返回了，根本走不到 c.CallTool、业务 error 从未产生——第一版就是这么
+	// 搭的，两个版本都绿（变异验证当场暴露）。
+	newHub := func(cancelDuringCall func()) (*mcp.Hub, *mcp.RemoteTool) {
+		t.Helper()
+		c := &memClient{name: "s", tools: specs("t"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+			if cancelDuringCall != nil {
+				cancelDuringCall()
+			}
+			return nil, typedNilError()
+		}}
+		h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("s",
+			func(context.Context) (mcp.Client, error) { return c, nil }, mcp.WithSerialCalls()))
+		if err := h.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		return h, h.Tools()[0]
+	}
+	assertCloseNotStuck := func(t *testing.T, h *mcp.Hub) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- h.Close() }()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("Hub.Close 挂死了：bg.Add(1) 已加而 reconnectLoop 没起，bg.Done() 永不调")
+		}
+	}
+
+	t.Run("markOffline_的日志不许直接调Error", func(t *testing.T) {
+		h, tl := newHub(nil)
+		escaped := func() (esc any) {
+			defer func() { esc = recover() }()
+			res, err := tl.Call(context.Background(), map[string]any{})
+			if err != nil || res == nil || res.Error == nil {
+				t.Errorf("该以 tool.Failure 交回，got res=%+v err=%v", res, err)
+			}
+			return nil
+		}()
+		if escaped != nil {
+			t.Errorf("panic 冲出了 RemoteTool.Call：%v", escaped)
+		}
+		assertCloseNotStuck(t, h)
+	})
+
+	t.Run("ctx路径的错误链完整且读文本不panic", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		h, tl := newHub(cancel)
+		escaped := func() (esc any) {
+			defer func() { esc = recover() }()
+			_, err := tl.Call(ctx, map[string]any{})
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("调用方 ctx 取消应留在错误链上，got %v", err)
+			}
+			if err != nil {
+				_ = err.Error() // 读一次文本：不许 panic
+			}
+			return nil
+		}()
+		if escaped != nil {
+			t.Errorf("panic 冲出了 RemoteTool.Call：%v", escaped)
+		}
+		assertCloseNotStuck(t, h)
+	})
+}
+
+// TestMCP_NoDirectErrorMethodCallInLogs：机械对账 —— **本包不许把 error 的 Error() 直接调来喂日志**。
+//
+// 为什么这是一条机械哨兵而不是一句注释：error 的 Error() 可能是**业务代码**（业务自定义 Client 返回的
+// error），CLAUDE.md 点名的 typed-nil 陷阱下调它就 panic。而框架里「哪些 error 是业务的」会随重构漂移
+// ——`hub.go` 那两处与 reconnectLoop 那处当前安全，只因为它们的 err 恰好先被 connect 的
+// `fmt.Errorf("%s: initialize: %w", …)` 包装过；有人改了 connect 不包装，它们立刻变成新入口。
+//
+// 实测的边界（go1.26）：
+//   - `slog.Warn(…, "err", err)`（传**值**）、`fmt.Errorf("…%w", err)`、`fmt.Sprintf("%v", err)` 都**安全**
+//     ——内部经 fmt 格式化，而 fmt 对 Error() 的 panic 自己兜住、渲染成 `%!v(PANIC=Error method: …)`；
+//     对 typed-nil 指针更是直接打 `<nil>`、连 Error() 都不调。`errors.Is` / `errors.As` 也照常成立。
+//   - 只有**直接调** `err.Error()` 会让 panic 冲出去。
+//
+// 所以规矩很简单：传值，别调。
+func TestMCP_NoDirectErrorMethodCallInLogs(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	// 形如 `logKeyErr, <任意>.Error()` —— 把 error 的文本直接取出来喂日志。
+	bad := regexp.MustCompile(`logKeyErr,\s*[^,)]*\.Error\(\)`)
+	var hits []string
+	scanned := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		scanned++
+		for i, line := range strings.Split(string(b), "\n") {
+			if bad.MatchString(line) {
+				hits = append(hits, fmt.Sprintf("%s:%d: %s", f, i+1, strings.TrimSpace(line)))
+			}
+		}
+	}
+	if scanned < 5 {
+		t.Fatalf("只扫到 %d 个生产文件——扫描面坏了，不是真的这么少", scanned)
+	}
+	if len(hits) > 0 {
+		t.Errorf("这些地方把 error 的 Error() 直接调出来喂日志了，改成传 error 本身（slog 内部经 fmt，"+
+			"对 Error() 的 panic 自己兜住）：\n  %s", strings.Join(hits, "\n  "))
+	}
+}
+
+// ignoreCtxFactory 是**建连接时不看 ctx** 的工厂：第 1 次直接给 first，第 2 次先等 gate（故意只等 gate、
+// 不 select ctx.Done()）再给 second。
+//
+// 为什么不能用 seqFactory：它的 gate 是 `select { gate; ctx.Done() }`，而 Hub.Close 会取消重连尝试的
+// ctx ⟹ 放行 gate 与取消是竞态，多数时候走 ctx 分支、连接根本建不出来，于是**根本到不了 goOnline**，
+// 下面那条不变量就测不到（第 6 类炸弹：fixture 没搭对 ⟹ 测出「缺陷不存在」）。业务工厂建连接时不检查
+// ctx 是真实世界的常态，这个形状不是人为的。
+type ignoreCtxFactory struct {
+	mu            sync.Mutex
+	n             int
+	gate          chan struct{}
+	first, second mcp.Client
+}
+
+func (f *ignoreCtxFactory) New(context.Context) (mcp.Client, error) {
+	f.mu.Lock()
+	f.n++
+	n := f.n
+	f.mu.Unlock()
+	if n == 1 {
+		return f.first, nil
+	}
+	<-f.gate
+	return f.second, nil
+}
+
+func (f *ignoreCtxFactory) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.n
+}
+
+// TestHub_ReconnectFinishingAfterClose_DiscardsNewClient：重连在 Hub.Close 之后才连上时，那个新连接
+// 必须被关掉、不能挂到已关闭的 server 上。
+//
+// 守的是 `server.goOnline` 开头的 `if s.closed { discard }` 早退。缺它的话：Close 已经把 server 标死、
+// 已有连接也关了，而重连循环随后把一个**活着的**连接写进 `s.client` 并标 online ⟹ 那个连接**永远没人
+// 关**（Hub 已经关完了，不会再有第二次 Close 去捡它），stdio 型就是一个留在系统里的子进程；而 Hub 的
+// 状态还会报 online，调用方照 `Status` 判断会以为这个 server 可用。
+//
+// ⚠️ 这条不变量**有时间窗**，所以 fixture 要把窗口撑开：工厂卡在第 2 次建连接上 → Close 进到
+// `bg.Wait()`（它在等重连循环退出）→ 这时才放行工厂 ⟹ goOnline 必然发生在 s.closed 之后。
+// 断言选在「新连接被关了没」上——那是只有早退才给的那个量（Close 关的是**掉线前**那个连接，
+// 数它的次数抓不到这个 bug）。
+func TestHub_ReconnectFinishingAfterClose_DiscardsNewClient(t *testing.T) {
+	var broken atomic.Bool
+	first := &memClient{name: "dev", tools: specs("run"), onCall: func(_ context.Context, name string, _ map[string]any) (*mcp.CallResult, error) {
+		if broken.Load() {
+			return nil, errDown
+		}
+		return &mcp.CallResult{Content: []mcp.Block{{Type: "text", Text: "ok"}}}, nil
+	}}
+	second := &memClient{name: "dev", tools: specs("run")}
+	f := &ignoreCtxFactory{gate: make(chan struct{}), first: first, second: second}
+	h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("dev", f.New))
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// 打掉连接 → 标离线 → 重连循环起来，卡在工厂第 2 次建连接上
+	broken.Store(true)
+	wantFailure(t, call(t, h, "mcp_dev_run"), mcp.ErrCodeServerUnavailable, "")
+	waitFor(t, "重连尝试开始", func() bool { return f.count() >= 2 })
+
+	closed := make(chan error, 1)
+	go func() { closed <- h.Close() }()
+
+	// 等 Close 真的把 server 标死（调用返「已关闭」即 s.closed 已置）——**必须等到这一步再放行工厂**，
+	// 否则连接可能在 closed 之前就挂上去了，那条早退根本不参与，用例恒真。
+	waitFor(t, "Close 已把 server 标死", func() bool {
+		out, err := h.Toolkit().Call(context.Background(), "mcp_dev_run", map[string]any{"q": "x"})
+		return err == nil && out != nil && out.Error != nil && strings.Contains(out.Error.Message, "已关闭")
+	})
+	close(f.gate) // 现在才放行：goOnline 必然在 s.closed 之后发生
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close 挂住了——重连循环的 bg.Done 没被等到")
+	}
+
+	waitFor(t, "Close 之后连上的那个连接被关掉", func() bool { return second.closed.Load() >= 1 })
+	if n := second.closed.Load(); n != 1 {
+		t.Errorf("Close 之后才连上的连接应被关掉恰好 1 次，实际 %d 次——0 次 = 它挂在了已关闭的 server 上、"+
+			"永远没人关（stdio 型是一个留在系统里的子进程）", n)
+	}
+	if st := statusOf(t, h, "dev"); st.State != mcp.ServerOffline {
+		t.Errorf("Hub 已关闭，server 状态应是离线，实际 %v——重连把它标回 online 了，"+
+			"调用方照 Status 判断会以为这个 server 还能用", st.State)
 	}
 }

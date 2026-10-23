@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -698,5 +699,206 @@ func TestSoftLanding_OpenAIWireKeepsToolsSendsNone(t *testing.T) {
 	var mie *compose_v2.MaxIterationsError
 	if fm := agent_v2.FinalMessage(events); fm == nil || fm.Content != "收尾答复" || !errors.As(err, &mie) {
 		t.Errorf("应以收尾答复 + MaxIterationsError 结束，实际答复 %+v err %v", fm, err)
+	}
+}
+
+// TestSoftLanding_HardCalledFrameworkToolNotExecuted：软降落轮硬调**框架工具**时同样不执行——放行的只有
+// 框架那件 final_output（结构化输出的唯一投递通道），按实例认。
+//
+// ⚠️ 这条钉的是 makeToolsFn 那道闸用 isFrameworkFinalOutput 而**不是** isFrameworkMintedIn。两者就差一个词、
+// 在相邻两行、形状相同，而注释反复讲「判的是实例不是名字」，极易被误改成后者。实测过：换成
+// isFrameworkMintedIn，`go test ./agent_v2/` 全量照样全绿——既有用例一条都钉不住它，因为
+// TestSoftLanding_BusinessFinalOutputWithoutSchemaNotExempt 验的是**业务**工具（本来就不是 minted，两种判据下
+// 都被拦）。
+//
+// 断言选在「ask_user 有没有真执行」而不是「有没有报错」：ask_user 真执行的表现就是抛中断，于是「Run 没中断」
+// 恰好是「它没执行」的可观测量（CLAUDE.md：验泄漏要断言工具有没有真执行，不是断言有没有中断——这里两者同一）。
+// 误放行的后果是把用户停在一个注定答不成的问题上：答完 Resume 只换来预算耗尽 + FinalMessage 为 nil。
+func TestSoftLanding_HardCalledFrameworkToolNotExecuted(t *testing.T) {
+	var noop atomic.Int32
+	m := &landingModel{hardCall: agent_v2.AskUserToolName}
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("slf"), agent_v2.WithModel(m), agent_v2.WithAskUser(),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &noop, "ok"))),
+		agent_v2.WithMaxRounds(1))
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+
+	rounds, choices := m.seen()
+	if len(rounds) != 2 {
+		t.Fatalf("fixture 没搭对：maxRounds=1 应调模型 2 次，实际 %d 次", len(rounds))
+	}
+	if !slices.Contains(rounds[1], agent_v2.AskUserToolName) || !isNone(choices[1]) {
+		t.Fatalf("fixture 没搭对：软降落轮应照旧绑着 ask_user 并发 tool_choice=none，"+
+			"实际那轮工具=%v tool_choice=%v", rounds[1], choiceNames(choices[1:]))
+	}
+	if ie, ok := compose_v2.IsInterrupt(err); ok {
+		t.Errorf("软降落轮硬调的 ask_user 被执行了——Run 停在提问 %q 上，而这个问题答完也只换来预算耗尽",
+			ie.Query.Question)
+	}
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(err, &mie) {
+		t.Errorf("软降落轮硬调工具、整批被拦后应以预算耗尽收尾，got err=%v", err)
+	}
+}
+
+// TestSoftLanding_HardToolCallErrorMentionsSoftLanding：provider 不守 tool_choice=none 时，报出去的错误
+// 正文要说清**发生了什么**——不能是裸的引擎消息。
+//
+// 这条路上图是失败的（整批被拦 ⟹ 条件边判「末条有 tool_call」回 model 节点 ⟹ 撞 maxVisit），所以 Run 出口
+// 那段友好正文的旧判据 `err == nil` 永不成立，调用方拿到的是 `node "model" visited N times (max M)`——
+// 一个字没提软降落，排查方向指不出去（审计实测）。而这条路上 postamble 没跑完，`FinalMessage` 可能是 nil，
+// 所以文案也不能照抄成功那条的「答复在 events 里」。
+//
+// ⚠️ 断言挑的是正文里那几个**只有这条路才会出现**的词（软降落 / round_budget_exhausted / FinalMessage
+// 可能为 nil），不是「正文非空」——后者在裸引擎消息下也成立，不承重。
+func TestSoftLanding_HardToolCallErrorMentionsSoftLanding(t *testing.T) {
+	var n atomic.Int32
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("sl"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(2))
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+	if err == nil {
+		t.Fatal("fixture 没搭对：软降落轮硬调工具、整批被拦，应以错误收尾")
+	}
+	for _, want := range []string{"软降落轮", "FinalMessage 可能为 nil", "跑满 3 轮"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误正文应点出 %q，实际正文：%v", want, err)
+		}
+	}
+	// 「跑满 N 轮」必须是**本 agent 自己的**轮数：正文的其余部分讲的是本 agent 的预算，数字跟着别人跑
+	// 就是把假归属写进了头条（见 TestSoftLanding_BudgetMessageDoesNotMisattribute）。
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(err, &mie) {
+		t.Errorf("仍应能 errors.As 出 MaxIterationsError（调用方据它判预算耗尽），实际 %v", err)
+	}
+}
+
+// hookErrAtNth：第 n 次 OnToolStart 返回一个包着「别人的」MaxIterationsError 的错误——模拟业务钩子里
+// 按 RegrantFromNode 范式调起的校验子 agent 自己预算耗尽。
+type hookErrAtNth struct {
+	hook.NoOpHooks
+	nth   int32
+	extra error // 非 nil 时与 MaxIterationsError 一起 Join（验「中断并存」那一档）
+	seen  atomic.Int32
+}
+
+func (h *hookErrAtNth) OnToolStart(ctx context.Context, _ *hook.AgentInfo, _ *schema.ToolInput) (context.Context, error) {
+	if h.seen.Add(1) != h.nth {
+		return ctx, nil
+	}
+	mie := &compose_v2.MaxIterationsError{Iterations: 99} // 99 便于辨认归属
+	if h.extra != nil {
+		return ctx, errors.Join(h.extra, mie)
+	}
+	return ctx, fmt.Errorf("校验子 agent 失败: %w", mie)
+}
+
+// TestSoftLanding_BudgetMessageDoesNotMisattribute：预算耗尽的正文**只陈述本 agent 能确定的事**，不把
+// 别人的 MaxIterationsError 说成「我的软降落轮模型硬调了工具」。
+//
+// 可达窗口（审计实测）：软降落轮的 tools 节点里业务 OnToolStart 对被拦下的那一批**照样 fire**，钩子返错
+// 让节点失败，而那个错里可以包着钩子自己调起的子 agent 的 MaxIterationsError。此刻 round 恰好是 mr+1，
+// 于是出口判据 `errors.As(err, &mie)` 成立 —— 但它问的是「链上任何位置有没有」，不足以支撑那句断言。
+//
+// ⚠️ 这条钉的是「正文不做假陈述」+「数字是自己的」两件事。断言挑的是**会随这个 bug 变**的量：
+// 正文里不许出现「仍硬调了工具」这种对本 agent 的断言式陈述，而「跑满 N 轮」必须是本 agent 的 3 而不是
+// 钩子里那个 99。af7c45a 的版本实测报出 `…模型仍硬调了工具…: 达到最大迭代：99`。
+func TestSoftLanding_BudgetMessageDoesNotMisattribute(t *testing.T) {
+	var n atomic.Int32
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("parent"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithHooks(&hookErrAtNth{nth: 3}), // maxRounds=2 ⟹ tools 跑 3 次，第 3 次是软降落轮
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))),
+		agent_v2.WithMaxRounds(2))
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+	if err == nil {
+		t.Fatal("fixture 没搭对：钩子在软降落轮返错，应以错误收尾")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "仍硬调了工具") {
+		t.Errorf("正文对本 agent 做了谓词不支撑的断言（真因是钩子里的子 agent 预算耗尽）：%v", err)
+	}
+	if !strings.Contains(msg, "跑满 3 轮") {
+		t.Errorf("正文里的轮数应是本 agent 自己的 3，实际：%v", err)
+	}
+	if !strings.Contains(msg, "校验子 agent 失败") {
+		t.Errorf("真正的错误应保留在链上可读，实际：%v", err)
+	}
+}
+
+// TestSoftLanding_BudgetMessageSkipsInterrupt：错误链上同时带中断时**整个不改写**。
+//
+// a2a/server 与 agui 按 IsInterrupt 走中断分支、把问题呈现给用户请他作答，而同一个错误的头条说「预算
+// 耗尽、FinalMessage 可能为 nil」是自相矛盾的。改写只放宽、不收窄——中断原样穿过。
+func TestSoftLanding_BudgetMessageSkipsInterrupt(t *testing.T) {
+	var n atomic.Int32
+	ie := &compose_v2.InterruptError{Reason: "需要人工确认", Query: &compose_v2.AskQuery{
+		InterruptID: "probe-id", Question: "批准吗",
+	}}
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("p"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithHooks(&hookErrAtNth{nth: 3, extra: ie}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))),
+		agent_v2.WithMaxRounds(2))
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+	got, isInt := compose_v2.IsInterrupt(err)
+	if !isInt {
+		t.Fatalf("fixture 没搭对：钩子返的错里带中断，IsInterrupt 应为真，err=%v", err)
+	}
+	if strings.Contains(err.Error(), "轮次预算耗尽") {
+		t.Errorf("前端会按中断请用户回答 %q，正文却说预算耗尽、FinalMessage 可能为 nil：%v", got.Query.Question, err)
+	}
+}
+
+// TestSoftLanding_IterationsIsOwnRoundCount：预算耗尽时 `errors.As` 取出的 `Iterations` 是**本 agent 跑满
+// 的轮数**，跟错误正文里那句「跑满 N 轮」是同一个数。
+//
+// ⚠️ 同一次跑满会**经过两个抛出点**：引擎的 maxVisit 先拒（它填 `visits[id]` = maxRounds+2，也就是被拒
+// 的那一次访问），出口再包一层。不在出口重铸的话 `errors.As` 取到的是引擎那个数，于是**同一个诊断给
+// 两个数**——正文说「跑满 3 轮」而载荷是 4。`withFinalRound` 的 godoc 正是教调用方「当预算用：
+// errors.As(&mie) 之后读」。
+//
+// 断言挑的是「载荷与正文里的数字相等」而不是「载荷等于某个常量」：后者在改了 maxRounds 的默认值或
+// maxVisit 公式之后要跟着改，而前者钉的是两者**一致**这个契约本身。
+func TestSoftLanding_IterationsIsOwnRoundCount(t *testing.T) {
+	var n atomic.Int32
+	const maxRounds = 2
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("sl"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))),
+		agent_v2.WithMaxRounds(maxRounds))
+	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+	if err == nil {
+		t.Fatal("fixture 没搭对：软降落轮硬调工具、整批被拦，应以错误收尾")
+	}
+	var mie *compose_v2.MaxIterationsError
+	if !errors.As(err, &mie) {
+		t.Fatalf("应能 errors.As 出 MaxIterationsError，实际 %v", err)
+	}
+	// 跑满 = 访问了 maxRounds+1 次 model 节点
+	if want := maxRounds + 1; mie.Iterations != want {
+		t.Errorf("Iterations=%d 应是本 agent 跑满的轮数 %d（引擎 maxVisit 填的是 %d，被拒的那次访问）"+
+			"——不重铸就会取到引擎那个数，跟正文里「跑满 %d 轮」对不上",
+			mie.Iterations, want, maxRounds+2, want)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("跑满 %d 轮", mie.Iterations)) {
+		t.Errorf("载荷 Iterations=%d 与正文里的轮数应是同一个数，实际正文：%v", mie.Iterations, err)
+	}
+
+	// **重铸的那条必须排在 errors.Join 的第一个参数**：errors.As 取链上第一个，调序就取回引擎填的
+	// visits[id]（上面那条断言会红），而 Join 的 Error() 按参数序用 \n 拼 ⟹ 参数序同时决定**正文的行序**。
+	// 两件事由同一个量决定，所以正文的指路话（「下一行…引擎的原错误在第二行」）是这个顺序的可观测影子：
+	// 这里把它钉住，调序时**正文与载荷一起红**。只断言载荷的话，指路话指错了行没人知道（审计实测它曾指向
+	// 一句同义重复）。
+	lines := strings.Split(err.Error(), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("出口错误应有两行（重铸的轮数 + 引擎原错误），实际 %d 行：%v", len(lines), err)
+	}
+	if !strings.HasSuffix(lines[0], mie.Error()) {
+		t.Errorf("第一行结尾应是重铸的那条（%q），实际 %q——Join 参数序反了的话这里与 Iterations 一起错",
+			mie.Error(), lines[0])
+	}
+	if !strings.Contains(lines[1], "max") || !strings.Contains(lines[1], "model") {
+		t.Errorf("第二行应是引擎的原错误（点出 model 节点与 max 访问次数），实际 %q", lines[1])
 	}
 }

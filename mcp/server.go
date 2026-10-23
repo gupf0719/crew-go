@@ -242,7 +242,21 @@ func (s *server) call(ctx context.Context, name, source string, args map[string]
 	}
 	defer cancel()
 
-	res, err := c.CallTool(callCtx, source, args)
+	res, err, panicked := s.callClient(callCtx, c, source, args)
+	if panicked != nil {
+		// 业务自定义 Client 的 CallTool panic：按这次调用失败交回模型。
+		//
+		// **健康降级那一维跳过**——panic 是调用方代码里的 bug，连接本身可能好着，把整个 server 标掉线
+		// 会让一个工具的 bug 变成所有工具快速失败。
+		//
+		// **但「连接还能不能接着用」那一维照样成立**（见 connectionUntrusted）：panic 不带 ErrNotSent，
+		// 按既有规则就是「请求可能已发出、结果不明」，串行 server 上旧连接那边可能还在执行，必须换一条。
+		// 不换的实测后果：工厂只建 1 个连接、硬件并发峰值 2（WithSerialCalls 要至多 1 个），而 err == nil。
+		if s.connectionUntrusted(false) {
+			s.markOffline(gen, fmt.Errorf("%s: 工具 %s 执行时 panic，连接状态不明", s.name, source))
+		}
+		return panicked, nil
+	}
 	if err != nil {
 		return s.callFailed(ctx, callCtx, name, gen, err)
 	}
@@ -260,6 +274,35 @@ func (s *server) call(ctx context.Context, name, source string, args map[string]
 		return tool.Success(res.Structured), nil
 	}
 	return tool.Success(flattenContent(res.Content)), nil
+}
+
+// callClient 调业务 Client 的 CallTool，兜住它的 panic。
+//
+// 为什么这里必须兜：[RemoteTool.Call] 的契约是**只在调用方 ctx 结束时返回 error**，其余失败一律
+// 以 tool.Failure 交回模型（BasicAgent 把工具 error 当整轮失败）。Client 是业务可自定义的实现，
+// 它 panic 时既不是 error 也不是 Failure——panic 会穿过 RemoteTool.Call 与 tool.Toolkit.Call（那一层
+// 不 recover），直到 agent_v2 / compose_v2 的外层兜底转成 error，于是**一个 server 的 bug 拖垮整个
+// Run**，正是「按 server 降级」要避免的那件事。
+//
+// 兜住之后 panic 只毁掉这一次工具调用：模型拿到一条失败的 tool_result，照常可以换个工具或改参数重试。
+// connect / closeQuietly / Hub.Close 三处同样兜业务 Client 的 panic，本函数是第四处（调用热路径）。
+//
+// 返回值三选一：panicked 非 nil 表示兜住了 panic（此时 res / err 都不可用），否则按 res / err 走常路。
+func (s *server) callClient(ctx context.Context, c Client, source string, args map[string]any) (res *CallResult, err error, panicked *tool.Result) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		pe := panicerr.New(r)
+		panicerr.Log(ctx, slog.LevelError, "mcp: 调用工具时兜住 panic，已转成失败结果", pe,
+			"mcp_server", s.name, "tool", source)
+		res, err = nil, nil
+		panicked = tool.Failure(tool.ErrCodeInternal,
+			fmt.Sprintf("%s 的工具 %s 执行时崩溃了（panic），这次调用没有结果", s.name, source))
+	}()
+	res, err = c.CallTool(ctx, source, args)
+	return res, err, nil
 }
 
 // admit 按当前状态决定这次调用能不能发出：能发时交出当前连接与它的代数，不能时交出给模型的失败结果。
@@ -291,10 +334,23 @@ func (s *server) admit(source string) (Client, uint64, *tool.Result) {
 //   - 其余算连接出错（含没写出就失败、HTTP 401 / 403 / 404 / 5xx）→ 标掉线、后台重连，返回「该能力暂时不可用」。
 //
 // 「没有发出」只认 Client 明确包上的 ErrNotSent，不从错误形状推断（推断错了，模型会把一个已执行的写操作当成没执行、再做一遍）。
+// connectionUntrusted 判「这次调用之后这条连接还能不能接着用」。
+//
+// ⚠️ 它问的**不是**「连接健康吗」，而是「请求可能已经发出、而我不知道结果吗」——串行的 server
+// （[WithSerialCalls]）上那边可能还在执行，下一个调用发给同一条连接就是让硬件上同时有两个操作。
+// 默认假定**已经发出**：只有 Client 明确包上 [ErrNotSent] 才算没发出（从错误形状推断会让模型把一个
+// 已执行的写操作当成没执行、再做一遍）。固定实例（[WithClient]）换不了连接，所以不适用。
+//
+// 两条路共用这一份：业务 Client 返回 error（callFailed）与业务 Client panic（call 里的 panic 分支）。
+// 判据只长在其中一处的后果实测过：panic 那条路跳过重置 ⟹ 工厂只建了 1 个连接、硬件并发峰值 2，
+// 而 err == nil。
+func (s *server) connectionUntrusted(notSent bool) bool {
+	return s.sem != nil && s.factory != nil && !notSent
+}
+
 func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint64, err error) (*tool.Result, error) {
 	notSent := errors.Is(err, ErrNotSent)
-	// 串行的 server：请求发出之后没等到结果，那边可能还在执行，连接不可信——标掉线、关旧连接再重连（见 WithSerialCalls）。
-	untrusted := s.sem != nil && s.factory != nil && !notSent
+	untrusted := s.connectionUntrusted(notSent)
 	if ctx.Err() != nil {
 		if untrusted {
 			s.markOffline(gen, err)
@@ -372,9 +428,22 @@ func (s *server) markOffline(gen uint64, cause error) bool {
 	// 在线时不会有重连循环在跑（循环只在离线时存在、上线即退出），所以每次掉线起一个。
 	s.hub.bg.Add(1)
 	s.mu.Unlock()
-	slog.Warn("mcp: server 掉线，后台重连；期间它的工具返回「该能力暂时不可用」",
-		logKeyServer, s.name, logKeyErr, cause.Error())
+	// **起 goroutine 紧跟在 Add 之后**（中间只隔一个 Unlock，它不会 panic）：这两者之间夹任何可能 panic 的
+	// 代码，panic 就留下一个「Add 了却没有对应 Done」的 WaitGroup ⟹ Hub.Close 的 bg.Wait() 永久挂住。
+	// 实测过：日志原先排在这中间，而它调的是**业务 error 的 Error()**（见下），Close 挂死、3 秒看门狗全程
+	// 不返回。**这里不要插代码。**
+	//
+	// ⚠️ 这一条**没有哨兵钉得住**，靠的就是这段注释：下面那行日志改成传 error 值之后它已经不会 panic，
+	// 于是把 go 挪回日志之后也没有任何行为差异（实测变异不红）。它防的是**将来**有人在这两行之间插入会
+	// panic 的代码，不是现在的某个 bug。
 	go s.reconnectLoop(stale)
+	// ⚠️ **传 cause 本身，不要传 cause.Error()**。cause 是业务 Client 返回的 error，它的 Error() 是业务
+	// 代码——CLAUDE.md 点名的 typed-nil 陷阱（`var e *myErr; return nil, e`）下 `err != nil` 为真而调它
+	// 解引用 nil。而 slog（以及 fmt.Errorf("%w") / fmt.Sprintf("%v")）内部经 fmt 格式化，fmt 对 Error()
+	// 的 panic **自己兜住**、渲染成 `%!v(PANIC=Error method: …)`，对 typed-nil 更是直接打 `<nil>` 连
+	// Error() 都不调。所以**框架只在直接调 .Error() 的地方才有风险**，而这里本来就不需要直接调。
+	slog.Warn("mcp: server 掉线，后台重连；期间它的工具返回「该能力暂时不可用」",
+		logKeyServer, s.name, logKeyErr, cause)
 	return true
 }
 
@@ -408,7 +477,7 @@ func (s *server) reconnectLoop(stale Client) {
 		}
 		delay = min(delay*2, h.backoffMax)
 		slog.Debug("mcp: 重连失败，稍后再试", logKeyServer, s.name, logKeyAttempt, attempt,
-			logKeyErr, err.Error(), logKeyRetryIn, delay.String())
+			logKeyErr, err, logKeyRetryIn, delay.String())
 		timer.Reset(delay)
 	}
 }
@@ -533,7 +602,7 @@ func closeQuietly(c Client) {
 		}
 	}()
 	if err := c.Close(); err != nil {
-		slog.Warn("mcp: 关闭 client 出错", logKeyServer, c.Name(), logKeyErr, err.Error())
+		slog.Warn("mcp: 关闭 client 出错", logKeyServer, c.Name(), logKeyErr, err)
 	}
 }
 

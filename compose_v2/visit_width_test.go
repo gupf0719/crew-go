@@ -128,15 +128,101 @@ func TestVisitCount_CompoundSelfFanoutIsBounded(t *testing.T) {
 	defer cancel()
 
 	err = compose_v2.Run(ctx, g, compose_v2.NewChannelManager())
-	var mie *compose_v2.MaxIterationsError
-	if !errors.As(err, &mie) {
-		t.Fatalf("宽度指数爆炸应被 MaxIterationsError 拦住，got %v（执行了 %d 次）\n"+
+	// 钉的**行为契约不变**：宽度指数爆炸必须被拦住。换的只是类型——宽度与深度是两个正交维度，
+	// 曾经共用 MaxIterationsError（`Iterations` 一个装宽度一个装深度，调用方 errors.As 之后分不出拿到
+	// 的是哪个量），现在宽度有自己的 [compose_v2.MaxWidthError]。用专属类型断言比原来**更准**：
+	// 深度触顶再也不会误命中这条。
+	var mwe *compose_v2.MaxWidthError
+	if !errors.As(err, &mwe) {
+		t.Fatalf("宽度指数爆炸应被 MaxWidthError 拦住，got %v（执行了 %d 次）\n"+
 			"  没拦住 = 宽度无界，默认 maxVisit=100 时是 2^100 次执行，OOM 先到",
 			err, ran.Load())
+	}
+	if mwe.Width <= 2000 {
+		t.Errorf("MaxWidthError.Width=%d 应大于宽度上限 2000——它要装的是触顶时的宽度", mwe.Width)
+	}
+	// 宽度失控不该被当成深度触顶：两个维度各有自己的类型，调用方据此分流处置
+	// （宽度 ⟹ 查业务的终止条件；深度 ⟹ 预算耗尽）。
+	var mie *compose_v2.MaxIterationsError
+	if errors.As(err, &mie) {
+		t.Errorf("宽度失控不该同时命中 MaxIterationsError（Iterations=%d）——那正是两个维度共用一个类型"+
+			"的老问题", mie.Iterations)
 	}
 	// 拦在宽度上限量级，而不是等指数涨到天上
 	if got := ran.Load(); got > 8000 {
 		t.Errorf("拦得太晚：已执行 %d 次（宽度上限 2000，应在同量级拦住）", got)
 	}
 	t.Logf("宽度防线在 %d 次执行后拦住", ran.Load())
+}
+
+// TestWidthOverflow_IsTerminalAndLeavesNoPoisonedCheckpoint：宽度失控是**终局**的——档被清掉、
+// 各吞错点不吞。
+//
+// 不清档的后果实测过：存进档的 `CurrentFrontier` 就是那个超限的 frontier，而续跑闸门按**内容**判
+// （`HasResumableWork`，不读 Status）⟹ 同 sid 再 Run 时 auto-load 捡起它，**节点一次没跑**就在同一道
+// 闸上以同一个 Width 再爆，那个 (sid, ns) 槽从此是死的，且每次重爆都往持久后端写一遍上万条 frontier。
+//
+// ⚠️ **断言选在承重的维度上**：不能只断言「errors.Is(ErrRunAborted)」——`MaxWidthError` 本来就实现
+// `NonRetryable`，把 `%w ErrRunAborted` 撤掉后 `IsRetryable` 仍是 false（双层防护遮蔽，CLAUDE.md
+// 第 4 类炸弹）。真正只有 abort 才给的是这三样：**档被清掉**、**第二次 Run 从头跑而不是 ran==0**、
+// **MustPropagate 为真**。
+func TestWidthOverflow_IsTerminalAndLeavesNoPoisonedCheckpoint(t *testing.T) {
+	var ran atomic.Int32
+	b := compose_v2.NewBuilder().WithName("poison").WithMaxVisit(60).WithMaxFrontierWidth(64)
+	b.AddNode("W", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		ran.Add(1)
+		compose_v2.SendFrom(ctx,
+			compose_v2.SendDirective{Target: "W"},
+			compose_v2.SendDirective{Target: "W"})
+		return nil, nil
+	})
+	b.AddEdge(compose_v2.StartNode, "W")
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	cp := compose_v2.NewInMemoryCheckpointer()
+	const sid = "poison-sid"
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ctx = compose_v2.WithCheckpointerCtx(ctx, cp)
+
+	err = compose_v2.Run(ctx, g, compose_v2.NewChannelManager(), compose_v2.WithSessionID(sid))
+	var mwe *compose_v2.MaxWidthError
+	if !errors.As(err, &mwe) {
+		t.Fatalf("fixture 没搭对：第一次 Run 应以宽度失控收尾，got %v（执行 %d 次）", err, ran.Load())
+	}
+	if ran.Load() == 0 {
+		t.Fatal("fixture 没搭对：第一次 Run 应真的执行过节点")
+	}
+	if !compose_v2.MustPropagate(ctx, err) {
+		t.Error("宽度失控应 MustPropagate——否则经 AgentAsTool 等吞错点会被吞成工具失败，模型换条路再试，" +
+			"最终调用方拿到的是别的错，这次区分宽度与深度的改动被抹掉")
+	}
+
+	ok, exErr := cp.ExistsNS(ctx, sid, "")
+	if exErr != nil {
+		t.Fatalf("ExistsNS: %v", exErr)
+	}
+	if ok {
+		ckpt, _ := cp.LoadNS(ctx, sid, "")
+		n := 0
+		if ckpt != nil {
+			n = len(ckpt.CurrentFrontier)
+		}
+		t.Errorf("宽度失控应清掉 cp 子树，档还在（frontier %d 条）——留着它 auto-load 会捡起来、"+
+			"节点一次没跑就在同一道闸再爆，那个 sid 从此是死的", n)
+	}
+
+	// 承重的那条：同 sid 再 Run 必须**从头跑**（节点真执行），而不是捡起毒档 ran==0 再爆。
+	ran.Store(0)
+	err2 := compose_v2.Run(ctx, g, compose_v2.NewChannelManager(), compose_v2.WithSessionID(sid))
+	if !errors.As(err2, &mwe) {
+		t.Fatalf("第二次 Run 也该以宽度失控收尾（图没变），got %v", err2)
+	}
+	if ran.Load() == 0 {
+		t.Error("第二次 Run 节点一次没跑 ⟹ auto-load 捡起了上次的毒档、直接在闸上再爆；" +
+			"清了档的话它是 fresh run，节点会从 StartNode 真跑一遍")
+	}
 }

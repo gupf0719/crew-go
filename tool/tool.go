@@ -1,9 +1,14 @@
 package tool
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
+	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"crew-go/schema"
 )
@@ -215,6 +220,47 @@ func IsFrameworkError(r *Result) bool {
 // Success 创建成功的结果。
 func Success(output any) *Result {
 	return &Result{Success: true, Output: output}
+}
+
+// OutputText 把 [Result].Output 写成交给模型的正文：字符串原样；合法 UTF-8 的 []byte 当文本（不是的按 JSON
+// 编成 base64 字符串）；map、slice、struct（及指向它们的指针）编成 JSON；其余（数字、布尔、实现了
+// fmt.Stringer / error 的值、nil）按 %v。
+//
+// 按 %v 打印 map / struct 得到的是 Go 的写法（`map[items:[...] total:1]`、`{a 1}`），模型读不准、也不是任何
+// 工具文档里写的格式；JSON 才是。编不成 JSON（含 channel、函数等）时退回 %v。
+func OutputText(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []byte:
+		if utf8.Valid(x) {
+			return string(x)
+		}
+	case fmt.Stringer, error:
+		return fmt.Sprintf("%v", x)
+	}
+	if v == nil || !structured(reflect.TypeOf(v)) {
+		return fmt.Sprintf("%v", v)
+	}
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false) // 给模型看的，<、>、& 原样
+	if err := enc.Encode(v); err != nil {
+		return fmt.Sprintf("%v", v)
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// structured 报一个类型是不是要编成 JSON 的那类：map、slice、array、struct，或指向它们的指针。
+func structured(t reflect.Type) bool {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
+		return true
+	}
+	return false
 }
 
 // Failure 创建业务级故障结果（返回给 LLM）。

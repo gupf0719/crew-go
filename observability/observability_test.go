@@ -1835,3 +1835,150 @@ func TestInterrupt_CheckpointNotPersisted_IsErrorNotBlocked(t *testing.T) {
 		t.Errorf("档没写成的中断不该留下挂起记录（它续不上），PendingInterrupts()=%d", n)
 	}
 }
+
+// TestNodeInstance_FanoutSpansAreDistinct：扇出实例维 `crew.node.instance` 两件事都钉住 ——
+// ① 写成属性让 trace 上分得出哪条是哪个实例；② **参与「同一实例不重开 span」的判据**。
+//
+// 实测厘清了一件事：`inst` 参与的那个早退判据（`cur.instance == inst`）防的是**同一个 Observability
+// 装了两层**（函数 godoc 原话），**不是**扇出——扇出的两个实例并发跑、各有自己的 ctx，`handleFrom(ctx)`
+// 取到的 cur 为 nil，早退条件根本不成立。所以变异 `inst := ""` 之后 span 仍是 2 个，红的是属性断言。
+//
+// ⚠️ 下面「span 个数 == 2」那条断言因此**在这个 fixture 下不承重**（变异时属性那条先红）。保留它是因为
+// 它防的是「装两层 + 扇出」的组合——那个组合下 instance 维一旦塌掉，第二个实例的 span 才会被判成已开过
+// 而整个不建，而 harness 的 assertAllEnded 只比 started/ended 的数量、抓不到。要钉死那个组合得再搭一层
+// Observability（形状见 TestTwoInstancesStacked_EachComplete），本轮没做。
+func TestNodeInstance_FanoutSpansAreDistinct(t *testing.T) {
+	h := newHarness(t)
+	in := compose_v2.LastValue[*schema.Message]("in")
+	out := compose_v2.Append[string]("out")
+	bld := compose_v2.NewBuilder()
+	compose_v2.WithChannel(bld, in)
+	compose_v2.WithChannel(bld, out)
+	// 扇出节点：对同一个 target 投两次 ⟹ 下一超步同一 nodeID 两个实例（引擎按 SendFrom 推 instance ID）。
+	bld.AddNode("spread", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		compose_v2.SendFrom(ctx,
+			compose_v2.SendDirective{Target: "fan"},
+			compose_v2.SendDirective{Target: "fan"})
+		return nil, nil
+	})
+	bld.AddNode("fan", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		return []compose_v2.ChannelWrite{compose_v2.Write(out, []string{compose_v2.GetCurrentInstanceID(ctx)})}, nil
+	})
+	bld.AddEdge(compose_v2.StartNode, "spread")
+	bld.AddEdge("fan", compose_v2.EndNode)
+	g, err := bld.Compile()
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	ga := agent_v2.NewGraphAgent(g,
+		agent_v2.WithGraphAgentName("fanout_agent"),
+		agent_v2.WithGraphAgentHooks(h.obs.AgentHooks()),
+		agent_v2.WithGraphInputWriter(func(m *schema.Message) []compose_v2.ChannelWrite {
+			return []compose_v2.ChannelWrite{compose_v2.Write(in, m)}
+		}),
+		agent_v2.WithGraphOutputReader(func(chs compose_v2.Channels) *schema.Message {
+			got, _ := compose_v2.Get(chs, out)
+			return schema.AssistantMessage(strings.Join(got, ","))
+		}))
+	ctx := agent_v2.WithCtxOrchHooks(context.Background(), h.obs.OrchHooks())
+	if _, err := ga.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("go")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	h.assertAllEnded(t)
+
+	spans := h.spansNamed("node fan")
+	if len(spans) != 2 {
+		t.Fatalf("同一 nodeID 扇出两个实例应各有一个 span，实际 %d 个——instance 维没进「同一实例不重开」"+
+			"的判据时第二个实例会被判成已开过、整个不建；全部 span：%v", len(spans), names(h.spans()))
+	}
+	seen := map[string]bool{}
+	for _, s := range spans {
+		inst := strAttr(t, s, observability.AttrNodeInstance)
+		if inst == "" {
+			t.Errorf("扇出实例的 span 应带 %s，got 空", observability.AttrNodeInstance)
+		}
+		if seen[inst] {
+			t.Errorf("两个实例的 %s 相同（%q）——trace 上分不出哪条是哪个", observability.AttrNodeInstance, inst)
+		}
+		seen[inst] = true
+	}
+}
+
+// TestA2AServerSpan_NestsUnderRemoteParent：server span 挂在**远端父**下、kind 是 Server，内层 agent
+// span 再挂在它下面——跨进程 trace 是一棵树。
+//
+// ⚠️ inject / extract 那半有 TestPropagation_RoundTrip 钉着，**消费 extract 结果的那半**此前一条用例
+// 都没有（StartA2AServerSpan 只在 TestNilObservability_NoPanic 里被调过一次、nil 接收者）。
+// 变异「用 context.Background() 起 span」或「改成 SpanKindInternal」都不会让任何既有用例变红，
+// 而后果是跨进程 trace 断成两棵树。断言挑的是 TraceID 相等 + 父 SpanID + SpanKind，三者各管一种退化。
+func TestA2AServerSpan_NestsUnderRemoteParent(t *testing.T) {
+	h := newHarness(t)
+	// 模拟对端：起一个 span 并把 trace context 注入 metadata。
+	clientCtx, clientSpan := h.obs.Tracer().Start(context.Background(), "remote_caller")
+	md := map[string]any{}
+	h.obs.InjectToMetadata(clientCtx, md)
+	clientSpan.End()
+
+	// server 侧：extract → 起 server span → 内层 agent span
+	srvCtx := h.obs.ExtractFromMetadata(context.Background(), md)
+	srvCtx, ss := h.obs.StartA2AServerSpan(srvCtx, "message/send", "ctx-1", "task-1")
+	ah := h.obs.AgentHooks()
+	info := &hook.AgentInfo{Name: "inner", Type: "base"}
+	innerCtx, _ := ah.OnAgentStart(srvCtx, info, &hook.AgentInput{})
+	ah.OnAgentEnd(innerCtx, info, &hook.AgentOutput{})
+	ss.End(observability.OutcomeSuccess, "")
+	h.assertAllEnded(t)
+
+	want := clientSpan.SpanContext().TraceID()
+	srv := h.span(t, "a2a.server message/send")
+	if srv.SpanContext().TraceID() != want {
+		t.Errorf("server span 不在远端父的 trace 里：got %s want %s——跨进程 trace 断成两棵树了",
+			srv.SpanContext().TraceID(), want)
+	}
+	if srv.Parent().SpanID() != clientSpan.SpanContext().SpanID() {
+		t.Errorf("server span 的父应是远端那个 span，got %s", srv.Parent().SpanID())
+	}
+	if srv.SpanKind() != trace.SpanKindServer {
+		t.Errorf("server span 的 kind 应是 Server，got %v", srv.SpanKind())
+	}
+	inner := h.span(t, "invoke_agent inner")
+	if inner.SpanContext().TraceID() != want || inner.Parent().SpanID() != srv.SpanContext().SpanID() {
+		t.Errorf("内层 agent span 应挂在 server span 下、同一棵 trace，got trace=%s parent=%s",
+			inner.SpanContext().TraceID(), inner.Parent().SpanID())
+	}
+}
+
+// TestToolCategory_WhitelistOnly：`crew.tool.category` 只放行 retrieval / embedding / guardrail。
+//
+// ⚠️ 业务 tool.Categorizer 返的是**任意字符串**，放开白名单就是**指标与属性基数无上限**（每个新值一个
+// 新的时间序列）。新 suite 只钉了 skill 那个分支，白名单本身零断言——变异「任意非空都放行」后全绿。
+// 断言用一个白名单外的值，钉「属性不出现」。
+func TestToolCategory_WhitelistOnly(t *testing.T) {
+	run := func(t *testing.T, category string) sdktrace.ReadOnlySpan {
+		t.Helper()
+		h := newHarness(t)
+		ah := h.obs.AgentHooks()
+		info := &hook.AgentInfo{Name: "a", Type: "base"}
+		ctx, _ := ah.OnAgentStart(context.Background(), info, &hook.AgentInput{})
+		in := &schema.ToolInput{Name: "t", CallId: "c1", Extra: map[string]any{"category": category}}
+		tctx, _ := ah.OnToolStart(ctx, info, in)
+		ah.OnToolEnd(tctx, info, &schema.ToolOutput{CallId: "c1", Result: &schema.ToolCallResult{Success: true, Output: "ok"}})
+		ah.OnAgentEnd(ctx, info, &hook.AgentOutput{})
+		return h.span(t, "execute_tool t")
+	}
+
+	t.Run("白名单内的记下来", func(t *testing.T) {
+		if got := strAttr(t, run(t, "retrieval"), observability.AttrToolCategory); got != "retrieval" {
+			t.Errorf("白名单内的 category 应记成属性，got %q", got)
+		}
+	})
+	t.Run("白名单外的不记", func(t *testing.T) {
+		span := run(t, "业务随便写的一个类别")
+		for _, kv := range span.Attributes() {
+			if kv.Key == observability.AttrToolCategory {
+				t.Errorf("白名单外的 category 被记进了 %s（值 %q）——业务返任意字符串就是基数无上限",
+					observability.AttrToolCategory, kv.Value.AsString())
+			}
+		}
+	})
+}

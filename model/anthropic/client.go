@@ -248,8 +248,8 @@ func WithCacheTTL(ttl CacheTTL) ClientOption {
 type Compaction struct {
 	// TriggerTokens 是输入达到多少 token 时压缩；<= 0 用 API 的默认（150000）。
 	TriggerTokens int64
-	// Instructions 替换 API 自带的摘要要求；空串用 API 的。压缩之前的 thinking 不进摘要的输入，
-	// 自己写时要讲清摘要必须保留什么。
+	// Instructions 是给摘要的补充要求（API 的 instructions 字段）；空串不发。按 Anthropic 迁移指南，带了它
+	// 摘要只看对话正文、看不到之前的 thinking，所以要写清摘要必须保留什么。
 	Instructions string
 }
 

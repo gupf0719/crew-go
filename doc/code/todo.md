@@ -138,8 +138,20 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
   在当前 fixture 下**不承重**（变异时属性断言先红），用例注释已写明。**仍开着**：要钉死「装两层 + 扇出」
   那个组合（instance 维塌掉 ⟹ 第二个实例 span 整个不建，而 assertAllEnded 只比数量抓不到），得再搭一层
   Observability，形状见 `TestTwoInstancesStacked_EachComplete`。
-- mcp 两条已实现但无哨兵的不变量：`goOnline` 的 `s.closed` 早退（缺它会泄漏一个永不关闭的新连接）、
-  `markOffline` 的 `bg.Add(1)` 必须在 `s.mu` 内（挪出去 `-race` 直接报竞争）。探针写法见 review-v7。
+- ~~mcp 两条已实现但无哨兵的不变量~~ **2026-10-23 处理完，但结局是一条修、一条如实降级**：
+  - `goOnline` 的 `s.closed` 早退 ✅ **已配哨兵**
+    `TestHub_ReconnectFinishingAfterClose_DiscardsNewClient`。fixture 的关键是**工厂建连接时不看
+    ctx**（`ignoreCtxFactory`）：既有的 `seqFactory` gate 是 `select{gate, ctx.Done()}`，而 Close 会
+    取消重连尝试的 ctx ⟹ 放行与取消是竞态、多数时候连接根本建不出来、**到不了 goOnline**，用例恒真
+    （第 6 类炸弹）。断言选在「Close 之后才连上的那个连接被关了没」——Close 关的是**掉线前**那个，
+    数它抓不到。变异（删早退）→ 红在「等不到：Close 之后连上的那个连接被关掉」。
+  - `markOffline` 的 `bg.Add(1)` 必须在 `s.mu` 内 ⚠️ **测不住，降级为注释保护**（原记「挪出去
+    `-race` 直接报竞争」**已证伪**）：实测把 `bg.Add(1)` 挪到 `s.mu.Unlock()` 之后，「掉线与 Close
+    并发、Close 返回后掉线前那个连接必须已关」这个探针跑 **1200 轮 `-race` 一次没红**。窗口只隔一个
+    `Unlock`，要命中得让 Close 在那一瞬间跑完 `shutdown` + `bg.Wait()`。它跟 `go s.reconnectLoop` 紧跟
+    `Add` 那条同一档（review-v7 已记那条测不住），都靠 `markOffline` 里那段注释；而危害还被上面刚钉住
+    的 `goOnline` 早退兜了一层（Close 之后连上的连接会被关掉）。**不为它写哨兵**——写一条在变异下不红
+    的用例，比没有用例更坏。
 - ~~`agent_v2/history_conformance` 没有长 key 用例，`HistoryKey` godoc 也没声明可移植上限~~
   **已修（2026-10-23）**：加 `LongKeys` 用例（两个维度 × 两档字符，`PortableKeyLen = 255` 由最窄的
   MySQL 列宽定）+ `HistoryKey` godoc 写明上限、各后端超限时的不同表现、以及「写是旁路所以症状是模型

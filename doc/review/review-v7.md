@@ -22,10 +22,16 @@
 > 劈出专属的 `MaxWidthError` + BasicAgent 出口重铸 `Iterations` / `f1afa64` 上一条带出来的
 > `error.type` 分类没跟上（修它时发现 `errorTypeOf` 5 条既有分支零用例，补了全分支表）。
 >
-> **仍开着的只有两条**，都在 `doc/code/todo.md` 里带理由登记：① H-02 的**行为改动**（留一格无工具轮 /
-> 出口边收尾）——它的曝光面取决于「`tool_choice=none` 在真 provider 上强制不强制」，而本环境没有 API
-> key，没实测就改默认行为是拿设计换猜测；② H-04 的最后一条哨兵（「装两层 Observability + 扇出」组合下
-> `crew.node.instance` 的 span 个数）——需要再搭一层 Observability 才测得出，单独那半已有哨兵。
+> **仍开着的项全部在 `doc/code/todo.md` 里带理由登记**（**不在这里数个数**——这一行曾写「只剩两条」，
+> 写的时候就漏了 mcp 那两条无哨兵的不变量；个数写在清单之外，加一条时几乎必然忘改）。最大的两类是：
+> ① H-02 的**行为改动**（留一格无工具轮 / 出口边收尾）——曝光面取决于「`tool_choice=none` 在真
+> provider 上强制不强制」，而本环境没有 API key，没实测就改默认行为是拿设计换猜测；② 几条「实现正确、
+> 缺防回归哨兵」的（H-04 的「装两层 Observability + 扇出」组合、mcp 的 `goOnline` 早退与
+> `markOffline` 的 `bg.Add` 位置）。
+>
+> 修复轮自己又被审了两轮（`a3d7218` 的 commit-level audit 2 个单视角 agent，`a8f088b` 1 个），结论与
+> 它们带回的项同样记在 todo.md ——**其中一条是真缺陷**：扇出宽度失控留下一份会被 auto-load 捡起的
+> 毒档（预存，`a8f088b` 修）。
 
 ---
 

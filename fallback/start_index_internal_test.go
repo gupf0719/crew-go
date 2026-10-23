@@ -97,3 +97,40 @@ func TestStartIndex_TerminatesOnDegenerateClocks(t *testing.T) {
 		})
 	}
 }
+
+// TestStartIndex_EmptyMembersVsAllTripped：**候选为空**与**全熔断**是两种情形，返回值必须分开。
+//
+// 候选为空 ⟹ 没有下标可报 ⟹ -1（调用方 f.members[i] 会越界）。
+// 全熔断 ⟹ 报首选 0 ⟹ 仍然有意义：cooldown 过后下一次调用会先去半开探测首选，那就是真正起手请求的那个。
+//
+// ⚠️ 曾经两者都返 0，越界风险全押在 ModelName 的 len 守卫上。断言挑的是「下标本身」而不是「ModelName
+// 返没返空串」——后者在两种修法下都是空串（候选为空时没有 ModelNamer 可问），不承重。
+func TestStartIndex_EmptyMembersVsAllTripped(t *testing.T) {
+	now := time.Now()
+
+	t.Run("候选为空返-1", func(t *testing.T) {
+		f := &FallbackChatModel{}
+		if got := f.startIndex(now); got != -1 {
+			t.Errorf("一个候选都没有时应返 -1（没有下标可报），got %d —— 调用方 f.members[%d] 会越界", got, got)
+		}
+		if got := f.ModelName(); got != "" {
+			t.Errorf("ModelName 应返空串，got %q", got)
+		}
+	})
+
+	t.Run("全熔断报首选0", func(t *testing.T) {
+		m0, m1 := mkMember("first"), mkMember("second")
+		m0.breaker.RecordFailure() // maxFailures=1 ⟹ 立刻跳开
+		m1.breaker.RecordFailure()
+		if !m0.breaker.Tripped() || !m1.breaker.Tripped() {
+			t.Fatal("fixture 没搭对：两个候选都该处于熔断中")
+		}
+		f := &FallbackChatModel{members: []*fallbackMember{m0, m1}}
+		if got := f.startIndex(now); got != 0 {
+			t.Errorf("全熔断时应报首选 0（cooldown 过后先探测它），got %d", got)
+		}
+		if got := f.ModelName(); got != "first" {
+			t.Errorf("ModelName 应报首选 first，got %q", got)
+		}
+	})
+}

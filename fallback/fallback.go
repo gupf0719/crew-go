@@ -487,10 +487,14 @@ func isNilModel(m model.ChatModel) bool {
 // 中途切到别的候选时也只报起手那个。实际回答的模型看响应里的模型名（gen_ai.response.model）与 failover 事件。
 // 候选没实现 model.ModelNamer 时返回空串。只读，不占探测名额、不影响放行决策。
 func (f *FallbackChatModel) ModelName() string {
-	if f == nil || len(f.members) == 0 {
+	if f == nil {
 		return ""
 	}
-	if n, ok := f.members[f.startIndex(time.Now())].model.(model.ModelNamer); ok {
+	i := f.startIndex(time.Now())
+	if i < 0 {
+		return "" // 一个候选都没有：没有可报的模型名
+	}
+	if n, ok := f.members[i].model.(model.ModelNamer); ok {
 		return n.ModelName()
 	}
 	return ""
@@ -528,6 +532,18 @@ func (f *FallbackChatModel) ModelName() string {
 // tryMembers **不等价**：它两处都用活钟、同向单调，所以安全。安全的是「两处同钟」，不是「冻结」或「活钟」
 // 本身——混用才死。
 func (f *FallbackChatModel) startIndex(now time.Time) int {
+	// 一个候选都没有 ⟹ **没有下标可报**，返 -1 让调用方显式判。
+	//
+	// ⚠️ 这和下面「全都有结局了」那条 return 0 **不是同一件事**，所以不能共用一个返回值：全熔断时报首选
+	// 仍然有意义（cooldown 过后下一次调用会先去半开探测它，那就是真正起手请求的那个），而候选为空时
+	// `f.members[0]` 直接越界。曾经两者都返 0，越界风险全押在调用方的 len 守卫上——第二个调用方出现时
+	// 就是 index out of range。
+	//
+	// len 的判据也只留这一份：ModelName 不再自己判（那是同一个判据的第二份拷贝，CLAUDE.md
+	// 「必须与 X 保持一致」那条规约）。
+	if len(f.members) == 0 {
+		return -1
+	}
 	states := make([]memberState, len(f.members))
 	for {
 		i, wait, ok := nextMember(states, now)

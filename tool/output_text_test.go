@@ -9,6 +9,11 @@ import (
 	"crew-go/tool"
 )
 
+// point 是 struct 又实现了 fmt.Stringer：业务自己定的写法优先，不编 JSON。
+type point struct{ X, Y int }
+
+func (p point) String() string { return fmt.Sprintf("(%d, %d)", p.X, p.Y) }
+
 type item struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
@@ -32,6 +37,7 @@ func TestOutputText(t *testing.T) {
 		{"bool", true, "true"},
 		{"nil", nil, "<nil>"},
 		{"stringer", 1500 * time.Millisecond, "1.5s"},
+		{"struct stringer wins over JSON", point{1, 2}, "(1, 2)"},
 		{"error", errors.New("坏了"), "坏了"},
 		{"not JSON-able falls back", map[string]any{"c": ch}, "map[c:" + fmtPtr(ch) + "]"},
 	} {

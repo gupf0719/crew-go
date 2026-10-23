@@ -131,16 +131,23 @@ func blockText(b Block) string {
 	switch {
 	case b.Type == "text":
 		return b.Text
-	case b.Text != "":
-		if b.URI != "" {
-			return fmt.Sprintf("[资源 %s]\n%s", b.URI, b.Text)
+	case b.Text != "" || b.textResource:
+		text := b.Text
+		if text == "" {
+			text = "（空）"
 		}
-		return b.Text
+		if b.URI != "" {
+			return fmt.Sprintf("[资源 %s]\n%s", b.URI, text)
+		}
+		return text
 	case b.Type == "resource_link":
 		return strings.Join(nonEmpty("[资源链接", b.Name, b.URI), " ") + "]"
 	default:
 		desc := nonEmpty(b.Type, b.Mime)
-		if len(b.Data) > 0 {
+		switch {
+		case b.undecodable:
+			desc = append(desc, "base64 解不了")
+		case len(b.Data) > 0:
 			desc = append(desc, fmt.Sprintf("%d 字节", len(b.Data)))
 		}
 		desc = append(desc, nonEmpty(b.URI)...)

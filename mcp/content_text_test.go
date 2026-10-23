@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"crew-go/mcp"
+	"crew-go/tool"
 )
 
 // callWith 起一个只有一个工具 t 的 HTTP MCP server，tools/call 回 result，返回框架拿到的 Output。
@@ -77,7 +78,32 @@ func TestCallContent_Structured(t *testing.T) {
 		"content":           []map[string]any{{"type": "text", "text": `{"total":1}`}},
 		"structuredContent": map[string]any{"total": 1},
 	})
-	if m, ok := got.(map[string]any); !ok || m["total"] != float64(1) {
-		t.Errorf("Output = %#v，期望 structuredContent 解出来的 map", got)
+	if m, ok := got.(map[string]any); !ok || m["total"] != json.Number("1") {
+		t.Errorf("Output = %#v，期望 structuredContent 解出来的 map（数字是 json.Number）", got)
+	}
+}
+
+// TestCallContent_StructuredBigIntExact：超过 2^53 的整数原样交给模型，不变成 float64 的近似值。
+func TestCallContent_StructuredBigIntExact(t *testing.T) {
+	got := callWith(t, map[string]any{"structuredContent": json.RawMessage(`{"id":1234567890123456789,"ratio":0.1}`)})
+	if s := tool.OutputText(got); s != `{"id":1234567890123456789,"ratio":0.1}` {
+		t.Errorf("交给模型的是 %s", s)
+	}
+}
+
+// TestCallContent_BadBase64DoesNotFailCall：二进制块的 base64 不规范时不让整次调用失败——同一次结果里的文本照常交出。
+func TestCallContent_BadBase64DoesNotFailCall(t *testing.T) {
+	got := callWith(t, map[string]any{"content": []map[string]any{
+		{"type": "text", "text": "文件在这"},
+		{"type": "resource", "resource": map[string]any{"uri": "file:///a.bin", "blob": "AQID_w"}},                         // URL-safe、缺 padding：认
+		{"type": "image", "data": "!!!不是base64", "mimeType": "image/png"},                                                  // 解不了：只写说明
+		{"type": "resource", "resource": map[string]any{"uri": "file:///empty.txt", "mimeType": "text/plain", "text": ""}}, // 空文件
+	}})
+	want := "文件在这\n\n" +
+		"[resource，4 字节，file:///a.bin：二进制内容，没有交给模型]\n\n" +
+		"[image，image/png，base64 解不了：二进制内容，没有交给模型]\n\n" +
+		"[资源 file:///empty.txt]\n（空）"
+	if got != want {
+		t.Errorf("Output =\n%q\n期望\n%q", got, want)
 	}
 }

@@ -186,7 +186,7 @@ func parseToolAnnotations(toolName string, raw json.RawMessage) *ToolAnnotations
 	}
 	var a ToolAnnotations
 	if err := json.Unmarshal(raw, &a); err != nil {
-		slog.Warn("mcp: 工具的 annotations 解析失败，按没有注解处理（也不算只读）", logKeyTool, toolName, logKeyErr, err.Error())
+		slog.Warn("mcp: 工具的 annotations 解析失败，按没有注解处理（也不算只读）", logKeyTool, toolName, logKeyErr, err)
 		return nil
 	}
 	return &a
@@ -218,18 +218,33 @@ func parseCallResult(raw json.RawMessage) (*CallResult, error) {
 	}, nil
 }
 
-// decodeBlock 解析单个 content block，支持 text / image / 未知类型。
+// decodeBlock 解析单个 content block：text / image / audio / resource（嵌入资源摊平，见 [Block]）/
+// resource_link / 未知类型（只留 type 与认得的字段）。
 func decodeBlock(raw json.RawMessage) (Block, error) {
 	var b struct {
 		Type     string `json:"type"`
 		Text     string `json:"text"`
 		Data     string `json:"data"` // base64
 		MimeType string `json:"mimeType"`
+		URI      string `json:"uri"`
+		Name     string `json:"name"`
+		Resource *struct {
+			URI      string `json:"uri"`
+			MimeType string `json:"mimeType"`
+			Text     string `json:"text"`
+			Blob     string `json:"blob"` // base64
+		} `json:"resource"`
 	}
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return Block{}, fmt.Errorf("decode content block: %w", err)
 	}
-	block := Block{Type: b.Type, Text: b.Text, Mime: b.MimeType}
+	if r := b.Resource; r != nil {
+		b.URI, b.Text, b.Data = r.URI, r.Text, r.Blob
+		if r.MimeType != "" {
+			b.MimeType = r.MimeType
+		}
+	}
+	block := Block{Type: b.Type, Text: b.Text, Mime: b.MimeType, URI: b.URI, Name: b.Name}
 	if b.Data != "" {
 		data, err := base64.StdEncoding.DecodeString(b.Data)
 		if err != nil {

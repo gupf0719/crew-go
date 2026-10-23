@@ -97,6 +97,9 @@ func (c *Client) interpret(ctx context.Context, resp *anthropic.BetaMessage, raw
 	if hops := fallbackValues(resp.Content); len(hops) > 0 {
 		t.annotations[FallbackAnnotation] = hops
 	}
+	if cs := compactionValues(resp); len(cs) > 0 {
+		t.annotations[CompactionAnnotation] = cs
+	}
 	t.metadata = &schema.MessageMetadata{
 		FinishReason: finishReason(resp.StopReason),
 		Model:        string(resp.Model),
@@ -113,7 +116,7 @@ func (c *Client) interpret(ctx context.Context, resp *anthropic.BetaMessage, raw
 //   - model_context_window_exceeded：输入加输出撑满了上下文窗口，返回包着
 //     model.ErrContextWindowExceeded 的错误（上下文压缩认得出，压缩后重试）。
 //   - pause_turn、compaction 与没见过的取值：按完整处理，记一条告警。前两个只在用了服务端工具 /
-//     服务端压缩时出现，本包不启用它们；新加的取值多半是正常结束的变体，当成错误会让整轮失败。
+//     服务端压缩的 pause_after_compaction 时出现，本包不启用它们；新加的取值多半是正常结束的变体，当成错误会让整轮失败。
 //   - 空：响应已经完整读完（流式要求先收到 message_stop），按完整处理。
 func (c *Client) checkStopReason(ctx context.Context, resp *anthropic.BetaMessage) error {
 	switch resp.StopReason {
@@ -295,6 +298,9 @@ func lastFallbackIndex(blocks []anthropic.BetaContentBlockUnion) int {
 // 比官方规则严一点：切换点之前成对的服务端工具块官方允许回放，这里也不留（本包不启用服务端工具）。
 func replayable(i int, blockType string, lastFallback int) bool {
 	switch {
+	case blockType == "compaction":
+		// 压缩的是这次请求的输入，跟哪个模型接着答无关；丢了它，下一次请求又从完整历史起算。
+		return true
 	case lastFallback < 0, i > lastFallback:
 		return true
 	case i < lastFallback:
@@ -320,6 +326,34 @@ func truncatedArguments(raw, input string) string {
 		s = "{"
 	}
 	return s
+}
+
+// compactionValues 是 [CompactionAnnotation] 的值：usage.iterations 里每个 compaction 项一项
+// {"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"}。content 里有
+// compaction 块、iterations 却没有对应项时，补成用量为 0 的项——至少记下压缩发生过。
+func compactionValues(resp *anthropic.BetaMessage) []any {
+	var out []any
+	for _, it := range resp.Usage.Iterations {
+		if it.Type == "compaction" {
+			out = append(out, map[string]any{
+				"input_tokens":                int(it.InputTokens),
+				"output_tokens":               int(it.OutputTokens),
+				"cache_read_input_tokens":     int(it.CacheReadInputTokens),
+				"cache_creation_input_tokens": int(it.CacheCreationInputTokens),
+			})
+		}
+	}
+	blocks := 0
+	for _, b := range resp.Content {
+		if b.Type == "compaction" {
+			blocks++
+		}
+	}
+	for len(out) < blocks {
+		out = append(out, map[string]any{"input_tokens": 0, "output_tokens": 0,
+			"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
+	}
+	return out
 }
 
 // fallbackValues 是 [FallbackAnnotation] 的值：每个 fallback 块一项 {"from": 模型, "to": 模型}。

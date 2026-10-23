@@ -27,6 +27,10 @@ const (
 	// FallbackAnnotation 记这次响应里服务端回退的切换，每项 {"from": 模型, "to": 模型}；没有回退时
 	// 不打。用 [Fallbacks] 读。
 	FallbackAnnotation = "anthropic.fallback"
+	// CompactionAnnotation 记这次响应里服务端压缩（[WithCompaction]）的用量，每次压缩一项
+	// {"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"}——这些不在
+	// 消息的 Usage 里（Usage 只算模型答的那一轮，也就是压缩之后的上下文）；没有压缩时不打。用 [Compactions] 读。
+	CompactionAnnotation = "anthropic.compaction"
 )
 
 // replayVersion 是 [AssistantContentAnnotation] 的格式版本：读到别的版本时按「没有快照」处理。
@@ -150,6 +154,28 @@ func Fallbacks(msg *schema.Message) []FallbackHop {
 	var out []FallbackHop
 	for _, item := range annotationItems(msg, FallbackAnnotation) {
 		out = append(out, FallbackHop{From: stringOf(item["from"]), To: stringOf(item["to"])})
+	}
+	return out
+}
+
+// CompactionUsage 是一次服务端压缩（摘要那一步）的用量。
+type CompactionUsage struct {
+	InputTokens              int
+	OutputTokens             int
+	CacheReadInputTokens     int
+	CacheCreationInputTokens int
+}
+
+// Compactions 读出 msg 上 [CompactionAnnotation] 记的服务端压缩；没有压缩时返回 nil。
+func Compactions(msg *schema.Message) []CompactionUsage {
+	var out []CompactionUsage
+	for _, item := range annotationItems(msg, CompactionAnnotation) {
+		out = append(out, CompactionUsage{
+			InputTokens:              intOf(item["input_tokens"]),
+			OutputTokens:             intOf(item["output_tokens"]),
+			CacheReadInputTokens:     intOf(item["cache_read_input_tokens"]),
+			CacheCreationInputTokens: intOf(item["cache_creation_input_tokens"]),
+		})
 	}
 	return out
 }

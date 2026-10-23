@@ -346,6 +346,12 @@ const ToolOutcomeDenied = "denied"
 // observability 不再记样本。
 const ToolReplayedExtraKey = "replayed"
 
+// ToolRedispatchedExtraKey 标「这一批 tool_call 是续跑时再次派发的」（OnToolStart 的 `ToolInput.Extra`，值为 true）：这一批
+// 上次已经交给工具执行过（内容在那一次定下，见 fixToolCallContent），没整体成功、续跑重跑 tools 节点时同一批的每个调用
+// 再触发一次 OnToolStart。把调用转发给前端的钩子据它不再重开同一个调用（agui：同一个 id 再发 TOOL_CALL_START 是重开、
+// 参数追加）。只看「是不是同一批的再次派发」，跟 toolCallId 无关——provider 在不同轮次复用同一个 ID 的不是重开。
+const ToolRedispatchedExtraKey = "redispatched"
+
 // ToolCallErrCode 是一批 tool_call 没整体成功时，硬失败的那个调用（工具返回 error、panic、中间件出错）交给 OnToolEnd
 // 的失败结果的错误码；它自身超时（错误链上有 context.DeadlineExceeded、调用方还没放弃）时用 [ToolTimeoutErrCode]。也是
 // 这时 OnError 的 Code。
@@ -902,7 +908,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		if hasRec && rec.Final {
 			compose_v2.EmitSignals(ctx, rec.Signals)
 			noteHistoryRecorded(ctx, modelHistoryRecords(rec.Notes, rec.Inter, rec.Boundary, rec.Out, rec.Late))
-			return append(basicModelWrites(rec.Notes, rec.Inter, rec.Out, rec.Late, rec.Compaction), compose_v2.Write(basicFinalRoundCh, finalRound)), nil
+			return append(basicModelWrites(rec.Notes, rec.Inter, rec.Out, rec.Late, rec.Compaction, rec.Binding), compose_v2.Write(basicFinalRoundCh, finalRound)), nil
 		}
 		// 只有原样的（上一次 OnModelEnd 中断或被叫停）沿用那次的答复、不再调模型，把 OnModelEnd 处理完。原样只在两种
 		// 结局下留着：处理完（覆盖成定下的那份）、因为等人或被叫停停下；别的结局——钩子报错拒掉、把答复置空、panic
@@ -976,6 +982,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		memoIn, _ := compose_v2.Get(chs, basicCompactionCh)
 		memo := &compactionMemoCtx{in: memoIn}
 		var out, boundary *schema.Message
+		var binding *toolBinding // 这一轮交给模型的工具，没有裁剪时为 nil（见 toolBinding）
 		// 处理这次模型调用时做出的上行信号收在一起（钩子与模型里做出的，多数为空）：定下时连同产出记下，续跑重放定下的
 		// 那一轮时交出当时那份（那时钩子不再触发）。
 		sigs, err := compose_v2.CaptureSignals(ctx, func(segCtx context.Context) error {
@@ -1025,10 +1032,15 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			if hasRec {
 				// 上一次模型调用成功之后、OnModelEnd 处理完之前停下了（中断、取消）：沿用那次的答复，不再调模型——钩子
 				// 问过人的话，用户答的就是这一份（见 modelCallRecord）
-				out, memo.out, boundary = rec.Out, rec.Compaction, rec.Boundary
+				out, memo.out, boundary, binding = rec.Out, rec.Compaction, rec.Boundary, rec.Binding
 			} else {
 				var err error
-				out, err = model(callCtx, modelIn.Preamble, msgs)
+				// modelFn 绑工具时把这一轮交给模型的那些填进来（见 toolBinding）
+				sink := &toolBinding{}
+				out, err = model(withToolBindingSink(callCtx, sink), modelIn.Preamble, msgs)
+				if sink.Restricted {
+					binding = sink
+				}
 				if err != nil {
 					// audit Round 7 Bug 3 修复：compose_v2.InterruptError 是控制流不是错误, 不上报 OnError
 					if _, isInt := compose_v2.IsInterrupt(err); !isInt {
@@ -1052,7 +1064,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				}
 				// 模型调用成功那一刻记下原样：OnModelEnd 因为要等人或被叫停停下时，续跑沿用这一份（见 modelCallRecord）。
 				// 记在交给 OnModelEnd 之前——存下的字节是钩子改写之前当场序列化的。
-				saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Out: out, Compaction: memo.out, Boundary: boundary, FinalRound: finalRound})
+				saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Out: out, Compaction: memo.out, Boundary: boundary, Binding: binding, FinalRound: finalRound})
 				keepRecord = false
 			}
 
@@ -1148,11 +1160,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		//
 		// 定下这一轮（见 modelCallRecord），在记会话历史之前：重放时据它跳过记历史——这次执行之后作废的话，续跑时
 		// 历史里已经有这一份。
-		saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Late: late, Out: out, Compaction: memo.out, Boundary: boundary, Final: true, Signals: sigs, FinalRound: finalRound})
+		saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Late: late, Out: out, Compaction: memo.out, Boundary: boundary, Binding: binding, Final: true, Signals: sigs, FinalRound: finalRound})
 		keepRecord = true
 		compose_v2.EmitSignals(ctx, sigs)
 		recordHistory(ctx, historyOwner(ctx, name), name, modelHistoryRecords(notes, inter, boundary, out, late))
-		return append(basicModelWrites(notes, inter, out, late, memo.out), compose_v2.Write(basicFinalRoundCh, finalRound)), nil
+		return append(basicModelWrites(notes, inter, out, late, memo.out, binding), compose_v2.Write(basicFinalRoundCh, finalRound)), nil
 	}
 
 	toolsNode := func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
@@ -1175,6 +1187,10 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 自己的工具要照常执行。
 		finalRound, _ := compose_v2.Get(chs, basicFinalRoundCh)
 		ctx = withFinalRound(ctx, finalRound)
+		// 这一批 tool_call 出自哪一轮的绑定（见 toolBinding）：执行闸只放行那一轮交给模型的业务工具。从 channel 读，
+		// 续跑直接进本节点时也是当初那份。没有也推（nil），盖掉从调用方继承来的那份。
+		binding, _ := compose_v2.Get(chs, basicToolBindingCh)
+		ctx = withToolBinding(ctx, binding)
 		// 这一批里检索解锁的名字记在这次执行上（工具体拿不到 channel 写入口），节点成功后写进 basicRevealedCh；
 		// 节点失败或中断时随这次执行一起丢掉，续跑重跑这一批时检索重新记（tool_search 不进工具账）。每次执行一份新的，
 		// 也盖掉从调用方继承来的那份——父 agent 工具里调起的子 agent 不该记进父的这一批。
@@ -1224,6 +1240,8 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 每个调用持有自己的 ctx：OnToolStart(i) 采纳之后的 ctx 只用于调用 i 的执行与 OnToolEnd(i)。每个 OnToolStart
 		// 都从节点的 ctx 起算，看不到别的调用的钩子放的值；节点后面的工作用节点自己的 ctx（见 BasicAgentToolFn）。
 		callCtxs := make([]context.Context, len(toolCalls))
+		// 这一批上次已经派发过（内容已定下）：续跑时的再次派发，OnToolStart 带上标记（见 ToolRedispatchedExtraKey）
+		redispatched := toolCallsDispatchedBefore(ctx)
 		for i := range toolCalls {
 			if isFixed(i) {
 				callCtxs[i] = ctx
@@ -1233,6 +1251,9 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				Name:          toolCalls[i].Function.Name,
 				ArgumentsJSON: toolCalls[i].Function.Arguments,
 				CallId:        toolCalls[i].ID,
+			}
+			if redispatched {
+				ti.Extra = map[string]any{ToolRedispatchedExtraKey: true}
 			}
 			if categoryLookup != nil {
 				if cat := categoryLookup(ti.Name); cat != "" {
@@ -1616,6 +1637,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	bld = compose_v2.WithChannel(bld, basicMessagesCh)
 	bld = compose_v2.WithChannel(bld, basicRoundCh)
 	bld = compose_v2.WithChannel(bld, basicRevealedCh)
+	bld = compose_v2.WithChannel(bld, basicToolBindingCh)
 	bld = compose_v2.WithChannel(bld, basicFinalOutputAttemptsCh)
 	bld = compose_v2.WithChannel(bld, basicReturnDirectCh)
 	bld = compose_v2.WithChannel(bld, basicToolsUsedCh)

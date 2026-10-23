@@ -244,6 +244,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	if input == nil {
 		return nil, fmt.Errorf("agent %q: input message must not be nil", a.config.Name)
 	}
+	input = ownRunInput(input)
 	if err := resolveRunSession(ctx, &session, a.config.Name); err != nil {
 		return nil, err
 	}
@@ -285,9 +286,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, startErr)
 	}
 	// 消费 hook 改写: 业务可改 agentIn.Messages 做 PII filter / 模板包装 (跟 PlanAgent 对齐)
-	if len(agentIn.Messages) > 0 && agentIn.Messages[len(agentIn.Messages)-1] != nil {
-		input = agentIn.Messages[len(agentIn.Messages)-1]
-	}
+	input = adoptHookInput(agentIn, input)
 
 	// hook OnAgentEnd 兜底——所有退出路径触发 (含 panic recover 路径 — defer 顺序: 内层先跑).
 	// audit² 改: hook 调用 panic 由本函数 outer recover defer (line 122)
@@ -1578,12 +1577,12 @@ func (a *BasicAgent) searchMemoriesUnscoped(ctx context.Context, st store.Store,
 	limit := a.config.StoreMemory.SearchLimit
 	if limit <= 0 {
 		// 不可达（WithStoreMemory 把 <=0 归一成 5），留作业务绕过 option 直构 Config 的防御。
-		return st.Search(ctx, base, opts...)
+		return searchMemoryShard(ctx, st, base, opts...)
 	}
 
 	// ① 后端自报按相关性排 → 别插手。
 	if r, ok := st.(store.RelevanceRanker); ok && r.RanksByRelevance() {
-		return st.Search(ctx, base, opts...)
+		return searchMemoryShard(ctx, st, base, opts...)
 	}
 
 	// 没有 query 就没有排序依据——注字典序前 N 条纯属噪声，不如不注。
@@ -1712,6 +1711,12 @@ const memoryCandidateFactor = 20
 // 这一条也是「为什么这里没有分片数上限」的真正理由：加过一个（超过 N 片退回单次 base
 // 查询），撤了——但**不是**因为它「制造了绕过」（数据经 base 那片本来就全读），而是因为
 // 它只削掉 gate 调用、换不来任何隔离，纯亏。
+//
+// # 扇出跑几遍
+//
+// preamble 只跑首轮的前提是它**成功过**：业务在 Store 里做的 gate 在 preamble 里抛中断时，节点没成功，Resume 重跑
+// 整个扇出（base + 每个写入者各一次 Search）。K 道 gate 就是 K+1 遍全量扇出——实测 300 个写入者 + 1 道 gate：Run
+// 时 301 次 Search，Resume 时又 301 次。
 func (a *BasicAgent) gatherMemoryCandidates(ctx context.Context, st store.Store,
 	base store.Namespace, opts []store.SearchOption, limit int,
 ) ([]*store.SearchItem, error) {
@@ -1753,7 +1758,7 @@ func (a *BasicAgent) gatherMemoryCandidates(ctx context.Context, st store.Store,
 	}
 	// 单写入者（或列不出来）→ 直接对基准 ns 超采，省一次扇出。
 	if len(subs) < 2 {
-		got, serr := st.Search(ctx, base, withLimit(want)...)
+		got, serr := searchMemoryShard(ctx, st, base, withLimit(want)...)
 		// **listErr 必须在这条路上也报出去。** 它曾经只在下面的扇出路径进 shardErrs，而
 		// `ListNamespaces` 按 Go 常规失败时返 `nil, err` ⟹ subs 空 ⟹ 走的正是这条早退 ⟹
 		// 那段「降级也必须报上去」的代码**在它要救的形态上是死的**。实测：列写入者失败时
@@ -1781,7 +1786,7 @@ func (a *BasicAgent) gatherMemoryCandidates(ctx context.Context, st store.Store,
 	// 基准 ns 本层也要查——顶层 agent 和业务 seed 的记忆落在那儿，它不是任何写入者的后代。
 	shards := append([]store.Namespace{base}, subs...)
 	for _, sub := range shards {
-		got, serr := st.Search(ctx, sub, withLimit(want)...)
+		got, serr := searchMemoryShard(ctx, st, sub, withLimit(want)...)
 		if serr != nil {
 			// **控制流信号当场停**，不接着查别的分片。
 			//
@@ -1810,6 +1815,30 @@ func (a *BasicAgent) gatherMemoryCandidates(ctx context.Context, st store.Store,
 		}
 	}
 	return out, compose_v2.PickFanoutError(shardErrs)
+}
+
+// searchMemoryShard 调一次后端的 Search，去掉结果里的 nil 元素——自研后端预分配了 slice 又没填满时会夹着它们，
+// 下游排序、按写入者去重、打分都要解引用（曾经 preamble 直接 panic，实测）。返回的是新 slice：有两条路把结果原样
+// 交给调用方，原地改写会写坏后端自己那份（见 searchMemoriesUnscoped）。
+func searchMemoryShard(ctx context.Context, st store.Store, ns store.Namespace, opts ...store.SearchOption) ([]*store.SearchItem, error) {
+	got, err := st.Search(ctx, ns, opts...)
+	nils := 0
+	for _, it := range got {
+		if it == nil {
+			nils++
+		}
+	}
+	if nils == 0 {
+		return got, err
+	}
+	kept := make([]*store.SearchItem, 0, len(got)-nils)
+	for _, it := range got {
+		if it != nil {
+			kept = append(kept, it)
+		}
+	}
+	slog.WarnContext(ctx, "agent_v2: 长期记忆后端的 Search 结果里有 nil 元素，已跳过", "ns", ns.String(), "nil_items", nils)
+	return kept, err
 }
 
 // memoryItemText 从一条记忆里抽出用于打分的文本。
@@ -2781,6 +2810,8 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 		toolsBound := false
 		if toolkit != nil {
 			tools := toolkit.ToolInfos()
+			// 这一轮有没有裁剪（ToolFilter 返回了名单、或软降落）：有的话交给模型的那些就是 tools 节点只执行的那些（见 toolBinding）
+			restricted := false
 			if tsDeferredNames != nil {
 				tools = filterVisibleTools(tools, tsDeferredNames, tsRevealed)
 			}
@@ -2804,6 +2835,7 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 				}
 				if allowed := cfg.ToolFilter(ctx, lastInput); allowed != nil {
 					tools = filterToolsByName(tools, allowed, toolkit)
+					restricted = true
 				}
 			}
 			// **软降落**（轮次预算的最后一轮，见 [withFinalRound]）分两档：
@@ -2845,6 +2877,13 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			// 中间态**。已登记 backlog。
 			if finalRound && cfg.OutputSchema != nil {
 				tools = keepOnlyTools(tools, FinalOutputToolName)
+			}
+			if sink := toolBindingSink(ctx); sink != nil && (restricted || isFinalRound(ctx)) {
+				sink.Restricted = true
+				sink.Names = make([]string, 0, len(tools))
+				for _, ti := range tools {
+					sink.Names = append(sink.Names, ti.Name)
+				}
 			}
 			if len(tools) > 0 {
 				bound, err := llm.WithTools(tools)
@@ -3318,6 +3357,14 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				// finding 3: 同 invalid_arguments——LLM 硬调未解锁工具是失败的 tool call
 				msg := fmt.Sprintf("工具 %q 未解锁——请先调 tool_search(query) 检索解锁后再调用。", tc.Function.Name)
 				return outcome{toolMsg: failedToolResult(tc.ID, "tool_not_revealed", msg)}
+			}
+			// 这一轮没交给模型的工具不执行（WithToolFilter 没放行、软降落摘掉了，见 toolBinding）：模型凭上文记得的
+			// 名字硬调时拿到失败结果。判的是产出这一批的那一轮的绑定（channel 里的那份，续跑也是它）；ToolFilter 豁免的
+			// 框架工具留在绑定里、照常执行，软降落摘掉的框架工具不在绑定里、同样拦。排在审批之前——不让人去批一个这一轮
+			// 不可用的工具。
+			if !toolBindingFrom(ctx).allows(tc.Function.Name) {
+				msg := fmt.Sprintf("工具 %q 这一轮不可用（没有提供给你），改用提供给你的工具，或者直接回答。", tc.Function.Name)
+				return outcome{toolMsg: failedToolResult(tc.ID, ToolNotAvailableErrCode, msg)}
 			}
 			// **工具审批 gate（harness P1）**：业务工具执行前查审批决策链（ApprovalMode!=Auto
 			// 或有 heuristic 时才有实际开销，默认 Auto 路径零开销）。Ask 未 resume → InterruptError

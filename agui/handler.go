@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,9 +32,12 @@ import (
 // 客户端的 system / developer 不采信（它们会成为模型的指令，而客户端能随意伪造），剥掉并告警；工具调用与结果、
 // reasoning、activity 不取；最后一条 user 之后的消息不取。
 type RunAgentInput struct {
-	ThreadID string        `json:"threadId"`
-	RunID    string        `json:"runId"`
-	Messages []AGUIMessage `json:"messages"`
+	ThreadID string `json:"threadId"`
+	RunID    string `json:"runId"`
+	// ProtocolVersion 是消费方说的协议版本（AG-UI 1.0 起每个请求都带，缺省表示版本化之前的客户端）。不同大版本的
+	// 请求开流之前回 400；同一大版本里更新的小版本、看不懂的值照常服务、告警一次（见 checkProtocolVersion）。
+	ProtocolVersion string        `json:"protocolVersion,omitempty"`
+	Messages        []AGUIMessage `json:"messages"`
 	// Resume 非空 = 回答上一次 HITL 中断、续跑（走 Resume 而非新 Run）。
 	Resume []ResumeEntry `json:"resume,omitempty"`
 }
@@ -309,6 +313,7 @@ type handler struct {
 	// 客户端内容没采信 / 没取时各告警一次（见 warnClientMessages）
 	warnedInstructions atomic.Bool
 	warnedMedia        atomic.Bool
+	warnedVersion      atomic.Bool
 
 	mu        sync.Mutex
 	sessions  map[sessionKey]*sessionEntry // (owner, threadId) → 挂起会话状态
@@ -317,18 +322,18 @@ type handler struct {
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		_ = writeReject(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
 	var in RunAgentInput
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		http.Error(w, "agui: bad request body: "+err.Error(), http.StatusBadRequest)
+		_ = writeReject(w, http.StatusBadRequest, "bad_request", "agui: bad request body: "+err.Error())
 		return
 	}
 
 	sse, ok := NewSSEWriter(w)
 	if !ok {
-		http.Error(w, "agui: streaming unsupported", http.StatusInternalServerError)
+		_ = writeReject(w, http.StatusInternalServerError, "streaming_unsupported", "agui: streaming unsupported")
 		return
 	}
 	// panic 兜底：handler goroutine 上（serveRun/serveResume/handleOutcome/factory 构造
@@ -340,7 +345,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if rec := recover(); rec != nil {
 			// 栈只进服务端日志，不发给前端
 			panicerr.Log(r.Context(), slog.LevelError, "agui: handler 兜住 panic，已给前端发 RUN_ERROR", panicerr.New(rec))
-			_ = sse.WriteEvent(NewRunError(fmt.Sprintf("agui: internal panic: %v", rec), "panic"))
+			_ = sse.Reject(http.StatusInternalServerError, "panic", fmt.Sprintf("agui: internal panic: %v", rec))
 		}
 	}()
 
@@ -363,9 +368,13 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 铸完之后「threadID 恒非空」成为不变量，下游那一串判空随之消失——**判据只留一处**。
 	// 那串判空正是这个坑的成因：同一个判断散在多处，其中一处（给 ctx 挂 checkpointer）
 	// 当初就漏了，而漏的方式恰恰是**没写**。
+	if msg := h.checkProtocolVersion(r.Context(), in.ProtocolVersion); msg != "" {
+		_ = sse.Reject(http.StatusBadRequest, "unsupported_protocol_version", msg)
+		return
+	}
 	if in.ThreadID == "" {
 		if len(in.Resume) > 0 {
-			_ = sse.WriteEvent(NewRunError("resume requires threadId to locate suspended session", "no_thread_id"))
+			_ = sse.Reject(http.StatusBadRequest, "no_thread_id", "resume requires threadId to locate suspended session")
 			return
 		}
 		in.ThreadID = newThreadID()
@@ -399,12 +408,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInput, key sessionKey) {
 	prior, inputMsg, rep := splitClientMessages(in.Messages)
 	if inputMsg == nil {
-		_ = sse.WriteEvent(NewRunError("no user message in request", "bad_request"))
+		_ = sse.Reject(http.StatusBadRequest, "bad_request", "no user message in request")
 		return
 	}
 	if inputMsg.Content == "" && rep.inputDropped {
 		// 只有媒体、没有文字：照跑的话模型收到一个空问题，还以为自己看过了用户发的东西
-		_ = sse.WriteEvent(NewRunError("the last user message has no text part; image / audio / video / document parts are not supported", "unsupported_content"))
+		_ = sse.Reject(http.StatusBadRequest, "unsupported_content", "the last user message has no text part; image / audio / video / document parts are not supported")
 		return
 	}
 	h.warnClientMessages(ctx, rep)
@@ -420,7 +429,7 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		h.dropCP(ctx, sid)
 	}
 	if !ok {
-		_ = sse.WriteEvent(NewRunError("run already in progress for this thread", "busy"))
+		_ = sse.Reject(http.StatusConflict, "busy", "run already in progress for this thread")
 		return
 	}
 	defer h.releaseBusy(key) // 确保 busy 清（含 panic 路径）
@@ -433,7 +442,7 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	ag := h.build(adapter)
 	if ag == nil {
 		h.removeEntry(key) // 清 acquireForRun 建的空壳，避免泄漏
-		_ = sse.WriteEvent(NewRunError("agui: AgentFactory returned nil agent", "nil_agent"))
+		_ = sse.Reject(http.StatusInternalServerError, "nil_agent", "agui: AgentFactory returned nil agent")
 		return
 	}
 	// ctx 版 OrchHooks 让嵌套 sub-agent 也继承 → sub-agent 的 chunk 也真流式，而非只靠
@@ -494,7 +503,7 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 // 配对注入。
 func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentInput, key sessionKey) {
 	if h.cp == nil {
-		_ = sse.WriteEvent(NewRunError("resume requires checkpointer (agui.WithCheckpointer)", "no_checkpointer"))
+		_ = sse.Reject(http.StatusNotImplemented, "no_checkpointer", "resume requires checkpointer (agui.WithCheckpointer)")
 		return
 	}
 	// 校验 resume entry 合法性（对齐官方 ResumeEntry：status 是 resolved/cancelled 枚举、
@@ -502,11 +511,11 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 	// enum 拒非法；内联协议层显式拒暴露客户端 bug，而非把未知状态当有效答案注入续跑）。
 	for _, e := range in.Resume {
 		if e.Status != ResumeStatusResolved && e.Status != ResumeStatusCancelled {
-			_ = sse.WriteEvent(NewRunError(fmt.Sprintf("invalid resume status %q (want %q or %q)", e.Status, ResumeStatusResolved, ResumeStatusCancelled), "invalid_resume"))
+			_ = sse.Reject(http.StatusBadRequest, "invalid_resume", fmt.Sprintf("invalid resume status %q (want %q or %q)", e.Status, ResumeStatusResolved, ResumeStatusCancelled))
 			return
 		}
 		if e.InterruptID == "" {
-			_ = sse.WriteEvent(NewRunError("resume entry missing interruptId", "invalid_resume"))
+			_ = sse.Reject(http.StatusBadRequest, "invalid_resume", "resume entry missing interruptId")
 			return
 		}
 	}
@@ -514,11 +523,11 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 	// 占用挂起会话（并发保护：已 busy = 另一 Resume/Run 在途，拒；不存在 = 会话已结束/过期）。
 	sess, open, prior, ok, busy := h.acquireForResume(key)
 	if busy {
-		_ = sse.WriteEvent(NewRunError("resume already in progress for this thread", "busy"))
+		_ = sse.Reject(http.StatusConflict, "busy", "resume already in progress for this thread")
 		return
 	}
 	if !ok {
-		_ = sse.WriteEvent(NewRunError("no suspended session for thread (interrupt expired or wrong threadId)", "no_session"))
+		_ = sse.Reject(http.StatusNotFound, "no_session", "no suspended session for thread (interrupt expired or wrong threadId)")
 		return
 	}
 	defer h.releaseBusy(key) // 确保 busy 清（含 panic 路径）
@@ -531,7 +540,7 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 	// 一部分）。规范把这条交给前端检查，这里仍然查：只答一部分的话，没答的那几问照样挂着，而同一批里没进工具账的
 	// 提问续跑时会重问；同一个 ID 出现两次时后一条覆盖前一条，审批的批准与拒绝取决于数组顺序（审计实测）。
 	if msg := coverageProblem(in.Resume, open); msg != "" {
-		_ = sse.WriteEvent(NewRunError(msg, "invalid_resume"))
+		_ = sse.Reject(http.StatusBadRequest, "invalid_resume", msg)
 		return
 	}
 
@@ -545,10 +554,9 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 		}
 		option, ok := approvalAnswerFromPayload(e.Payload)
 		if !ok {
-			_ = sse.WriteEvent(NewRunError(fmt.Sprintf("interrupt %q is a tool approval; answer with true / false, "+
+			_ = sse.Reject(http.StatusBadRequest, "invalid_resume_payload", fmt.Sprintf("interrupt %q is a tool approval; answer with true / false, "+
 				`{"approved": true|false} (no other fields: editing the tool arguments is not supported), `+
-				`or one of "approve", "approve_always", "approve_always_tool", "deny"`, e.InterruptID),
-				"invalid_resume_payload"))
+				`or one of "approve", "approve_always", "approve_always_tool", "deny"`, e.InterruptID))
 			return
 		}
 		approvalAnswers[e.InterruptID] = option
@@ -577,7 +585,7 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 	adapter := newSSEAdapter(sse, wireRunID)
 	ag := h.build(adapter)
 	if ag == nil {
-		_ = sse.WriteEvent(NewRunError("agui: AgentFactory returned nil agent", "nil_agent"))
+		_ = sse.Reject(http.StatusInternalServerError, "nil_agent", "agui: AgentFactory returned nil agent")
 		return
 	}
 	ctx = agent_v2.WithCtxOrchHooks(ctx, adapter) // 同 serveRun，让 sub-agent 也真流式
@@ -628,10 +636,8 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 			return
 		}
 		// cancelled 走**正式的 outcome**（1.0 定稿后有这个分支了，见 NewRunCancelled 的
-		// godoc——此前发的「省掉 outcome」那一版会被 1.0 前端读成一个成功完成的 run）。
-		// Custom("cancelled") 保留：它早于 outcome 存在，前端可能已依赖；但它不再是
-		// 唯一信号。
-		_ = sse.WriteEvent(NewCustom("cancelled", map[string]any{"runId": wireRunID}))
+		// godoc——此前发的「省掉 outcome」那一版会被 1.0 前端读成一个成功完成的 run）。曾另发一条
+		// Custom("cancelled")，已删：协议不让 CUSTOM 事件承载标准事件的语义，取消的唯一信号就是 outcome。
 		_ = sse.WriteEvent(NewRunCancelled(in.ThreadID, wireRunID))
 		return
 	}
@@ -1068,9 +1074,9 @@ func approvalInterrupt(q *compose_v2.AskQuery) RunInterrupt {
 	if q.ToolCallID == "" {
 		reason = "confirmation"
 	}
-	meta := map[string]any{"options": q.Options}
+	meta := map[string]any{MetadataKeyApprovalOptions: q.Options}
 	if q.ToolName != "" {
-		meta["toolName"] = q.ToolName
+		meta[MetadataKeyToolName] = q.ToolName
 	}
 	return RunInterrupt{
 		ID:             q.InterruptID,
@@ -1169,6 +1175,40 @@ func splitClientMessages(msgs []AGUIMessage) (prior []*schema.Message, input *sc
 		}
 	}
 	return prior, input, rep
+}
+
+// checkProtocolVersion 按 AG-UI 的版本协商处理请求声明的协议版本，返回非空表示开流之前拒绝（错误信息）。
+//
+// 规范：同一大版本里更新的小版本 MUST 照常服务（新增的东西按处理模型是安全的），SHOULD 告警；看不懂的声明当成更新的
+// 处理（照常服务、告警）；只有本实现不支持的大版本 MAY 在 RUN_STARTED 之前拒绝。缺省 = 版本化之前的客户端，照常服务。
+func (h *handler) checkProtocolVersion(ctx context.Context, v string) string {
+	if v == "" || v == ProtocolVersion {
+		return ""
+	}
+	major, minor, ok := parseProtocolVersion(v)
+	ours, _, _ := parseProtocolVersion(ProtocolVersion)
+	if ok && major != ours {
+		return fmt.Sprintf("protocolVersion %q is not supported (this server speaks AG-UI %s)", v, ProtocolVersion)
+	}
+	if h.warnedVersion.CompareAndSwap(false, true) {
+		slog.WarnContext(ctx, "agui: 客户端声明的协议版本与本实现不同，按 "+ProtocolVersion+" 服务（本条每个 handler 只记一次）",
+			"client_version", v, "parsed", ok, "minor", minor)
+	}
+	return ""
+}
+
+// parseProtocolVersion 解 `MAJOR.MINOR`（逐段按数字比，1.10 比 1.9 新）。
+func parseProtocolVersion(v string) (major, minor int, ok bool) {
+	a, b, found := strings.Cut(v, ".")
+	if !found {
+		return 0, 0, false
+	}
+	ma, err1 := strconv.Atoi(a)
+	mi, err2 := strconv.Atoi(b)
+	if err1 != nil || err2 != nil || ma < 0 || mi < 0 {
+		return 0, 0, false
+	}
+	return ma, mi, true
 }
 
 // warnClientMessages 对没采信 / 没取的客户端内容各告警一次（每个 handler 一次，每个请求都告警会刷屏）。

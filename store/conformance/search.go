@@ -185,6 +185,17 @@ func testSearch(t *testing.T, factory StoreFactory) {
 		}
 	})
 
+	t.Run("Search_NegativeOffset_Returns_ErrNegativeOffset", func(t *testing.T) {
+		st := factory()
+		ctx := context.Background()
+		ns := store.NS("neg_offset")
+		_ = st.Put(ctx, ns, "a", 1)
+		// 负 offset 是调用方算错了：入口报错（不 panic、不当 0、不透传给数据库各报各的）
+		if _, err := st.Search(ctx, ns, store.WithOffset(-1)); !errors.Is(err, store.ErrNegativeOffset) {
+			t.Errorf("Search(offset=-1) err = %v, want store.ErrNegativeOffset", err)
+		}
+	})
+
 	t.Run("Search_WithFilter_ExactMatch", func(t *testing.T) {
 		st := factory()
 		ctx := context.Background()

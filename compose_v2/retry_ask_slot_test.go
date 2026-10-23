@@ -443,11 +443,12 @@ func retryAskDraftGraph(t *testing.T, drafts *atomic.Int32) (*compose_v2.Graph, 
 }
 
 // TestRunWithRetry_NestedGraphRegenerated_OldApprovalNotAppliedToNewContent：fn 里直接跑一张会问人的嵌套图，
-// 它答完、成功（存档随之清掉），fn 后面一步瞬时失败。重试的第二次尝试从头再跑那张图，draft 产出 v2，confirm
-// 在同一个位置、同一个 ID 问「批准 v2 吗」。用户只批准过 v1——这个批准不能兑付给 v2：当场终局失败。
+// 它答完、成功（存档随之清掉），fn 后面一步瞬时失败。重试的第二次尝试从头再跑那张图（一次重生），draft 产出 v2。
+// 用户只批准过 v1——这个批准不能兑付给 v2：重生的图问的是新问题（换了 ID，见 compose_v2 的 nestedRegenKey），
+// 用户对「批准 v2 吗」的答复用在 v2 上。
 //
-// 嵌套图冒上来的兑付曾经也按尝试分层，后一次尝试看不见它，结果是 `v2 已批准(答:批准 v1 吗)`、`err == nil`
-// （审计实测）。
+// 嵌套图冒上来的兑付曾经按尝试分层，后一次尝试看不见它，结果是 `v2 已批准(答:批准 v1 吗)`、`err == nil`
+// （审计实测）；后来改成同一个 ID 再问当场终局失败——不兑付旧答案了，但任务也过不去。重生换身份之后两样都对。
 func TestRunWithRetry_NestedGraphRegenerated_OldApprovalNotAppliedToNewContent(t *testing.T) {
 	var drafts atomic.Int32
 	inner, outCh := retryAskDraftGraph(t, &drafts)
@@ -472,11 +473,11 @@ func TestRunWithRetry_NestedGraphRegenerated_OldApprovalNotAppliedToNewContent(t
 	if n := drafts.Load(); n != 2 {
 		t.Fatalf("fixture 没搭对：重试应从头再跑嵌套图（draft 跑 2 次），实际 %d 次", n)
 	}
-	if final != "" {
-		t.Fatalf("对 v1 的批准被兑付给了重新生成的内容：final=%q（问过 %q）", final, asked)
+	if err != nil {
+		t.Fatalf("没收敛：%v（问过 %q）", err, asked)
 	}
-	if !errors.Is(err, compose_v2.ErrRunAborted) {
-		t.Errorf("同一个位置再问应当场终局失败，got %v（问过 %q）", err, asked)
+	if !slices.Equal(asked, []string{"批准 v1 吗", "批准 v2 吗"}) || final != "v2 已批准(答:批准 v2 吗)" {
+		t.Errorf("重生的图应问新问题、批准用在 v2 上；问过 %q，final=%q（对 v1 的批准兑付给 v2 时是 `答:批准 v1 吗`）", asked, final)
 	}
 }
 

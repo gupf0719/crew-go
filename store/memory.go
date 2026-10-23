@@ -232,6 +232,9 @@ func (s *InMemoryStore) Search(ctx context.Context, namespacePrefix Namespace, o
 	if cfg.limit <= 0 {
 		cfg.limit = 10
 	}
+	if err := ValidateOffset(cfg.offset); err != nil {
+		return nil, err
+	}
 	// 预校验 filter 操作符——业务误传 $or / $nor 等早错
 	if err := ValidateFilter(cfg.filter); err != nil {
 		return nil, err
@@ -312,6 +315,9 @@ func (s *InMemoryStore) ListNamespaces(_ context.Context, opts ...ListOption) ([
 	}
 	if cfg.limit <= 0 {
 		cfg.limit = 100
+	}
+	if err := ValidateOffset(cfg.offset); err != nil {
+		return nil, err
 	}
 	// prefix / suffix 自身需合法（非空时才校验）
 	if len(cfg.prefix) > 0 {

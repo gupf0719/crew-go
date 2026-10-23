@@ -60,6 +60,8 @@ type modelCallRecord struct {
 	// Boundary 是这一轮要写进会话历史的压缩边界（没摘要、或 OnModelStart 钩子动了消息列表时为 nil）。在模型调用
 	// 那一刻定：沿用原样续跑时 OnModelStart 再触发一次，它这次动没动消息列表跟那次答复无关。
 	Boundary *schema.Message `json:"boundary,omitempty"`
+	// Binding 是这一轮交给模型的工具（见 toolBinding）：沿用这份答复时，执行它的 tool_call 照这一份判。
+	Binding *toolBinding `json:"binding,omitempty"`
 	// Final 报这一轮已经处理完、定下了。
 	Final bool `json:"final,omitempty"`
 	// FinalRound 报这份答复是不是在软降落轮生成的（模型被告知 tool_choice=none / 只留 final_output 的那一轮，见
@@ -113,7 +115,7 @@ func modelHistoryRecords(notes, inter []*schema.Message, boundary, out *schema.M
 }
 
 // basicModelWrites 是 model 节点这一轮的写入：通知、插话与答复进消息流、轮次加一、摘要过就更新压缩备忘、答复交给
-// basicFinalCh。接进了插话时重复调用的计数链从头数（用户插话改变了语境，之后的重复调用不算原地打转），插话另记进
+// basicFinalCh、这一轮交给模型的工具交给 basicToolBindingCh。接进了插话时重复调用的计数链从头数（用户插话改变了语境，之后的重复调用不算原地打转），插话另记进
 // basicInterjectionsCh。
 //
 // **本轮产出交给 basicFinalCh**，而不是让下游事后回消息列表里倒扫找——那个列表含 prior，倒扫分不出「本轮产出」和
@@ -122,12 +124,14 @@ func modelHistoryRecords(notes, inter []*schema.Message, boundary, out *schema.M
 // **两种都该由这条 assistant 代表本轮**：无 tool_call 时它就是模型的答复；return-direct 时它是模型在转交 / 路由**之前
 // 说的话**，丢掉它会真丢东西——session events 只存 Exit 这一条，Handoff 的后接 agent 完全靠它看前接说了什么
 // （Rewrite 模式的接力语义）。
-func basicModelWrites(notes, inter []*schema.Message, out *schema.Message, late []*schema.Message, compaction *compactionMemo) []compose_v2.ChannelWrite {
+func basicModelWrites(notes, inter []*schema.Message, out *schema.Message, late []*schema.Message, compaction *compactionMemo, binding *toolBinding) []compose_v2.ChannelWrite {
 	produced := make([]*schema.Message, 0, len(notes)+len(inter)+1+len(late))
 	produced = append(append(append(append(produced, notes...), inter...), out), late...)
 	writes := []compose_v2.ChannelWrite{
 		compose_v2.Write(basicMessagesCh, produced),
 		compose_v2.Write(basicRoundCh, 1), // 累加 round
+		// 每一轮都写（没有裁剪时是 nil）：tools 节点读到的要是产出这一批 tool_call 的那一轮的绑定
+		compose_v2.Write(basicToolBindingCh, binding),
 	}
 	if len(inter)+len(late) > 0 {
 		writes = append(writes,

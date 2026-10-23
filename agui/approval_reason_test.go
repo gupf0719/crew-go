@@ -73,7 +73,7 @@ func TestHandler_MergedApprovals_EachKeepsItsReason(t *testing.T) {
 			t.Errorf("第 %d 条应带答复 schema（approved: boolean），实际 %v", i+1, m["responseSchema"])
 		}
 		meta, _ := m["metadata"].(map[string]any)
-		if opts, _ := meta["options"].([]any); len(opts) != 4 {
+		if opts, _ := meta[agui.MetadataKeyApprovalOptions].([]any); len(opts) != 4 {
 			t.Errorf("第 %d 条的 metadata 应带四个选项，实际 %v", i+1, m["metadata"])
 		}
 	}

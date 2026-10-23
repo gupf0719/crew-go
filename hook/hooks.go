@@ -24,6 +24,9 @@ type AgentInfo struct {
 
 // AgentInput 传递给 OnAgentStart.
 //
+// Messages 里的输入是这个 agent 自己那份（Run 入口拷过）：原地改它、换掉它，这个 agent 用的就是改过的，调用方手里
+// 那条与兄弟 agent 拿到的不受影响。
+//
 // **改写 Messages 时关键约束 (R22 audit MED-1)**:
 // 业务 hook 改写消息 (如 PII filter / content redaction) 时**必须保留所有
 // Annotations**——含 framework 内部 marker (SkillBodyAnnotation /
@@ -116,7 +119,8 @@ type AgentOutput struct {
 //	                            交框架合成的失败结果（agent_v2.ToolCallErrCode）；挂起的（等人回答、等审批）不触发。这时这批的结果整体
 //	                            作废，改写不被消费，钩子的错误与 panic 只记日志——给用户展示结果的钩子据这个标记跳过、等续跑那一次。续跑时
 //	                            跑完的那几个从工具账重放、再触发一次，Extra 带 agent_v2.ToolReplayedExtraKey（改写照常消费）——按调用计数
-//	                            或计时的钩子据它跳过
+//	                            或计时的钩子据它跳过。续跑时同一批的每个调用再触发一次 OnToolStart，ToolInput.Extra 带
+//	                            agent_v2.ToolRedispatchedExtraKey——把调用转发给前端的钩子据它不再重开同一个调用
 //
 // [只读] 观测 / 统计 / 配对锚点字段，框架不消费，改写不生效（by design；tool/model 层是 observation-only）：
 //

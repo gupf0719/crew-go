@@ -218,6 +218,7 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	if input == nil {
 		input = schema.UserMessage("")
 	}
+	input = ownRunInput(input)
 	if g.graph == nil {
 		return nil, fmt.Errorf("graph agent %q: graph required", g.Name())
 	}
@@ -298,9 +299,7 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, hookErr)
 	}
 	// 消费 hook 改写: 空 Messages 时保持原 input (避免 inputWriter 拿 nil panic).
-	if len(agentIn.Messages) > 0 && agentIn.Messages[len(agentIn.Messages)-1] != nil {
-		input = agentIn.Messages[len(agentIn.Messages)-1]
-	}
+	input = adoptHookInput(agentIn, input)
 
 	// 注入 user input 审计事件——在 OnAgentStart 消费**之后**（四编排 review GA-M1 fix，
 	// 对齐其余 7 编排 "OnAgentStart → 消费改写 → AddEvent" 序）：hook 改写（如 PII

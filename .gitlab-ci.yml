@@ -1,6 +1,6 @@
 # crew-go GitLab CI (OKR 9.4)
 #
-# 六道关: build (主 module + 3 独立 module) / test / race / vet / lint / coverage。
+# 六道关: build / test / race / vet (这四道都覆盖主 module + 3 个独立 module) / lint / coverage。
 # 覆盖率门禁: 核心包 >= 75% (scripts/check-coverage.sh); MR / 徽章看核心包合并 total。
 
 stages:
@@ -31,27 +31,35 @@ build:
     - (cd sql && go build ./...)
     - (cd a2a/zk && go build ./...)
 
-# ---------- test (主 module 单测, 不连外网) ----------
-# ⚠️ go.work 下根目录 `go test ./...` **不含** redis / sql / a2a/zk 三个子模块的包,
-# 所以它们的测试现在 CI 里一条都不跑(只在 build job 里编译)。redis 用 miniredis、
-# sql 用 SQLite, 都自包含不连外网, 可以直接加 (cd redis && go test ./...) 等;
-# 只有 a2a/zk 的 conformance 要真 ZK(integration tag)。见 doc/code/todo.md 同名条目。
+# ---------- test (主 module + 3 个子模块单测, 不连外网) ----------
+# go.work 下根目录 `go test ./...` **不含** redis / sql / a2a/zk 三个子模块的包, 要各自进目录跑。
+# redis 用 miniredis、sql 用 SQLite, 都自包含不连外网; a2a/zk 的 conformance 要真 ZK, 打了 integration tag,
+# 默认不编译。真 PG / MySQL 还没接(要给 sql 模块加驱动依赖), 见 doc/code/todo.md 同名条目。
 test:
   stage: test
   script:
     - go test ./...
+    - (cd redis && go test ./...)
+    - (cd sql && go test ./...)
+    - (cd a2a/zk && go test ./...)
 
-# ---------- race (主 module 竞态检测) ----------
+# ---------- race (主 module + 子模块竞态检测) ----------
 race:
   stage: test
   script:
     - go test -race ./...
+    - (cd redis && go test -race ./...)
+    - (cd sql && go test -race ./...)
+    - (cd a2a/zk && go test -race ./...)
 
 # ---------- vet ----------
 vet:
   stage: test
   script:
     - go vet ./...
+    - (cd redis && go vet ./...)
+    - (cd sql && go vet ./...)
+    - (cd a2a/zk && go vet ./...)
 
 # ---------- lint (golangci-lint, 规则见 .golangci.yml) ----------
 lint:

@@ -249,6 +249,7 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 	if input == nil {
 		input = schema.UserMessage("")
 	}
+	input = ownRunInput(input)
 	if h.initial == "" {
 		return nil, fmt.Errorf("handoff agent %q: initial required (use WithHandoffInitial)", h.Name())
 	}
@@ -295,9 +296,7 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 		}
 		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, startErr)
 	}
-	if len(agentIn.Messages) > 0 && agentIn.Messages[len(agentIn.Messages)-1] != nil {
-		input = agentIn.Messages[len(agentIn.Messages)-1]
-	}
+	input = adoptHookInput(agentIn, input)
 
 	var finalRef *schema.Message
 	// P0 observability: push retErr 让 observability OnAgentEnd 识别 InterruptError 路径
@@ -602,7 +601,7 @@ func (h *HandoffAgent) buildComposeGraph(
 			sigs, err := compose_v2.CaptureSignals(ctx, func(c context.Context) error {
 				return lanes.run(func(s *RunSession) error {
 					var runErr error
-					events, runErr = ag.Run(c, s, input,
+					events, runErr = ag.Run(c, s, cloneCalleeInput(input),
 						withHandoffGrant(&handoffGrant{grantee: ag, candidates: candSet}),
 						withRouteGrant(route.regrant(ag)))
 					return runErr

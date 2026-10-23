@@ -110,7 +110,7 @@ fan-out N 分支某一支失败，剩下兄弟怎么办：
 
 | **多分支同时失败时返给调用方什么** | 抛**一个**（`_panic_or_proceed` 从 `done` 这个 set 里 `pop()`，既非完成序也非声明序）；中断例外——全部摊平进一个 `GraphInterrupt`。仓库里 0 处 `ExceptionGroup`（Python 3.11+ 有但不用）。真正的答案是 node-level `error_handler`：配了就不抛、路由回图里，N 个分支各触发各的 | 抛**第一个完成的**（图层 `resolveInterruptCompletedTasks` 见非中断错立即 return）；中断例外——`CompositeInterrupt(errs...)` 结构化聚合。全仓 0 处 `errors.Join`。ToolsNode 那层反而是**声明序**（先 `wg.Wait()` 再按下标扫）——同一个框架里两层不统一 | **中断优先**（`frontierResult.exitErr`）：有任何分支中断就返中断（1 个返该分支原始 error 保第二 sentinel，多个 `MergeInterrupts` 合成带 N 条 query 的），否则返 `FirstErr`（frontier 索引序第一个）。**不聚合**——理由见下 |
 
-**「业务错只给一个」是五家一致的做法**，而且不是没想过聚合：LangGraph 有 `ExceptionGroup` 不用、MAF 在 .NET 上有现成的 `AggregateException` 却 `await Task.WhenAll` 掉（只拿 `InnerExceptions[0]`）、eino 有 `errors.Join` 全仓 0 处。我们也试过聚合版，实测它引入一个比它解决的更隐蔽的问题：`errors.Join` 的 `Unwrap() []error` 让 `errors.Is/As` 遍历所有分支，判断语义从「这个错是不是 X」**静默**变成「有没有哪个分支是 X」——3 个分支里 2 个是可重试业务错、1 个 wrap 了自己下游调用的 `context.DeadlineExceeded`（全局 ctx 健康），聚合后 `IsControlFlowSignal` 返 true → `IsRetryable` 返 false → 那 2 个再也不会重试。不聚合时该误判只有 1/3 概率撞上，聚合让它必现。
+**「业务错只给一个」是五家一致的做法**，而且不是没想过聚合：LangGraph 有 `ExceptionGroup` 不用、MAF 在 .NET 上有现成的 `AggregateException` 却 `await Task.WhenAll` 掉（只拿 `InnerExceptions[0]`）、eino 有 `errors.Join` 全仓 0 处。我们也试过聚合版，实测它引入一个比它解决的更隐蔽的问题：`errors.Join` 的 `Unwrap() []error` 让 `errors.Is/As` 遍历所有分支，判断语义从「这个错是不是 X」**静默**变成「有没有哪个分支是 X」——3 个分支里 2 个是可重试业务错、1 个返了 `ErrSoftCanceled`（业务在那个分支里说了停），聚合后 `IsRetryable` 返 false → 那 2 个再也不会重试（2026-10-23 之前的实测例子是 wrap 了下游 `DeadlineExceeded` 的分支，默认谓词不再按错误链的 ctx 错判之后换成这个，形状一样）。不聚合时该误判只有 1/3 概率撞上，聚合让它必现。
 
 消费侧的实证比推演更有说服力：OpenAI SDK 面对 anyio 抛来的 `BaseExceptionGroup` 时，「能不能重试」被迫写成 `all(...)` 而不是 any（`mcp/server.py`）；CrewAI 为了从聚合里挑出「那个真正有意义的错」退化成字符串匹配（`"401" in error_msg`、`"TaskGroup" in str(e)`）。**Python 生态里唯一大规模输出 ExceptionGroup 的地方（anyio），下游都在想办法把它拆掉**——聚合把成本转移给了每一个调用方。
 
@@ -488,7 +488,7 @@ LangChain 走 `on_retriever_error`、我们走 `OnNodeEnd`），返回值只给�
 仲裁**共用同一份判据本体** `pickFanoutError`，不是两份要手工同步的拷贝）。
 
 判据不是「返回值几个槽」，而是**有没有一个先于降级策略执行的分类步**——我们用
-`compose_v2.IsRetryFutile`（fallback guard 与框架重试守卫共用；retry 默认谓词 `IsRetryable` 仍走 `IsControlFlowSignal`，见中心 backlog），形状对应
+`compose_v2.IsRetryFutile`（fallback guard 与框架重试守卫共用；retry 默认谓词 `IsRetryable` 2026-10-23 起也不再按错误链上的 ctx 错判），形状对应
 LangGraph 的 `GraphBubbleUp`。ES 那种「默认且无条件降级」容不下中断：中断是「必须停下来
 等人」，跟「缺就缺了继续给结果」直接冲突。
 

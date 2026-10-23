@@ -220,6 +220,7 @@ func (r *ReflectAgent) Run(ctx context.Context, session *RunSession, input *sche
 	if input == nil {
 		input = schema.UserMessage("")
 	}
+	input = ownRunInput(input)
 	if r.actor == nil {
 		return nil, fmt.Errorf("reflect agent %q: actor required (call WithActor)", r.Name())
 	}
@@ -260,9 +261,7 @@ func (r *ReflectAgent) Run(ctx context.Context, session *RunSession, input *sche
 		}
 		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, startErr)
 	}
-	if len(agentIn.Messages) > 0 && agentIn.Messages[len(agentIn.Messages)-1] != nil {
-		input = agentIn.Messages[len(agentIn.Messages)-1]
-	}
+	input = adoptHookInput(agentIn, input)
 
 	var finalRef *schema.Message
 	// P0 observability: push retErr 让 observability OnAgentEnd 识别 InterruptError 路径

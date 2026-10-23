@@ -38,8 +38,10 @@ func TestIsRetryable_AllFrameworkSentinels(t *testing.T) {
 				Reason: "r", Query: &compose_v2.AskQuery{InterruptID: "i", Question: "q"},
 			}, false, "在等人答，重跑白跑",
 		},
-		{"ctx.Canceled", context.Canceled, false, "调用方要停"},
-		{"ctx.DeadlineExceeded", context.DeadlineExceeded, false, "超时了，重跑还是超"},
+		// 错误链上的 ctx 错不等于调用方的 ctx 结束了（后端自己的超时也是这个形状）：谓词不按它判，调用方的 ctx
+		// 由 RunWithRetry 在调谓词之前判（见 TestIsRetryable_CallerCanceledStillStops）
+		{"ctx.Canceled", context.Canceled, true, "可能是后端自己取消的；调用方的取消由 RunWithRetry 的守卫按 ctx 拦"},
+		{"ctx.DeadlineExceeded", context.DeadlineExceeded, true, "pgx / http.Client{Timeout} 的超时，调用方还活着时该重试"},
 		{
 			"ErrSoftCanceled", compose_v2.ErrSoftCanceled, false,
 			"业务明确说停且已存档；重跑会从断点再推进一个超步，多做一步真实工作",

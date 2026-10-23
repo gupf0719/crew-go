@@ -224,8 +224,8 @@ type FailoverPolicy interface {
 
 - **判据收在 compose_v2**：`compose_v2.IsRetryFutile(ctx, err)` 判「再做一次有没有可能有用」——三个框架自铸哨兵
   （`InterruptError` / `ErrCheckpointStale` / `ErrSoftCanceled`）按 error 判，ctx 那档问调用方的 `ctx.Err()`，不问错误链
-  （后端自己的超时也会产 `DeadlineExceeded`）。fallback 层与框架重试守卫用它；⚠️ retry 层的默认谓词 `IsRetryable`
-  还没跟上，仍走 `IsControlFlowSignal`（2026-09-18 核验，见 `doc/code/todo.md`）。
+  （后端自己的超时也会产 `DeadlineExceeded`）。fallback 层与框架重试守卫用它；retry 层的默认谓词 `IsRetryable`
+  不再按错误链上的 ctx 错判（调用方的 ctx 由守卫判，2026-10-23 改）。
 - **构造期包装**：`fallback.New()` 把业务 policy 包进 `guardedPolicy`——所有决策点
   （`tryMembers` 切换 + `callMemberWithRetry` 重试 + 未来新增）自动豁免，不依赖逐点
   前置检查的纪律。

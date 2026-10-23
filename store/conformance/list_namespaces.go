@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -89,6 +90,23 @@ func testListNamespaces(t *testing.T, factory StoreFactory) {
 		}
 	})
 
+	// 不传 WithListLimit 时默认最多 100 个（同 Search 的默认 10）：调用方不传 limit 时拿它当成本上界，后端「不限」的话
+	// 那个界不存在，跨后端行为也会漂。
+	t.Run("ListNamespaces_Default_Limit_Is_100", func(t *testing.T) {
+		st := factory()
+		ctx := context.Background()
+		for i := 0; i < 105; i++ {
+			_ = st.Put(ctx, store.NS("dflt", fmt.Sprintf("n%03d", i)), "k", i)
+		}
+		nss, err := st.ListNamespaces(ctx, store.WithListPrefix(store.NS("dflt")))
+		if err != nil {
+			t.Fatalf("ListNamespaces: %v", err)
+		}
+		if len(nss) != 100 {
+			t.Errorf("不传 WithListLimit 应默认返回 100 个（写了 105 个），got %d", len(nss))
+		}
+	})
+
 	// 不变量：结果按 Namespace.String() 的字节序排列，分页窗口是这个次序里的连续一段。
 	//
 	// 把排序交给数据库的后端，次序跟着列的排序规则走：PG 库的默认规则常是 en-US 一类
@@ -96,6 +114,20 @@ func testListNamespaces(t *testing.T, factory StoreFactory) {
 	// "o.B" 前面、"o._c" 排在最前，与字节序相反——同一个 (offset, limit) 在不同后端上
 	// 拿到的是不同的几项。夹具用大小写、'_'（0x5F，介于大写与小写字母之间）和 '-'
 	// （0x2D，小于分隔符 '.'）把字节序与语言规则区分开。
+	t.Run("ListNamespaces_NegativeOffset_Returns_ErrNegativeOffset", func(t *testing.T) {
+		st := factory()
+		ctx := context.Background()
+		_ = st.Put(ctx, store.NS("neg_list"), "a", 1)
+		for _, opts := range [][]store.ListOption{
+			{store.WithListOffset(-1)},
+			{store.WithListOffset(-1), store.WithListMaxDepth(1)}, // 带 maxDepth 的那条路（有的后端在 Go 里分页）
+		} {
+			if _, err := st.ListNamespaces(ctx, opts...); !errors.Is(err, store.ErrNegativeOffset) {
+				t.Errorf("ListNamespaces(offset=-1) err = %v, want store.ErrNegativeOffset", err)
+			}
+		}
+	})
+
 	t.Run("ListNamespaces_Sorted_By_String_Bytes", func(t *testing.T) {
 		st := factory()
 		ctx := context.Background()

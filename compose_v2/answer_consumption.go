@@ -227,9 +227,10 @@ func bubbleConsumedAnswersTo(parent *answerLedger, cm *ChannelManager) {
 // 分层只管重试会原样重做的那部分：fn 直接兑付的（[Ask]、[NextAnswerSlot]、[GetResumeAnswer]，包括交出去的
 // 执行在自己的图之外问的）。嵌套图成功退出时冒上来的兑付（[bubbleConsumedAnswersTo]）越过尝试层，直接记进
 // 外面那本账、立即可见。那张图在失败那次尝试里已经跑完，存档随成功清掉；后一次尝试要么拿回记录不再跑它
-// （`agent_v2.RunSubAgent` 的完成记录），要么从头再跑——从头再跑时内容可能重新生成（草稿 v1 变 v2），同一个
-// 位置问的已经不是同一个问题。它的兑付对后一次尝试照旧可见，再问就当场终局失败，对 v1 的批准不会兑付给
-// v2。这部分也分层的话，那个批准是静默兑付给 v2 的（实测，`err == nil`）。
+// （`agent_v2.RunSubAgent` 的完成记录），要么从头再跑——一次重生，内容可能重新生成（草稿 v1 变 v2），里面的提问
+// 换新身份（见 nestedRegenKey），问的是新问题、拿不到对 v1 的批准。它的兑付对后一次尝试照旧可见，作为第二道保险：
+// 万一重生的提问落在旧位置上，当场终局失败而不是兑付旧答案。这部分也分层的话，那个批准曾是静默兑付给 v2 的
+// （实测，`err == nil`）。
 //
 // 不配重试（MaxRetries 为 0）或外层没有账本（不在节点执行里）时为 nil，各方法什么也不做。
 type retryLedger struct {

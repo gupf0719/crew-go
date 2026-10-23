@@ -27,6 +27,9 @@ func (s *Store) ListNamespaces(ctx context.Context, opts ...store.ListOption) ([
 	if cfg.Limit <= 0 {
 		cfg.Limit = 100
 	}
+	if err := store.ValidateOffset(cfg.Offset); err != nil {
+		return nil, err
+	}
 
 	if len(cfg.Suffix) > 0 {
 		return nil, fmt.Errorf("sql store ListNamespaces: WithListSuffix not supported in PoC: %w",

@@ -10,9 +10,10 @@ package common
 //   - CachedInputTokens: InputTokens 中命中 cache 的部分 (provider 折价计费, 业务降本指标)
 //   - CacheCreationInputTokens: InputTokens 中本次写入 cache 的部分 (Anthropic 按写入价计费,
 //     比普通输入贵; 只报 cache 读的 provider 恒为 0)
-//   - OutputTokens: LLM 输出 token (不含 think)
-//   - ThinkTokens: 模型推理 think token (OpenAI o1 / qwen-thinking / Claude thinking)
-//   - TotalTokens: provider 返的合计 (业务校验用, 通常 = InputTokens + OutputTokens + ThinkTokens)
+//   - OutputTokens: LLM 输出 token（含推理那部分，provider 按它计输出费用）
+//   - ThinkTokens: OutputTokens 中推理（思考）的那部分（OpenAI 推理模型 / deepseek-reasoner / qwen 思考模式的
+//     completion_tokens_details.reasoning_tokens，Claude 的 output_tokens_details.thinking_tokens），跟 CachedInputTokens 之于 InputTokens 同一个口径：子集，不另外相加
+//   - TotalTokens: provider 返的合计 (业务校验用, 通常 = InputTokens + OutputTokens)
 type MessageUsage struct {
 	ThinkTokens              int32 `json:"thinkTokens"`
 	InputTokens              int32 `json:"inputTokens"`

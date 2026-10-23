@@ -103,7 +103,7 @@ func TestNewClient_ExplicitKeyWinsOverEnvToken(t *testing.T) {
 }
 
 // TestGenerate_ResponseMapping 钉住响应到 Message 的映射：文本、thinking 文本、工具调用、结束原因、
-// 模型、provider，以及用量的口径（InputTokens 含 cache 读写，OutputTokens 不含 thinking）。
+// 模型、provider，以及用量的口径（InputTokens 含 cache 读写，OutputTokens 含 thinking、ThinkTokens 是其中那部分）。
 func TestGenerate_ResponseMapping(t *testing.T) {
 	srv, _ := newServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
 		replyJSON(w, http.StatusOK, message([]any{
@@ -132,7 +132,7 @@ func TestGenerate_ResponseMapping(t *testing.T) {
 		t.Fatalf("Metadata = %+v", md)
 	}
 	want := schema.MessageUsage{InputTokens: 450, CachedInputTokens: 300, CacheCreationInputTokens: 50,
-		OutputTokens: 50, ThinkTokens: 30, TotalTokens: 530}
+		OutputTokens: 80, ThinkTokens: 30, TotalTokens: 530}
 	if md.Usage == nil || *md.Usage != want {
 		t.Errorf("Usage = %+v，期望 %+v", md.Usage, want)
 	}

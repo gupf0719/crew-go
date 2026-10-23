@@ -88,6 +88,12 @@ func fixedToolCallContentOf(ctx context.Context, original []schema.ToolCall) ([]
 	return out, true
 }
 
+// toolCallsDispatchedBefore 报这一批 tool_call 上次是不是已经交给工具执行过（内容已经定下，见 fixToolCallContent）。
+func toolCallsDispatchedBefore(ctx context.Context) bool {
+	rec, ok := compose_v2.GetStepResult[*fixedToolCalls](ctx, fixedToolCallsStep)
+	return ok && rec != nil
+}
+
 func fixToolCallContent(ctx context.Context, toolCalls, original []schema.ToolCall) {
 	if len(original) != len(toolCalls) {
 		return // 同一条消息取出来的两份，长度必然相同

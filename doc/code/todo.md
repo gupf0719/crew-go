@@ -87,14 +87,16 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
   fixture 而不是问题。
 
 补哨兵类（实现正确、缺防回归；review-v7 H-04 剩余）：
-- `crew.node.instance`（扇出实例维）零断言——变异 `inst := ""` 后 `go test ./observability/` 全绿。
-  连带：嵌套同名节点时第二个实例的 span 会被判「已开过」整个不建，而 `assertAllEnded` 只比
-  started/ended 数、抓不到「凭空少一个」。
-- `StartA2AServerSpan` 只在 `TestNilObservability_NoPanic` 里被调一次（nil 接收者），没有一条验行为——
-  丢远端父 + 改 `SpanKind` 后全绿，后果是跨进程 trace 断成两棵树。inject / extract 那半有
-  `TestPropagation_RoundTrip`，**消费 extract 结果的那半没有**。
-- `crew.tool.category` 白名单（只放行 retrieval / embedding / guardrail）零断言——放开后业务
-  `tool.Categorizer` 返任意字符串，指标 / 属性基数无上限。
+- ~~`crew.node.instance`（扇出实例维）零断言~~ / ~~`StartA2AServerSpan` 没有一条验行为~~ /
+  ~~`crew.tool.category` 白名单零断言~~ **已修（2026-10-23）**：
+  `TestNodeInstance_FanoutSpansAreDistinct`（真实 SendFrom 扇出图）/
+  `TestA2AServerSpan_NestsUnderRemoteParent`（TraceID + 父 SpanID + SpanKind 三条各管一种退化，
+  补上「消费 extract 结果」那半）/ `TestToolCategory_WhitelistOnly`（白名单内外各一条）。三条变异都红。
+  ⚠️ 实测厘清：`inst` 参与的早退判据防的是**同一个 Observability 装两层**，**不是**扇出（扇出的实例
+  并发跑、各有自己的 ctx，`handleFrom` 取到 nil、早退不成立）。所以那条用例里「span 个数 == 2」的断言
+  在当前 fixture 下**不承重**（变异时属性断言先红），用例注释已写明。**仍开着**：要钉死「装两层 + 扇出」
+  那个组合（instance 维塌掉 ⟹ 第二个实例 span 整个不建，而 assertAllEnded 只比数量抓不到），得再搭一层
+  Observability，形状见 `TestTwoInstancesStacked_EachComplete`。
 - mcp 两条已实现但无哨兵的不变量：`goOnline` 的 `s.closed` 早退（缺它会泄漏一个永不关闭的新连接）、
   `markOffline` 的 `bg.Add(1)` 必须在 `s.mu` 内（挪出去 `-race` 直接报竞争）。探针写法见 review-v7。
 - ~~`agent_v2/history_conformance` 没有长 key 用例，`HistoryKey` godoc 也没声明可移植上限~~

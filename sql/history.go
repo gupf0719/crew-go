@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -144,7 +145,9 @@ func (h *HistoryStore) Load(ctx context.Context, key agent_v2.HistoryKey, q agen
 		cond("agent", q.Agent)
 	}
 	stmt := fmt.Sprintf(`SELECT id, payload FROM %s WHERE %s ORDER BY id`, h.table, where.String())
-	if q.Limit > 0 {
+	// Limit = math.MaxInt 时多取一行会溢出成负数（PG / MySQL 拒绝负的 LIMIT），那么大的上限按不限处理。
+	limited := q.Limit > 0 && q.Limit < math.MaxInt
+	if limited {
 		stmt += fmt.Sprintf(" DESC LIMIT %d", q.Limit+1)
 	}
 	rows, err := h.db.QueryContext(ctx, stmt, args...)
@@ -175,7 +178,7 @@ func (h *HistoryStore) Load(ctx context.Context, key agent_v2.HistoryKey, q agen
 		return agent_v2.HistoryPage{}, fmt.Errorf("sql history load: %w", err)
 	}
 	more := false
-	if q.Limit > 0 {
+	if limited {
 		// 倒序读的：多出来的那一行是更早的一条，只说明还有更多
 		if len(out) > q.Limit {
 			more = true

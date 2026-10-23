@@ -533,15 +533,15 @@ func (h *agentHooks) OnToolEnd(ctx context.Context, info *hook.AgentInfo, out *s
 	replayed, _ := out.Extra[agent_v2.ToolReplayedExtraKey].(bool)
 	if replayed {
 		extra = append(extra, AttrToolReplayed.Bool(true))
-		if th.scope != nil {
-			th.scope.toolCalls.Add(-1)
-		}
 	}
 	th.scope.remove(th)
 	if !o.finish(th, r, extra...) {
-		return ctx, nil
+		return ctx, nil // 已经收过尾（同一个 Observability 装了两层，外层这一次）：计数也已经退过
 	}
 	if replayed {
+		if th.scope != nil {
+			th.scope.toolCalls.Add(-1)
+		}
 		return ctx, nil
 	}
 	o.recordToolDuration(ctx, th, info.Name, r, denied)

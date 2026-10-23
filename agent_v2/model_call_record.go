@@ -62,6 +62,11 @@ type modelCallRecord struct {
 	Boundary *schema.Message `json:"boundary,omitempty"`
 	// Final 报这一轮已经处理完、定下了。
 	Final bool `json:"final,omitempty"`
+	// FinalRound 报这份答复是不是在软降落轮生成的（模型被告知 tool_choice=none / 只留 final_output 的那一轮，见
+	// withFinalRound）。沿用原样、重放定下的那一轮时 tools 节点据它判这批调用执不执行——不能按续跑时的预算现算：
+	// 续跑调整了轮次预算（WithResumeMaxRounds）时现算的值跟这份答复生成时不同，缩预算会把可以调工具的一轮当成软降落轮
+	// （硬调不执行、随后被「至多一个软降落轮」的闸拦下，一次收尾都没有），调大预算会执行软降落轮里硬调的工具。
+	FinalRound bool `json:"final_round,omitempty"`
 	// Signals 是处理这次调用时做出的上行信号（钩子与模型里做出的，多数为空；Final 时有意义）。
 	Signals compose_v2.Signals `json:"signals,omitzero"`
 }

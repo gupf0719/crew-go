@@ -1566,7 +1566,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			return fmt.Errorf("superstep frontier width %d exceeds max %d (fan-out 宽度失控——"+
 				"节点自己 SendFrom 自己时宽度逐超步相乘，检查业务的终止条件；确需更大并发用 "+
 				"WithMaxFrontierWidth): %w",
-				len(frontier), g.maxWidth, &MaxIterationsError{Iterations: len(frontier)})
+				len(frontier), g.maxWidth, &MaxWidthError{Width: len(frontier)})
 		}
 
 		// 节点访问次数防御——返 typed `*MaxIterationsError` 让业务用 errors.As 解析。

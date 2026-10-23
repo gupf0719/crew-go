@@ -43,10 +43,23 @@ type NonRetryable interface {
 	NonRetryable()
 }
 
-// MaxIterationsError 表示循环超过了其迭代限制——典型 LoopAgent 触顶 maxIterations
-// 或 Graph 触顶 maxVisit 时使用。
+// MaxIterationsError 表示循环超过了其**迭代深度**限制——典型 LoopAgent 触顶 maxIterations、
+// Graph 触顶 maxVisit、BasicAgent 跑满 maxRounds 时使用。
 //
 // errors.As / errors.Is 友好——caller 用 `var e *MaxIterationsError` 解析具体值。
+//
+// # Iterations 是「第几次迭代触顶的」，不是别的量
+//
+// 各处抛出时填的都是**迭代计数**，但**计数基准按抛出方**：Graph 的 maxVisit 填 `visits[id]`，
+// 也就是**被拒的那一次访问**（= maxVisit+1）；BasicAgent 的 Run / Resume 出口填本 agent 自己**已跑满的
+// 轮数**（= maxRounds+1）。同一次 BasicAgent 跑满会同时经过这两处（引擎先拒、出口再包一层），
+// 而出口**重铸**了一个自己的 MaxIterationsError 挂在外层，所以 `errors.As` 取到的是**轮数**、跟错误正文
+// 里那句「跑满 N 轮」一致（引擎的原错误仍经 `%w` 留在链上，诊断不丢）。
+//
+// ⚠️ **扇出宽度失控不用这个类型**，用 [MaxWidthError]：宽度（一个超步里的并发成员数）与深度（同一节点
+// 被反复访问的轮数）是**两个正交维度**（`graph_loop.go` 那两段注释原话），而 `Iterations` 这个名字里没有
+// 「宽度」的意思。曾经两者共用它、`Iterations` 一个装宽度一个装深度，调用方 `errors.As` 之后**分不出
+// 拿到的是哪个量**——CLAUDE.md 「用 X 来做 Y 而 X 的名字里没有 Y 的意思」那条判别式的实例。
 type MaxIterationsError struct {
 	Iterations int
 }
@@ -58,6 +71,27 @@ func (e *MaxIterationsError) Error() string {
 
 // NonRetryable 实现 [NonRetryable]——预算耗尽属「重放代价已知是最大值」那一类。
 func (e *MaxIterationsError) NonRetryable() {}
+
+// MaxWidthError 表示一个超步的 fan-out **宽度**超过了 maxFrontierWidth（见 WithMaxFrontierWidth）。
+//
+// 它与 [MaxIterationsError] 是**两个正交维度**：宽度是「一个超步里有多少并发成员」，深度是「同一节点被
+// 回边反复访问多少轮」。节点在自己的 NodeFunc 里 SendFrom 自己 N(≥2) 次时宽度逐超步相乘，业务终止条件
+// 写错就是指数爆炸——而深度每超步只 +1，等 maxVisit 触顶时进程早已 OOM。
+//
+// 所以它要有自己的类型：共用 MaxIterationsError 的话，`Iterations` 一个装宽度一个装深度，调用方
+// `errors.As` 之后分不出拿到的是哪个量，而两者的处置完全不同（宽度失控查业务的终止条件 / 深度触顶是
+// 预算耗尽）。
+type MaxWidthError struct {
+	Width int
+}
+
+// Error 返人类可读错误信息。
+func (e *MaxWidthError) Error() string {
+	return fmt.Sprintf("扇出宽度超限：%d", e.Width)
+}
+
+// NonRetryable 实现 [NonRetryable]——宽度失控是业务的终止条件写错了，重跑必然一样。
+func (e *MaxWidthError) NonRetryable() {}
 
 // MaxRoundsError 表示代理超过了其最大允许轮数. **预留 typed 供业务自定义抛**——
 // framework 生产路径不抛 (BasicAgent ReAct 触顶走 `WithMaxVisit(maxRounds * 2)` →

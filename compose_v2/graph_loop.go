@@ -1563,10 +1563,22 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		// 业务终止条件写错就是指数爆炸；而深度每超步只 +1，等 maxVisit 触顶时进程早已
 		// OOM（实测 N=2/maxVisit=6 执行 63 次，默认 maxVisit=100 是 2^100）。
 		if len(frontier) > g.maxWidth {
+			// **也 `%w ErrRunAborted`**：不重试（`IsRetryable` 已排除它）+ Run 出口清 cp 子树
+			// + 各吞错点不吞（[MustPropagate]）。
+			//
+			// ⚠️ 理由同单写入者冲突那条，**不是「重跑必然一样」**：扇出几路取决于运行时数据
+			// （节点按 LLM 给的清单 SendFrom），换批数据就不触发。真正的理由是**这个爆炸会随
+			// 存档反复复现**——存进档的 `CurrentFrontier` 就是那个超限的 frontier 本身，而续跑
+			// 闸门按内容判（`HasResumableWork`，不读 Status）⟹ auto-load 捡起 ⟹ **节点一次没跑
+			// 就在同一道闸上再爆**，那个 (sid, ns) 槽从此是死的，且每次重爆都往持久后端写一遍
+			// 那份（默认 maxWidth=10000 时上万条）frontier（审计实测：Run2 的 ran=0、Width 与
+			// Run1 逐字相同；逃生舱 `WithFreshRun` 存在但要靠调用方知道，而 abort 买的正是
+			// 「不用调用方知道」）。清掉档之后下一次 Run 就是 fresh run——数据变了它可能本来就
+			// 不该失败，这正是想要的。
 			return fmt.Errorf("superstep frontier width %d exceeds max %d (fan-out 宽度失控——"+
 				"节点自己 SendFrom 自己时宽度逐超步相乘，检查业务的终止条件；确需更大并发用 "+
-				"WithMaxFrontierWidth): %w",
-				len(frontier), g.maxWidth, &MaxWidthError{Width: len(frontier)})
+				"WithMaxFrontierWidth): %w: %w",
+				len(frontier), g.maxWidth, &MaxWidthError{Width: len(frontier)}, ErrRunAborted)
 		}
 
 		// 节点访问次数防御——返 typed `*MaxIterationsError` 让业务用 errors.As 解析。

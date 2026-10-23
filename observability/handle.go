@@ -215,6 +215,14 @@ func errMsgOf(errs ...error) string {
 
 // errorTypeOf 给 error.type 一个低基数的值：框架认得的错误用固定名，其余统一 _OTHER（GenAI 约定的兜底值）。
 func errorTypeOf(err error) string {
+	// ⚠️ **宽度要排在 run_aborted 之前**：它是唯一**自己带着** ErrRunAborted 的 typed error
+	// （见 MaxWidthError godoc），排在后面就永远读不到它、全落进 run_aborted。而 `error.type` 这个
+	// 维度要的是**原因**（run_aborted 是「终局」这个处置，处置已经由 crew.outcome 记着了）。
+	// 其余 typed error 不带哨兵，位置无所谓，照旧排在哨兵之后。
+	var mw *compose_v2.MaxWidthError
+	if errors.As(err, &mw) {
+		return "max_width"
+	}
 	switch {
 	case errors.Is(err, compose_v2.ErrRunAborted):
 		return "run_aborted"
@@ -229,13 +237,9 @@ func errorTypeOf(err error) string {
 	if errors.As(err, &mi) {
 		return "max_iterations"
 	}
-	// 宽度与深度**各记一个值**：两者的处置不同（宽度失控查业务的终止条件 / 深度触顶是预算耗尽），
-	// 合成一个值的话看板上分不出来。⚠️ 新增一个这样的 typed error 时**这里要跟上**——否则它静默落
-	// `_OTHER`，而 `_OTHER` 是「框架不认得」的意思，看板上读成「业务自己的错」。
-	var mw *compose_v2.MaxWidthError
-	if errors.As(err, &mw) {
-		return "max_width"
-	}
+	// 宽度那条在函数开头（它自己带 ErrRunAborted，见那里）。⚠️ 新增一个这样的 typed error 时
+	// **这里要跟上**——否则它静默落 `_OTHER`，而 `_OTHER` 是「框架不认得」的意思，看板上读成
+	// 「业务自己的错」。
 	return "_OTHER"
 }
 

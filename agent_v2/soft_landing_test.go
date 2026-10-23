@@ -884,4 +884,21 @@ func TestSoftLanding_IterationsIsOwnRoundCount(t *testing.T) {
 	if !strings.Contains(err.Error(), fmt.Sprintf("跑满 %d 轮", mie.Iterations)) {
 		t.Errorf("载荷 Iterations=%d 与正文里的轮数应是同一个数，实际正文：%v", mie.Iterations, err)
 	}
+
+	// **重铸的那条必须排在 errors.Join 的第一个参数**：errors.As 取链上第一个，调序就取回引擎填的
+	// visits[id]（上面那条断言会红），而 Join 的 Error() 按参数序用 \n 拼 ⟹ 参数序同时决定**正文的行序**。
+	// 两件事由同一个量决定，所以正文的指路话（「下一行…引擎的原错误在第二行」）是这个顺序的可观测影子：
+	// 这里把它钉住，调序时**正文与载荷一起红**。只断言载荷的话，指路话指错了行没人知道（审计实测它曾指向
+	// 一句同义重复）。
+	lines := strings.Split(err.Error(), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("出口错误应有两行（重铸的轮数 + 引擎原错误），实际 %d 行：%v", len(lines), err)
+	}
+	if !strings.HasSuffix(lines[0], mie.Error()) {
+		t.Errorf("第一行结尾应是重铸的那条（%q），实际 %q——Join 参数序反了的话这里与 Iterations 一起错",
+			mie.Error(), lines[0])
+	}
+	if !strings.Contains(lines[1], "max") || !strings.Contains(lines[1], "model") {
+		t.Errorf("第二行应是引擎的原错误（点出 model 节点与 max 访问次数），实际 %q", lines[1])
+	}
 }

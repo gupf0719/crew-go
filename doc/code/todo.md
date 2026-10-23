@@ -37,6 +37,29 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
 - ~~AG-UI 标准审批答案被当成拒绝（`{"approved":true}`、`Yes.` 都落进拒绝分支，实测）~~ 已修（2026-10-19，`fix/approval-answers`）
 - ~~中断时根 cp 写失败，agui / a2a 仍当成正常挂起（实测：用户答完续跑找不到存档，工具 0 次执行）~~ 已修（2026-10-19，`fix/interrupt-not-persisted`）
 
+**`a3d7218`（宽度劈出 MaxWidthError）的 commit-level audit（2026-10-23，2 个单视角 agent）**
+
+- 「错误链语义」视角 **0 finding**：出口新引入的 `errors.Join` 在 16 个下游判据 × 6 种内层错误上与
+  老形态（单链 `%w`）**逐项相同**。结构性理由：闸是 `errors.As(err, &mie)`，所以树里本来就有一个
+  `*MaxIterationsError`、它本来就实现 `NonRetryable` ⟹ 这次 join **没往树里加任何新类型 / 新哨兵 /
+  新 ctx 错**，CLAUDE.md 记的那个事故形态（join 引入一条带 ctx 错的分支 ⟹ `IsControlFlowSignal` 翻转）
+  **没有可翻转的维度**。它带回的两条 LOW 都已修（指路话指向同义重复 / `withFinalRound` godoc 的
+  「经 `%w`」在出口这一跳已是 `errors.Join`）。
+- 「新类型能到哪些消费方」视角：宽度失控的**产生点全仓只有 1 处**（子图 / `SendFrom` /
+  `AddSubgraphNode` / `RunWithRetry` 包住的嵌套运行全部收敛到同一个超步循环），按类型分流的 21 个
+  `errors.As` 消费点逐个核过，**没有「原来按 MaxIterationsError 分类、现在落错兜底」的地方**；三条
+  教学面漏列已修。它找到的宽度存档那条见下。
+- 🟢 **BasicAgent 出口那个 `switch` 没有 `default`**（预存，agent A 登记）：末轮错误不是
+  `MaxIterationsError` 时（嵌套图冒上来的宽度错、普通工具错）出口既不重铸也不改文案，把 `maxRounds`
+  当保险丝用的调用方在这些组合下看不到熔断。**未复现**可达性（BasicAgent 自己的四节点图不经 frontier
+  扇出）。要不要补 default 是另一个视角的问题 | `agent_v2/basic_agent.go` Run / Resume 出口 | ⬜ OPEN
+- 🟢 **`agui` / `a2a/server` 把两个 `NonRetryable` 类型都归进「可能瞬时、重来合理」的桶**（预存，
+  **本次改动前后同一个桶**）：`agui/handler.go` 的 `agentErrorCode` 5 条分支全是哨兵判据，两个 typed
+  error 都落 `default: "agent_error"`，而本表给 `agent_error` 的语义是「其余，可能瞬时，重来是合理
+  选项」——跟 `NonRetryable` 正好相反；`a2a/server/executor.go` 只分 stale / not-resumable。⚠️ 它对两个类型
+  **对称**，不是这次改动带出来的 |
+  `agui/handler.go`、`a2a/server/executor.go` | ⬜ OPEN
+
 **review-v7 修复轮自审新发现（2026-10-22，3 个单视角 agent 审 `af7c45a` 自己的改动）**
 
 预存缺陷（不是那次改动引入的，各自独立）：

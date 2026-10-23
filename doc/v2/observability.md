@@ -196,7 +196,7 @@ A2A client span 按发请求用的 ctx 判（`A2AClientSpan.End(ctx, err)`），
 
 | 来源 | 取值 |
 |---|---|
-| 框架认得的错误 | `run_aborted`、`checkpoint_not_persisted`、`graph_id_conflict`、`no_pending_checkpoint`、`max_iterations`、`checkpoint_stale`、`timeout` |
+| 框架认得的错误 | `run_aborted`、`checkpoint_not_persisted`、`graph_id_conflict`、`no_pending_checkpoint`、`max_iterations`（迭代深度触顶）、`max_width`（扇出宽度失控）、`checkpoint_stale`、`timeout` |
 | 工具失败 | `tool.Result` 的错误码（`ToolCallResult.ErrorCode`），没有时 `tool_error` |
 | `OnError` 交来的 | `CommError.Code` |
 | A2A client | `a2a_remote_error` |

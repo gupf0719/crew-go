@@ -1230,7 +1230,9 @@ nil ⟹ cleanup 走成功分支 `purgeExitSlot(reason="success")`。实测后果
 
 ### 11.2 5 类典型错误（Stage 5 C3 补）
 
-4 个 sentinel + 2 个 typed error：
+哨兵（找不到子图存档 / 没有可续的档 / 图身份冲突）+ typed error（迭代深度 / 扇出宽度 / ReAct 轮次）——
+**按类目写、别数个数**：个数写在清单之外的那一行，加一条时几乎必然忘改（`compose_v2/errors.go` 的
+`ErrRunAborted` godoc 记着同一条教训，那里的「共几条」在三处写出过三个互不相同的数）。
 
 ```go
 // compose_v2/errors.go

@@ -352,9 +352,15 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 			// Iterations 是**本 agent 跑满的轮数**（= maxRounds+1），跟上面正文里那句「跑满 %d 轮」一致。
 			// 不重铸的话取到的是引擎 maxVisit 填的 visits[id]（= maxRounds+2，被拒的那次访问），同一个
 			// 诊断给两个数。引擎的原错误经 errors.Join 留在链上，诊断不丢。
+			//
+			// ⚠️ **正文里那句指路要点明「第一行是重铸的那条」**：`errors.Join` 的 Error() 按参数序用 \n 拼，
+			// 而重铸的那条必须排**第一**（errors.As 取链上第一个，调序就取回引擎那个数、这次改动白做）。于是
+			// 冒号之后紧跟的是「达到最大迭代：N」——对前半句的同义重复，引擎的原错误被挤到第二行。曾经写
+			// 「真正的错误见下」，读的人顺着冒号读到的是一句废话（审计实测量过那一行）。
 			err = fmt.Errorf("basic agent %q: 轮次预算耗尽（跑满 %d 轮），本次 Run 以错误收尾、没有交付答复"+
 				"（FinalMessage 可能为 nil）。软降落轮（tool_choice=none）里模型硬调的工具不执行，模型仍硬调就会走到这里"+
-				"——provider 或业务的 ChatModel 不强制执行 none 是常见原因之一；真正的错误见下: %w",
+				"——provider 或业务的 ChatModel 不强制执行 none 是常见原因之一；下一行重复本 agent 跑满的轮数"+
+				"（errors.As 取的就是它），引擎的原错误在第二行: %w",
 				a.config.Name, lastRound,
 				errors.Join(&compose_v2.MaxIterationsError{Iterations: int(lastRound)}, err))
 		}
@@ -521,7 +527,8 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 			// 重铸同 Run 那处（理由见那里）。
 			runErr = fmt.Errorf("basic agent %q: 轮次预算耗尽（跑满 %d 轮），本次续跑以错误收尾、没有交付答复"+
 				"（FinalMessage 可能为 nil）。软降落轮（tool_choice=none）里模型硬调的工具不执行，模型仍硬调就会走到这里"+
-				"——provider 或业务的 ChatModel 不强制执行 none 是常见原因之一；真正的错误见下: %w",
+				"——provider 或业务的 ChatModel 不强制执行 none 是常见原因之一；下一行重复本 agent 跑满的轮数"+
+				"（errors.As 取的就是它），引擎的原错误在第二行: %w",
 				a.config.Name, info.Round,
 				errors.Join(&compose_v2.MaxIterationsError{Iterations: int(info.Round)}, runErr))
 		}
@@ -2553,7 +2560,8 @@ type finalRoundKey struct{}
 //   - 当预算用：`errors.As(&mie)` 之后读 `FinalMessage(events)` ⟹ 拿到那条收尾答复
 //
 // ⚠️ **后半句只对直调 BasicAgent 成立**。成员跑在编排里时，`MaxIterationsError` 经 `%w`
-// 一路冒到顶层、`errors.As` 照样命中，但 `FinalMessage(events)` 拿到的是**那个打满轮次的
+// （出口这一跳是 `errors.Join`——出口重铸一个自己的挂在外层，见 Run 出口那段）一路冒到顶层、
+// `errors.As` 照样命中，但 `FinalMessage(events)` 拿到的是**那个打满轮次的
 // 成员的**收尾文本——后续步骤根本没跑，而调用方从错误里分辨不出来。编排层要判「哪一步
 // 耗尽了」得走 `OnAgentEnd` 或每步各自的返回值。
 //

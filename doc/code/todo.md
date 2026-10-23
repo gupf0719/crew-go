@@ -40,13 +40,23 @@ Stage 1-7 全部完成，v1 (`agent/` + `compose/`) 已删，v2 = main 唯一实
 **review-v7 修复轮自审新发现（2026-10-22，3 个单视角 agent 审 `af7c45a` 自己的改动）**
 
 预存缺陷（不是那次改动引入的，各自独立）：
-- **业务 Client 返回的 error 的方法 panic 照旧冲出 `RemoteTool.Call`，还会把 `Hub.Close` 永久挂住**。
-  `mcp/server.go` 的 `markOffline` 里 `cause.Error()` 裸跑业务 error 的方法：业务返 typed-nil error
-  （`var e *badErr` + 值接收者的 `Error()`）⟹ panic 落在 `s.hub.bg.Add(1)` 与 `go s.reconnectLoop(stale)`
-  **之间** ⟹ `bg.Done()` 永不调 ⟹ `Hub.Close` 的 `bg.Wait()` 死锁（探针实测 25s 超时）。同家族还有
-  `s.hub.events.push(s.statusLocked())` 把 `Err: cause` 交给业务 status hook。
-  ⚠️ 这是「业务代码进框架的入口不止 `Client` 接口那 4 个方法」——`callClient` 只罩住 `CallTool` 那一行。
-  修 `CallTool` 时做过的机械对账把「入口」定义成了接口方法，漏掉了「业务返回的 error 的方法」这一类。
+- ~~**业务 Client 返回的 error 的方法 panic 照旧冲出 `RemoteTool.Call`，还会把 `Hub.Close` 永久挂住**~~
+  **已修（2026-10-23）**：真入口只有**直接调 `.Error()`** 一种，修法就是传 error 值而不是调它
+  （`markOffline` 的日志 + 同包另外 4 处），并把 `go s.reconnectLoop(stale)` 提到日志之前让
+  `bg.Add(1)` 与它之间不夹任何代码。哨兵
+  `TestHub_BusinessErrorMethodPanic_ContainedAndCloseNotStuck`（panic 不冲出 + Close 在看门狗内返回）
+  + 机械哨兵 `TestMCP_NoDirectErrorMethodCallInLogs`（扫全包禁止 `logKeyErr, x.Error()` 形状）。
+  ⚠️ **实测纠正两条此前的判断**（go1.26）：① `fmt.Errorf("…%w", err)` / `fmt.Sprintf("%v", err)` /
+  `slog` 传 error 值都**安全**——内部经 fmt，而 fmt 对 `Error()` 的 panic 自己兜住、渲染成
+  `%!v(PANIC=Error method: …)`，对 typed-nil 更是直接打 `<nil>` 连 `Error()` 都不调，且 `errors.Is` /
+  `errors.As` 照常成立。所以原先登记的「隐式入口（`fmt.Errorf` 的 `%w`）」**不存在**，探针里那个 panic
+  其实来自 `markOffline`。② `statusLocked()` / `statusQueue.push()` 只把 `s.lastErr` 存进结构体 / append，
+  **不调它的方法**，所以不存在「持 `s.mu` 时 panic 导致锁永久持有」；业务 status hook 那条由
+  `callStatusHook` 的 recover 兜。③ `Start` / `reconnectLoop` 的日志当前安全，只因为它们的 err 先被
+  `connect` 的 `fmt.Errorf("%s: initialize: %w", …)` 包装过——那是间接事实，所以也一并改成传值，并用机械
+  哨兵钉住（有人改了 `connect` 不包装，它们立刻会变成新入口）。
+  ⚠️ 一条如实声明：「`go reconnectLoop` 提到日志之前」**没有哨兵钉得住**（日志已安全 ⟹ 挪回去无行为差异，
+  实测变异不红），靠的是那处注释。
 - **`compose_v2.MaxIterationsError.Iterations` 在三条路上不是同一个量**（同一个 `maxRounds=2` 实测）：
   BasicAgent 软降落奏效那条给 `lastRound`=3（轮数）、引擎 `maxVisit` 那条给 `visits[id]`=4（访问计数，
   `graph_loop.go` 的 `Iterations: visits[id]`）、Resume 那道闸给 `round`=3。`withFinalRound` 的 godoc 教

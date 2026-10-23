@@ -12,6 +12,8 @@ import (
 	"net/http/httptest"
 	"net/http/httptrace"
 	"os"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -1741,5 +1743,145 @@ func TestHub_ClientCallToolPanic_SerialResetsConnection(t *testing.T) {
 	mu.Unlock()
 	if got := len(first.calls()); got != 1 {
 		t.Errorf("第二次调用被发给了那条状态不明的旧连接：它累计收到 %d 次（应只有 panic 那一次）", got)
+	}
+}
+
+// nilMethodErr 的 Error() 是**值接收者** ⟹ *nilMethodErr 也有 Error()，而对 typed-nil 指针调它会解引用
+// nil。这是 CLAUDE.md 点名的 typed-nil 陷阱：`err != nil` 为真，调它的方法却 panic。业务自定义 Client
+// 返回这样的 error 完全可能（`var e *myErr; return nil, e`）。
+type nilMethodErr struct{ msg string }
+
+func (e nilMethodErr) Error() string { return e.msg }
+
+func typedNilError() error {
+	var e *nilMethodErr
+	return e // 作为 error 非 nil
+}
+
+// TestHub_BusinessErrorMethodPanic_ContainedAndCloseNotStuck：业务 Client 返回的 **error 的方法** panic
+// 时，① 不冲出 RemoteTool.Call（契约：只在调用方 ctx 结束时返回 error，其余一律 tool.Failure），
+// ② 不把 Hub.Close 挂死。
+//
+// 真入口只有一个：markOffline 里原先的 `slog.Warn(…, cause.Error())`。它夹在 bg.Add(1) 与
+// go reconnectLoop 之间，panic 留下一个「Add 了却没有 Done」的 WaitGroup ⟹ Close 的 bg.Wait() 永久挂住。
+// 两层后果这条用例各有一个断言。
+//
+// ⚠️ 断言必须同时有「panic 没冲出」**和**「Close 在看门狗内返回」：panic 之前失败结果就已经算好了，
+// 只看返回值看不出 Close 已经废了。
+//
+// 顺带钉 ctx 路径的错误链：那条路按契约**可以**返回 error（调用方 ctx 结束了），但 ctx 的原因与业务 error
+// 都得留在链上，而且读它的文本不许 panic（`fmt.Errorf("%w")` 本来就安全——fmt 自己兜住 Error() 的 panic；
+// 这条断言防的是有人把它改成手工拼接或 `%s`，那会断链）。
+func TestHub_BusinessErrorMethodPanic_ContainedAndCloseNotStuck(t *testing.T) {
+	// cancelDuringCall 在 CallTool **执行期间**取消调用方 ctx。⚠️ 提前取消的话 call 在排队那一步
+	// （select on waitCtx.Done()）就返回了，根本走不到 c.CallTool、业务 error 从未产生——第一版就是这么
+	// 搭的，两个版本都绿（变异验证当场暴露）。
+	newHub := func(cancelDuringCall func()) (*mcp.Hub, *mcp.RemoteTool) {
+		t.Helper()
+		c := &memClient{name: "s", tools: specs("t"), onCall: func(context.Context, string, map[string]any) (*mcp.CallResult, error) {
+			if cancelDuringCall != nil {
+				cancelDuringCall()
+			}
+			return nil, typedNilError()
+		}}
+		h := mcp.NewHub(fastBackoff(), mcp.WithClientFactory("s",
+			func(context.Context) (mcp.Client, error) { return c, nil }, mcp.WithSerialCalls()))
+		if err := h.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		return h, h.Tools()[0]
+	}
+	assertCloseNotStuck := func(t *testing.T, h *mcp.Hub) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- h.Close() }()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("Hub.Close 挂死了：bg.Add(1) 已加而 reconnectLoop 没起，bg.Done() 永不调")
+		}
+	}
+
+	t.Run("markOffline_的日志不许直接调Error", func(t *testing.T) {
+		h, tl := newHub(nil)
+		escaped := func() (esc any) {
+			defer func() { esc = recover() }()
+			res, err := tl.Call(context.Background(), map[string]any{})
+			if err != nil || res == nil || res.Error == nil {
+				t.Errorf("该以 tool.Failure 交回，got res=%+v err=%v", res, err)
+			}
+			return nil
+		}()
+		if escaped != nil {
+			t.Errorf("panic 冲出了 RemoteTool.Call：%v", escaped)
+		}
+		assertCloseNotStuck(t, h)
+	})
+
+	t.Run("ctx路径的错误链完整且读文本不panic", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		h, tl := newHub(cancel)
+		escaped := func() (esc any) {
+			defer func() { esc = recover() }()
+			_, err := tl.Call(ctx, map[string]any{})
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("调用方 ctx 取消应留在错误链上，got %v", err)
+			}
+			if err != nil {
+				_ = err.Error() // 读一次文本：不许 panic
+			}
+			return nil
+		}()
+		if escaped != nil {
+			t.Errorf("panic 冲出了 RemoteTool.Call：%v", escaped)
+		}
+		assertCloseNotStuck(t, h)
+	})
+}
+
+// TestMCP_NoDirectErrorMethodCallInLogs：机械对账 —— **本包不许把 error 的 Error() 直接调来喂日志**。
+//
+// 为什么这是一条机械哨兵而不是一句注释：error 的 Error() 可能是**业务代码**（业务自定义 Client 返回的
+// error），CLAUDE.md 点名的 typed-nil 陷阱下调它就 panic。而框架里「哪些 error 是业务的」会随重构漂移
+// ——`hub.go` 那两处与 reconnectLoop 那处当前安全，只因为它们的 err 恰好先被 connect 的
+// `fmt.Errorf("%s: initialize: %w", …)` 包装过；有人改了 connect 不包装，它们立刻变成新入口。
+//
+// 实测的边界（go1.26）：
+//   - `slog.Warn(…, "err", err)`（传**值**）、`fmt.Errorf("…%w", err)`、`fmt.Sprintf("%v", err)` 都**安全**
+//     ——内部经 fmt 格式化，而 fmt 对 Error() 的 panic 自己兜住、渲染成 `%!v(PANIC=Error method: …)`；
+//     对 typed-nil 指针更是直接打 `<nil>`、连 Error() 都不调。`errors.Is` / `errors.As` 也照常成立。
+//   - 只有**直接调** `err.Error()` 会让 panic 冲出去。
+//
+// 所以规矩很简单：传值，别调。
+func TestMCP_NoDirectErrorMethodCallInLogs(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	// 形如 `logKeyErr, <任意>.Error()` —— 把 error 的文本直接取出来喂日志。
+	bad := regexp.MustCompile(`logKeyErr,\s*[^,)]*\.Error\(\)`)
+	var hits []string
+	scanned := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		scanned++
+		for i, line := range strings.Split(string(b), "\n") {
+			if bad.MatchString(line) {
+				hits = append(hits, fmt.Sprintf("%s:%d: %s", f, i+1, strings.TrimSpace(line)))
+			}
+		}
+	}
+	if scanned < 5 {
+		t.Fatalf("只扫到 %d 个生产文件——扫描面坏了，不是真的这么少", scanned)
+	}
+	if len(hits) > 0 {
+		t.Errorf("这些地方把 error 的 Error() 直接调出来喂日志了，改成传 error 本身（slog 内部经 fmt，"+
+			"对 Error() 的 panic 自己兜住）：\n  %s", strings.Join(hits, "\n  "))
 	}
 }

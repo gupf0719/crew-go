@@ -417,9 +417,22 @@ func (s *server) markOffline(gen uint64, cause error) bool {
 	// 在线时不会有重连循环在跑（循环只在离线时存在、上线即退出），所以每次掉线起一个。
 	s.hub.bg.Add(1)
 	s.mu.Unlock()
-	slog.Warn("mcp: server 掉线，后台重连；期间它的工具返回「该能力暂时不可用」",
-		logKeyServer, s.name, logKeyErr, cause.Error())
+	// **起 goroutine 紧跟在 Add 之后**（中间只隔一个 Unlock，它不会 panic）：这两者之间夹任何可能 panic 的
+	// 代码，panic 就留下一个「Add 了却没有对应 Done」的 WaitGroup ⟹ Hub.Close 的 bg.Wait() 永久挂住。
+	// 实测过：日志原先排在这中间，而它调的是**业务 error 的 Error()**（见下），Close 挂死、3 秒看门狗全程
+	// 不返回。**这里不要插代码。**
+	//
+	// ⚠️ 这一条**没有哨兵钉得住**，靠的就是这段注释：下面那行日志改成传 error 值之后它已经不会 panic，
+	// 于是把 go 挪回日志之后也没有任何行为差异（实测变异不红）。它防的是**将来**有人在这两行之间插入会
+	// panic 的代码，不是现在的某个 bug。
 	go s.reconnectLoop(stale)
+	// ⚠️ **传 cause 本身，不要传 cause.Error()**。cause 是业务 Client 返回的 error，它的 Error() 是业务
+	// 代码——CLAUDE.md 点名的 typed-nil 陷阱（`var e *myErr; return nil, e`）下 `err != nil` 为真而调它
+	// 解引用 nil。而 slog（以及 fmt.Errorf("%w") / fmt.Sprintf("%v")）内部经 fmt 格式化，fmt 对 Error()
+	// 的 panic **自己兜住**、渲染成 `%!v(PANIC=Error method: …)`，对 typed-nil 更是直接打 `<nil>` 连
+	// Error() 都不调。所以**框架只在直接调 .Error() 的地方才有风险**，而这里本来就不需要直接调。
+	slog.Warn("mcp: server 掉线，后台重连；期间它的工具返回「该能力暂时不可用」",
+		logKeyServer, s.name, logKeyErr, cause)
 	return true
 }
 
@@ -453,7 +466,7 @@ func (s *server) reconnectLoop(stale Client) {
 		}
 		delay = min(delay*2, h.backoffMax)
 		slog.Debug("mcp: 重连失败，稍后再试", logKeyServer, s.name, logKeyAttempt, attempt,
-			logKeyErr, err.Error(), logKeyRetryIn, delay.String())
+			logKeyErr, err, logKeyRetryIn, delay.String())
 		timer.Reset(delay)
 	}
 }
@@ -562,7 +575,7 @@ func closeQuietly(c Client) {
 		}
 	}()
 	if err := c.Close(); err != nil {
-		slog.Warn("mcp: 关闭 client 出错", logKeyServer, c.Name(), logKeyErr, err.Error())
+		slog.Warn("mcp: 关闭 client 出错", logKeyServer, c.Name(), logKeyErr, err)
 	}
 }
 

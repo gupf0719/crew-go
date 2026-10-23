@@ -14,9 +14,18 @@
 > `mcp/server.go:234`、H-04 的 `observability/content.go:245`、M-02 的 `fallback/fallback.go:491`
 > 等），行号会漂——定位请按函数名与符号名找，别照行号跳。
 >
-> **修复状态**：H-01 / H-03 / H-05 / H-06 / M-01 / M-02 / M-03 与 H-02 的可观测性那半已修并各配
-> sanity-revert 验证过的回归哨兵；H-04 补了 4 条哨兵（另 4 条登记 backlog）；H-02 的行为改动
-> （留一格无工具轮 / 出口边收尾）需要设计决策，登记 backlog 未实施。逐条见各节末「修复」。
+> **修复状态**（2026-10-23 收口）：H-01 / H-03 / H-04 / H-05 / H-06 / M-01 / M-02 / M-03 与 H-02 的
+> 可观测性那半**已全部修完**，各配 sanity-revert 验证过的回归哨兵。本轮登记进 backlog 的 5 组预存缺陷
+> 随后逐组修完（一组一个 commit）：`cec060b` fallback `startIndex` 候选为空返 -1 不给越界下标 /
+> `ce8cb61` history conformance 长 key 用例 + `HistoryKey` 可移植上限声明 / `f6e0c89` observability
+> 三条承重语义哨兵（扇出实例维 / A2A server span 嵌套 / tool.category 白名单）/ `a3d7218` 宽度失控
+> 劈出专属的 `MaxWidthError` + BasicAgent 出口重铸 `Iterations` / `f1afa64` 上一条带出来的
+> `error.type` 分类没跟上（修它时发现 `errorTypeOf` 5 条既有分支零用例，补了全分支表）。
+>
+> **仍开着的只有两条**，都在 `doc/code/todo.md` 里带理由登记：① H-02 的**行为改动**（留一格无工具轮 /
+> 出口边收尾）——它的曝光面取决于「`tool_choice=none` 在真 provider 上强制不强制」，而本环境没有 API
+> key，没实测就改默认行为是拿设计换猜测；② H-04 的最后一条哨兵（「装两层 Observability + 扇出」组合下
+> `crew.node.instance` 的 span 个数）——需要再搭一层 Observability 才测得出，单独那半已有哨兵。
 
 ---
 

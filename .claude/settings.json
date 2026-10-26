@@ -88,5 +88,9 @@
       "Write(//Users/gupengfei/program/go/src/crew-go/**)",
       "Write(//tmp/**)"
     ]
+  },
+  "attribution": {
+    "commit": "Co-Authored-By: kirito <gupf0719@gmail.com>",
+    "pr": ""
   }
 }

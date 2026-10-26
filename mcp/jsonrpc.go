@@ -186,7 +186,7 @@ func parseToolAnnotations(toolName string, raw json.RawMessage) *ToolAnnotations
 	}
 	var a ToolAnnotations
 	if err := json.Unmarshal(raw, &a); err != nil {
-		slog.Warn("mcp: 工具的 annotations 解析失败，按没有注解处理（也不算只读）", logKeyTool, toolName, logKeyErr, err.Error())
+		slog.Warn("mcp: 工具的 annotations 解析失败，按没有注解处理（也不算只读）", logKeyTool, toolName, logKeyErr, err)
 		return nil
 	}
 	return &a

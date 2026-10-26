@@ -113,6 +113,7 @@ thinking 模型（DeepSeek deepseek-reasoner / Qwen3 thinking 等）的 wire 协
 | 顶层 `cache_control: {type: "ephemeral"}`（自动 prompt cache）| `WithPromptCaching(false)`、`WithCacheTTL(CacheTTL1h)` |
 | `fallbacks: "default"`（beta `server-side-fallback-2026-07-01`，被安全分类器拒绝时由 Anthropic 指定的回退模型接着答）| `WithFallbacks(false)`（Bedrock / Vertex / Foundry 等不支持的端点要关）|
 | effort、thinking display 用 API 默认 | `WithEffort` / 按次 `WithEffortOption`；`WithThinkingDisplay(DisplaySummarized / DisplayUpdates)` |
+| 不开服务端压缩 | `WithCompaction(Compaction{TriggerTokens, Instructions})`：每次请求带 `context_management.edits: [{type: "compact_20260112", trigger, instructions}]`（beta `compact-2026-01-12`），输入达到阈值（不填用 API 默认 15 万）时 API 先把更早的内容摘要成一个 compaction 块再接着答。不支持 `pause_after_compaction` |
 
 `WithExtraBody`（构造期）与 `model.WithExtraBody`（按次）按 **JSON merge patch（RFC 7386）** 并进请求体：对象逐键递归合并、null 删除键——跟 `model/openai` 的顶层整键覆盖不同，`{"output_config": {"effort": "high"}}` 不会冲掉 `output_config.format`。
 
@@ -125,6 +126,7 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 - 快照里 `tool_use.input` 用响应原文：SDK 把块转成请求形状时会把 input 解成 `any`，超过 2^53 的整数（雪花 ID、纳秒时间戳）与高精度小数会变成 float64 近似值——值变了既是改了前缀，也让模型看到的参数跟实际执行的不一样。
 - `max_tokens` 截在工具调用中间（结束原因 `max_tokens` 且最后一块是 `tool_use`）：这个调用带着解析不了的参数交出（流式是收到的原文，非流式是去掉末尾 `}` 的 input），框架按「参数非法」拒掉、以失败结果交回模型，不会拿残缺的参数执行（SDK 累积流式响应时会把截断的参数换成 `{}`，照它交出工具就会拿空参数跑）。同一条响应里更早的、完整的工具调用照常执行。
 - 服务端回退在中途切换模型时，切换点之前被拒模型的 thinking 与工具调用作废：不回放、工具调用不交出（所以流式把工具调用压到最后一片才交），文本照常保留；切换经过记在标注 `anthropic.fallback`（`anthropic.Fallbacks(msg)` 读）。
+- 服务端压缩返回的 compaction 块跟别的块一样进快照、原样回放（排在服务端回退切换点之前的也保留：压缩的是这次请求的输入，跟哪个模型接着答无关），API 据它把块之前的历史换成摘要；调用方的历史照常只追加、全量发送，本包不删。
 - API 对输入的改动（丢掉的 thinking 块等）按（种类, 原因）归并计数，记在标注 `anthropic.input_transformations`（`anthropic.InputTransformations(msg)` 读），每条响应打一条告警。不逐块记：历史改过之后，后面每次请求都会把同一批块再丢一遍，逐块记会让会话标注按轮数的平方增长。
 
 ### 5.3 映射规则
@@ -133,7 +135,7 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 - 相邻同角色消息合并（tool 与 user 都映射成 user）；user 消息里 `tool_result` 排最前；`ToolresultContentBlock.IsError` → `is_error: true`（工具调用失败时置上：框架合成的失败结果与业务工具返回 `tool.Failure` 都算，OnToolEnd 改写结论时同步；审批拒绝不算失败、不置）。
 - `tool_choice`：`required` 与 `auto` 都不发（Opus 5.5 对强制选工具返回 400），`none` 原样发；`StructuredCapability` 报 `SupportsToolChoiceRequired=false`、`SupportsJSONSchema=true`（`output_config.format`）、`SupportsJSONObject=false`（`json_object` 直接报错）。工具按名字排序，`ToolInfo.Extra["strict"] == true` 的发 `strict: true`。
 - 结束原因：`refusal` → `*anthropic.RefusalError`（包 `model.ErrContentFiltered`，不可重试）；`model_context_window_exceeded` → 包 `model.ErrContextWindowExceeded`；`max_tokens` 按完整处理（同 openai 的 `length`）。
-- 用量：`InputTokens` 含 cache 读写两部分，`CachedInputTokens` = cache 读，`CacheCreationInputTokens` = cache 写，`OutputTokens` 含 thinking，`ThinkTokens` = `output_tokens_details.thinking_tokens`（`OutputTokens` 的子集）。服务端回退时只计接着答的那次尝试（被拒的那次在 `usage.iterations` 里，不汇总）。
+- 用量：`InputTokens` 含 cache 读写两部分，`CachedInputTokens` = cache 读，`CacheCreationInputTokens` = cache 写，`OutputTokens` 是 API 的 `output_tokens` 原样（含 thinking，计费口径），`ThinkTokens` = 其中的 `output_tokens_details.thinking_tokens`。服务端回退时只计接着答的那次尝试（被拒的那次在 `usage.iterations` 里，不汇总）。服务端压缩那一步的用量也不在顶层 usage 里（顶层只算模型答的那一轮，`InputTokens` 就是压缩之后的上下文，按它估上下文大小仍然对），每次压缩一项记在标注 `anthropic.compaction`（`anthropic.Compactions(msg)` 读；iterations 没报而 content 里有 compaction 块时补一项 0）。
 - 采样参数（`model.WithTemperature` / `WithTopP`）原样转发：Opus 4.7 起的 Opus 模型只要带上就返回 400，Fable 5.1 / Haiku 5.5 只接受默认值；确定性失败、不重试。
 
 ### 5.4 跟 crew-go 其他功能的冲突
@@ -145,13 +147,15 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 - 每次 Run 变化的开头 system 消息：`WithStoreMemory` 每次 Run 检索一次，结果作为开头的 system 消息进顶层 `system`。
 - Handoff 的 Raw 历史（`HistoryForRaw`）把别的 agent 的 assistant 消息连同回放快照原样交给接手的 agent：那些 thinking 是在另一套 `system` / tools 下产生的，必然对不上。
 
+上下文管理换成服务端压缩（`WithCompaction`）就不冲突：客户端历史不改，前缀校验从最近的 compaction 块算起，压缩之后产生的 thinking 照常回放（见 5.5 实测）；代价是压缩让 prompt cache 从头开始，压缩之前的 thinking 不带到之后。已知局限：客户端仍发全量历史，ReactiveCompact 按本地全量估 token、从最旧的组删起，而最新 compaction 块之前的内容服务端本来就不看——它的头几次重试在服务端眼里输入没变；另外 SDK 累积流式响应时 `compaction_delta` 是赋值不是追加，真 API 若把摘要拆成多段 delta 只剩最后一段（SDK 行为，未见实例）。
+
 `agent_v2.NewLLMPlanner` 固定发 `tool_choice=required`、不看 `StructuredCapability`：本适配器把它降为不指定，模型回自由文本时 planner 报 `ErrPlannerNoToolCall`。
 
 另外，`EstimateMessageTokens` 看不到回放快照里的 thinking，而 preserved thinking 计入输入 token——按估算触发的压缩会偏晚。
 
 ### 5.5 测试
 
-单测（`model/anthropic/*_test.go`）用 httptest 桩断言请求体；真 API 冒烟 `example/model/anthropic_smoke`（`//go:build integration`，需 `ANTHROPIC_API_KEY`），全部用例都在 `prefix_mismatch_behavior: "error"` 下跑：BasicAgent 跨两次 Run 的多轮工具调用、中途 system 消息、prompt cache 命中、并行工具结果合并。
+单测（`model/anthropic/*_test.go`）用 httptest 桩断言请求体；真 API 冒烟 `example/model/anthropic_smoke`（`//go:build integration`，需 `ANTHROPIC_API_KEY`），全部用例都在 `prefix_mismatch_behavior: "error"` 下跑：BasicAgent 跨两次 Run 的多轮工具调用、中途 system 消息、prompt cache 命中、并行工具结果合并、服务端压缩。压缩用例 2026-10-23 实跑（`claude-haiku-5-5`、阈值 5 万、自定义 instructions）：第一轮约 7.5 万 token 的输入触发压缩，响应带 compaction 块、`Compactions` 记下一项；第二轮原样回放它（连同第一轮的 thinking），没有 400，计费输入只剩一两千 token（两次实跑 655 / 1221），模型凭摘要答出开头埋的暗号。
 
 ## 六、相关 commit
 

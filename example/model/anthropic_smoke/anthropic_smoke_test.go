@@ -7,6 +7,7 @@
 //     prefix_binding_mismatch；并断言确实回放过 thinking 块——一次都没回放的话这个用例什么也没证明。
 //   - G2 prompt cache：同前缀的第二轮请求命中 cache；两次请求的 tools 序列化逐字节相同。
 //   - G4 并行工具：模型一轮调两个工具时，两个 tool_result 发在同一条 user 消息里。
+//   - 服务端压缩（WithCompaction）：超过阈值时响应带 compaction 块，下一轮原样回放、摘要留住要点。
 //
 // 默认 go test ./... 不编译（integration tag）。跑法：
 //
@@ -376,5 +377,58 @@ func TestSmoke_G4_ParallelTools(t *testing.T) {
 	}
 	if last["role"] != "user" || n != len(calls) {
 		t.Errorf("最后一条消息 role=%v、tool_result %d 个，期望 user、%d 个", last["role"], n, len(calls))
+	}
+}
+
+// TestSmoke_Compaction：服务端压缩（WithCompaction）。第一轮输入超过阈值，响应带 compaction 块、压缩用量记进
+// 标注；第二轮把它原样回放（error 档，压缩之后的 thinking 也要对得上），模型凭摘要答出开头埋的暗号。
+func TestSmoke_Compaction(t *testing.T) {
+	c, rec := newClient(t, anthropic.WithCompaction(anthropic.Compaction{
+		TriggerTokens: 50000,
+		Instructions:  "写一段摘要概括之前的对话，必须原样保留对话里出现的暗号。",
+	}))
+	ctx := context.Background()
+	var filler strings.Builder
+	filler.WriteString("先记住：暗号是「蓝鲸-42」。下面是一份仓库流水，不用逐条处理。\n")
+	for i := 1; i <= 3000; i++ {
+		fmt.Fprintf(&filler, "Record %05d: shipment of item A%d verified and logged at station %d.\n", i, i%97, i%13)
+	}
+	history := []*schema.Message{schema.UserMessage(filler.String() + "流水看完了吗？一句话回答。")}
+	reader, err := c.Stream(ctx, history)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	first := aggregate(t, reader)
+	cs := anthropic.Compactions(first)
+	t.Logf("第一轮：%q；压缩 %+v；Usage %+v", first.Content, cs, first.Metadata.Usage)
+	if len(cs) == 0 {
+		t.Fatal("输入超过阈值却没压缩")
+	}
+	history = append(history, first, schema.UserMessage("暗号是什么？只回答暗号。"))
+	second, err := c.Generate(ctx, history)
+	if err != nil {
+		t.Fatalf("第二轮 Generate（回放 compaction 块）: %v", err)
+	}
+	checkNoPrefixMismatch(t, second)
+	t.Logf("第二轮：%q；压缩 %+v；Usage %+v", second.Content, anthropic.Compactions(second), second.Metadata.Usage)
+	if !strings.Contains(second.Content, "蓝鲸-42") {
+		t.Errorf("摘要没留住暗号：%q", second.Content)
+	}
+	reqs := rec.requests(t)
+	msgs, _ := reqs[len(reqs)-1]["messages"].([]any)
+	replayed := false
+	for _, m := range msgs {
+		blocks, _ := m.(map[string]any)["content"].([]any)
+		for _, b := range blocks {
+			if bm, _ := b.(map[string]any); bm["type"] == "compaction" {
+				replayed = true
+			}
+		}
+	}
+	if !replayed {
+		t.Error("第二轮请求里没有回放 compaction 块")
+	}
+	if replayedThinking(reqs[len(reqs)-1:]) == 0 {
+		t.Error("第二轮没有回放压缩之后的 thinking 块，证明不了压缩不算改动")
 	}
 }

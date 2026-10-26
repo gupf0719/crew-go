@@ -103,12 +103,22 @@ type CallResult struct {
 }
 
 // Block 是 MCP 内容块的框架表示。
-// Type 取值遵循 MCP 协议："text" | "image" | "resource" 等。
+// Type 取值遵循 MCP 协议："text" | "image" | "audio" | "resource" | "resource_link" 等。
+//
+// 嵌入资源（resource）的内容摊平到同一层：resource.text → Text，resource.blob → Data，resource.uri → URI，
+// resource.mimeType → Mime。资源链接（resource_link）的 uri / name 进 URI / Name。
 type Block struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
 	Data []byte `json:"data,omitempty"`
 	Mime string `json:"mimeType,omitempty"`
+	URI  string `json:"uri,omitempty"`
+	Name string `json:"name,omitempty"`
+
+	// textResource：这是文本资源（resource.text 有这个键，可能是空串——空文件），不是二进制。
+	textResource bool
+	// undecodable：data / blob 的 base64 解不了，Data 为空。
+	undecodable bool
 }
 
 // FirstText 返回 blocks 中首个 text 块的内容，无则空串。

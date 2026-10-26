@@ -2,7 +2,6 @@ package agent_v2
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"crew-go/schema"
@@ -45,7 +44,7 @@ func renderToolContent(ctx context.Context, cfg *Config, minted bool, toolName s
 	if failed {
 		code, body = res.Error.Code, res.Error.Message
 	} else {
-		body = fmt.Sprintf("%v", res.Output)
+		body = tool.OutputText(res.Output)
 	}
 	sized := sizedToolContent{body: body}
 	switch {

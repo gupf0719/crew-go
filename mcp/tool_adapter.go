@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"crew-go/tool"
@@ -110,25 +111,56 @@ func (t *RemoteTool) Call(ctx context.Context, args map[string]any) (*tool.Resul
 	return t.srv.call(ctx, t.canonical, t.sourceName, args)
 }
 
-// flattenContent 把 MCP content blocks 整理为对 LLM 友好的输出：
-//   - 全为 text block：拼接为字符串
-//   - 含非 text block：text 拼接后与其余 blocks 打包为 map
-func flattenContent(blocks []Block) any {
-	if len(blocks) == 0 {
-		return ""
-	}
-	var texts []string
-	var others []Block
+// flattenContent 把 MCP content blocks 按原顺序整理成交给模型的文本，块与块之间空一行（见 blockText）。
+//
+// 二进制内容（图片、音频、二进制资源）不交给模型，只写一行说明：塞进文本的话，几 KB 的图片就是几千个 token 的
+// base64（以前打包成 map 再按 %v 打印，模型看到的是一长串数字）。原样交图片要等 tool_result 支持图片块。
+func flattenContent(blocks []Block) string {
+	parts := make([]string, 0, len(blocks))
 	for _, b := range blocks {
-		if b.Type == "text" {
-			texts = append(texts, b.Text)
-		} else {
-			others = append(others, b)
+		if s := blockText(b); s != "" {
+			parts = append(parts, s)
 		}
 	}
-	joined := strings.Join(texts, "\n\n")
-	if len(others) == 0 {
-		return joined
+	return strings.Join(parts, "\n\n")
+}
+
+// blockText 是一个内容块交给模型的文本：text 原样；带文本的嵌入资源在正文前标出 URI；资源链接写成一行；
+// 其余（图片、音频、二进制资源、不认识的类型）写一行说明：类型、MIME、大小、URI。
+func blockText(b Block) string {
+	switch {
+	case b.Type == "text":
+		return b.Text
+	case b.Text != "" || b.textResource:
+		text := b.Text
+		if text == "" {
+			text = "（空）"
+		}
+		if b.URI != "" {
+			return fmt.Sprintf("[资源 %s]\n%s", b.URI, text)
+		}
+		return text
+	case b.Type == "resource_link":
+		return strings.Join(nonEmpty("[资源链接", b.Name, b.URI), " ") + "]"
+	default:
+		desc := nonEmpty(b.Type, b.Mime)
+		switch {
+		case b.undecodable:
+			desc = append(desc, "base64 解不了")
+		case len(b.Data) > 0:
+			desc = append(desc, fmt.Sprintf("%d 字节", len(b.Data)))
+		}
+		desc = append(desc, nonEmpty(b.URI)...)
+		return "[" + strings.Join(desc, "，") + "：二进制内容，没有交给模型]"
 	}
-	return map[string]any{"text": joined, "blocks": others}
+}
+
+func nonEmpty(ss ...string) []string {
+	out := ss[:0:0]
+	for _, s := range ss {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }

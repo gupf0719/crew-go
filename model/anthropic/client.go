@@ -122,6 +122,7 @@ type Client struct {
 	fallbacks      bool
 	caching        bool
 	cacheTTL       CacheTTL
+	compaction     *Compaction // nil = 不开服务端压缩
 	betas          []anthropic.AnthropicBeta
 	extraBody      map[string]any
 	requestTimeout time.Duration
@@ -241,6 +242,28 @@ func WithPromptCaching(enabled bool) ClientOption {
 // WithCacheTTL 设自动 cache 断点的存活时间（默认 API 的 5 分钟）。
 func WithCacheTTL(ttl CacheTTL) ClientOption {
 	return func(c *Client) { c.cacheTTL = ttl }
+}
+
+// Compaction 配服务端上下文压缩，见 [WithCompaction]。
+type Compaction struct {
+	// TriggerTokens 是输入达到多少 token 时压缩；<= 0 用 API 的默认（150000）。
+	TriggerTokens int64
+	// Instructions 是给摘要的补充要求（API 的 instructions 字段）；空串不发。按 Anthropic 迁移指南，带了它
+	// 摘要只看对话正文、看不到之前的 thinking，所以要写清摘要必须保留什么。
+	Instructions string
+}
+
+// WithCompaction 开服务端上下文压缩（beta compact-2026-01-12）：每次请求带 context_management 的
+// compact_20260112，输入达到阈值时 API 先把更早的内容摘要成一个 compaction 块、再接着答。这个块随
+// 回放快照（[AssistantContentAnnotation]）原样发回，API 据它把块之前的历史换成摘要——调用方的历史只追加、
+// 不用改，preserved thinking 的前缀校验也不把它当改动（压缩之后从 compaction 块算起）。
+//
+// 代价：压缩让 prompt cache 从头开始；压缩之前的 thinking 不会带到之后。摘要那一步的用量不在顶层 usage
+// 里（顶层只算模型答这一轮），记在 [CompactionAnnotation]。消息照常全发，本包不替调用方删历史。
+//
+// 不支持 pause_after_compaction（那会让一次调用只返回 compaction 块、stop_reason=compaction）。
+func WithCompaction(cfg Compaction) ClientOption {
+	return func(c *Client) { c.compaction = &cfg }
 }
 
 // WithBetas 追加 anthropic-beta 请求头的取值（本包自己需要的会自动带上，不用写）。

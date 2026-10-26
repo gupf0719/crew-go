@@ -89,7 +89,7 @@ agent := agent_v2.NewBasicAgent(agent_v2.WithToolkit(hub.Toolkit()), ...)
 | 其余连接错误（写出之后断开、HTTP 5xx、stdio 子进程中途退出……） | `server_unavailable` | 该能力暂时不可用（X 连接出错），这次调用没拿到结果，不确定是否已执行 | 掉线 |
 | server 返回 `isError` | `internal_error` | 第一个非空文本块（没有则 "mcp tool call failed"） | 不变 |
 | `CallTool` 返回 `(nil, nil)` | `internal_error` | X 返回了空结果 | 不变 |
-| 成功 | — | 有 `structuredContent` 时 `Output` 是解出来的值（BasicAgent 用 `%v` 交给模型，Go 的 map 打印格式——见 §9），否则文本块拼接；有非文本块时打包成 `{"text", "blocks"}` | — |
+| 成功 | — | 有 `structuredContent` 时 `Output` 是解出来的值（数字是 `json.Number`，大整数不失真；BasicAgent 用 `tool.OutputText` 编成 JSON 交给模型），否则各内容块按原顺序整理成文本、块间空一行：text 原样；嵌入资源（resource）取出正文、前面标 `[资源 URI]`；资源链接写成 `[资源链接 名字 URI]`；图片、音频、二进制资源只写一行说明（类型、MIME、字节数、URI），字节不交给模型；base64 不规范也不让调用失败（URL-safe、缺 padding 照认，解不了就在说明里写「base64 解不了」）；空的文本资源写「（空）」 | — |
 
 「没有发出」只认 `ErrNotSent`，不从错误形状推断：推断错了，模型会把一个已执行的写操作当成没执行、再做一遍。
 `StreamableHTTPClient` 用 `httptrace` 判：trace 生效了（`GetConn` 到过）而请求头、请求体都没写出才算没发出（请求 ctx
@@ -163,10 +163,9 @@ query 值与长路径段），响应体再截到 512 字节（不切断多字节
 
 见 [`doc/code/todo.md`](../code/todo.md)：
 
-- `tools/list` 不处理分页。
 - `StreamableHTTPClient` 只实现了 streamable HTTP 的子集：只解 JSON 响应、`Accept` 只写 `application/json`、不处理
   `Mcp-Session-Id`、不发 `notifications/initialized`。实测（2026-10-22）官方 MCP Go SDK v1.8.0 的 server 四种配置全在
   `initialize` 处 400；加 `WithHTTPHeader("Accept", "application/json, text/event-stream")` 之后只有
   `StreamableHTTPOptions{Stateless: true, JSONResponse: true}` 能用（另三种败在 SSE 响应或缺 initialized 通知）。
-- `structuredContent` 与非文本块（图片等）没有交给模型的好形状：BasicAgent 用 `%v` 打印 `Output`。
+- 图片、音频不交给模型（只有一行说明）：要原样交，得让 tool_result 带图片块（Anthropic 支持），牵涉 schema 与各家适配器，没做。
 - stdio 子进程继承主进程的全部环境变量（`WithStdioEnv` 只能追加）。

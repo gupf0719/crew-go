@@ -3408,9 +3408,9 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				msg := fmt.Sprintf("工具 %q 未解锁——请先调 tool_search(query) 检索解锁后再调用。", tc.Function.Name)
 				return outcome{toolMsg: failedToolResult(tc.ID, "tool_not_revealed", msg)}
 			}
-			// 这一轮没交给模型的工具不执行（WithToolFilter 没放行、软降落摘掉了，见 toolBinding）：模型凭上文记得的
-			// 名字硬调时拿到失败结果。判的是产出这一批的那一轮的绑定（channel 里的那份，续跑也是它）；ToolFilter 豁免的
-			// 框架工具留在绑定里、照常执行，软降落摘掉的框架工具不在绑定里、同样拦。排在审批之前——不让人去批一个这一轮
+			// 这一轮没交给模型的工具不执行（WithToolFilter 没放行，见 toolBinding）：模型凭上文记得的名字硬调时拿到失败
+			// 结果。判的是产出这一批的那一轮的绑定（channel 里的那份，续跑也是它）；ToolFilter 豁免的框架工具留在绑定里、
+			// 照常执行。软降落轮的硬调已经被上面那道闸（round_budget_exhausted）拦下。排在审批之前——不让人去批一个这一轮
 			// 不可用的工具。
 			if !toolBindingFrom(ctx).allows(tc.Function.Name) {
 				msg := fmt.Sprintf("工具 %q 这一轮不可用（没有提供给你），改用提供给你的工具，或者直接回答。", tc.Function.Name)

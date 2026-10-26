@@ -133,7 +133,7 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 - 相邻同角色消息合并（tool 与 user 都映射成 user）；user 消息里 `tool_result` 排最前；`ToolresultContentBlock.IsError` → `is_error: true`（工具调用失败时置上：框架合成的失败结果与业务工具返回 `tool.Failure` 都算，OnToolEnd 改写结论时同步；审批拒绝不算失败、不置）。
 - `tool_choice`：`required` 与 `auto` 都不发（Opus 5.5 对强制选工具返回 400），`none` 原样发；`StructuredCapability` 报 `SupportsToolChoiceRequired=false`、`SupportsJSONSchema=true`（`output_config.format`）、`SupportsJSONObject=false`（`json_object` 直接报错）。工具按名字排序，`ToolInfo.Extra["strict"] == true` 的发 `strict: true`。
 - 结束原因：`refusal` → `*anthropic.RefusalError`（包 `model.ErrContentFiltered`，不可重试）；`model_context_window_exceeded` → 包 `model.ErrContextWindowExceeded`；`max_tokens` 按完整处理（同 openai 的 `length`）。
-- 用量：`InputTokens` 含 cache 读写两部分，`CachedInputTokens` = cache 读，`CacheCreationInputTokens` = cache 写，`OutputTokens` 不含 thinking，`ThinkTokens` = `output_tokens_details.thinking_tokens`。服务端回退时只计接着答的那次尝试（被拒的那次在 `usage.iterations` 里，不汇总）。
+- 用量：`InputTokens` 含 cache 读写两部分，`CachedInputTokens` = cache 读，`CacheCreationInputTokens` = cache 写，`OutputTokens` 含 thinking，`ThinkTokens` = `output_tokens_details.thinking_tokens`（`OutputTokens` 的子集）。服务端回退时只计接着答的那次尝试（被拒的那次在 `usage.iterations` 里，不汇总）。
 - 采样参数（`model.WithTemperature` / `WithTopP`）原样转发：Opus 4.7 起的 Opus 模型只要带上就返回 400，Fable 5.1 / Haiku 5.5 只接受默认值；确定性失败、不重试。
 
 ### 5.4 跟 crew-go 其他功能的冲突

@@ -78,13 +78,13 @@ func TestToolFilter_FilteredToolNotExecuted(t *testing.T) {
 	}
 }
 
-// 最后一轮软降落摘掉了业务工具：模型在这一轮硬调业务工具也不执行。
+// 最后一轮软降落（tool_choice=none）：模型在这一轮硬调业务工具也不执行（round_budget_exhausted）。
 func TestToolFilter_FinalRoundStrippedToolNotExecuted(t *testing.T) {
 	ct := &countingTools{}
 	ag := agent_v2.NewBasicAgent(agent_v2.WithName("final_round"),
 		agent_v2.WithModel(newStubModel([]*schema.Message{
 			callTool("c1", "lookup"),
-			callTool("c2", "delete_account"), // 第二次调模型是最后一轮（maxRounds=1），工具已被摘掉
+			callTool("c2", "delete_account"), // 第二次调模型是最后一轮（maxRounds=1），发的是 none
 			schema.AssistantMessage("done"),
 		})),
 		agent_v2.WithToolkit(ct.toolkit()), agent_v2.WithMaxRounds(1))
@@ -97,11 +97,11 @@ func TestToolFilter_FinalRoundStrippedToolNotExecuted(t *testing.T) {
 		t.Fatalf("fixture：第一轮的 lookup 应执行 1 次，got %d", ct.lookups.Load())
 	}
 	if n := ct.deletes.Load(); n != 0 {
-		t.Errorf("最后一轮被摘掉的 delete_account 执行了 %d 次，want 0", n)
+		t.Errorf("最后一轮硬调的 delete_account 执行了 %d 次，want 0", n)
 	}
 }
 
-// 最后一轮软降落连框架工具一起摘：模型在这一轮硬调 ask_user 不执行（不去问人），Run 以轮次超限收尾。ToolFilter 的
+// 最后一轮软降落连框架工具一起拦：模型在这一轮硬调 ask_user 不执行（不去问人），Run 以轮次超限收尾。ToolFilter 的
 // 轮次豁免框架工具，软降落轮不豁免——豁免的话人答完那一问也被丢掉（审计实测）。
 func TestToolFilter_FinalRoundFrameworkToolNotExecuted(t *testing.T) {
 	ct := &countingTools{}

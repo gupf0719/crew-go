@@ -6,20 +6,24 @@ import (
 	"crew-go/compose_v2"
 )
 
-// ToolNotAvailableErrCode 是「这个工具这一轮没有交给模型」的 tool error code：[WithToolFilter] 这一轮没放行它、或者
-// 轮次预算的最后一轮把工具都摘掉了（结构化输出的 final_output 除外），模型照样发了调它的 tool_call。工具不执行，模型收到一条失败结果（业务级软
+// ToolNotAvailableErrCode 是「这个工具这一轮没有交给模型」的 tool error code：[WithToolFilter] 这一轮没放行它，模型
+// 照样发了调它的 tool_call。工具不执行，模型收到一条失败结果（业务级软
 // 失败，不 abort 整个 Run）。
 //
 // 模型能调的就是交给它的那些：只裁模型看得见的、执行时不拦的话，模型凭上文记得的工具名（之前的轮次里绑过、或者
 // 从对话里学来的）照样调得动，裁剪就只是建议。判据只有一条：执行的就是这一轮绑定的那些。[WithToolFilter] 豁免
-// 框架工具（ask_user、activate_skill、tool_search……），它们留在绑定里，照常执行；最后一轮软降落连框架工具一起摘
-// （只留结构化输出的 final_output），它们不在绑定里，同样拦下——曾经按 ToolFilter 的口径豁免框架工具，模型在最后
-// 一轮硬调 ask_user 照样去问人、答完被丢掉（审计实测）。没解锁的延迟工具先被渐进披露那道闸拦下（`tool_not_revealed`）。
+// 框架工具（ask_user、activate_skill、tool_search……），它们留在绑定里，照常执行。没解锁的延迟工具先被渐进披露那道闸
+// 拦下（`tool_not_revealed`）。
+//
+// 轮次预算的最后一轮（软降落轮）不靠这道闸：crew-go 的软降落轮没配结构化输出时工具照旧绑着、发 tool_choice=none，
+// 模型硬调的工具（框架工具也算，只放行结构化输出的 final_output）由前面那道闸以 `round_budget_exhausted` 拦下，见
+// withFinalRound。
 const ToolNotAvailableErrCode = "tool_not_available"
 
 // toolBinding 是 model 节点这一轮实际交给模型的工具：Restricted 为真时，这一批 tool_call 里只执行 Names 里的工具。
 //
-// 只在有裁剪时为真：配了 [WithToolFilter] 且它这一轮返回了名单，或者是轮次预算的最后一轮（软降落摘掉了工具）。
+// 只在有裁剪时为真：配了 [WithToolFilter] 且它这一轮返回了名单，或者是软降落轮（名单是这一轮实际绑着的：没配结构化输出时是整套工具，配了时只有 final_output——两种情形下硬调都先被
+// 软降落那道闸拦下，见 ToolNotAvailableErrCode）。
 // 没有裁剪时为假——不受这道闸的情形（没配 ToolFilter、自定义 modelFn 不填它）照旧，执行什么由派发表决定。
 //
 // 它随 model 节点的写入进 basicToolBindingCh、也记在模型调用记录里：续跑时 tools 节点从存档恢复、直接进节点，

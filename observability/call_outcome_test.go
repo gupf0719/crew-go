@@ -4,10 +4,12 @@ package observability_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -230,5 +232,122 @@ func TestToolDenied_Blocked(t *testing.T) {
 	want := map[string]string{"gen_ai.tool.name": "get_weather", "crew.tool.outcome": agent_v2.ToolOutcomeDenied}
 	if n := histCount(t, rm, observability.MetricExecuteToolDuration, want); n != 1 {
 		t.Errorf("带 crew.tool.outcome=denied 的时长样本=%d 应=1", n)
+	}
+}
+
+// rewriteAnswer 在 OnModelEnd 里换掉答复（护栏钩子做 PII 过滤后改写的写法）。
+type rewriteAnswer struct{ hook.NoOpHooks }
+
+func (rewriteAnswer) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
+	if out != nil && out.Message != nil {
+		out.Message = schema.AssistantMessage("REWRITTEN-PRIVATE-CONTENT 13800000000")
+	}
+	return ctx, nil
+}
+
+// TestRewrittenAnswer_ContentFollowsRecordingSwitch：钩子改写答复时框架发的 reset_stream 事件带着改写之后的完整答复
+// （元数据 replacement）。它是内容：关着内容采集时不进 span，打开时记。
+func TestRewrittenAnswer_ContentFollowsRecordingSwitch(t *testing.T) {
+	for _, record := range []bool{false, true} {
+		t.Run(fmt.Sprintf("record=%v", record), func(t *testing.T) {
+			h := newHarness(t, observability.WithContentRecording(record))
+			ctx, opts := h.obs.Install(context.Background(),
+				agent_v2.WithName("a"), agent_v2.WithModel(&scriptModel{}), agent_v2.WithMaxRounds(3),
+				agent_v2.WithHooks(rewriteAnswer{}))
+			if _, err := agent_v2.NewBasicAgent(opts...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("hi")); err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, s := range h.spans() {
+				for _, e := range s.Events() {
+					for _, a := range e.Attributes {
+						if strings.Contains(a.Value.Emit(), "REWRITTEN-PRIVATE") {
+							found = true
+						}
+					}
+				}
+			}
+			if found != record {
+				t.Errorf("内容采集=%v 时改写后的答复进没进 span=%v，应与开关一致", record, found)
+			}
+		})
+	}
+}
+
+// panicOnAgentEnd 的 OnAgentEnd panic。
+type panicOnAgentEnd struct{ hook.NoOpHooks }
+
+func (panicOnAgentEnd) OnAgentEnd(ctx context.Context, _ *hook.AgentInfo, _ *hook.AgentOutput) context.Context {
+	panic("业务的 OnAgentEnd 炸了")
+}
+
+// TestInnerOnAgentEndPanic_SpanStillEnds：里面的 OnAgentEnd 钩子 panic（框架兜住、调用照常成功）时，agent span 照样收尾。
+func TestInnerOnAgentEndPanic_SpanStillEnds(t *testing.T) {
+	h := newHarness(t)
+	ctx, opts := h.obs.Install(context.Background(),
+		agent_v2.WithName("a"), agent_v2.WithModel(&scriptModel{}), agent_v2.WithHooks(panicOnAgentEnd{}))
+	if _, err := agent_v2.NewBasicAgent(opts...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("hi")); err != nil {
+		t.Fatalf("OnAgentEnd panic 不该改变调用的结局，got %v", err)
+	}
+	h.assertAllEnded(t)
+	if len(h.spansNamed("invoke_agent a")) != 1 {
+		t.Errorf("agent span 应收尾一个，got %d", len(h.spansNamed("invoke_agent a")))
+	}
+}
+
+// flakyStream 第一次建流吐一片后断开，之后每次等 delay 再吐完整答复。
+type flakyStream struct {
+	calls atomic.Int32
+	delay time.Duration
+}
+
+func (m *flakyStream) WithTools([]*schema.ToolInfo) (model.ChatModel, error) { return m, nil }
+
+func (m *flakyStream) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	return nil, model.ErrStreamUnsupported
+}
+
+func (m *flakyStream) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	n := m.calls.Add(1)
+	sr, send := schema.NewStreamReader[*schema.Message](8)
+	go func() {
+		defer schema.CloseSend(sr)
+		if n == 1 {
+			send(&schema.Message{Role: schema.RoleAssistant, Content: "半截"})
+			schema.SendError(sr, &model.APIError{Provider: "mock", Err: errors.New("stream broke")})
+			return
+		}
+		time.Sleep(m.delay)
+		send(&schema.Message{Role: schema.RoleAssistant, Content: "完整答复", Metadata: &schema.MessageMetadata{
+			Model: "mock-model", System: "mock", FinishReason: "stop", Usage: &schema.MessageUsage{InputTokens: 10, OutputTokens: 3, TotalTokens: 13}}})
+	}()
+	return sr, nil
+}
+
+// TestModelRetry_TTFCFromDeliveredAttempt：模型调用整次重来（WithModelRetry）时，首片时长记的是交付出去的那份答复的首片，
+// 不是被撤回那次尝试的。
+func TestModelRetry_TTFCFromDeliveredAttempt(t *testing.T) {
+	h := newHarness(t)
+	m := &flakyStream{delay: 150 * time.Millisecond}
+	ctx, opts := h.obs.Install(context.Background(),
+		agent_v2.WithName("a"), agent_v2.WithModel(m), agent_v2.WithModelRetry(compose_v2.SimpleRetry(2)))
+	if _, err := agent_v2.NewBasicAgent(opts...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("hi")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if n := m.calls.Load(); n != 2 {
+		t.Fatalf("fixture：应建流两次（第一次断开、重来一次），got %d", n)
+	}
+	var chats []sdktrace.ReadOnlySpan
+	for _, s := range h.spans() {
+		if strings.HasPrefix(s.Name(), "chat") {
+			chats = append(chats, s)
+		}
+	}
+	if len(chats) != 1 {
+		t.Fatalf("整次重来仍是一次模型调用，应只有一个 chat span，got %d", len(chats))
+	}
+	v, ok := attrOf(chats[0], observability.AttrResponseTTFC)
+	if !ok || v.AsFloat64() < 0.15 {
+		t.Errorf("首片时长=%v 应 ≥ 交付那次尝试首片之前等的 150ms", v.AsFloat64())
 	}
 }

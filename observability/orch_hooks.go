@@ -182,11 +182,22 @@ func (h *orchHooks) OnNodeEvent(ctx context.Context, nodeID string, ev agent_v2.
 	return ctx
 }
 
+// contentMetadataKeys 是事件元数据里装着内容（模型答复的正文）的键：跟 ev.Content 一样，只在打开内容采集时记。
+// 钩子改写答复时 reset_stream 的 replacement 是改写之后的完整答复——护栏钩子常在这里做 PII 过滤后改写，不按开关记的话
+// 过滤后的正文无条件进 trace。新加装内容的元数据键要登记在这里。
+var contentMetadataKeys = map[string]bool{"replacement": true}
+
 // eventAttrs 把事件元数据里的标量（字符串 / 数字 / 布尔）记成事件属性；结构化的 action 按类型展开。
-// 字符串经脱敏、截断（跟错误信息同一套处理）。
+// 字符串经脱敏、截断（跟错误信息同一套处理）；装内容的键（contentMetadataKeys）只在打开内容采集时记。
 func (o *Observability) eventAttrs(ev agent_v2.Event) []attribute.KeyValue {
 	var attrs []attribute.KeyValue
 	for k, v := range ev.Metadata {
+		if contentMetadataKeys[k] {
+			if x, ok := v.(string); ok && o.recordContent {
+				attrs = append(attrs, attribute.String(k, o.text(x)))
+			}
+			continue
+		}
 		switch x := v.(type) {
 		case string:
 			attrs = append(attrs, attribute.String(k, o.errText(x)))

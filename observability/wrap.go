@@ -46,10 +46,11 @@ func (w *wrappedHooks) OnAgentStart(ctx context.Context, info *hook.AgentInfo, i
 	return o.keepHandles(ctx1, ctx2), nil
 }
 
+// OnAgentEnd 先让里面的钩子跑，再收尾 agent span。收尾放在 defer 里：里面的钩子 panic 时框架兜住、不改变调用的结局，
+// 这里不收的话 span 永远不结束（不会被导出），crew.agent.active 也永久多 1。panic 照样往上抛，交给框架处置。
 func (w *wrappedHooks) OnAgentEnd(ctx context.Context, info *hook.AgentInfo, out *hook.AgentOutput) context.Context {
-	ret := w.inner.OnAgentEnd(ctx, info, out)
-	w.obs.o.endAgent(ctx, info, out)
-	return ret
+	defer w.obs.o.endAgent(ctx, info, out)
+	return w.inner.OnAgentEnd(ctx, info, out)
 }
 
 func (w *wrappedHooks) OnModelStart(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {

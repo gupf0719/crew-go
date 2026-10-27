@@ -228,6 +228,9 @@ A2A client span 按发请求用的 ctx 判（`A2AClientSpan.End(ctx, err)`），
   （`Extra` 带 `agent_v2.ToolReplayedExtraKey`）：span 标 `crew.tool.replayed`，不记时长样本、不计入 agent 的调用次数。
 - 被审批拒绝的调用没有执行：`OnToolEnd` 的 `Extra` 带 `agent_v2.ToolOutcomeDenied`，span 记 `blocked`、不标 Error、
   带 `crew.tool.outcome=denied`，时长样本带同一个属性——跟执行成功的分得开。
+- 模型调用整次重来（`agent_v2.WithModelRetry`）仍是一次调用：一个 `chat` span，时长含全部尝试与退避，用量只记交付那次；
+  首片时长（`gen_ai.response.time_to_first_chunk` 与对应指标）记交付那份答复的首片，作废尝试的首片不算。作废尝试白付的
+  token 不进用量（框架拿不到），成本按用量算会偏低。节点上的 `crew.stream.chunks` 是交给前端的片段数，含之后被撤回的。
 
 ### 2.5 span 事件
 
@@ -346,6 +349,9 @@ mp := sdkmetric.NewMeterProvider(
 超出上限的数据点并进同一个指标上带 `otel.metric.overflow=true` 属性的那一条序列；上限把这条也算在内。
 
 ## 4. 内容采集
+
+事件元数据里装内容的键（钩子改写答复时 `reset_stream` 的 `replacement`，即改写之后的完整答复）跟其余内容一样，只在
+打开内容采集时记；新加装内容的元数据键登记在 `observability/orch_hooks.go` 的 `contentMetadataKeys`。
 
 默认不采集输入输出内容——可能含个人信息，按 GenAI 约定是 opt-in。`WithContentRecording(true)` 打开后：
 

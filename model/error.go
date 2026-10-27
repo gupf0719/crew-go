@@ -139,13 +139,20 @@ func (e *APIError) Error() string {
 }
 
 // Unwrap 暴露底层错误，让 errors.Is/As 穿透到网络层错误（如 context.Canceled），
-// 故障切换层据此把控制流信号判为"不该切换"。HTTP 错误的响应体是计费类额度用完时交出 [ErrBillingExhausted]。
-func (e *APIError) Unwrap() error {
+// 故障切换层据此把控制流信号判为"不该切换"。HTTP 错误的响应体是计费类额度用完时另外交出 [ErrBillingExhausted]。
+//
+// 两样并列交出（多分支），不是二选一：有的客户端在 HTTP 错误上也填 Err（model/anthropic 放的是 SDK 的错误），只在
+// Err 为空时才交出计费哨兵的话，同一个计费错误在那样的客户端上认不出——不重试、不切换候选的判据都跟着失效。
+func (e *APIError) Unwrap() []error {
 	if e == nil {
 		return nil
 	}
-	if e.Err == nil && e.StatusCode != 0 && billingExhausted(e.Body) {
-		return ErrBillingExhausted
+	var errs []error
+	if e.Err != nil {
+		errs = append(errs, e.Err)
 	}
-	return e.Err
+	if e.StatusCode != 0 && billingExhausted(e.Body) {
+		errs = append(errs, ErrBillingExhausted)
+	}
+	return errs
 }

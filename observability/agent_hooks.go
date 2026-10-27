@@ -283,6 +283,9 @@ func (h *agentHooks) OnModelEndStream(ctx context.Context, info *hook.AgentInfo,
 		return ctx, sr, nil // 装了两层时里层不再包一次
 	}
 	mh.span.SetAttributes(AttrRequestStream.Bool(true))
+	// 每次包流都重新计首片：一次模型调用整次重来时（agent_v2.WithModelRetry）每次尝试各建一次流，作废那次的首片不算——
+	// 首片时长记的是交付出去的那份答复的首片（从调用开始算，含之前作废的尝试与退避）。
+	mh.firstChunk.Store(0)
 	return ctx, &firstChunkReader{inner: sr, h: mh}, nil
 }
 

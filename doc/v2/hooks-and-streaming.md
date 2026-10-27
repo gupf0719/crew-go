@@ -203,13 +203,16 @@ OnModelEnd (final 完整)       ↓ (final 走 session.Events 写审计)
 业务场景: streaming 中途业务工具抛 `InterruptError` (HITL) → 已 emit 半流 chunk 应让前端丢弃, Resume 新流不污染:
 
 ```go
-// 框架 emit reset_stream 的 3 处:
-// 1. ReactiveCompact retry (agent_v2/basic_agent.go, reason=prompt_too_long)
-//    reason=prompt_too_long; Metadata: attempt / max / compact_len / orig_len
-// 2. mid-stream Interrupt (agent_v2/basic_agent.go, reason=stream_recv_error)
-//    reason=stream_recv_error; Metadata: chunks_emitted / is_interrupt
-// 3. OnModelEnd hook 改写 final Message (agent_v2/basic_builder.go, reason=hook_overrode_message)
-//    reason=hook_overrode_message; Metadata: new_len
+// 框架 emit reset_stream 的 4 处（撤回只在失败点 / 作废点发；压缩重试不再单独发）:
+// 1. 流读出错（agent_v2/basic_agent.go streamOrGenerate, reason=stream_recv_error）：交出过片段才发
+//    Metadata: chunks_emitted / is_interrupt
+// 2. 一份答复作废、续跑重新生成（OnModelEnd 钩子报错 / 置空 / panic；agent_v2/basic_builder.go, reason=answer_discarded）
+// 3. 编排成员或节点（WithNodeRetry）的一次尝试被取代、或同一个节点失败 / 中断 / 被否决之后再执行（compose_v2/stream_attempt.go,
+//    reason=attempt_discarded）：那次交出、
+//    之后的尝试没再采用的每个 run_id 各一个——取代它的尝试也失败了时留到下一次尝试再看（它可能在拿回已完成的
+//    嵌套调用之前就失败了），到有一次尝试成功或重试用完时才撤；第 2 种已经撤过的不再撤
+// 4. OnModelEnd 钩子改写了答复（agent_v2/basic_builder.go, reason=hook_overrode_message）——是替换不是作废：
+//    Metadata: new_len / replacement（新答复的正文）
 sink.Send(compose_v2.Event{
     Type: "reset_stream",
     Metadata: map[string]any{
@@ -224,8 +227,11 @@ sink.Send(compose_v2.Event{
 
 **前端协议**:
 - 监听 `Type: "reset_stream"` Event
-- 按 `Metadata.run_id` 精确清空当前流缓冲
+- 按 `Metadata.run_id` 精确清空当前流缓冲；带 `Metadata.replacement` 时把那条消息换成它（不是删掉）
 - 接新 chunks (Resume 重发的)
+
+agui 与 a2a 流桥已经按这套协议处理（agui 发 `MessagesSnapshot`、a2a 一次模型调用一个 artifact、用 `append=false` 替换），业务前端只在
+自己消费 `OnNodeEvent` 时要照做。
 
 防"按 session 清"导致**跨 Run 串台** — 同 sess 多 Run 可能共存 (LoopAgent body 多轮).
 
@@ -246,7 +252,7 @@ agent_v2.WithHooks(hooks)
   自己修, framework 不 silent isolate)
 - panic 冒泡到调用这条链的地方兜住, 不让 Run goroutine crash 进程。多数转 **wrapped err 返业务**;
   跑在工作之后、只作观测的那几处 (节点体成功之后的 OnNodeEnd、图成功之后的 OnGraphEnd、任何时候的
-  OnNodeEvent、调用成功之后的 OnAgentEnd) 就地兜住、带栈记一条 ERROR, 结果照常提交 (逐道分工见
+  OnNodeEvent、任何时候的 OnAgentEnd——调用失败时照旧交出原来那个错误) 就地兜住、带栈记一条 ERROR, 结果照常提交 (逐道分工见
   `compose_v2/panic_recovery.go`)。转成错误的那几层:
   1. `compose_v2.Run` 入口 outer recover (`graph_loop.go::Run`)
   2. `runNodeWithHooks` 整函数 defer recover (覆盖 fan-out 跨 goroutine)

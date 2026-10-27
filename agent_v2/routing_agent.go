@@ -459,7 +459,7 @@ func (r *RoutingAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 		runOpts = append(runOpts, compose_v2.WithResumeUserText(rcfg.userText))
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, rcfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
 	final := RoutingAgentFinalMessage(cm.Channels())
@@ -508,7 +508,7 @@ func (r *RoutingAgent) runGraph(
 		}
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
 	final := RoutingAgentFinalMessage(cm.Channels())

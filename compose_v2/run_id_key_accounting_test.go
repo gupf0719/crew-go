@@ -39,10 +39,13 @@ func TestRunIDKey_LiteralCopiesAreAccounted(t *testing.T) {
 	// 两个包），但有测试网兜着（改生产侧的键，agui 与 agent_v2 共 5 条测试立刻红），
 	// 按「真问题修完就停」不再为它造第二个常量。
 	baseline := map[string]int{
-		"agent_v2/basic_agent.go":     3, // Event.Metadata：compact retry / stream 错误 / chunk
-		"agent_v2/basic_builder.go":   1, // Event.Metadata：reset_stream
-		"agui/adapter.go":             3, // 发给浏览器的 JSON 字段（index.html 读 d.run_id）
-		"compose_v2/message_group.go": 1, // 常量自己的定义
+		"agent_v2/basic_agent.go":      2, // Event.Metadata：stream 错误时的 reset_stream / chunk
+		"agent_v2/basic_builder.go":    2, // Event.Metadata：钩子改写答复 / 作废答复时的 reset_stream
+		"compose_v2/stream_attempt.go": 3, // Event.Metadata：作废的尝试撤回时的 reset_stream、节点 sink 与记录型 sink 读 chunk 的 run_id
+		"agui/adapter.go":              3, // 发给浏览器的 JSON 字段（index.html 读 d.run_id）
+		"a2a/remote_output.go":         2, // Event.Metadata：转发远端片段的 chunk / reset_stream
+		"a2a/server/executor.go":       1, // Event.Metadata：流桥读 chunk / reset_stream 的 run_id
+		"compose_v2/message_group.go":  1, // 常量自己的定义
 	}
 
 	root := ".."

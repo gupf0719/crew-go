@@ -830,6 +830,54 @@ None 才抛），但它没有存档类的哨兵。Codex 没有默认，产生处
 
 **已有的半解**：`SaveNodeState` 就是记进度用的，重跑时跳过已完成的部分。
 
+## 模型调用的重试：流开始之后出的错（2026-10-26 调研）
+
+起因：流式空闲超时（`openai.ErrStreamIdleTimeout`）落在一个缺口里——BasicAgent 模型节点只在报上下文过长时压缩后重试，
+`fallback.WithPerModelRetry` 与候选切换只管建流阶段，流开始之后的错（空闲超时、连接中途断、错误帧）只有外层成员 /
+节点重试（`RunWithRetry`，重做整个成员或节点）接得住。读源码（克隆日期 2026-09-29 ～ 10-22）看了 8 家：
+
+| 框架 | 流中途出错重不重试 | 在哪一层、默认 | 已交出的半截输出 |
+|---|---|---|---|
+| codex | 重试 | turn 采样循环，默认开（`stream_max_retries` 5，空闲超时 5 分钟算可重试） | 不撤回，只显示「Reconnecting」；已完成的 item 与已启动的工具留下，只重做正在流的那个 item |
+| eino adk | 重试 | ChatModelAgent 的模型包装器，默认关（`ModelRetryConfig`） | 流末尾注入 `WillRetryError`，约定消费方丢弃这一段，组历史时跳过 |
+| openai-agents | 交出过可见事件就**绝不**重试 | Runner，默认关 | 理由：已交给应用的事件撤不回 |
+| LangChain core | 不重试（`RunnableRetry` 明确不包 stream） | — | — |
+| LangChain v1 中间件 / LangGraph `RetryPolicy` | 整次调用 / 整个节点重来 | 用户加了才有 | 不撤回，已发 token 留在消费方 |
+| openai-python / adk-python / agentscope | 只重试建流之前 | SDK / 请求层 | adk 的 FallbackModel：第一个响应之后「这一轮归它」，不切换（两个模型的输出拼不起来） |
+| agent-framework | 无内置 | — | — |
+
+**前提在我们这儿的对照**：
+- codex「按已完成 item 续接」不成立：我们走 chat completions，一次调用就是一条 assistant 消息，收到 finish_reason 之前没有
+  已完成的子单元；工具在 tools 节点才执行，流中途出错时没有本地副作用——对我们来说重试只能是**整次模型调用重来**，而
+  重放的安全性反倒比 codex 简单。
+- openai-agents「撤不回」只部分成立：片段不进 session.Events、历史、存档（最终消息另走 OutputEvent），重来不污染历史；
+  前端已显示的片段靠 `reset_stream` 撤回——同 eino 的做法。它目前只在上下文过长重试时发，agui 之外的流消费方（a2a
+  server 的 chunk→artifact 桥、业务 OnNodeEvent）认不认没核实。
+- adk「第一个响应之后不切换」仍成立，约束的是拼接式续接，不约束作废前段、整次重做。
+- 超时重试可能付两次费（服务端可能还在生成）：codex 接受，openai-agents 不接受。
+- 分层：adk / agentscope / openai-agents 都防同一个失败被两层各重试一遍；我们模型层若再加一层，会与 fallback 每候选重试
+  （建流阶段）和外层 `RunWithRetry` 叠加。
+
+**两个代价业内怎么处理**（第二轮调研，2026-10-26）：
+- **重试多付钱：业内普遍接受，不专门设计。** 能续传的只有 OpenAI Responses API 的 background 模式（要 `store=true`，
+  chat completions 没有，codex 也没用）；DeepSeek 前缀续写只此一家、没有框架拿它做断流续传；Anthropic 已去掉预填。各家做的
+  只有按错误类型挑着重试、靠前缀缓存兜底（OpenAI / DeepSeek / 百炼都默认开、都按前缀匹配，DeepSeek 命中约原价 2%、百炼隐式
+  约 20%），剩下的真实代价是被作废的那段输出。断开之后停不停生成、怎么计费，三家都没有官方说法。
+- **多层重试相乘：有成熟做法。** Google SRE 书：「只在被拒那一层的紧上一层重试」，下层用完返回「别再重试」原样上传；
+  openai-agents 开了 runner 重试就把 SDK 的关成 0（最坏是相加不是相乘）；ADK 的 FallbackModel 自己不重试、交给模型的
+  retry_options（注释原话：免得一个失败被两层各重试一遍）。反例：LangGraph 节点重试叠 SDK 重试最多 9 次、框架不管；codex
+  的 HTTP 层与 turn 层在 5xx 上相乘（最多 30 次），只靠按场景压低配置。
+
+**落地**（2026-10-26，`fix/p0-retriage`）：
+- `agent_v2.WithModelRetry`：BasicAgent 模型调用整次重来，默认关、复用 `RetryConfig`。不做续写（前提不成立，见上）。
+- 采 SRE 的做法而不是「上层开了就关下层」：各层由业务各自配置，框架不知道上层开没开，但知道下层用完了没有——
+  `compose_v2.RetriesExhaustedError`，`RunWithRetry` 与 fallback 每候选重试用完时打，`RunWithRetry` 的守卫看到就不再重试、
+  业务谓词绕不开。框架里没找到这种标记的先例，它是 SRE「别再重试」信号在进程内的对应。
+- 半截输出：失败那一刻撤回（`reset_stream`，只在真交出过片段时、只在失败点发）；agui 另发 AG-UI 标准的
+  `MESSAGES_SNAPSHOT`（LangGraph 与 Vercel 的 AG-UI 接入都在 run 结束时发它校正流式期间的消息），a2a 流桥一次模型调用一个
+  artifact、用 `append=false` 替换那一次调用的、RemoteAgent 认它（替换的单位与撤回的单位都是一次调用：一个请求共用一个
+  artifact 时，续跑替换上一个请求的那份会把别的调用的文本一起重发）。
+
 ## 节点/工具超时
 
 A 家有 **per-node `timeout`** + `TimeoutPolicy{run_timeout, idle_timeout}`。

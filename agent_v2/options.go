@@ -357,26 +357,21 @@ func GetCtxOrchHooks(ctx context.Context) OrchestrationHooks {
 	return nil
 }
 
-// extractOrchHooksOrCtx 拿 OrchHooks——RunOption 优先 / ctx fallback。
-//
-// 嵌套场景关键：父 编排 sub-agent.Run(ctx, ...) 时如果 ctx 含 OrchHooks，子
-// agent 自动继承——streaming 跨子图边界不丢。
-//
-// 用法：编排 wrapper 在 Run 入口调用，把结果传给 compose_v2.WithHooks RunOption：
-//
-//	hooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks)
-//	if hooks != nil {
-//	    runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
-//	}
-func extractOrchHooksOrCtx(ctx context.Context, optsHooks OrchestrationHooks) OrchestrationHooks {
-	// review-v6 M-19 fix: 用 isFrameworkNil 防 typed nil — 业务自定义 OrchestrationHooks
-	// 实现传 `var h *MyHooks; ...` 时是 typed nil interface (非 untyped nil).
-	// 当前 WithOrchHooks 已防 typed nil, 这里是 defense in depth — 未来加新 With*
-	// option 忘 isFrameworkNil 时第二层保护. 与其他防御协议对称.
-	if !isFrameworkNil(optsHooks) {
-		return optsHooks
+// extractOrchHooksOrCtx 取这张图的编排钩子，交给 compose_v2.WithHooks：RunOption 给的优先，其次 agent_v2 的 ctx 钩子
+// （WithCtxOrchHooks），再次 compose_v2 的 ctx 钩子（compose_v2.WithOrchHooks）——嵌套的子 agent 经 ctx 继承父的钩子，
+// 流式片段跨子图边界不丢。都没有时返回 nil。
+func extractOrchHooksOrCtx(ctx context.Context, optsHooks OrchestrationHooks) compose_v2.OrchestrationHooks {
+	// isFrameworkNil 防 typed nil（review-v6 M-19：WithOrchHooks 已防，这里是第二层）
+	switch {
+	case !isFrameworkNil(optsHooks):
+		return adaptHooks(optsHooks)
+	case !isFrameworkNil(GetCtxOrchHooks(ctx)):
+		return adaptHooks(GetCtxOrchHooks(ctx))
 	}
-	return GetCtxOrchHooks(ctx)
+	if h := compose_v2.GetOrchHooks(ctx); !isFrameworkNil(h) {
+		return h
+	}
+	return nil
 }
 
 // ResumeOption 是 Agent.Resume 的可选参数。
@@ -538,4 +533,31 @@ func applyResumeOptions(opts []ResumeOption) resumeConfig {
 // 信号（调用方的 ctx 没死），所以按普通工具错处理：转成 tool_result 给模型看，让它换条路。
 func WithToolTimeout(d time.Duration) Option {
 	return func(c *Config) { c.ToolTimeout = d }
+}
+
+// WithModelRetry 设一次模型调用失败时整次重来的策略（默认不重试）。
+//
+// 重试的单位是**一次模型调用**：同一份输入再调一次，建流之前的错（5xx、限流、网络）与流开始之后的错（连接中途断开、
+// 流里的错误帧、`openai.ErrStreamIdleTimeout`）一样处理。整次重来是安全的：一次调用就是一条完整的消息，工具要等模型
+// 节点结束才执行，流中途出错时没有本地副作用；失败那次已交出的片段在失败那一刻撤回（`reset_stream` 事件，agui 另发
+// AG-UI 标准的 MESSAGES_SNAPSHOT），会话历史与存档只收成功那次的消息。
+//
+// **一个失败只被重试一层**：
+//   - 模型套了 `fallback` 且配了每候选重试时，建流之前的错已在候选上重试过，用完之后带
+//     [compose_v2.RetriesExhaustedError] 标记，这里不再重试它；
+//   - 这里重试用完也带上标记，外层的编排成员重试 / 节点重试不再重做这个失败。
+//
+// 代价：重来要重发整份 prompt（命中 provider 的前缀缓存时按缓存价计），前一次已生成、被作废的输出白付；空闲超时时
+// 服务端可能还在生成，断开之后停不停、怎么计费各家没有官方说法。不想为某类错付这笔钱就在 ShouldRetry 里排除它，
+// 例如 `!errors.Is(err, openai.ErrStreamIdleTimeout)`。
+//
+// 只对会自己恢复的错误重试：`compose_v2.SimpleRetry(n)` / `ExponentialBackoff(...)` 带的默认谓词
+// [compose_v2.IsRetryable] 排除确定性的 HTTP 失败（400 / 401 / 403 / 404 / 422）与声明了不可重试的错误（内容过滤、
+// 上下文超窗——后者交给 [WithReactiveCompact]）；服务端给了 Retry-After 时照它等，限流可单独设上限
+// （RateLimitMaxRetries）。`cfg.MaxRetries > 0` 时 `cfg.ShouldRetry` 必填，不给在这一行 panic。
+//
+// 重试都在一对 OnModelStart / OnModelEnd 之内：钩子与观测看到的是一次模型调用；OnModelEndStream 每次尝试各触发一次。
+func WithModelRetry(cfg compose_v2.RetryConfig) Option {
+	compose_v2.ValidateRetryConfig(cfg, "WithModelRetry")
+	return func(c *Config) { c.ModelRetry = cfg }
 }

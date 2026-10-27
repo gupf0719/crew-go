@@ -76,6 +76,8 @@ type AGUIMessage struct {
 	Content string `json:"content"`
 	// droppedParts 是 content 数组里没取的媒体部分的类型（按出现顺序），解码时填。
 	droppedParts []string
+	// raw 是这条消息的原文，解码时填：撤回一条已发出的消息时，消息快照要把前端手上的消息原样重述一遍（见 sseAdapter.snapshotLocked）。
+	raw json.RawMessage
 }
 
 // UnmarshalJSON 解 role 与 content：content 接受字符串、ContentPart 数组、对象与 null（见类型说明）。
@@ -88,6 +90,7 @@ func (m *AGUIMessage) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	m.Role, m.Content, m.droppedParts = raw.Role, "", nil
+	m.raw = append(json.RawMessage(nil), b...)
 	c := bytes.TrimSpace(raw.Content)
 	switch {
 	case len(c) == 0 || bytes.Equal(c, []byte("null")):
@@ -438,7 +441,7 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		h.dropCP(ctx, stale.RunID)
 	}
 
-	adapter := newSSEAdapter(sse, in.RunID)
+	adapter := newSSEAdapter(sse, in.RunID, in.Messages)
 	ag := h.build(adapter)
 	if ag == nil {
 		h.removeEntry(key) // 清 acquireForRun 建的空壳，避免泄漏
@@ -489,6 +492,7 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		// sess==nil 让 LRU 也清不了）。
 		h.dropCP(ctx, sess.RunID)
 		h.removeEntry(key)
+		adapter.finish() // 收尾在途的流式消息、发出攒着的撤回快照
 		_ = sse.WriteEvent(NewRunError("run terminated abnormally (goroutine exited without returning)", "agent_error"))
 	}()
 
@@ -582,7 +586,7 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 		wireRunID = sess.RunID
 	}
 
-	adapter := newSSEAdapter(sse, wireRunID)
+	adapter := newSSEAdapter(sse, wireRunID, in.Messages)
 	ag := h.build(adapter)
 	if ag == nil {
 		_ = sse.Reject(http.StatusInternalServerError, "nil_agent", "agui: AgentFactory returned nil agent")
@@ -619,6 +623,7 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 		if settled {
 			return
 		}
+		adapter.finish() // 收尾在途的流式消息、发出攒着的撤回快照
 		_ = sse.WriteEvent(NewRunError("resume terminated abnormally (goroutine exited without returning)", "agent_error"))
 	}()
 

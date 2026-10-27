@@ -126,6 +126,9 @@ func evalMemberOutEdges(ctx context.Context, g *Graph, cm *ChannelManager, m Fro
 	})
 	if condRejected(ctx, err) {
 		cm.bumpRerunGen(nodeKey, "")
+	} else if err != nil && IsRetryFutile(ctx, err) {
+		// 节点体成功之后在出边上被叫停：这次执行算暂停结束，续跑时它交出的流不撤（见 settleNodeStreams）
+		cm.markNodeStreamsPaused(nodeKey)
 	}
 	if err != nil {
 		return nil, nil, err

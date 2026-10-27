@@ -42,6 +42,8 @@ type ToolEndpoint func(ctx context.Context, name string, args map[string]any) (*
 //     （`compose_v2.EnterHook`，规则同 CallHook）：派生的，你推的值、调用方可配的（软取消、环境）、
 //     超时都生效；外来的（存下来的、`context.Background()`）只借你推的业务值，工具体照样在这次
 //     调用的位置上、按这次请求的环境与取消跑。
+//  7. **工具在一个 tool_call 里只执行一次。** 在 next 之后挂起或返回 error，续跑时 next 交回第一次的
+//     结果、工具不再执行（形状与例外见 [WithToolMiddleware]）。
 //
 // # 顺序
 //

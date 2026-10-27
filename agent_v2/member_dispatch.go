@@ -102,13 +102,13 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 	subCtx = shadowNodeGrants(subCtx)
 
 	// 每次尝试写进会话的事件先落在暂存 lane 上：被下一次从头再跑的尝试取代时作废，其余照常提交（见 attemptLanes）
-	lanes := newAttemptLanes(subCtx, m.sess)
+	lanes := newAttemptLanes(subCtx, m.sess, m.agent.Name())
 	defer lanes.finish()
 	return compose_v2.RunWithRetry(subCtx, m.retryCfg, func(ctx context.Context) (*schema.Message, error) {
 		var events []*AgentEvent
-		err := lanes.run(func(s *RunSession) error {
+		err := lanes.run(ctx, func(c context.Context, s *RunSession) error {
 			var runErr error
-			events, runErr = m.agent.Run(ctx, s, cloneCalleeInput(m.input), grants.regrantOpts(m.agent)...)
+			events, runErr = m.agent.Run(c, s, cloneCalleeInput(m.input), grants.regrantOpts(m.agent)...)
 			return runErr
 		})
 		if err != nil {

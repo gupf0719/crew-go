@@ -339,6 +339,7 @@ func SaveNodeState(ctx context.Context, v any) error {
 		return fmt.Errorf("SaveNodeState: %w", err)
 	}
 	a.cm.putNodeState(a.base(), tv)
+	a.cm.noteStateWrite(ctx, a.base())
 	return nil
 }
 
@@ -368,5 +369,7 @@ func GetNodeState[T any](ctx context.Context) (T, bool) {
 	if !ok {
 		return zero, false
 	}
+	// 从别的执行拿回的进度：它对应哪些流框架说不清，这次执行取代的流一个都不撤（见 stream_attempt.go）
+	a.cm.noteRecall(ctx, a.base())
 	return typed, true
 }

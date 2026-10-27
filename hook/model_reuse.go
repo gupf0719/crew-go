@@ -24,3 +24,14 @@ func IsModelResponseReused(extra map[string]any) bool {
 	reused, _ := extra[ModelResponseReusedKey].(bool)
 	return reused
 }
+
+// ModelRunIDKey 是这次模型调用的 run_id（框架放在 OnModelEnd 的 ModelOutput.Extra 上，string），与它流式片段的 run_id
+// 同一个。要知道「这份答复出自哪次调用」读它、别读 output.Message 上的标注：排在前面的钩子可能换掉了 Message，新消息不带
+// 框架的标注（曾经适配层排在改写钩子后面时按消息标注取不到 run_id，把改写后的答复当成另一条消息发出，审计实测）。
+const ModelRunIDKey = "crew_model_run_id"
+
+// ModelRunIDOf 取 extra（ModelOutput.Extra）上的 [ModelRunIDKey]；没有时返回空串。
+func ModelRunIDOf(extra map[string]any) string {
+	id, _ := extra[ModelRunIDKey].(string)
+	return id
+}

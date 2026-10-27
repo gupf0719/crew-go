@@ -276,6 +276,8 @@ func (s *nodeEventSink) Send(ev Event) {
 	if s == nil || s.hooks == nil {
 		return
 	}
+	// 交给前端的片段在出口上登记（见 stream_attempt.go）：所在的尝试作废时据此撤回
+	recordChunk(s.ctx, ev)
 	// 自动注入 graph_ns 到 ev.Metadata——让前端 SSE 流可按 ns 分通道展示父子嵌套.
 	// 业务自填 graph_ns 时不覆盖 (业务优先, 让自定义 ns 维度生效).
 	//

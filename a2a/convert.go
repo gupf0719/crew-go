@@ -1,12 +1,10 @@
 package a2a
 
 import (
-	"context"
 	"encoding/base64"
 	"strings"
 	"unicode"
 
-	"crew-go/compose_v2"
 	"crew-go/schema"
 
 	a2atypes "github.com/a2aproject/a2a-go/v2/a2a"
@@ -179,21 +177,6 @@ func PartToBlock(p *a2atypes.Part) *schema.ContentBlock {
 		}
 	}
 	return nil
-}
-
-// emitChunk 把远程 A2A 流式增量通过 host 的 EventSink 实时投递前端（有 sink 时——
-// RemoteAgent 嵌入 host graph 节点内运行时 ctx 自带 nodeEventSink；裸跑时无 sink 静默跳过）。
-func emitChunk(ctx context.Context, agentName, text string) {
-	if text == "" {
-		return
-	}
-	if sink := compose_v2.GetEventSink(ctx); sink != nil {
-		sink.Send(compose_v2.Event{
-			Type:     "chunk",
-			Content:  text,
-			Metadata: map[string]any{"agent": agentName, "source": "a2a_remote"},
-		})
-	}
 }
 
 // sanitizeName 把远程 AgentCard.Name 转 OpenAI 合规工具名（字母数字下划线，非法字符转 _）。

@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -43,6 +44,33 @@ func (contextWindowExceededError) Error() string { return "model: context length
 
 // NonRetryable 实现 compose_v2.NonRetryable：同一份输入重试必然一样。
 func (contextWindowExceededError) NonRetryable() {}
+
+// ErrBillingExhausted 表示 provider 报的是计费类额度用完：账户额度 / 余额用完，或免费额度用完且只允许免费额度——等多久
+// 都不会恢复，要改账户设置。按时间窗口的配额（「每分钟请求数超了」）是限流、会自己恢复，不算。
+//
+// 不可重试（实现 compose_v2.NonRetryable）：[APIError] 的响应体是这一类时，经 Unwrap 交出它，所以默认重试判据
+// （compose_v2.IsRetryable，SimpleRetry / ExponentialBackoff 带的就是它）、fallback 的每候选重试都不再重试，业务用
+// errors.Is 认。换一个候选照样有用，fallback 的默认策略照常切换。判据只有这一份：曾经 fallback 按响应体认、默认判据
+// 只看状态码，同一个 429 insufficient_quota 在 fallback 里不重试、单模型配了 WithModelRetry 时白重试 n 次。
+var ErrBillingExhausted error = billingExhaustedError{}
+
+// billingExhaustedError 是 [ErrBillingExhausted] 的类型。
+type billingExhaustedError struct{}
+
+func (billingExhaustedError) Error() string { return "model: billing quota exhausted" }
+
+// NonRetryable 实现 compose_v2.NonRetryable：额度用完，等多久重试都一样。
+func (billingExhaustedError) NonRetryable() {}
+
+// billingExhausted 从错误响应体判计费类额度用完。只认语义明确的标记，按时间窗口的配额、限流不算。
+func billingExhausted(body string) bool {
+	b := strings.ToLower(body)
+	return strings.Contains(b, "insufficient_quota") || // OpenAI 429：账户额度用完
+		strings.Contains(b, "freetieronly") || // dashscope 403 AllocationQuota.FreeTierOnly：免费额度用完、只允许免费额度
+		strings.Contains(b, "quota has been exhausted") || // dashscope 同上的 message
+		strings.Contains(b, "insufficient balance") || // deepseek：余额不足
+		strings.Contains(b, "credit balance is too low") // Anthropic 400 配额耗尽（同 LiteLLM#24320）
+}
 
 // APIError 是 provider HTTP 调用的结构化错误，让上层（如故障切换装饰器
 // FallbackChatModel）能按 StatusCode 分类，而不必正则解析错误字符串（脆弱、易误判）。
@@ -111,5 +139,13 @@ func (e *APIError) Error() string {
 }
 
 // Unwrap 暴露底层错误，让 errors.Is/As 穿透到网络层错误（如 context.Canceled），
-// 故障切换层据此把控制流信号判为"不该切换"。
-func (e *APIError) Unwrap() error { return e.Err }
+// 故障切换层据此把控制流信号判为"不该切换"。HTTP 错误的响应体是计费类额度用完时交出 [ErrBillingExhausted]。
+func (e *APIError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	if e.Err == nil && e.StatusCode != 0 && billingExhausted(e.Body) {
+		return ErrBillingExhausted
+	}
+	return e.Err
+}

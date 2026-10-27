@@ -757,7 +757,7 @@ OnModelEnd 钩子拿答复问人之后续跑重新调模型，用户批准的是
 
 - **当时先不改引擎这一层**：成功路径的 OnNodeEnd 不另加兜底是当时的既定决策。引擎的契约是「成功的执行可能作废重跑，
   节点要靠私有态做到重跑幂等」——问题出在我们自己的节点没守这条契约，就在节点上修。**2026-10-22 引擎这一层也改了**：
-  节点体成功之后的 OnNodeEnd、图成功之后的 OnGraphEnd、任何时候的 OnNodeEvent、调用成功之后的 OnAgentEnd panic 一律就地
+  节点体成功之后的 OnNodeEnd、图成功之后的 OnGraphEnd、任何时候的 OnNodeEvent、任何时候的 OnAgentEnd panic 一律就地
   兜住、带栈记一条 ERROR，结果与写入照常提交（对照 LangGraph 回调出错默认吞掉、显式上抛时 task 照样算完成；OpenAI Agents SDK
   工具输出在 `on_tool_end` 之前已提交）。节点私有态那套留着兜剩下两条路：成功之后的钩子 Goexit、提交出错（reducer panic
   那条路引擎本来就整超步重跑）。

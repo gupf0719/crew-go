@@ -184,6 +184,16 @@ type taskState struct {
 	busy      bool               // 有在途 run 正跑——防并发续发 + 让 Cancel 协调
 	canceled  bool               // tombstone：Cancel 来过——acquire 拒、在途 run 的 conclude 改走清理
 	cancelRun context.CancelFunc // 取消在途 run 的 runCtx（Cancel 用它停在途 Resume，避免并发 abort）
+	// artifacts 是流桥在这个任务里写过的 artifact，一次模型调用（run_id）一个，跨请求保留：续跑时改写、作废的可能是上一个
+	// 请求流出的那次调用（沿用原样续跑的答复在这一遍才经过 OnModelEnd 钩子），要替换的是当初那个 artifact。只由持有 busy
+	// 的那次读写。
+	artifacts map[string]*bridgeArtifact
+}
+
+// bridgeArtifact 是流桥为一次模型调用写的 artifact 与它此刻的全文。
+type bridgeArtifact struct {
+	id   a2atypes.ArtifactID
+	text string
 }
 
 var _ a2asrv.AgentExecutor = (*Executor)(nil)
@@ -405,7 +415,7 @@ func (e *Executor) runStreaming(
 	st.cancelRun = cancel
 	e.mu.Unlock()
 
-	fw := &chunkForwarder{ch: make(chan string, 256), stop: make(chan struct{})}
+	fw := &chunkForwarder{ch: make(chan streamPiece, 256), stop: make(chan struct{})}
 	// **业务 OrchHooks 不被顶掉（audit obs-#1 fix）**：RunOption hooks 优先级高于 ctx hooks
 	//（extractOrchHooksOrCtx 不 chain）——若只传 fw，业务经 HTTP middleware push 的
 	// WithCtxOrchHooks(obs.OrchHooks()) 会被静默顶掉（node/cp/compact/fanout/skill 等
@@ -435,15 +445,45 @@ func (e *Executor) runStreaming(
 		sent = true
 	}()
 
-	// 首 chunk 建 artifact，后续 append 同一 artifact
-	var artifactID a2atypes.ArtifactID
-	emit := func(text string) bool {
-		if artifactID == "" {
-			ev := a2atypes.NewArtifactEvent(execCtx, a2atypes.NewTextPart(text))
-			artifactID = ev.Artifact.ID
+	// 一次模型调用（run_id）的片段写进它自己的 artifact：第一个片段建、之后接在后面。它的片段作废（reset_stream）时用
+	// append=false 把那个 artifact 换成空，改写时换成新正文——A2A 里替换 artifact 的办法。撤回与替换的单位就是一次调用：
+	// 曾经只追加，失败那次的半截留在 artifact 里，对端把「半截 + 重来的完整答复」拼成一份（实测 "partial-full"）；后来一个
+	// 请求共用一个 artifact，续跑时替换上一个请求的那个，整份重发带上了那个请求里别的调用的文本，对端 RemoteAgent 没见过那个
+	// artifact、把全文当成这一轮的答复（审计实测宿主拿到 "A-REDACTED"）。
+	newArtifact := func(runID, text string) bool {
+		ev := a2atypes.NewArtifactEvent(execCtx, a2atypes.NewTextPart(text))
+		if st.artifacts == nil {
+			st.artifacts = map[string]*bridgeArtifact{}
+		}
+		st.artifacts[runID] = &bridgeArtifact{id: ev.Artifact.ID, text: text}
+		return yield(ev, nil)
+	}
+	emit := func(p streamPiece) bool {
+		art := st.artifacts[p.runID]
+		if p.reset {
+			text := ""
+			if p.replacement != nil {
+				text = *p.replacement
+			}
+			if art == nil {
+				if text == "" {
+					return true // 这次调用没往 artifact 里写过，没有可撤的
+				}
+				return newArtifact(p.runID, text) // 之前没流出片段的改写：照常发一份
+			}
+			if art.text == text {
+				return true
+			}
+			art.text = text
+			ev := a2atypes.NewArtifactUpdateEvent(execCtx, art.id, a2atypes.NewTextPart(text))
+			ev.Append = false
 			return yield(ev, nil)
 		}
-		return yield(a2atypes.NewArtifactUpdateEvent(execCtx, artifactID, a2atypes.NewTextPart(text)), nil)
+		if art == nil {
+			return newArtifact(p.runID, p.text)
+		}
+		art.text += p.text
+		return yield(a2atypes.NewArtifactUpdateEvent(execCtx, art.id, a2atypes.NewTextPart(p.text)), nil)
 	}
 
 	// abandon：客户端断开 / 父 ctx 取消——停收 chunk + cancel agent + 等 goroutine 退出，
@@ -641,21 +681,41 @@ func (e *Executor) acquire(k taskKey) (*taskState, error) {
 
 // ---- chunk → artifact 桥 ----
 
-// chunkForwarder 实现 agent_v2.OrchestrationHooks，把 OnNodeEvent 的 chunk 转发给
+// streamPiece 是转给 runStreaming 主循环的一段：模型调用（run_id）流出的文本，或「这次调用的片段作废」（reset）。
+type streamPiece struct {
+	runID string
+	text  string
+	reset bool
+	// replacement 非 nil：这次 reset 是替换（OnModelEnd 钩子改写了答复），这次调用的各段换成它，不是删掉
+	replacement *string
+}
+
+// chunkForwarder 实现 agent_v2.OrchestrationHooks，把 OnNodeEvent 的 chunk 与 reset_stream 转发给
 // runStreaming 主循环。send 阻塞提供背压（A2A 客户端慢时反压 LLM 流）；stop 关闭后
 // 丢弃（主循环已停止消费，防 OnNodeEvent 永久阻塞挂死 agent goroutine）。
 type chunkForwarder struct {
 	agent_v2.NoOpOrchestrationHooks
-	ch   chan string
+	ch   chan streamPiece
 	stop chan struct{}
 }
 
 func (f *chunkForwarder) OnNodeEvent(ctx context.Context, _ string, ev agent_v2.Event) context.Context {
-	if ev.Type == "chunk" && ev.Content != "" {
-		select {
-		case f.ch <- ev.Content:
-		case <-f.stop:
+	runID, _ := ev.Metadata["run_id"].(string)
+	var p streamPiece
+	switch {
+	case ev.Type == "chunk" && ev.Content != "":
+		p = streamPiece{runID: runID, text: ev.Content}
+	case ev.Type == "reset_stream" && runID != "":
+		p = streamPiece{runID: runID, reset: true}
+		if r, ok := ev.Metadata["replacement"].(string); ok {
+			p.replacement = &r
 		}
+	default:
+		return ctx
+	}
+	select {
+	case f.ch <- p:
+	case <-f.stop:
 	}
 	return ctx
 }

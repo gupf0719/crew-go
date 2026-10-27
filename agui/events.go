@@ -17,6 +17,8 @@
 // 决策溯源见 doc/issue/issue-49-frontend-stream-adapter.md「2026-07-01 决策修订」。
 package agui
 
+import "encoding/json"
+
 // EventType 是 AG-UI 事件的 wire 类型（大写下划线，如 "RUN_STARTED"）。
 type EventType string
 
@@ -43,8 +45,9 @@ const (
 	EventTypeToolCallResult EventType = "TOOL_CALL_RESULT"
 
 	// 状态 + 自定义
-	EventTypeStateSnapshot EventType = "STATE_SNAPSHOT"
-	EventTypeCustom        EventType = "CUSTOM"
+	EventTypeStateSnapshot    EventType = "STATE_SNAPSHOT"
+	EventTypeMessagesSnapshot EventType = "MESSAGES_SNAPSHOT"
+	EventTypeCustom           EventType = "CUSTOM"
 )
 
 // Event 是所有 AG-UI 事件的公共接口——SSE writer 用它拿 wire type + 时间戳编 frame。
@@ -339,6 +342,18 @@ type StateSnapshotEvent struct {
 // NewStateSnapshot 构造 STATE_SNAPSHOT。
 func NewStateSnapshot(snapshot any) *StateSnapshotEvent {
 	return &StateSnapshotEvent{baseEvent: baseEvent{EventType: EventTypeStateSnapshot}, Snapshot: snapshot}
+}
+
+// MessagesSnapshotEvent —— 生产方持有的完整消息集合（AG-UI 1.0 events/state）。消费方按 id 就地替换同 id 的消息、追加
+// 没见过的、**丢掉手上有而快照里没有的**（activity / reasoning 消息除外）——这是协议里撤回一条已发出的消息的标准办法。
+type MessagesSnapshotEvent struct {
+	baseEvent
+	Messages []json.RawMessage `json:"messages"`
+}
+
+// NewMessagesSnapshot 构造 MESSAGES_SNAPSHOT。
+func NewMessagesSnapshot(messages []json.RawMessage) *MessagesSnapshotEvent {
+	return &MessagesSnapshotEvent{baseEvent: baseEvent{EventType: EventTypeMessagesSnapshot}, Messages: messages}
 }
 
 // CustomEvent —— 自定义事件（承载 AG-UI 原生无对应的 crew-go 概念，如 reset_stream /

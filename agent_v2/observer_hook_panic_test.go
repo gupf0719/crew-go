@@ -2,12 +2,14 @@ package agent_v2_test
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/model"
 	"crew-go/schema"
 	"crew-go/tool"
 )
@@ -67,4 +69,62 @@ func TestObserverHookPanic_AgentEndDoesNotRedoMember(t *testing.T) {
 			}
 		})
 	}
+}
+
+// agentEndPanicAlways 在每次 OnAgentEnd 里都 panic。
+type agentEndPanicAlways struct{ hook.NoOpHooks }
+
+func (agentEndPanicAlways) OnAgentEnd(context.Context, *hook.AgentInfo, *hook.AgentOutput) context.Context {
+	panic("agent end boom")
+}
+
+// 调用失败时 OnAgentEnd 钩子 panic：交出的仍是原来那个错误（同一个错误文本、认得出模型的 APIError、没有 PanicError）。曾经
+// panic 交给外层兜底，原来的错误被整个换成 panic 的错误。
+func TestObserverHookPanic_AgentEndKeepsFailure(t *testing.T) {
+	run := func(hooks hook.Hooks) error {
+		m := &scriptedStreamModel{
+			openErr: func(int) error { return &model.APIError{Provider: "stub", StatusCode: 400, Body: "bad request"} },
+			script:  func(int) ([]string, error) { return nil, nil },
+		}
+		opts := []agent_v2.Option{agent_v2.WithName("f"), agent_v2.WithModel(m), agent_v2.WithMaxRounds(2)}
+		if hooks != nil {
+			opts = append(opts, agent_v2.WithHooks(hooks))
+		}
+		_, err := agent_v2.NewBasicAgent(opts...).Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("hi"))
+		return err
+	}
+	want := run(nil)
+	got := run(agentEndPanicAlways{})
+	var apiErr *model.APIError
+	var pe *compose_v2.PanicError
+	if got == nil || want == nil || got.Error() != want.Error() || !errors.As(got, &apiErr) || errors.As(got, &pe) {
+		t.Fatalf("OnAgentEnd panic 不该改变失败的结局：期望 %v，实际 %v", want, got)
+	}
+}
+
+// 调用停在中断上时 OnAgentEnd 钩子 panic：交出的仍是那个中断，续跑接得上（曾经被换成 panic 的错误，调用方认不出有问题要答）。
+func TestObserverHookPanic_AgentEndKeepsInterrupt(t *testing.T) {
+	m := &scriptedStreamModel{script: func(int) ([]string, error) { return []string{"draft"}, nil }}
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("i"), agent_v2.WithModel(m), agent_v2.WithMaxRounds(2),
+		agent_v2.WithHooks(hook.NewChainHooks(askOnModelEnd{}, agentEndPanicAlways{})))
+	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
+	sess := agent_v2.NewRunSession()
+	_, err := ag.Run(ctx, sess, schema.UserMessage("hi"))
+	ie, ok := compose_v2.IsInterrupt(err)
+	if !ok {
+		t.Fatalf("OnAgentEnd panic 不该吞掉中断，实际 %v", err)
+	}
+	events, err := ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess),
+		agent_v2.WithResumeUserInputs(map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("是")}))
+	if err != nil || agent_v2.FinalMessage(events).Content != "draft" {
+		t.Fatalf("续跑应接上并交出答复，实际 err=%v", err)
+	}
+}
+
+// askOnModelEnd 在 OnModelEnd 里问一次人。
+type askOnModelEnd struct{ hook.NoOpHooks }
+
+func (askOnModelEnd) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, _ *schema.ModelOutput) (context.Context, error) {
+	_, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "发出去吗"})
+	return ctx, err
 }

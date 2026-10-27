@@ -178,15 +178,15 @@ func (a *RemoteAgent) Run(ctx context.Context, session *agent_v2.RunSession, inp
 			panicerr.Log(ctx, slog.LevelError, "a2a: RemoteAgent 收尾兜住 panic，已转成错误", pe, panicerr.KeyError, retErr.Error())
 		}
 		ctxOut := agent_v2.WithEndError(ctx, retErr)
-		if retErr == nil {
-			// 这次调用已经成功：OnAgentEnd 是观测钩子，它 panic 不把成功报成失败——就地兜住、带栈记一条 ERROR（同 agent_v2 的
-			// 编排）。转成错误的话，编排续跑 / 重试时远端请求再发一遍、远端的副作用重放。
-			defer func() {
-				if r := recover(); r != nil {
-					panicerr.Log(ctx, slog.LevelError, "a2a: RemoteAgent 的 OnAgentEnd 钩子 panic（这次调用已经成功，结果不变）", panicerr.New(r))
-				}
-			}()
-		}
+		// OnAgentEnd 是观测钩子，它 panic 不改变这次调用的结局——就地兜住、带栈记一条 ERROR（同 agent_v2 的编排）。成功时转成
+		// 错误的话，编排续跑 / 重试时远端请求再发一遍、远端的副作用重放；失败时交给外层兜底的话，原来的错误（远端的追问中断、
+		// 终局失败）被整个换掉。
+		defer func() {
+			if r := recover(); r != nil {
+				panicerr.Log(ctx, slog.LevelError, "a2a: RemoteAgent 的 OnAgentEnd 钩子 panic（这次调用的结局不变）", panicerr.New(r),
+					"call_failed", retErr != nil)
+			}
+		}()
 		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: finalMessagesRef})
 	}()
 
@@ -304,8 +304,7 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 	}
 
 	var (
-		result       strings.Builder
-		blocks       []*schema.ContentBlock // 远程应答的非文本 part（raw/url/data → File/Data block）
+		result       = newRemoteOutput(a.name) // 远程应答的文本与非文本 part（raw/url/data → File/Data block）
 		lastState    a2atypes.TaskState
 		newTaskID    string
 		newContextID string
@@ -358,10 +357,7 @@ stream:
 		}
 		switch v := ev.(type) {
 		case *a2atypes.Message:
-			t, bs := PartsToContent(v.Parts)
-			result.WriteString(t)
-			blocks = append(blocks, bs...)
-			emitChunk(ctx, a.name, t)
+			result.add(ctx, v.Parts, true)
 			if v.TaskID != "" {
 				newTaskID = string(v.TaskID)
 			}
@@ -378,9 +374,7 @@ stream:
 			}
 			for _, art := range v.Artifacts {
 				if art != nil {
-					t, bs := PartsToContent(art.Parts)
-					result.WriteString(t)
-					blocks = append(blocks, bs...)
+					result.taskArtifact(ctx, art.ID, art.Parts)
 				}
 			}
 			if waitsForInput(lastState) {
@@ -403,10 +397,7 @@ stream:
 			}
 		case *a2atypes.TaskArtifactUpdateEvent:
 			if v.Artifact != nil {
-				t, bs := PartsToContent(v.Artifact.Parts)
-				result.WriteString(t)
-				blocks = append(blocks, bs...)
-				emitChunk(ctx, a.name, t)
+				result.artifactUpdate(ctx, v.Artifact.ID, v.Artifact.Parts, v.Append)
 			}
 		}
 	}
@@ -513,7 +504,7 @@ stream:
 		if sessionHandles {
 			a.clearIDs(session)
 		}
-		return assistantWithBlocks(firstNonEmpty(result.String(), statusMsg), blocks), nil
+		return assistantWithBlocks(firstNonEmpty(result.String(), statusMsg), result.Blocks()), nil
 	case a2atypes.TaskStateFailed, a2atypes.TaskStateRejected, a2atypes.TaskStateCanceled:
 		if sessionHandles {
 			a.clearIDs(session)
@@ -529,7 +520,7 @@ stream:
 		if sessionHandles {
 			a.storeIDs(session, newTaskID, newContextID)
 		}
-		return assistantWithBlocks(result.String(), blocks), nil
+		return assistantWithBlocks(result.String(), result.Blocks()), nil
 	}
 }
 

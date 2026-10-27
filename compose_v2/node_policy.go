@@ -132,6 +132,9 @@ func runNodeBody(ctx context.Context, id NodeID, fn NodeFunc, chs Channels, p no
 	}
 	attempt := 0
 	var lastErr error
+	// 每次尝试交给前端的流：被下一次从头再跑取代的那次撤回（同编排成员的重试）
+	streams := NewStreamAttempts(ctx, string(id))
+	defer streams.Finish()
 	out, err := RunWithRetry(ctx, p.retry, func(c context.Context) (attemptResult, error) {
 		attempt++
 		if attempt > 1 {
@@ -139,7 +142,17 @@ func runNodeBody(ctx context.Context, id NodeID, fn NodeFunc, chs Channels, p no
 				"node", id, "ns", GetGraphNS(ctx), "attempt", attempt, "err", lastErr)
 		}
 		sink := &sendSink{}
+		c = streams.Begin(c)
+		// 节点体 runtime.Goexit 时 End 跑不到：当场定（同 panic 越过重试，不会再有下一次）
+		ended := false
+		defer func() {
+			if !ended {
+				streams.Abandon()
+			}
+		}()
 		ws, err := runNodeAttempt(withSendSink(c, sink), id, fn, chs, p.timeout)
+		streams.End(err)
+		ended = true
 		lastErr = err
 		return attemptResult{ws: ws, sink: sink}, err
 	})

@@ -391,7 +391,7 @@ func (r *ReflectAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 		runOpts = append(runOpts, compose_v2.WithResumeUserText(rcfg.userText))
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, rcfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
 	final := ReflectAgentFinalMessage(cm.Channels())
@@ -444,7 +444,7 @@ func (r *ReflectAgent) runGraph(
 		}
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
 	final := ReflectAgentFinalMessage(cm.Channels())

@@ -306,6 +306,18 @@ type StepOption func(*stepOptions)
 
 type stepOptions struct {
 	rerunnable bool
+	streams    *[]string
+}
+
+// WithStreams 声明这一步交给前端的流（chunk 的 run_id，见 [StreamScope]）：重跑时 [GetStepResult] 拿回这条记录，就把这些流
+// 登记回拿回它的那次执行，它们不随被取代的那次撤回。没声明的记录被拿回时，框架说不清它对应哪些流，那次执行取代的流一个
+// 都不撤（宁可留着作废的，也不删掉被采用的）。这一步没交出流时传 nil 也算声明。`agent_v2.RunSubAgent` 的完成记录用它。
+//
+// 声明的必须是这一步**最终采用**的全部流：这一步里有从存档续跑过的部分时（[StreamScope.Uncertain]），续跑之前交出、已提交
+// 的那些不会再登记，别声明——曾经照声明，调用方之后再停一次、拿回这条记录时把那部分撤了（审计实测）。
+func WithStreams(runIDs []string) StepOption {
+	ids := append([]string(nil), runIDs...)
+	return func(o *stepOptions) { o.streams = &ids }
 }
 
 // Rerunnable 声明这条记录是「这一步的**产出**」而不是「这一步做过的**事**」：节点被要求重新
@@ -391,6 +403,14 @@ func SaveStepResult(ctx context.Context, key string, v any, opts ...StepOption) 
 		k = a.redoKey(key)
 	}
 	a.cm.putNodeState(k, tv)
+	a.cm.noteStateWrite(ctx, k)
+	if o.streams != nil {
+		stv, err := marshalValue(nodeStreams(*o.streams))
+		if err != nil {
+			return fmt.Errorf("SaveStepResult %q streams: %w", key, err)
+		}
+		a.cm.putNodeState(k+nodeStreamsSuffix, stv)
+	}
 	return nil
 }
 
@@ -408,9 +428,11 @@ func GetStepResult[T any](ctx context.Context, key string) (T, bool) {
 	if a == nil {
 		return zero, false
 	}
-	tv, ok := a.cm.getNodeState(stepStateKey(a.base(), key))
+	k := stepStateKey(a.base(), key)
+	tv, ok := a.cm.getNodeState(k)
 	if !ok {
-		tv, ok = a.cm.getNodeState(a.redoKey(key))
+		k = a.redoKey(key)
+		tv, ok = a.cm.getNodeState(k)
 	}
 	if !ok {
 		return zero, false
@@ -423,5 +445,16 @@ func GetStepResult[T any](ctx context.Context, key string) (T, bool) {
 	if !ok {
 		return zero, false
 	}
+	// 拿回了这一步：声明过流的把流登记回这次执行，没声明的、又是从别的执行拿回的，框架说不清，这次执行取代的流一个都不撤
+	// （见 [WithStreams]）
+	if stv, ok := a.cm.getNodeState(k + nodeStreamsSuffix); ok {
+		if sv, err := unmarshalValue(stv); err == nil {
+			if ids, ok := sv.(nodeStreams); ok {
+				RecordStreams(ctx, ids...)
+				return typed, true
+			}
+		}
+	}
+	a.cm.noteRecall(ctx, k)
 	return typed, true
 }

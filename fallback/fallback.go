@@ -231,7 +231,9 @@ func (f *FallbackChatModel) WithTools(tools []*schema.ToolInfo) (model.ChatModel
 //     错（上下文超限被换成后面候选的 401，ReactiveCompact 认不出）（都是审计实测）。
 //
 // 全部候选失败时返**排得最靠前的那个候选**的错误（model-fallback.md §11.7：主 model 的诊断价值最高，用户最关心主候选
-// 为何失败；第 4 条的情形除外）；全部熔断（没有一个候选请求过、也没有一个被门挡住）时返 ErrAllMembersUnavailable。
+// 为何失败；第 4 条的情形除外），但有候选的失败还值得再来一次（compose_v2.IsRetryable）时返排得最靠前的那个——交出的错误
+// 的可重试性要等于整次调用的，主候选额度用完、备用瞬时 503 时外层照常重试；全部熔断（没有一个候选请求过、也没有一个被门
+// 挡住）时返 ErrAllMembersUnavailable。
 //
 // （Go 方法不能带类型参数，故为接收 f 的包级泛型函数。）
 func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(context.Context, model.ChatModel) (T, error)) (T, error) {
@@ -240,6 +242,16 @@ func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(cont
 	states := make([]memberState, len(f.members))
 	last := -1 // 上一个请求过（或被门挡住）的候选：换到别的候选时，切换回调与 failover 事件的 from
 	var lastErr error
+	// exhausted 是这次调用里在本层把重试用完的候选的标记（有的话）。交出的最终错误照样带上它：一次调用就是这一层的一次
+	// 失败，只看被选中报告的那个候选会让标记丢掉——主候选额度用完不重试、备用重试用完，交出的是主候选的错，外层又整轮
+	// 重做，备用被请求 9 次（审计实测）。
+	var exhausted *compose_v2.RetriesExhaustedError
+	finalErr := func(err error) error {
+		if exhausted == nil || compose_v2.IsRetryFutile(ctx, err) {
+			return err
+		}
+		return compose_v2.MarkRetriesExhausted(err, exhausted.Attempts)
+	}
 	for {
 		i, wait, ok := nextMember(states, time.Now())
 		if !ok {
@@ -293,6 +305,9 @@ func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(cont
 		}
 		st.requested, st.err = true, err // 自己拿到的错为准
 		last, lastErr = i, err
+		if re := (*compose_v2.RetriesExhaustedError)(nil); exhausted == nil && errors.As(err, &re) {
+			exhausted = re
+		}
 		if gated {
 			// 设了门（第 1 条）：不是失败，不记断路器；这次请求占着半开的探测名额时放掉（回访的那次没占）
 			if !revisit {
@@ -316,7 +331,7 @@ func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(cont
 			// 换候选没用（第 4 条）：排在它后面的不再试，前面推迟着的照样回去
 			skipAfter(states, i)
 			if compose_v2.IsRetryFutile(ctx, err) || !anyDeferred(states) {
-				return zero, err
+				return zero, finalErr(err)
 			}
 			noSwitchErr = err // 此后再报的只会出自排得更靠前的候选：后者覆盖前者
 			continue
@@ -324,12 +339,39 @@ func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(cont
 		recordMemberFailure(ctx, i, mem, err)
 	}
 	if noSwitchErr != nil {
-		return zero, noSwitchErr
+		return zero, finalErr(noSwitchErr)
 	}
+	// 交出的错误决定调用方下一步做什么，它的可重试性要等于整次调用的：有候选的失败还值得再来一次（瞬时 5xx、限流）时，
+	// 交出排得最靠前的那个；都不值得时交出排得最靠前的候选的错误。曾经一律交出排得最靠前的：主候选额度用完（不可重试）、
+	// 备用瞬时 503 时外层不再重试整次调用，备用本来能恢复（审计实测）。被跳过的那些原因在切换事件与日志里。
+	var first error
 	for _, st := range states {
-		if st.err != nil {
-			return zero, st.err // 排得最靠前的候选的错误
+		if st.err == nil {
+			continue
 		}
+		if first == nil {
+			first = st.err
+		}
+		// 值得再来一次 = 错误可重试，且它要求等的（Retry-After、门还要关多久）在调用方期限之内：这次调用里已经判过等不到的
+		// 候选交出去，外层会照它的 Retry-After 一直睡到期限，真正的原因还被换成期限到了（审计实测）
+		if compose_v2.IsRetryable(st.err) && !exceedsDeadline(ctx, compose_v2.RetryAfterFromError(st.err)) {
+			return zero, finalErr(st.err)
+		}
+	}
+	if first != nil {
+		// 没有一个候选值得再来一次：交出的错误也不能让外层再来。排得最靠前的那个本身可能可重试、只是这次等不到（Retry-After
+		// 超过调用方期限），原样交出去外层会照它睡到期限（审计实测）——补上「这一层已经用完」的标记，错误文本不变。框架的重试
+		// 守卫认这个标记，业务谓词放得再宽也不再重试
+		if compose_v2.IsRetryable(first) {
+			failed := 0
+			for _, st := range states {
+				if st.err != nil {
+					failed++
+				}
+			}
+			return zero, compose_v2.MarkRetriesExhausted(finalErr(first), max(failed, 2))
+		}
+		return zero, finalErr(first)
 	}
 	return zero, ErrAllMembersUnavailable
 }
@@ -452,8 +494,12 @@ func callMemberWithRetry[T any](ctx context.Context, retry PerModelRetry, mem *f
 		if gated {
 			mem.gate.set(time.Now().Add(ra), err) // T 之前所有调用都不请求它（第 1 条）
 		}
-		if attempt == maxRetries || exceedsDeadline(ctx, delay) {
-			return out, err, nil, gated // 重试用完 / 等完也到期了：不等
+		if attempt == maxRetries {
+			// 重试用完：带上「已在这一层重试过」的标记，上面各层（BasicAgent 的模型调用重试、编排成员重试）不再重试它
+			return out, compose_v2.MarkRetriesExhausted(err, attempt+1), nil, gated
+		}
+		if exceedsDeadline(ctx, delay) {
+			return out, err, nil, gated // 等完也到期了：不等
 		}
 		if gated {
 			return out, err, &deferral{readyAt: time.Now().Add(delay), attempt: attempt + 1}, true

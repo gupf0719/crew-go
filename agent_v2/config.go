@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"crew-go/compose_v2"
 	"crew-go/hook"
 	"crew-go/model"
 	"crew-go/prompt"
@@ -222,6 +223,9 @@ type Config struct {
 	// ToolTimeout 是**单个业务工具**调用的 deadline（0 = 不设，默认）。见 [WithToolTimeout]。
 	ToolTimeout time.Duration
 
+	// ModelRetry 是一次模型调用失败时整次重来的策略（零值 = 不重试，默认）。见 [WithModelRetry]。
+	ModelRetry compose_v2.RetryConfig
+
 	// RepeatTool 配置工具重复调用检测（nil / 未启用 = 零开销）。见 [WithRepeatToolReminder]。
 	RepeatTool *RepeatToolConfig
 
@@ -418,16 +422,21 @@ func WithToolkit(tk *tool.Toolkit) Option {
 //	    return next(ctx, name, args)
 //	}
 //
-// ⚠️ 两件跟嵌套调用相关的事（工具是 AgentAsTool、或工具体里经 RunSubAgent 调别的 agent 时）：
+// **工具在一个 tool_call 里只执行一次**：同步执行的工具成功返回之后，结果记在这个 tool_call 里。中间件在 next 之后
+// 挂起（问人确认结果）、或在 next 之后返回 error，续跑 / 重试时 next 交回记下的那一份、工具不再执行——跟这次传给
+// next 的参数无关。交回的 Output：类型用 `compose_v2.RegisterValueType` 注册过的是原类型；字符串原样；别的是交给
+// 模型的那段文本（`%v`），类型变成 string——模型看到的跟没停过时一样，中间件要做类型断言就注册那个类型。超过
+// [WithToolTimeout] 之后才返回的成功照样按超时收尾。Metadata 编不成 JSON 时记不下（告警），续跑会再执行一次。工具
+// 返回 Go error 的那次不记。所以「校验产出、不合格就重来」别在 next 之后返 error（拿回的还是同一份），
+// 返 `tool.Failure`，让模型看到失败、重发一个 tool_call（新的一次调用）。可后台的调用（[WithBackgroundTasks]）不记。
+//
+// ⚠️ 跟嵌套调用相关的一件事（工具是 AgentAsTool、或工具体里经 RunSubAgent 调别的 agent 时）：
 //
 //   - **往 args 里注入每次都变的值**（trace_id、时间戳），而它落进了交给被调方的输入（AgentAsTool
 //     配了自定义 schema 时整个 args 都是输入；默认 schema 下只有 `input` 字段是），被调方的输入就每次
 //     都不同，按内容定身份就是一次新调用：续跑时被调方从头跑、换一个 ID 重问、永远收敛不了。要么别
 //     注入进那部分（放 ctx 里、或放 `input` 之外的字段），要么给 AgentAsTool 声明身份
-//     （[WithAgentToolCallKey]）；
-//   - **在 next 之后校验产出、不合格时返 error**，拿不到新的一份：被调方已完成的调用在重跑时原样
-//     拿回（完成记录）。要换一份就返 `tool.Failure`，让模型看到失败、重发一个 tool_call（新的一次
-//     调用）。
+//     （[WithAgentToolCallKey]）。
 func WithToolMiddleware(mws ...ToolMiddleware) Option {
 	return func(c *Config) {
 		for _, m := range mws {

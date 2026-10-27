@@ -231,6 +231,8 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 调用方所在的那段执行；失败 / 中断时随它作废——被调方停下时它图里已提交的那些留在它的存档里，
 	// 续跑跑完时一起交上来。拿回记下的结果时原样交出（见 recallNestedCall）。
 	var events []*AgentEvent
+	// 这次调用交给前端的流单独记一份（成功时随完成记录声明，见 compose_v2.WithStreams），同时登记进所在的那段执行
+	subCtx, streams := compose_v2.BeginStreamScope(subCtx)
 	// 被调方拿调用方显式交给它的那几份（opts），拿不到调用方那一层放给 RegrantFromNode 的那份——孙辈
 	// 拿到的是空的（见 shadowNodeGrants）。
 	sigs, err := compose_v2.CaptureSignals(shadowNodeGrants(subCtx), func(c context.Context) error {
@@ -238,6 +240,8 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 		events, runErr = sub.Run(c, childSess, cloneCalleeInput(input), opts...)
 		return runErr
 	})
+	streamIDs := streams.Take()
+	compose_v2.RecordStreams(ctx, streamIDs...)
 	if err != nil {
 		// 可 Resume 的退出先落输入（见 settleHistoryOnPause）。开关同下面的成功补记。
 		if mode.settle && compose_v2.LeavesResumableCheckpoint(err) {
@@ -250,7 +254,7 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	}
 	// 6. 记住这次调用已经完成：父节点重跑时直接拿回结果，不再执行
 	if mode.remember {
-		rememberNestedCall(ctx, call, events, sigs, mode.finalOnly)
+		rememberNestedCall(ctx, call, events, sigs, streamIDs, !streams.Uncertain(), mode.finalOnly)
 	}
 	compose_v2.EmitSignals(ctx, sigs)
 	// 7. 边界补记：业务塞进来的 sub 可能不是 BasicAgent（远程 / 自研 / 别的框架的壳），
@@ -288,7 +292,7 @@ func inputSettledBefore(ctx context.Context, call nestedCall) bool {
 // markInputSettled 记下「这次调用的输入已经落过历史」（暂停时结算之后）。记不住（不在节点执行里）
 // 时是 no-op：那里没有续跑这回事。
 func markInputSettled(ctx context.Context, call nestedCall) {
-	if err := compose_v2.SaveStepResult(ctx, settledInputStepKey(call), nestedInputSettled(true)); err != nil {
+	if err := compose_v2.SaveStepResult(ctx, settledInputStepKey(call), nestedInputSettled(true), compose_v2.WithStreams(nil)); err != nil {
 		slog.WarnContext(ctx, "agent_v2: 记不住这次嵌套调用的输入已落过历史，续跑完成时它会再记一份",
 			"ns", call.ns, "err", err)
 	}
@@ -374,7 +378,7 @@ func recallNestedCall(ctx context.Context, call nestedCall) ([]*AgentEvent, bool
 // [WithRerunnable] 时记成「可重做」的那种（compose_v2.Rerunnable）：父节点的条件出边按
 // CondFailRerunFrom 否决、要求父节点重新产出时，它跟着作废、重跑时重新调用。finalOnly 时只留
 // 最后那条退出事件（见 nestedMode.finalOnly）。
-func rememberNestedCall(ctx context.Context, call nestedCall, events []*AgentEvent, signals compose_v2.Signals, finalOnly bool) {
+func rememberNestedCall(ctx context.Context, call nestedCall, events []*AgentEvent, signals compose_v2.Signals, streams []string, streamsKnown, finalOnly bool) {
 	if finalOnly {
 		events = lastExitEvent(events)
 	}
@@ -382,6 +386,10 @@ func rememberNestedCall(ctx context.Context, call nestedCall, events []*AgentEve
 	var opts []compose_v2.StepOption
 	if call.rerunnable {
 		opts = append(opts, compose_v2.Rerunnable())
+	}
+	// 这次调用交出的流：被调方这次是从存档续的话，续跑之前交出的不在 streams 里，不声明（拿回时按说不清处理）
+	if streamsKnown {
+		opts = append(opts, compose_v2.WithStreams(streams))
 	}
 	if err := compose_v2.SaveStepResult(ctx, call.stepKey, rec, opts...); err != nil {
 		slog.WarnContext(ctx, "agent_v2: 记不住这次已完成的嵌套调用，父节点重跑时它会再执行一遍",

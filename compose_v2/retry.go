@@ -386,6 +386,45 @@ func IsRetryFutile(ctx context.Context, err error) bool {
 	return ctx.Err() != nil
 }
 
+// RetriesExhaustedError 表示这个失败已经在某一层重试到了上限：上面各层不再重试它。
+//
+// **一个失败只被重试一层**：各层的重试各自配置（模型调用重试、fallback 的每候选重试、编排成员重试、节点重试），
+// 都开着时次数相乘——每层 3 次、叠三层就是 27 次请求，在服务端过载时成倍放大流量。规则取「只在被拒那一层的紧上
+// 一层重试」：最先重试这个失败的那一层把预算用完之后，交出的错误带上本标记，[RunWithRetry] 的守卫看到它就不再重试，
+// 业务谓词也绕不开；默认谓词 [IsRetryable] 经 [NonRetryable] 同样认它。只在这一层真的重试过（至少两次尝试）时才打——
+// 第一次就被判成不可重试的错不带它，上层照自己的判据处理。
+//
+// 错误文本与被包住的错误相同，`errors.Is` / `errors.As` 照常穿过（Unwrap）。打标记用 [MarkRetriesExhausted]。
+type RetriesExhaustedError struct {
+	// Err 是最后一次尝试的错误
+	Err error
+	// Attempts 是这一层一共尝试的次数
+	Attempts int
+}
+
+func (e *RetriesExhaustedError) Error() string { return e.Err.Error() }
+
+// Unwrap 交出最后一次尝试的错误。
+func (e *RetriesExhaustedError) Unwrap() error { return e.Err }
+
+// NonRetryable 实现 [NonRetryable]：重试预算已在下层用完。
+func (*RetriesExhaustedError) NonRetryable() {}
+
+// MarkRetriesExhausted 给「在这一层重试到上限之后仍然失败」的错误打标记（见 [RetriesExhaustedError]）。attempts 是这一层
+// 一共尝试的次数；attempts < 2（没真的重试过）、err 为 nil 或已经带标记时原样返回。
+func MarkRetriesExhausted(err error, attempts int) error {
+	if err == nil || attempts < 2 || retriesExhausted(err) {
+		return err
+	}
+	return &RetriesExhaustedError{Err: err, Attempts: attempts}
+}
+
+// retriesExhausted 报错误链上有没有 [RetriesExhaustedError]。
+func retriesExhausted(err error) bool {
+	var re *RetriesExhaustedError
+	return errors.As(err, &re)
+}
+
 // IsRetryable 判断错误是否值得重试。
 //
 // 四类不重试（对应函数体的四道闸）：
@@ -558,6 +597,9 @@ func isDeterministicHTTPFailure(code int) bool {
 //
 // **InterruptError**：永不重试，第一次抛出直接返——HITL 控制流不能被吃掉。
 //
+// **下层已经重试到上限的失败**（带 [RetriesExhaustedError]）：永不重试，业务谓词也绕不开——一个失败只被重试一层。
+// 这里重试用完时同样给最后那个错误打上它，外层的重试不再重做。
+//
 // **ctx cancel**：调用方 ctx 已取消 / 超时时，fn 的失败在第 2 步直接返（[IsRetryFutile]
 // 按调用方 ctx 判，不按错误链）；等待期间 ctx 取消时返 ctx 的错。
 func RunWithRetry[T any](ctx context.Context, cfg RetryConfig, fn func(ctx context.Context) (T, error)) (T, error) {
@@ -632,8 +674,10 @@ func RunWithRetry[T any](ctx context.Context, cfg RetryConfig, fn func(ctx conte
 		// 档没写成（ErrCheckpointNotPersisted）同样恒不重试：多数时候它带着 ErrRunAborted，但槽属于别人（身份
 		// 冲突）那种不带，只靠类型上的 NonRetryable——那只在默认谓词里生效，业务写个宽松谓词就会把嵌套执行
 		// 连同副作用重跑（实测 4 次）。
+		// 下层已经重试到上限的失败（RetriesExhaustedError）同样恒不重试：一个失败只被重试一层，否则各层次数相乘。
 		if IsRetryFutile(ctx, err) || errors.Is(err, ErrRunAborted) ||
-			errors.Is(err, ErrCheckpointNotResumable) || errors.Is(err, ErrCheckpointNotPersisted) {
+			errors.Is(err, ErrCheckpointNotResumable) || errors.Is(err, ErrCheckpointNotPersisted) ||
+			retriesExhausted(err) {
 			return out, err
 		}
 		// 业务谓词：只有配重试的人答得上「这个错重跑有没有救」。没给谓词而 MaxRetries>0
@@ -654,11 +698,11 @@ func RunWithRetry[T any](ctx context.Context, cfg RetryConfig, fn func(ctx conte
 			rlAttempts++
 		}
 		if cfg.RateLimitMaxRetries > 0 && rlAttempts > cfg.RateLimitMaxRetries {
-			return out, err // 限流预算耗尽
+			return out, MarkRetriesExhausted(err, attempt+1) // 限流预算耗尽
 		}
 		if attempt >= cfg.MaxRetries {
-			// 总预算耗尽——返当时的 (out, err)（out 通常 zero）
-			return out, err
+			// 总预算耗尽——返当时的 (out, err)（out 通常 zero），带上「已在这一层重试过」的标记
+			return out, MarkRetriesExhausted(err, attempt+1)
 		}
 		// 等待 BackoffDelay 后重试（attempt+1 次将开始）。
 		//

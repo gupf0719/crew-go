@@ -114,7 +114,7 @@ func fixToolCallContent(ctx context.Context, toolCalls, original []schema.ToolCa
 			rec.Rewritten[i] = &fixedToolCall{Name: tc.Function.Name, Arguments: tc.Function.Arguments}
 		}
 	}
-	if err := compose_v2.SaveStepResult(ctx, fixedToolCallsStep, rec); err != nil {
+	if err := compose_v2.SaveStepResult(ctx, fixedToolCallsStep, rec, compose_v2.WithStreams(nil)); err != nil {
 		slog.WarnContext(ctx, "agent_v2: 存这一批工具调用的内容失败，续跑时会按钩子那一次的改写执行", "err", err)
 	}
 }

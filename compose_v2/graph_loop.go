@@ -1464,6 +1464,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		if err := cm.Restore(cfg.resumeFrom); err != nil {
 			return fmt.Errorf("auto-restore: %w", err)
 		}
+		// 从存档续跑：已提交的进度原样拿回、不重新交出流，所在那段执行取代的东西一个都不撤（见 stream_attempt.go）
+		markStreamsUncertain(ctx)
 		// import baseline 已在 OnGraphStart 之前摆好（F5 不变量：续跑读到父图**最新**值——
 		// 那层不进 cp，每次进入都从父图重摆；Restore 只写 values，不会盖到它）。
 		if len(cfg.resumeFrom.CurrentFrontier) == 0 {
@@ -2072,6 +2074,9 @@ type frontierResult struct {
 	// 难查：5 次的 CI 大概率一次都撞不上、线上按流量撞。
 	// 与 SuccessWrites 的合并顺序同源（见其说明）。
 	FirstErr error
+	// ExhaustedErr 是本超步里第一个带「重试用完」标记（RetriesExhaustedError）的分支错：交出 FirstErr 时据此带上标记，
+	// 外层不再重试（见 pickFanoutError）。
+	ExhaustedErr error
 	// AllInterrupts 本超步所有抛 InterruptError 的分支 query 列表（按 frontier
 	// 顺序）。HITL 路径用——多 worker 并发抛中断时全部 recordInterrupt 让
 	// caller 拿全 N 条 PendingInterrupt 配答。**audit Round 6 Bug 3 修复**：
@@ -2238,7 +2243,7 @@ func (r frontierResult) exitErr() error {
 	if r.NotPersistedErr != nil {
 		return r.NotPersistedErr
 	}
-	return pickFanoutError(r.interruptRaws, r.FirstErr)
+	return pickFanoutError(r.interruptRaws, r.FirstErr, r.ExhaustedErr)
 }
 
 // executeFrontier 执行当前帧所有节点，收集 per-branch 结果。
@@ -2462,6 +2467,10 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 			out.FailedBranches = append(out.FailedBranches, r.member)
 			if out.FirstErr == nil {
 				out.FirstErr = r.err
+			}
+			// 「下层已经重试用完」独立记账：交出的错带不带这个标记不随分支先后变（见 pickFanoutError）
+			if out.ExhaustedErr == nil && retriesExhausted(r.err) {
+				out.ExhaustedErr = r.err
 			}
 			// 「终局失败」独立记账——它驱动后果，不参与「报告」的仲裁
 			if out.AbortErr == nil && errors.Is(r.err, ErrRunAborted) {
@@ -2854,6 +2863,11 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 			"hint", "hook 的契约是返回「基于入参派生的 ctx」")
 	}
 
+	// 这次执行交给前端的流单独记一份，结束时处置（见 settleNodeStreams）：上一次执行同一个节点留下、这次没再登记的撤回。
+	// 要在建节点 sink 之前开，节点 sink 发片段时记进它
+	streamNodeKey := nodeStateKey(id, instanceID, visit)
+	ctx, nodeStreamRec, prevStreams := beginNodeStreams(ctx, cm, streamNodeKey)
+
 	// 节点入口注入 EventSink + sendSink + per-node interrupt counter
 	// graphNS 节点入口时 ctx 已含 (Run 入口 line 255 push cfg.graphNS), 缓存避免每
 	// chunk Send 走 ctx.Value lookup——业务 LLM 流式高频热路径敏感.
@@ -2877,6 +2891,7 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 	// 收集器每次尝试一个，拿回来的是成功那次的。
 	var sink *sendSink
 	writes, sink, err = runNodeBody(nodeCtx, id, fn, chs, policy)
+	settleNodeStreams(nodeCtx, cm, streamNodeKey, nodeStreamRec, prevStreams, err, GetEventSink(nodeCtx), string(id))
 	// **普通语句置旗，不能放 defer**：NodeFunc 里 Goexit 时 runNodeBody（里面的 safeNodeRun）
 	// 永不返回、这一行执行不到 ⟹ 旗保持 false ⟹ 函数头 defer 第三支接手；panic 则被
 	// safeNodeRun 转成 err 正常返回到这里 ⟹ 旗置位 ⟹ 不误判。

@@ -424,7 +424,7 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 		runOpts = append(runOpts, compose_v2.WithResumeUserText(rcfg.userText))
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, rcfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
 	final := HandoffAgentFinalMessage(cm.Channels())
@@ -483,7 +483,7 @@ func (h *HandoffAgent) runGraph(
 		}
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
 	final := HandoffAgentFinalMessage(cm.Channels())
@@ -586,7 +586,7 @@ func (h *HandoffAgent) buildComposeGraph(
 		// 每次尝试写进会话的事件先落在暂存 lane 上：被下一次从头再跑的尝试取代时作废，其余照常提交（见 attemptLanes）。
 		// 结账放在 defer 里：重试判据或退避 panic 时最后那次失败尝试也照常提交。下一跳是 step 节点的下一次执行，
 		// 这次执行返回时已经结完账，看得到这一跳的事件。
-		lanes := newAttemptLanes(subCtx, parentSession)
+		lanes := newAttemptLanes(subCtx, parentSession, ag.Name())
 		defer lanes.finish()
 		attempt, err := compose_v2.RunWithRetry(subCtx, retryCfg, func(ctx context.Context) (handoffAttempt, error) {
 			// **一次尝试收一次**：候选这次调用做出的决定只在它成功时交上来；失败 / 中断的这次
@@ -599,9 +599,9 @@ func (h *HandoffAgent) buildComposeGraph(
 			// 每次尝试铸一份新的。
 			var events []*AgentEvent
 			sigs, err := compose_v2.CaptureSignals(ctx, func(c context.Context) error {
-				return lanes.run(func(s *RunSession) error {
+				return lanes.run(c, func(lc context.Context, s *RunSession) error {
 					var runErr error
-					events, runErr = ag.Run(c, s, cloneCalleeInput(input),
+					events, runErr = ag.Run(lc, s, cloneCalleeInput(input),
 						withHandoffGrant(&handoffGrant{grantee: ag, candidates: candSet}),
 						withRouteGrant(route.regrant(ag)))
 					return runErr

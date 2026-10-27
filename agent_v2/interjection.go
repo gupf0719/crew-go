@@ -157,7 +157,7 @@ func takeInterjections(ctx context.Context) ([]*schema.Message, error) {
 		return taken, nil
 	}
 	all := append(append(make([]*schema.Message, 0, len(taken)+len(fresh)), taken...), fresh...)
-	if err := compose_v2.SaveStepResult(ctx, interjectionStepKey, all); err != nil {
+	if err := compose_v2.SaveStepResult(ctx, interjectionStepKey, all, compose_v2.WithStreams(nil)); err != nil {
 		b.putBack(fresh) // 记不下就还回去，别取走了又丢掉
 		return nil, err
 	}

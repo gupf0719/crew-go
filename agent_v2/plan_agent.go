@@ -597,7 +597,7 @@ func (p *PlanAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 		runOpts = append(runOpts, compose_v2.WithResumeUserText(rcfg.userText))
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, rcfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 
 	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
@@ -647,7 +647,7 @@ func (p *PlanAgent) runPlanGraph(ctx context.Context, runCfg *runConfig, session
 		}
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 
 	runErr := compose_v2.Run(ctx, g, cm, runOpts...)

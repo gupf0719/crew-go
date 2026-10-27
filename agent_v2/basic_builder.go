@@ -352,6 +352,12 @@ const ToolReplayedExtraKey = "replayed"
 // 参数追加）。只看「是不是同一批的再次派发」，跟 toolCallId 无关——provider 在不同轮次复用同一个 ID 的不是重开。
 const ToolRedispatchedExtraKey = "redispatched"
 
+// ToolModelRunIDExtraKey 标「这个 tool_call 出自哪次模型调用」（OnToolStart 的 `ToolInput.Extra` 与 OnToolEnd 的
+// `ToolOutput.Extra`，值是那次调用的 run_id，与它流式片段的 run_id 同一个）。一次模型调用被撤回时（reset_stream，见
+// streamOrGenerate 与 compose_v2.StreamAttempts），前端适配层据此连同它的工具调用与结果一起撤回——不能按 tool_call ID 认：provider
+// 会在一个 run 里复用 ID，按 ID 认会把别的调用的工具调用与结果一起撤掉（审计实测）。模型的答复上没有 run_id 时不带。
+const ToolModelRunIDExtraKey = "model_run_id"
+
 // ToolCallErrCode 是一批 tool_call 没整体成功时，硬失败的那个调用（工具返回 error、panic、中间件出错）交给 OnToolEnd
 // 的失败结果的错误码；它自身超时（错误链上有 context.DeadlineExceeded、调用方还没放弃）时用 [ToolTimeoutErrCode]。也是
 // 这时 OnError 的 Code。
@@ -421,6 +427,36 @@ func toolOutputFor(r *schema.Message, callID string, replayed bool) *schema.Tool
 		to.Extra[ToolReplayedExtraKey] = true
 	}
 	return to
+}
+
+// retractModelAnswer 撤回一份作废的模型答复已交给前端的那些（按它的 run_id 发 reset_stream）；答复上没有 run_id 时什么也不做。
+func retractModelAnswer(ctx context.Context, out *schema.Message, agentName string) {
+	if out == nil {
+		return
+	}
+	runID, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string)
+	sink := compose_v2.GetEventSink(ctx)
+	if runID == "" || sink == nil {
+		return
+	}
+	sink.Send(compose_v2.Event{
+		Type:     "reset_stream",
+		Content:  "model answer discarded and will be regenerated",
+		Metadata: map[string]any{"reason": "answer_discarded", "run_id": runID, "agent": agentName},
+	})
+	compose_v2.ForgetStream(ctx, runID) // 撤过了：所在的尝试作废时不再撤一次
+}
+
+// withModelRunID 在 Extra 上标这个 tool_call 出自哪次模型调用（见 ToolModelRunIDExtraKey）；runID 为空时原样返回。
+func withModelRunID(extra map[string]any, runID string) map[string]any {
+	if runID == "" {
+		return extra
+	}
+	if extra == nil {
+		extra = map[string]any{}
+	}
+	extra[ToolModelRunIDExtraKey] = runID
+	return extra
 }
 
 // endSettledToolCalls 在一批 tool_call 没整体成功时，给 ends[from:] 里已经有结局的调用触发 OnToolEnd（规则见
@@ -917,6 +953,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		keepRecord := !hasRec // 还没有记录时没东西可作废
 		defer func() {
 			if !keepRecord {
+				// 这份答复作废、续跑重新生成：它已经交给前端的那些在这一刻撤回（同 streamOrGenerate 流中途失败时）。不撤的话
+				// 续跑从存档续、编排成员重试从存档续时，前端留着被拒掉的那份（审计实测）
+				if r, ok := modelCallOf(ctx); ok && r != nil {
+					retractModelAnswer(ctx, r.Out, name)
+				}
 				clearModelCall(ctx)
 			}
 		}()
@@ -1081,6 +1122,13 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			if hasRec {
 				modelOut.Extra = map[string]any{hook.ModelResponseReusedKey: true}
 			}
+			// 这是哪次模型调用（见 hook.ModelRunIDKey）：钩子可能换掉 Message，按消息标注就认不出了
+			if rid, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string); rid != "" {
+				if modelOut.Extra == nil {
+					modelOut.Extra = map[string]any{}
+				}
+				modelOut.Extra[hook.ModelRunIDKey] = rid
+			}
 			// 一次模型调用的用量只交给 OnModelEnd 一次：沿用原样时，上一次 OnModelEnd 停下之前排在前面的钩子已经收到过
 			// （观测链装在最前），再带一次就是一次调用报两次。
 			if out.Metadata != nil && out.Metadata.Usage != nil && !hasRec {
@@ -1114,6 +1162,24 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				return err
 			}
 			// out / preHookMsg 现都保证非 nil——条件简化 + 下方 len(out.Content) 安全
+			//
+			// 钩子换上的消息仍是这次模型调用的答复：盖上这次调用的 run_id（下面的改写信号、tools 节点给工具调用标的出处都从
+			// 它取）。最自然的写法 `out.Message = &schema.Message{...}` 不带标注，曾经改写信号的 run_id 为空、前端与对端对不上
+			// 原来那条消息，没脱敏的原文留着（审计实测，经 A2A 一跳宿主拿到的也是原文）。盖在消息与标注表的拷贝上，钩子交来的
+			// 对象不动：护栏钩子常返回一条共享的固定回复（out.Message = blocked），在它身上盖章会让并发的调用互相改写、
+			// 各自的改写信号对不上自己那条（-race 实测）。
+			if rid, _ := preHookMsg.Annotations[compose_v2.RunIDAnnotationKey].(string); rid != "" {
+				if cur, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string); cur != rid {
+					ann := make(map[string]any, len(out.Annotations)+1)
+					for k, v := range out.Annotations {
+						ann[k] = v
+					}
+					ann[compose_v2.RunIDAnnotationKey] = rid
+					stamped := *out
+					stamped.Annotations = ann
+					out = &stamped
+				}
+			}
 			if out != preHookMsg || out.Content != preHookMsg.Content {
 				if sink := compose_v2.GetEventSink(segCtx); sink != nil {
 					runID := ""
@@ -1122,14 +1188,17 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 							runID = v
 						}
 					}
+					// 不是作废、是替换：带上新答复的正文（replacement），前端与对端用它替换那条消息。只有清片段的信号时，适配层
+					// 无从得知新内容，按作废处理会让整条答复消失（审计实测）
 					sink.Send(compose_v2.Event{
 						Type:    "reset_stream",
 						Content: "OnModelEnd hook 改写 Message，前端应清老 chunks buffer + 渲染新 final.Content",
 						Metadata: map[string]any{
-							"reason":  "hook_overrode_message",
-							"run_id":  runID,
-							"agent":   name,
-							"new_len": len(out.Content),
+							"reason":      "hook_overrode_message",
+							"run_id":      runID,
+							"agent":       name,
+							"new_len":     len(out.Content),
+							"replacement": out.Content,
 						},
 					})
 				}
@@ -1212,6 +1281,8 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		if len(toolCalls) == 0 {
 			return nil, fmt.Errorf("tools: last message has no tool_calls")
 		}
+		// 这一批出自哪次模型调用（见 ToolModelRunIDExtraKey）
+		modelRunID, _ := last.Annotations[compose_v2.RunIDAnnotationKey].(string)
 
 		// 每个 tool_call 触发 OnToolStart——消费 hook 对 Name / ArgumentsJSON 的改写
 		// 后再调用业务工具（参数注入 / 重定向）。CallId 是 tool_call ↔ tool_result
@@ -1255,6 +1326,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			if redispatched {
 				ti.Extra = map[string]any{ToolRedispatchedExtraKey: true}
 			}
+			ti.Extra = withModelRunID(ti.Extra, modelRunID)
 			if categoryLookup != nil {
 				if cat := categoryLookup(ti.Name); cat != "" {
 					if ti.Extra == nil {
@@ -1336,6 +1408,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			}
 			// 还原成交给 OnToolEnd 的 ToolOutput（失败的结构化信息、审批拒绝、从工具账重放的，见 toolOutputFor）
 			to := toolOutputFor(r, toolCalls[i].ID, i < len(batch.ends) && batch.ends[i].replayed)
+			to.Extra = withModelRunID(to.Extra, modelRunID)
 			res := to.Result
 			before := *res // 钩子之前那份（值拷贝：钩子可能就地改 res）
 			if !before.Success {
@@ -1445,7 +1518,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// （见 agent_v2 的 finalizeToolMemo）。不记这一笔的话同一批结果在历史里两份，下一次 Run 的 prior 里一个
 		// 调用配两条结果（审计实测）。按 Rerunnable 记：被否决重做的那一批是新结果，照常记。
 		if done, _ := compose_v2.GetStepResult[bool](ctx, basicToolsHistoryStep); !done {
-			if err := compose_v2.SaveStepResult(ctx, basicToolsHistoryStep, true, compose_v2.Rerunnable()); err != nil {
+			if err := compose_v2.SaveStepResult(ctx, basicToolsHistoryStep, true, compose_v2.Rerunnable(), compose_v2.WithStreams(nil)); err != nil {
 				slog.WarnContext(ctx, "agent_v2: 记「这一批已记过会话历史」失败，这次执行之后作废时续跑会再记一份", "err", err)
 			}
 			recordHistory(ctx, historyOwner(ctx, name), name, results)

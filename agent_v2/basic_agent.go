@@ -507,7 +507,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 		runOpts = append(runOpts, compose_v2.WithResumeUserText(rcfg.userText))
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, rcfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 	// Phase 2 Sub-3: 透传 EmitCpEvent 让 framework cp 操作 fire event
 	if a.config.EmitCpEvent {
@@ -645,7 +645,7 @@ func (a *BasicAgent) runGraph(ctx context.Context, runCfg *runConfig, session *R
 		}
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 	// Phase 2 Sub-3: 透传 EmitCpEvent
 	if a.config.EmitCpEvent {
@@ -2967,9 +2967,14 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 		// minimal AgentInfo for hook.OnModelEndStream——modelFn 闭包看不到 round，
 		// 业务想要精确 round 通过 OnModelStart/End 配合。
 		streamHookInfo := &hook.AgentInfo{Name: cfg.Name, Type: "base"}
-		callLLM := func(in []*schema.Message) (*schema.Message, error) {
+		// callOnce 是一次模型调用（一个 run_id、一条流）。失败时它已交出的片段由 streamOrGenerate 在失败点撤回
+		// （reset_stream），所以下面整次重来、ReactiveCompact 压缩后重调都不用再管前一次的片段。
+		callOnce := func(c context.Context, in []*schema.Message) (*schema.Message, error) {
 			runID := newUUID()
 			lastRunID = runID
+			// 记进所在那段执行的流记录：这次尝试被从头再跑取代时撤回（见 compose_v2.StreamAttempts）。非流式时没有片段，
+			// 适配层在 OnModelEnd 补发一整条，也按这个 run_id 撤
+			compose_v2.RecordStreams(c, runID)
 			// 「agent 是什么」那一段（模板渲染 + sysPrompt + skill hint/body）在这里 prepend。
 			//
 			// **位置是承重的**：必须在 callLLM 内、也就是 MicroCompact / AutoCompact /
@@ -2987,7 +2992,30 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			if agentsMD != "" {
 				in = append([]*schema.Message{schema.SystemMessage(agentsMD)}, in...)
 			}
-			return streamOrGenerate(ctx, llm, in, cfg.Name, runID, cfg.Hooks, streamHookInfo, modelRunOpts...)
+			return streamOrGenerate(c, llm, in, cfg.Name, runID, cfg.Hooks, streamHookInfo, modelRunOpts...)
+		}
+		// callLLM 按 WithModelRetry 整次重来：一次调用就是一条消息、工具在 tools 节点才执行，重来没有本地副作用；
+		// 建流之前与流开始之后的错一样处理。下层（fallback 的每候选重试）已重试到上限的错误带标记，RunWithRetry 不再
+		// 重试它；这里用完了也打上标记，外层的成员 / 节点重试不再重做（一个失败只被重试一层）。
+		callLLM := func(in []*schema.Message) (*schema.Message, error) {
+			if cfg.ModelRetry.MaxRetries <= 0 {
+				return callOnce(ctx, in)
+			}
+			// 上下文超窗的错一律不在这里重试：同一份过长的输入重发多少次都一样，只白付钱（配了 ReactiveCompact 时交给它压缩
+			// 后重调）。默认谓词只认 400 与 model.ErrContextWindowExceeded，provider 用别的形状报超窗时（不带状态码的错误、
+			// Anthropic 413、OpenAI 429「Request too large」）曾被重发 N 次才轮到压缩（审计实测）。
+			retryCfg := cfg.ModelRetry
+			if userRetry := retryCfg.ShouldRetry; userRetry != nil {
+				retryCfg.ShouldRetry = func(err error) bool { return !IsPromptTooLongError(err) && userRetry(err) }
+			}
+			attempt := 0
+			return compose_v2.RunWithRetry(ctx, retryCfg, func(c context.Context) (*schema.Message, error) {
+				attempt++
+				if attempt > 1 {
+					slog.InfoContext(ctx, "agent_v2: 模型调用失败，整次重来", "agent", cfg.Name, "attempt", attempt)
+				}
+				return callOnce(c, in)
+			})
 		}
 
 		out, err := callLLM(msgs)
@@ -3028,28 +3056,10 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			}
 			curMsgs = compacted
 
-			// retry 前通知前端清此 run_id chunk buffer——
-			// 第一次 attempt 已 emit 部分 chunks（典型 typed Stream 时），第二次
-			// Generate 产新流避免"半截答案 + 全新答案"重复渲染。
+			// 前一次调用交出过片段时，它失败那一刻 streamOrGenerate 已经发了 reset_stream（流中途报上下文超窗也走
+			// 那条路）；没交出过就没有可撤的。这里曾经再发一次，没片段时是空发、有片段时与失败点那次重复。
 			//
-			// 附 run_id（即将作废的 stream group id）让前端精确按 run_id 丢 buffer。
-			if sink := compose_v2.GetEventSink(ctx); sink != nil {
-				sink.Send(compose_v2.Event{
-					Type:    "reset_stream",
-					Content: fmt.Sprintf("ReactiveCompact retry attempt %d/%d", attempt+1, maxAttempts),
-					Metadata: map[string]any{
-						"reason":      "prompt_too_long",
-						"attempt":     attempt + 1,
-						"max":         maxAttempts,
-						"compact_len": len(curMsgs),
-						"orig_len":    len(msgs),
-						"run_id":      lastRunID,
-						"agent":       cfg.Name,
-					},
-				})
-			}
-			// Phase 2 Sub-4: compact:reactive:retry event (跟 reset_stream 并行 —
-			// reset_stream 是前端清 chunk buffer, compact retry 是 compact 状态观测).
+			// Phase 2 Sub-4: compact:reactive:retry event——压缩状态观测（带上作废那次调用的 run_id）。
 			// sink-gated——接了 observability 才发.
 			if hasEventSink(ctx) {
 				EmitCompactionEvent(ctx, &CompactionAction{
@@ -3494,22 +3504,34 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			//
 			// c 是交给工具的 ctx；guard 是判「中间件吞掉的错能不能吞」用的调用方 ctx（见 guardControlFlow）——同步执行
 			// 时是工具超时派生之前那个，别把框架自己设的 deadline 当成调用方喊停；后台执行时就是后台任务自己的 ctx。
-			invoke := func(c, guard context.Context) (*tool.Result, error) {
-				callTool := ToolEndpoint(func(ctx context.Context, name string, a map[string]any) (*tool.Result, error) {
-					return dispatchToolkit.Call(ctx, name, a)
-				})
-				if len(cfg.ToolMiddlewares) == 0 || minted {
-					return callTool(c, tc.Function.Name, args)
+			//
+			// record：同步执行时最内层的工具端点记下这次执行的结果（recordedEndpoint）——中间件在 next 之后挂起时，续跑
+			// 拿回它、工具不再执行。后台执行不记：后台任务的生命周期不跟这次节点执行走，结果另有自己的去处。拿回的那次
+			// 当时超过了工具期限（迟到的成功）时 recalledTimeout 置真，下面照样按超时收尾。
+			recalledTimeout := false
+			invokeWith := func(record bool) func(c, guard context.Context) (*tool.Result, error) {
+				return func(c, guard context.Context) (*tool.Result, error) {
+					callTool := ToolEndpoint(func(ctx context.Context, name string, a map[string]any) (*tool.Result, error) {
+						return dispatchToolkit.Call(ctx, name, a)
+					})
+					if len(cfg.ToolMiddlewares) == 0 || minted {
+						return callTool(c, tc.Function.Name, args)
+					}
+					// 中间件交给 next 的 ctx 跟钩子返回的 ctx 一样采纳（compose_v2.EnterHook，规则同 CallHook）：
+					// 交过来的是存下来的 ctx 时，工具体照样在这次调用的位置上跑。曾经原样交给工具体：中间件为了
+					// 挂 span 沿用第一次存下的 ctx，工具里的提问每次续跑都换一个 ID、永远答不完（实测）。
+					mwCtx, adopt := compose_v2.EnterHook(c)
+					if record {
+						callTool = recordedEndpoint(callTool,
+							func() bool { return toolDeadlineExceeded(guard, c, cfg.ToolTimeout, nil) },
+							func() { recalledTimeout = true })
+					}
+					adopting := ToolEndpoint(func(ctx context.Context, name string, a map[string]any) (*tool.Result, error) {
+						return callTool(adopt(ctx), name, a)
+					})
+					guarded, check := guardControlFlow(guard, adopting)
+					return check(chainToolMiddlewares(cfg.ToolMiddlewares, guarded)(mwCtx, tc.Function.Name, args))
 				}
-				// 中间件交给 next 的 ctx 跟钩子返回的 ctx 一样采纳（compose_v2.EnterHook，规则同 CallHook）：
-				// 交过来的是存下来的 ctx 时，工具体照样在这次调用的位置上跑。曾经原样交给工具体：中间件为了
-				// 挂 span 沿用第一次存下的 ctx，工具里的提问每次续跑都换一个 ID、永远答不完（实测）。
-				mwCtx, adopt := compose_v2.EnterHook(c)
-				adopting := ToolEndpoint(func(ctx context.Context, name string, a map[string]any) (*tool.Result, error) {
-					return callTool(adopt(ctx), name, a)
-				})
-				guarded, check := guardControlFlow(guard, adopting)
-				return check(chainToolMiddlewares(cfg.ToolMiddlewares, guarded)(mwCtx, tc.Function.Name, args))
 			}
 			var res *tool.Result
 			var err error
@@ -3522,7 +3544,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 					rc := renderToolContent(c, &cfg, false, tc.Function.Name, r, false)
 					return bgRendered{content: rc.content, spillID: rc.spillID, spillInfo: rc.spillInfo}
 				}
-				bo, started := sc.cfg.Manager.call(callCtx, sc, tc, cfg.ToolTimeout, invoke, render)
+				bo, started := sc.cfg.Manager.call(callCtx, sc, tc, cfg.ToolTimeout, invokeWith(false), render)
 				if started {
 					ran = true
 					if bo.task != nil {
@@ -3547,15 +3569,16 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 					callCtx, cancel = context.WithTimeout(callCtx, cfg.ToolTimeout)
 					defer cancel()
 				}
-				res, err = invoke(callCtx, parentCtx)
+				res, err = invokeWith(true)(callCtx, parentCtx)
 				// **框架自己设的 deadline 到期 ⟹ 框架自己收尾**，不指望工具返对东西。
 				//
 				// 本仓契约是「工具返 error = 硬失败（整节点挂）、返 tool.Failure = 给模型看」。
 				// 而超时是**这次工具调用**的失败、不是整轮的失败——该让模型看见并换条路。
 				// 响应 ctx 的工具会返 `context.DeadlineExceeded`（那是 error 档，会挂整轮），
 				// 不响应的会返一个迟到的成功。**两种都不是我们要的**，所以在这儿统一改写。
-				if toolDeadlineExceeded(parentCtx, callCtx, cfg.ToolTimeout, err) {
-					if err == nil && res != nil && res.Success {
+				if (recalledTimeout && !compose_v2.MustPropagate(parentCtx, err)) ||
+					toolDeadlineExceeded(parentCtx, callCtx, cfg.ToolTimeout, err) {
+					if err == nil && res != nil && res.Success && !recalledTimeout { // 拿回的那次第一次执行时已经告警过
 						// 超了 deadline 还返回成功 ⟹ 这个工具没看 ctx。出声——**一个不生效
 						// 又不出声的超时比没有超时更坏**，业务会以为有保护。
 						slog.WarnContext(ctx, "agent_v2: 工具超过 WithToolTimeout 仍返回成功——"+
@@ -4010,6 +4033,7 @@ func streamOrGenerate(ctx context.Context, llm model.ChatModel, in []*schema.Mes
 						"is_interrupt":   isInterruptErr(recvErr),
 					},
 				})
+				compose_v2.ForgetStream(ctx, runID) // 撤过了：所在的尝试作废时不再撤一次
 			}
 			return nil, fmt.Errorf("stream recv: %w", recvErr)
 		}

@@ -6,14 +6,12 @@ import (
 	"crew-go/compose_v2"
 )
 
-// runDiscarded 报一次调用以错误 err 结束之后，它的进度是不是整个作废了：没有 checkpointer（一点没存下，
-// 下一次只能从头再来），或者终局失败（[compose_v2.ErrRunAborted]，存档已清）。成功、或者留下了可续的存档
-// （下一次从存档续）时不算作废。cper 是这次调用交给引擎的 checkpointer。
+// runDiscarded 报一次调用以错误 err 结束之后，它的进度是不是整个作废了（判据见 [compose_v2.AttemptDiscarded]）。
 //
 // 用在两处：取走的插话要不要放回收件箱（settleInterjections）；编排成员的一次失败尝试被下一次尝试取代时，
-// 下一次是从头再跑还是从存档续（attemptLanes）。
+// 下一次是从头再跑还是从存档续（attemptLanes）。交给前端的流的处置（compose_v2.StreamAttempts）用的是同一个判据。
 func runDiscarded(cper compose_v2.Checkpointer, err error) bool {
-	return err != nil && (cper == nil || !compose_v2.LeavesResumableCheckpoint(err))
+	return compose_v2.AttemptDiscarded(cper, err)
 }
 
 // attemptLanes 让编排成员每次尝试写进会话的事件先落在 sess 的一条暂存 lane 上（[RunSession.ForkLane]），按这次
@@ -33,51 +31,68 @@ func runDiscarded(cper compose_v2.Checkpointer, err error) bool {
 // lane 看到的上文是这次尝试开始那一刻 sess 的全部事件（快照，见 [RunSession.ForkLane]），成员的上文不受影响；
 // 尝试进行中，它写的事件只在它拿到的那个会话（lane）里看得到，调用方手里的 sess 要等这次尝试有了结局才看得到
 // （同 ParallelAgent 的分支）。尝试一次接一次地跑，不并发。
+//
+// 交给前端的流按同一个判断处置（compose_v2.StreamAttempts）：被从头再跑取代的那次尝试交出、之后的尝试没再采用的，逐个
+// 撤回（reset_stream）。
 type attemptLanes struct {
 	sess    *RunSession
 	cper    compose_v2.Checkpointer
+	streams *compose_v2.StreamAttempts
 	pending *RunSession // 上一次失败尝试的 lane，等下一次尝试或 finish 来定去留
 	pendErr error
 }
 
-func newAttemptLanes(ctx context.Context, sess *RunSession) *attemptLanes {
-	return &attemptLanes{sess: sess, cper: compose_v2.GetCheckpointer(ctx)}
+func newAttemptLanes(ctx context.Context, sess *RunSession, agentName string) *attemptLanes {
+	return &attemptLanes{sess: sess, cper: compose_v2.GetCheckpointer(ctx), streams: compose_v2.NewStreamAttempts(ctx, agentName)}
 }
 
-// run 跑一次尝试：先处置上一次失败尝试留下的 lane（这一次就是取代它的那次），再在新 lane 上跑 fn。
-func (a *attemptLanes) run(fn func(*RunSession) error) error {
-	if a.sess == nil {
-		return fn(nil)
-	}
+// run 跑一次尝试：先处置上一次失败尝试留下的 lane（这一次就是取代它的那次），再在新 lane 上跑 fn。fn 收到的 ctx 带着这次
+// 尝试的流记录。
+func (a *attemptLanes) run(ctx context.Context, fn func(context.Context, *RunSession) error) error {
 	a.settle(false)
-	lane := a.sess.ForkLane()
+	ctx = a.streams.Begin(ctx)
+	var lane *RunSession
+	if a.sess != nil {
+		lane = a.sess.ForkLane()
+	}
 	// fn 没正常返回（panic）时当场提交。不 recover：兜住 panic、留下 panic 现场的栈归引擎的节点兜底，在这里
 	// recover 再 panic 会把栈换成这一行。
 	returned := false
 	defer func() {
 		if !returned {
-			CommitLaneEvents(a.sess, lane)
+			a.streams.Abandon() // panic 越过重试往上走，不会再有下一次尝试：当场定
+			if lane != nil {
+				CommitLaneEvents(a.sess, lane)
+			}
 		}
 	}()
-	err := fn(lane)
+	err := fn(ctx, lane)
 	returned = true
-	if err == nil {
-		CommitLaneEvents(a.sess, lane)
-		return nil
-	}
-	a.pending, a.pendErr = lane, err
+	a.streams.End(err)
+	a.hold(lane, err)
 	return err
 }
 
-// finish 在重试结束之后调：最后那次失败尝试的事件照常提交。
-func (a *attemptLanes) finish() { a.settle(true) }
-
-// settle 处置上一次失败尝试的 lane：final（不会再有下一次尝试）或下一次从存档续时提交，下一次从头再跑时丢掉。
-func (a *attemptLanes) settle(final bool) {
-	if a.pending == nil {
+// hold 收下一次尝试的结局：成功的当场提交，失败的留着等下一次尝试或 finish 来定。
+func (a *attemptLanes) hold(lane *RunSession, err error) {
+	if err == nil {
+		if lane != nil {
+			CommitLaneEvents(a.sess, lane)
+		}
 		return
 	}
-	if final || !runDiscarded(a.cper, a.pendErr) {
+	a.pending, a.pendErr = lane, err
+}
+
+// finish 在重试结束之后调：最后那次失败尝试的事件照常提交，流的处置收尾（见 compose_v2.StreamAttempts.Finish）。
+func (a *attemptLanes) finish() {
+	a.settle(true)
+	a.streams.Finish()
+}
+
+// settle 处置上一次失败尝试的会话事件：final（不会再有下一次尝试）或下一次从存档续时提交，下一次从头再跑时丢掉。
+func (a *attemptLanes) settle(final bool) {
+	if a.pending != nil && (final || !runDiscarded(a.cper, a.pendErr)) {
 		CommitLaneEvents(a.sess, a.pending)
 	}
 	a.pending, a.pendErr = nil, nil

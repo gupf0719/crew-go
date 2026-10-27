@@ -455,7 +455,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 		runOpts = append(runOpts, compose_v2.WithResumeUserText(rcfg.userText))
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, rcfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 
 	// 8-method 协议：Resume 入口 fire OnAgentStart 与 Run 协议对称（各 1 次）.
@@ -551,7 +551,7 @@ func (g *GraphAgent) runGraph(
 		}
 	}
 	if hooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(adaptHooks(hooks)))
+		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 	// **顶层 Run 恒不 auto-load**。判据不在这里重算——`Run` 入口的 `enterRunTask`
 	// 已经声明过一次，这里只是把同一个信号转成引擎的显式 RunOption。

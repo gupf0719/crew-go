@@ -31,7 +31,7 @@
    自己恢复的错误（5xx / 429 / 408 / 网络 / 不认识的错误），跟 `ShouldFailover`（换不换候选）是两个判断
    ——同一个错两边的答案可以相反，额度耗尽不该重试、该切换。曾经两者共用 `ShouldFailover`，额度耗尽先
    在同一个候选上重试、白等退避才换（2026-10-19 拆开，见 §7.3）。
-2. **§11.7 取 first_error**：全候选失败抛**第一个**（主候选）错误，诊断价值最高。
+2. **§11.7 取 first_error**：全候选失败抛**第一个**（主候选）错误，诊断价值最高——但有候选的失败还值得再来一次（`compose_v2.IsRetryable`）时抛排得最靠前的那个：交出的错误的可重试性要等于整次调用的（2026-10-27：主候选额度用完、备用瞬时 503 时交出主候选的错，外层不再重试整次调用，审计实测）。「值得再来」还要求它要等的（Retry-After、门）在调用方期限之内；一个都不值得时交出排得最靠前的候选的错，它本身可重试的话补上「重试用完」标记，外层不再照它的 Retry-After 睡到期限。
 3. **§11.5 取哨兵**：全员熔断返 `fallback.ErrAllMembersUnavailable`（`errors.Is` 可判）。
 4. **prompt-too-long 不单列**：设计 §4.3 把 `IsPromptTooLongError` 单列一行判不切——实际
    上下文超限是 400（4xx），已被"4xx 不切"规则覆盖（交第 3 层 ReactiveCompact），
@@ -382,6 +382,11 @@ m := fallback.New(
 ag := agent_v2.NewBasicAgent(agent_v2.WithModel(m), /* ... */)
 ```
 
+**一个失败只被重试一层**（2026-10-26）：某个候选上的重试用完之后，交出的错误带 `compose_v2.RetriesExhaustedError` 标记，
+上面各层——BasicAgent 的模型调用重试（`agent_v2.WithModelRetry`）、编排成员重试、节点重试——都不再重试它，业务谓词也绕不开。
+不然每层 3 次叠三层就是 27 次请求，正好在服务端过载时成倍放大流量。分工：这里管建流之前、候选内的重试与切换；流开始之后的错
+（连接中途断开、错误帧、空闲超时）这里接不住（已交出的片段拼不到另一个模型的输出上），由 `WithModelRetry` 整次重来。
+
 ### 7.1 WithTools 的传播（易漏点）
 
 `WithTools` 返回**新的** `model.ChatModel`（`interface.go:19`）。FallbackChatModel 的 `WithTools` 必须**对每个候选都调一次**、再用绑定后的候选重组一个新 FallbackChatModel：
@@ -544,7 +549,7 @@ if gated {
 4. **[已决] onSwitch 独立回调**——已实现 `WithFallbackHook`（§7），不塞进 hook 体系（切换早于 agent/orch hook 触发时机）。
 5. **[已决] 全员 cooldown 抛哨兵**——`ErrAllMembersUnavailable`（`fallback/fallback.go`，`errors.Is` 可判）。
 6. **[已实现] 观测 metric**——候选切换记 `crew.fallback.failovers{crew.failover.reason, crew.failover.from}`、候选断路器熔断记 `crew.fallback.member_trips{crew.fallback.member, crew.fallback.reason}`（closed→open 边缘，含"全员挂光"——failover 计不到最后一个候选熔断）；`from` / `member` 记候选下标。均 sink-gated（事件定义在 `fallback/event.go`，`observability/orch_hooks.go` 的 `recordEventMetric` 转成指标，业务接 observability 的编排钩子 + 用 fallback 自动采集，边缘检测 `circuit_breaker.go` RecordFailure 返回值）。
-7. **[已决] 全失败取 first_error**——主候选原始错误诊断价值最高（`fallback/fallback.go`，§0 落地偏离第 2 条，对齐 LangChain `fallbacks.py:215`）。
+7. **[已决] 全失败取 first_error**——主候选原始错误诊断价值最高（`fallback/fallback.go`，§0 落地偏离第 2 条，对齐 LangChain `fallbacks.py:215`）。2026-10-27 补：有候选的失败还值得再来一次时取排得最靠前的那个，让交出的错误的可重试性等于整次调用的。
 8. **[已接受] 半开探测在请求热路径**（断路器固有代价）——某候选 trip 后 cooldown 到期的第一个请求会先探测（含 retry 耗尽）再切健康候选，latency 偏高。代价是**每 cooldown 周期一次**（cooldown 窗口内 `Allow()=false` 直接 skip `circuit_breaker.go:91-92`；到期时 half-open 只放行**单次探测**、并发的其他 `Allow()` 仍返 false 防 thundering herd `circuit_breaker.go:94-102`）。AutoCompact/ReactiveCompact 同款接受；高频长 session + 主 model 长期不可用时可评估后台探测。第一版接受。
 
 ---

@@ -99,6 +99,9 @@ type ChannelManager struct {
 	// 清的是「给调用方看的挂起 query」，这里是「节点自用的进度」，Resume 时节点正要
 	// 读它来跳过已完成的部分，清掉就等于白存。
 	nodeStates map[string]taggedValue
+	// nodeStateWriters 记每条节点私有态是哪段执行写的（写入时 ctx 上的流记录），只在内存里：读到时据此判断是不是从别的
+	// 执行拿回来的（见 noteRecall）。从存档恢复的条目没有写入者，读到就算拿回。
+	nodeStateWriters map[string]*streamRecord
 
 	// entryRejections 记本次 Run 里各次节点执行名下发生过的嵌套图入口否决：节点执行键 → 产出那份
 	// 输入的分域（执行级为空串）。成员结束时取走（见 applyNestedEntryRejections）。只活在内存里：

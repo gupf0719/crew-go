@@ -47,12 +47,10 @@ func (h *captureHooks) OnNodeEvent(ctx context.Context, _ string, ev agent_v2.Ev
 	return ctx
 }
 
-// TestResetStream_EmitOnReactiveCompactRetry 验证：
-//   - flakyModel 第 1 次抛 prompt-too-long
-//   - ReactiveCompact 删旧消息组 + 第 2 次 retry 成功
-//   - retry 前框架通过 EventSink 投递 type=reset_stream 事件
-//   - captureHooks.OnNodeEvent 应收到 reset_stream + reason=prompt_too_long
-func TestResetStream_EmitOnReactiveCompactRetry(t *testing.T) {
+// TestResetStream_ReactiveCompactRetryWithoutChunks：第 1 次调用（Generate，没交出过片段）报 prompt-too-long，压缩后
+// 重调成功。没有可撤的片段，不发 reset_stream——撤回只在失败点、只在真交出过片段时发（streamOrGenerate）。这里曾经
+// 无条件再发一次，没片段时是空发、有片段时跟失败点那次重复。
+func TestResetStream_ReactiveCompactRetryWithoutChunks(t *testing.T) {
 	stub := &flakyModel{}
 	hooks := &captureHooks{}
 
@@ -70,50 +68,72 @@ func TestResetStream_EmitOnReactiveCompactRetry(t *testing.T) {
 		sess.AddEvent(agent_v2.NewOutputEvent("test_reset_stream", schema.AssistantMessage(fmt.Sprintf("ans %d", i))))
 	}
 
-	ctx := context.Background()
-	_, err := ag.Run(ctx, sess, schema.UserMessage("trigger compact"),
-		agent_v2.WithOrchHooks(hooks))
+	_, err := ag.Run(context.Background(), sess, schema.UserMessage("trigger compact"), agent_v2.WithOrchHooks(hooks))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-
-	// 验证 model 被调 2 次（第 1 次 fail，第 2 次 retry 成功）
 	if stub.calls != 2 {
 		t.Fatalf("expected model.Generate called 2 times (1 fail + 1 retry), got %d", stub.calls)
 	}
-
-	// 验证 hooks 收到 reset_stream event
 	hooks.mu.Lock()
 	defer hooks.mu.Unlock()
-	gotResetStream := false
 	for _, ev := range hooks.events {
-		if ev.Type != "reset_stream" {
-			continue
-		}
-		gotResetStream = true
-		// 验证 metadata 含 reason
-		if reason, _ := ev.Metadata["reason"].(string); reason != "prompt_too_long" {
-			t.Fatalf("reset_stream event metadata.reason 应是 'prompt_too_long'，实际 %q", reason)
-		}
-		// audit Round 5 Bug #2 修复：reset_stream 必须附 run_id 让前端精确清此
-		// stream group buffer——之前缺 run_id 前端要么全清要么漏清。
-		runID, _ := ev.Metadata["run_id"].(string)
-		if runID == "" {
-			t.Fatalf("Bug #2 reproduced: reset_stream event metadata 缺 run_id（前端无法精确清此 stream buffer）\n"+
-				"修复方向：modelFn 管理 runID 生命周期，emit reset_stream 时附即将作废的 run_id\n"+
-				"实际 metadata: %+v", ev.Metadata)
-		}
-		// agent name 也应附（多 sub-agent 场景前端按 agent 分流）
-		if agName, _ := ev.Metadata["agent"].(string); agName != "test_reset_stream" {
-			t.Fatalf("reset_stream event metadata.agent 应是 'test_reset_stream'，实际 %q", agName)
+		if ev.Type == "reset_stream" {
+			t.Fatalf("第 1 次调用没交出过片段，不该发 reset_stream：%+v", ev.Metadata)
 		}
 	}
-	if !gotResetStream {
-		evTypes := make([]string, len(hooks.events))
-		for i, e := range hooks.events {
-			evTypes[i] = e.Type
+}
+
+// chunkThenTooLongModel 第 1 次流出一个片段后以 prompt-too-long 结束（provider 在流中途报上下文超窗），之后正常。
+type chunkThenTooLongModel struct{ calls int }
+
+func (m *chunkThenTooLongModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	return nil, errors.New("unused")
+}
+func (m *chunkThenTooLongModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	m.calls++
+	sr, send := schema.NewStreamReader[*schema.Message](2)
+	if m.calls == 1 {
+		send(&schema.Message{Role: schema.RoleAssistant, Content: "half"})
+		schema.SendError(sr, errors.New(`{"error":{"code":"context_length_exceeded","message":"prompt is too long: 50000 tokens > 8192 maximum"}}`))
+	} else {
+		send(&schema.Message{Role: schema.RoleAssistant, Content: "ok"})
+	}
+	schema.CloseSend(sr)
+	return sr, nil
+}
+func (m *chunkThenTooLongModel) WithTools([]*schema.ToolInfo) (model.ChatModel, error) { return m, nil }
+
+// TestResetStream_MidStreamTooLongResetOnce：交出过片段之后报上下文超窗、压缩后重调成功。作废那次的片段恰好撤回一次，
+// 带它自己的 run_id。
+func TestResetStream_MidStreamTooLongResetOnce(t *testing.T) {
+	stub := &chunkThenTooLongModel{}
+	hooks := &captureHooks{}
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("rs2"), agent_v2.WithModel(stub),
+		agent_v2.WithReactiveCompact(&agent_v2.ReactiveCompactConfig{Enabled: true, MaxAttempts: 3}), agent_v2.WithMaxRounds(3))
+	sess := &agent_v2.RunSession{RunID: "test_rs2"}
+	for i := 0; i < 3; i++ {
+		sess.AddEvent(agent_v2.NewOutputEvent("rs2", schema.UserMessage(fmt.Sprintf("prior %d", i))))
+		sess.AddEvent(agent_v2.NewOutputEvent("rs2", schema.AssistantMessage(fmt.Sprintf("ans %d", i))))
+	}
+	if _, err := ag.Run(context.Background(), sess, schema.UserMessage("go"), agent_v2.WithOrchHooks(hooks)); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	hooks.mu.Lock()
+	defer hooks.mu.Unlock()
+	var halfRun string
+	resets := map[string]int{}
+	for _, ev := range hooks.events {
+		runID, _ := ev.Metadata["run_id"].(string)
+		switch {
+		case ev.Type == "chunk" && ev.Content == "half":
+			halfRun = runID
+		case ev.Type == "reset_stream":
+			resets[runID]++
 		}
-		t.Fatalf("ReactiveCompact retry 应 emit reset_stream event，实际收到 events: %v", evTypes)
+	}
+	if halfRun == "" || resets[halfRun] != 1 || len(resets) != 1 {
+		t.Fatalf("作废那次调用（run_id %q）的片段应恰好撤回一次，实际 %v", halfRun, resets)
 	}
 }
 

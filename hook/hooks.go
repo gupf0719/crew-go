@@ -73,9 +73,9 @@ type AgentOutput struct {
 // ─── panic 语义 ───
 // 业务 hook panic = 业务 bug, framework **不做 per-hook isolation**（链里排在它后面的不再调）。框架在调用
 // 钩子的地方兜住、不让 goroutine 崩：OnAgentStart / OnModel* / OnTool*（跑在工作之前或改得了结果）与
-// OnError（调用已经失败）panic 转成这次调用的错误；OnAgentEnd 跑在工作之后、只作观测，调用成功时它 panic 就地兜住、
-// 带栈记一条 ERROR，结果不变（转成错误的话调用方的重试 / 续跑会把已经做完的再做一次），调用失败时并到
-// 那个错误上。业务想 panic-safe 自己在 hook 内 defer recover().
+// OnError（调用已经失败）panic 转成这次调用的错误；OnAgentEnd 跑在工作之后、只作观测，它 panic 就地兜住、带栈记一条
+// ERROR，这次调用的结局不变：成功照旧成功（转成错误的话调用方的重试 / 续跑会把已经做完的再做一次），失败照旧交出原来
+// 那个错误（换掉的话中断认不出、终局失败被当成可重试）。业务想 panic-safe 自己在 hook 内 defer recover().
 //
 // ─── 消费语义（按字段分档，不是"所有 hook 一律可改"）───
 // hook 入参是指针，但**改了是否生效取决于框架是否在该 hook 后消费该字段**。

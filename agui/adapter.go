@@ -2,10 +2,13 @@ package agui
 
 import (
 	"context"
-	"crew-go/compose_v2"
+	"encoding/json"
+	"strconv"
+	"strings"
 	"sync"
 
 	"crew-go/agent_v2"
+	"crew-go/compose_v2"
 	"crew-go/hook"
 	"crew-go/schema"
 )
@@ -49,6 +52,57 @@ type sseAdapter struct {
 	// runID 是 AG-UI run id（handler 传入，**每个 run 唯一**）——tool result 的 messageId
 	// 前缀 + chunk 无 run_id 时兜底。
 	runID string
+
+	// input 是请求带来的消息原文（AG-UI 1.0：消费方每次都发完整的对话），emitted 是这个 run 发出的消息，按发出顺序；
+	// voided 是其中作废了的（流中途失败的那次模型调用，见 reset_stream）。撤回靠 MESSAGES_SNAPSHOT：消费方丢掉快照里
+	// 没有的消息，所以快照必须重述它手上的每一条——请求里的原样带回，这个 run 发出的按消费方落库时的 id 重建。
+	input    []json.RawMessage
+	inputIDs map[string]bool
+	// inputCallIDs 是请求带来的消息里已有的工具调用 id（不论装着它的那条消息 id 是什么）：官方客户端的 TOOL_CALL_START 在
+	// 所有消息的工具调用里找同一个 id，找到就并进去，不另建消息
+	inputCallIDs map[string]bool
+	emitted      []*emittedMessage
+	byID         map[string]*emittedMessage // 文本消息与工具结果按 id 认（工具调用每次发出单独一条，不进这里）
+	// snapshotPending 标「有撤回或改写，快照还没发」：攒到下一个入口（下一个钩子事件进来、改状态之前）、或这个 run 收尾时
+	// 发一份。一次尝试作废时每次模型调用各来一个撤回，逐个发的话每个都重述整场对话，长对话下发送量近似平方增长。
+	// 有在途的流式消息时不发、等它们都收尾：快照落在一条文本流中间时，官方客户端的事件压缩回放把它排到那条流之后，回放
+	// 出来那条消息只剩快照那一刻的半截。
+	snapshotPending bool
+}
+
+// emittedMessage 是这个 run 发给前端的一条消息，id 与官方客户端落库时用的一致：文本消息是 messageId（模型调用的
+// run_id），工具调用没带 parentMessageId 时客户端建一条 id = toolCallId 的 assistant 消息来装，工具结果是 messageId。
+type emittedMessage struct {
+	id         string
+	producer   string // 出自哪次模型调用（run_id）：文本消息是它自己的 id，工具调用与结果取 agent_v2.ToolModelRunIDExtraKey
+	role       string
+	content    strings.Builder
+	toolName   string
+	toolArgs   string
+	toolCallID string // 工具调用 / 工具结果所属的调用
+	isToolCall bool
+	voided     bool
+}
+
+// snapshotJSON 按 AG-UI 1.0 的 Message 形状编码。
+func (m *emittedMessage) snapshotJSON() json.RawMessage {
+	var v any
+	switch {
+	case m.isToolCall:
+		v = map[string]any{"id": m.id, "role": "assistant", "toolCalls": []map[string]any{{
+			"id": m.toolCallID, "type": "function",
+			"function": map[string]any{"name": m.toolName, "arguments": m.toolArgs},
+		}}}
+	case m.role == "tool":
+		v = map[string]any{"id": m.id, "role": "tool", "toolCallId": m.toolCallID, "content": m.content.String()}
+	default:
+		v = map[string]any{"id": m.id, "role": m.role, "content": m.content.String()}
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil // 只有字符串字段，编不成 JSON 不会发生
+	}
+	return b
 }
 
 // 编译期确认 sseAdapter 满足两个 hook 接口。
@@ -57,9 +111,186 @@ var (
 	_ agent_v2.OrchestrationHooks = (*sseAdapter)(nil)
 )
 
-// newSSEAdapter 构造 adapter。runID 是本次 AG-UI run 的 id。
-func newSSEAdapter(w *SSEWriter, runID string) *sseAdapter {
-	return &sseAdapter{w: w, runID: runID, openMsgs: map[string]bool{}}
+// newSSEAdapter 构造 adapter。runID 是本次 AG-UI run 的 id，input 是请求带来的消息（撤回消息时重述它们）。
+func newSSEAdapter(w *SSEWriter, runID string, input []AGUIMessage) *sseAdapter {
+	a := &sseAdapter{w: w, runID: runID, openMsgs: map[string]bool{}, byID: map[string]*emittedMessage{},
+		inputIDs: map[string]bool{}, inputCallIDs: map[string]bool{}}
+	for _, m := range input {
+		if len(m.raw) == 0 {
+			continue
+		}
+		a.input = append(a.input, m.raw)
+		if id := inputMessageID(m.raw); id != "" {
+			a.inputIDs[id] = true
+		}
+		var calls struct {
+			ToolCalls []struct {
+				ID string `json:"id"`
+			} `json:"toolCalls"`
+		}
+		if json.Unmarshal(m.raw, &calls) == nil {
+			for _, tc := range calls.ToolCalls {
+				if tc.ID != "" {
+					a.inputCallIDs[tc.ID] = true
+				}
+			}
+		}
+	}
+	return a
+}
+
+// recordLocked 记下这个 run 发出的一条消息。文本消息与工具结果按 id 认（同 id 已记过、没作废时返回已有的那条——流式片段
+// 接在同一条后面）；工具调用每次发出单独记一条：provider 会复用 tool_call ID，它们出自不同的模型调用、各自作废（快照里
+// 同一个 id 只重述一份，见 voidLocked）。调用方须持 a.mu。
+func (a *sseAdapter) recordLocked(m *emittedMessage) *emittedMessage {
+	if !m.isToolCall {
+		if old, ok := a.byID[m.id]; ok && !old.voided {
+			return old
+		}
+		a.byID[m.id] = m
+	}
+	a.emitted = append(a.emitted, m)
+	return m
+}
+
+// producerOf 取工具调用 / 结果出自哪次模型调用（见 agent_v2.ToolModelRunIDExtraKey）。
+func producerOf(extra map[string]any) string {
+	id, _ := extra[agent_v2.ToolModelRunIDExtraKey].(string)
+	return id
+}
+
+// voidLocked 撤回这个 run 里一次模型调用（run_id）发出的消息——它的文本，连同它产出的工具调用与这些调用的结果：发
+// MESSAGES_SNAPSHOT，快照里是请求带来的消息加这个 run 发出、没作废的消息，消费方据此把作废的丢掉。请求没带消息时不发——
+// 快照之外的消息会被消费方丢掉，而我们不知道它手上有什么。调用方须持 a.mu。
+//
+// 续跑时作废的是上一个请求已经交给前端的答复：它在请求带来的对话里，从快照要重述的原文里去掉（曾经只看这个 run 发出的，
+// 被审核钩子拒掉的答复留在前端、下一轮又作为前文回到模型的上下文里，审计实测）。原文里它的工具调用与结果不带出处，去不掉。
+func (a *sseAdapter) voidLocked(runID string) {
+	if runID == "" {
+		return
+	}
+	changed := false
+	for _, e := range a.emitted {
+		if !e.voided && e.producer == runID {
+			e.voided, changed = true, true
+		}
+	}
+	if a.inputIDs[runID] {
+		kept := a.input[:0]
+		for _, raw := range a.input {
+			if inputMessageID(raw) == runID {
+				changed = true
+				continue
+			}
+			kept = append(kept, raw)
+		}
+		a.input = kept
+		delete(a.inputIDs, runID)
+	}
+	if changed {
+		a.snapshotLocked()
+	}
+}
+
+// inputMessageID 取请求带来的一条消息的 id（解不开时返回空串）。
+func inputMessageID(raw json.RawMessage) string {
+	var head struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(raw, &head) != nil {
+		return ""
+	}
+	return head.ID
+}
+
+// replaceLocked 把这个 run 里一次模型调用（run_id）的文本消息换成 content（OnModelEnd 钩子改写了答复）：记过这条就改它的
+// 内容、发快照纠正前端手上的；没发过（流式只出了工具调用、或适配层排在钩子前面且没发文本）就照常发一条完整的文本消息。
+// 调用方须持 a.mu。
+func (a *sseAdapter) replaceLocked(runID, content string) {
+	if m := a.byID[runID]; m != nil && !m.voided && !m.isToolCall && m.role == "assistant" {
+		if m.content.String() == content {
+			return
+		}
+		m.content.Reset()
+		m.content.WriteString(content)
+		a.snapshotLocked()
+		return
+	}
+	// 续跑时改写的是上一个请求已经交给前端的消息：它在请求带来的对话里。改那条原文、发快照——流式重发同一个 id 在客户端
+	// 是追加（官方客户端：消息已存在时 START 不新建、CONTENT 接在后面），曾经得到「原文 + 改写」（审计实测）
+	if a.inputIDs[runID] {
+		if a.rewriteInputLocked(runID, content) {
+			a.snapshotLocked()
+		}
+		return
+	}
+	if content == "" {
+		return
+	}
+	a.flushSnapshotLocked() // 先发攒着的快照：它不能已经含有下面要发的这一条
+	a.recordLocked(&emittedMessage{id: runID, producer: runID, role: "assistant"}).content.WriteString(content)
+	a.writeLocked(NewTextMessageStart(runID, "assistant"))
+	a.writeLocked(NewTextMessageContent(runID, content))
+	a.writeLocked(NewTextMessageEnd(runID))
+}
+
+// rewriteInputLocked 把请求带来的 id 为 id 的消息的正文换成 content（就地改快照要重述的原文；客户端违约重复了同一个 id 时
+// 每一条都改，只改第一条的话快照里还留着原文）；一条都没改时返回假。调用方须持 a.mu。
+func (a *sseAdapter) rewriteInputLocked(id, content string) bool {
+	changed := false
+	for i, raw := range a.input {
+		var m map[string]any
+		if json.Unmarshal(raw, &m) != nil || m["id"] != id {
+			continue
+		}
+		if old, ok := m["content"].(string); ok && old == content {
+			continue
+		}
+		m["content"] = content
+		b, err := json.Marshal(m)
+		if err != nil {
+			continue
+		}
+		a.input[i] = b
+		changed = true
+	}
+	return changed
+}
+
+// snapshotLocked 记下「要发一份快照」，攒到下一次往外写别的事件或 run 收尾时发（flushSnapshotLocked）。调用方须持 a.mu。
+func (a *sseAdapter) snapshotLocked() { a.snapshotPending = true }
+
+// writeLocked 往外写一个事件。攒着的快照由各入口在改状态之前发（见 flushSnapshotLocked 的调用处），这里不发：入口多是先把
+// 要发的消息记进状态再写事件，在这里发的话快照里已经有这个事件，增量又发一遍（审计实测前端出现 "FINALFINAL"、工具参数
+// 拼成两份）。调用方须持 a.mu。
+func (a *sseAdapter) writeLocked(ev Event) {
+	_ = a.w.WriteEvent(ev)
+}
+
+// flushSnapshotLocked 发攒着的 MESSAGES_SNAPSHOT：请求带来的消息原样加上这个 run 发出、没作废的消息。请求没带消息时不发——
+// 快照之外的消息会被消费方丢掉，而我们不知道它手上有什么。调用方须持 a.mu。
+func (a *sseAdapter) flushSnapshotLocked() {
+	if !a.snapshotPending || len(a.openMsgs) > 0 {
+		return
+	}
+	a.snapshotPending = false
+	if len(a.input) == 0 {
+		return
+	}
+	msgs := make([]json.RawMessage, 0, len(a.input)+len(a.emitted))
+	msgs = append(msgs, a.input...)
+	// 同一个 tool_call ID 只重述一份：官方客户端的 TOOL_CALL_START 是幂等的，几次复用同一个 ID 的调用在它手上是一条消息
+	calls := map[string]bool{}
+	for _, e := range a.emitted {
+		if e.voided || (e.isToolCall && calls[e.id]) {
+			continue
+		}
+		if e.isToolCall {
+			calls[e.id] = true
+		}
+		msgs = append(msgs, e.snapshotJSON())
+	}
+	_ = a.w.WriteEvent(NewMessagesSnapshot(msgs))
 }
 
 // ── hook.Hooks：LLM 输出收尾 + 工具调用 ──
@@ -81,11 +312,17 @@ func (a *sseAdapter) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, output *
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	// 本轮 message 的 id = output 的 run_id（与流式 chunk 的 run_id 同一 UUID）；缺省兜底 runID。
+	a.flushSnapshotLocked() // 在这次要改的状态记进去之前：快照里不能已经有这个入口接着要发的事件
+	// 本轮 message 的 id = 这次模型调用的 run_id（与流式 chunk 的 run_id 同一 UUID）：先取框架放在 Extra 上的（排在前面的
+	// 钩子可能换掉了 Message，新消息不带标注，见 hook.ModelRunIDKey），再取消息标注，都没有时兜底 runID。
 	msgID := a.runID
-	if output != nil && output.Message != nil {
-		if rid, ok := output.Message.Annotations[compose_v2.RunIDAnnotationKey].(string); ok && rid != "" {
+	if output != nil {
+		if rid := hook.ModelRunIDOf(output.Extra); rid != "" {
 			msgID = rid
+		} else if output.Message != nil {
+			if rid, ok := output.Message.Annotations[compose_v2.RunIDAnnotationKey].(string); ok && rid != "" {
+				msgID = rid
+			}
 		}
 	}
 	// 流式路径：本轮 run_id 的 message 开着 → 收尾（发 End），仅此一条。
@@ -98,9 +335,10 @@ func (a *sseAdapter) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, output *
 	if output != nil && output.Message != nil {
 		msg := output.Message
 		if msg.Content != "" && len(schema.GetToolCalls(msg)) == 0 {
-			_ = a.w.WriteEvent(NewTextMessageStart(msgID, "assistant"))
-			_ = a.w.WriteEvent(NewTextMessageContent(msgID, msg.Content))
-			_ = a.w.WriteEvent(NewTextMessageEnd(msgID))
+			a.recordLocked(&emittedMessage{id: msgID, producer: msgID, role: "assistant"}).content.WriteString(msg.Content)
+			a.writeLocked(NewTextMessageStart(msgID, "assistant"))
+			a.writeLocked(NewTextMessageContent(msgID, msg.Content))
+			a.writeLocked(NewTextMessageEnd(msgID))
 		}
 	}
 	return ctx, nil
@@ -116,17 +354,26 @@ func (a *sseAdapter) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, output *
 func (a *sseAdapter) OnToolStart(ctx context.Context, _ *hook.AgentInfo, in *schema.ToolInput) (context.Context, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.flushSnapshotLocked() // 在这次要改的状态记进去之前：快照里不能已经有这个入口接着要发的事件
 	// 续跑时同一批调用的再次派发（框架标 agent_v2.ToolRedispatchedExtraKey）：上一个 run 已经发过它们的 START / ARGS / END，
 	// 再发就是重开同一个调用、参数追加，前端的参数文本变成两份。结果照常在执行的那一次发（见 OnToolEnd）。按 toolCallId
 	// 记「发过没有」不行：provider 在不同轮次复用同一个 ID 时，后一个调用的 START 会被吞掉、结果挂到前一个头上（审计实测）。
 	if again, _ := in.Extra[agent_v2.ToolRedispatchedExtraKey].(bool); again {
 		return ctx, nil
 	}
-	_ = a.w.WriteEvent(NewToolCallStart(in.CallId, in.Name))
-	if in.ArgumentsJSON != "" {
-		_ = a.w.WriteEvent(NewToolCallArgs(in.CallId, in.ArgumentsJSON))
+	// provider 跨轮复用 tool_call ID 时：同一个 ID 已经在请求带来的消息里（以前的 run 发出的，或外来历史里装在别的 id 的
+	// 消息下——带 parentMessageId 的），客户端把这次的调用并进它手上那条（官方客户端的 TOOL_CALL_START 在所有消息的工具
+	// 调用里找同一个 id），快照照原样重述那条、这里不另记；曾经只认消息 id 等于 toolCallId 的那种，外来历史下快照里同一个
+	// 工具调用出现两份。这个 run 里复用的每次单独记一条（各自作废），快照里同一个 ID 只重述一份
+	if !a.inputIDs[in.CallId] && !a.inputCallIDs[in.CallId] {
+		a.recordLocked(&emittedMessage{id: in.CallId, producer: producerOf(in.Extra), role: "assistant", isToolCall: true,
+			toolCallID: in.CallId, toolName: in.Name, toolArgs: in.ArgumentsJSON})
 	}
-	_ = a.w.WriteEvent(NewToolCallEnd(in.CallId))
+	a.writeLocked(NewToolCallStart(in.CallId, in.Name))
+	if in.ArgumentsJSON != "" {
+		a.writeLocked(NewToolCallArgs(in.CallId, in.ArgumentsJSON))
+	}
+	a.writeLocked(NewToolCallEnd(in.CallId))
 	return ctx, nil
 }
 
@@ -143,6 +390,7 @@ func (a *sseAdapter) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, out *sche
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.flushSnapshotLocked() // 在这次要改的状态记进去之前：快照里不能已经有这个入口接着要发的事件
 	content := ""
 	if out.Result != nil {
 		if out.Result.Success {
@@ -169,7 +417,14 @@ func (a *sseAdapter) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, out *sche
 	//
 	// 用 `<runID>/<callID>` 派生：runID 每个 run 唯一（见 handler 的 wireRunID），
 	// callID 在一个 run 内唯一，合起来即 thread 内唯一，且**可读、可由两端各自推导**。
-	_ = a.w.WriteEvent(NewToolCallResult(a.runID+"/"+out.CallId, out.CallId, content))
+	// provider 在一个 run 里复用 tool_call ID 时 `<runID>/<callID>` 会撞：加序号保 thread 内唯一。撞了的话消费方把后一条
+	// 当成同一条消息（规范：重发已有的消息是追加），快照里也会把两次结果拼成一条（审计实测 "RaRb"）
+	resultID := a.runID + "/" + out.CallId
+	for n := 2; a.byID[resultID] != nil || a.inputIDs[resultID]; n++ {
+		resultID = a.runID + "/" + out.CallId + "#" + strconv.Itoa(n)
+	}
+	a.recordLocked(&emittedMessage{id: resultID, producer: producerOf(out.Extra), role: "tool", toolCallID: out.CallId}).content.WriteString(content)
+	a.writeLocked(NewToolCallResult(resultID, out.CallId, content))
 	return ctx, nil
 }
 
@@ -181,7 +436,8 @@ func (a *sseAdapter) OnError(ctx context.Context, _ *hook.AgentInfo, err *schema
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	_ = a.w.WriteEvent(NewCustom(CustomEventError, map[string]any{"code": err.Code, "message": err.Message}))
+	a.flushSnapshotLocked() // 在这次要改的状态记进去之前：快照里不能已经有这个入口接着要发的事件
+	a.writeLocked(NewCustom(CustomEventError, map[string]any{"code": err.Code, "message": err.Message}))
 	return ctx
 }
 
@@ -203,6 +459,10 @@ func (a *sseAdapter) OnNodeEnd(ctx context.Context, _ string, _ error) context.C
 func (a *sseAdapter) OnNodeEvent(ctx context.Context, _ string, ev agent_v2.Event) context.Context {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// 在这次要改的状态记进去之前发攒着的快照；撤回事件自己只往里攒，连着来的几个只发一份
+	if ev.Type != "reset_stream" {
+		a.flushSnapshotLocked()
+	}
 
 	switch ev.Type {
 	case "chunk":
@@ -214,19 +474,29 @@ func (a *sseAdapter) OnNodeEvent(ctx context.Context, _ string, ev agent_v2.Even
 		// run_id"就收尾当前——并发 sub-agent 的多条 message 各自独立在途。
 		if !a.openMsgs[runID] {
 			a.openMsgs[runID] = true
-			_ = a.w.WriteEvent(NewTextMessageStart(runID, "assistant"))
+			a.writeLocked(NewTextMessageStart(runID, "assistant"))
 		}
+		m := a.recordLocked(&emittedMessage{id: runID, producer: runID, role: "assistant"})
 		if ev.Content != "" {
-			_ = a.w.WriteEvent(NewTextMessageContent(runID, ev.Content))
+			m.content.WriteString(ev.Content)
+			a.writeLocked(NewTextMessageContent(runID, ev.Content))
 		}
 	case "reset_stream":
-		// ReactiveCompact retry / 流中断——收尾对应 run_id 的 message + 通知前端丢弃其
-		// chunk buffer。AG-UI 无原生对应，走 Custom（标准组件忽略，业务前端可处理）。
+		// 一次模型调用流中途失败，它已交出的片段作废：收尾对应 run_id 的 message，再发 MESSAGES_SNAPSHOT 撤回它
+		// （AG-UI 的标准办法，标准前端照做，见 voidLocked）；自定义事件留着给按 run_id 自己管缓冲的业务前端。曾经只发
+		// 自定义事件，标准前端忽略它，半截那条一直留在对话里（实测）。
 		runID, _ := ev.Metadata["run_id"].(string)
 		if runID == "" {
 			runID = a.runID
 		}
 		a.closeMsgLocked(runID)
+		if replacement, ok := ev.Metadata["replacement"].(string); ok {
+			// 钩子改写了答复：不是作废，用新正文替换那条消息
+			a.replaceLocked(runID, replacement)
+		} else {
+			a.voidLocked(runID)
+		}
+		// 自定义事件立即发、不带出快照：连着来的几个撤回只发一份快照
 		_ = a.w.WriteEvent(NewCustom(CustomEventResetStream, map[string]any{"run_id": runID, "reason": ev.Content}))
 	case "state_snapshot":
 		// 业务 opt-in 的结构化 state 同步：节点内
@@ -238,7 +508,7 @@ func (a *sseAdapter) OnNodeEvent(ctx context.Context, _ string, ev agent_v2.Even
 		// state——什么 state 该同步给前端由业务定义，框架不自动暴露引擎内部。
 		// snapshot 为 nil 跳过——避免发语义空的 "snapshot":null 帧（业务应发非 nil state）。
 		if snap, ok := ev.Metadata["snapshot"]; ok && snap != nil {
-			_ = a.w.WriteEvent(NewStateSnapshot(snap))
+			a.writeLocked(NewStateSnapshot(snap))
 		}
 	}
 	return ctx
@@ -250,22 +520,26 @@ func (a *sseAdapter) OnNodeEvent(ctx context.Context, _ string, ev agent_v2.Even
 func (a *sseAdapter) finish() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.flushSnapshotLocked() // 在这次要改的状态记进去之前：快照里不能已经有这个入口接着要发的事件
 	a.closeAllLocked()
+	a.flushSnapshotLocked() // 撤回发生在最后一个事件之后（没有别的事件带出它）时在这里发
 }
 
 // closeMsgLocked 若指定 message 处于打开态则发 TextMessageEnd 并移出 open-set。
 // 调用方须持 a.mu。
 func (a *sseAdapter) closeMsgLocked(msgID string) {
 	if a.openMsgs[msgID] {
-		_ = a.w.WriteEvent(NewTextMessageEnd(msgID))
+		a.writeLocked(NewTextMessageEnd(msgID))
 		delete(a.openMsgs, msgID)
+		a.flushSnapshotLocked() // 等着在途消息收尾的快照
 	}
 }
 
 // closeAllLocked 收尾所有仍打开的流式 message。调用方须持 a.mu。
 func (a *sseAdapter) closeAllLocked() {
 	for msgID := range a.openMsgs {
-		_ = a.w.WriteEvent(NewTextMessageEnd(msgID))
+		a.writeLocked(NewTextMessageEnd(msgID))
 		delete(a.openMsgs, msgID)
 	}
+	a.flushSnapshotLocked()
 }

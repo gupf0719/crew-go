@@ -312,15 +312,35 @@ func PickFanoutError(errs []error) error {
 			return e
 		}
 	}
-	return pickFanoutError(raws, firstErr)
+	return pickFanoutError(raws, firstErr, firstExhausted(errs))
+}
+
+// firstExhausted 返回第一个带「重试用完」标记（[RetriesExhaustedError]）的错，没有时返回 nil。
+func firstExhausted(errs []error) error {
+	for _, e := range errs {
+		if e != nil && retriesExhausted(e) {
+			return e
+		}
+	}
+	return nil
 }
 
 // pickFanoutError 是判据本体。interruptRaws 必须是抛了中断的那些子调用的**原始
 // error**（不抠不重建——链上并列挂的第二 sentinel 靠它保住），firstErr 是按顺序
-// 第一个非 nil 的错。
-func pickFanoutError(interruptRaws []error, firstErr error) error {
+// 第一个非 nil 的错，exhausted 是第一个带「重试用完」标记的错（没有时为 nil）。
+//
+// 交出业务错时，只要有一个失败的子调用已经在下层重试用完，交出的就带上标记（文本仍是 firstErr 的）：一个失败只被重试
+// 一层，外层再重试的话那个子调用被再做一轮、次数相乘。代价是同时失败的别的子调用外层也不再重试——跟次数相乘的放大比，
+// 这是小的那个。曾经带不带标记取决于失败的子调用谁排在前面。
+func pickFanoutError(interruptRaws []error, firstErr, exhausted error) error {
 	switch len(interruptRaws) {
 	case 0:
+		if exhausted != nil && firstErr != nil && !retriesExhausted(firstErr) {
+			var re *RetriesExhaustedError
+			if errors.As(exhausted, &re) {
+				return MarkRetriesExhausted(firstErr, re.Attempts)
+			}
+		}
 		return firstErr
 	case 1:
 		return interruptRaws[0]

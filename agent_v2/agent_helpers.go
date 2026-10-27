@@ -244,21 +244,24 @@ func recoverPanicToErr(ctx context.Context, what string, r any, retErr *error) {
 	panicerr.Log(ctx, slog.LevelError, "agent_v2: 编排收尾兜住 panic，已转成错误", pe, panicerr.KeyError, (*retErr).Error())
 }
 
-// fireAgentEnd 调 OnAgentEnd。它是观测钩子（返回值不往后流、不影响执行结果）：这次调用已经成功（retErr 为 nil）时它 panic
-// 就地兜住、带栈记一条 ERROR，结果照旧算成功。转成错误的话，一次已经做完的调用被报成失败：它自己的存档已经按成功清掉，
-// 编排续跑 / 重试时它从头再跑、做过的副作用重放（实测）。调用失败时照旧让 panic 交给外层兜底、并进那次调用的错误里。
+// fireAgentEnd 调 OnAgentEnd。它是观测钩子（返回值不往后流、不影响执行结果），它 panic 不改变这次调用的结局：就地兜住、
+// 带栈记一条 ERROR，成功照旧算成功，失败照旧交出原来那个错误。
+//
+// 成功时转成错误的话，一次已经做完的调用被报成失败：它自己的存档已经按成功清掉，编排续跑 / 重试时它从头再跑、做过的副作用
+// 重放（实测）。失败时曾经让 panic 交给外层兜底，外层把原来的错误整个换成 panic 的错误：中断认不出来（调用方不知道有问题
+// 要答）、终局失败（ErrRunAborted）的标记丢了被当成可重试、错误文本也变了。挂在原错误旁边也不行——错误链上多出一个 PanicError，
+// 按「是不是 panic」分档的地方会把一个观测钩子的问题当成这次调用的。
 func fireAgentEnd(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo, out *hook.AgentOutput, retErr error) {
-	if retErr == nil {
-		defer func() {
-			if r := recover(); r != nil {
-				name := ""
-				if info != nil {
-					name = info.Name
-				}
-				panicerr.Log(ctx, slog.LevelError, "agent_v2: OnAgentEnd 钩子 panic（这次调用已经成功，结果不变）", panicerr.New(r), "agent", name)
+	defer func() {
+		if r := recover(); r != nil {
+			name := ""
+			if info != nil {
+				name = info.Name
 			}
-		}()
-	}
+			panicerr.Log(ctx, slog.LevelError, "agent_v2: OnAgentEnd 钩子 panic（这次调用的结局不变）", panicerr.New(r),
+				"agent", name, "call_failed", retErr != nil)
+		}
+	}()
 	_ = hooks.OnAgentEnd(ctx, info, out)
 }
 

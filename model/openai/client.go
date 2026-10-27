@@ -80,6 +80,8 @@ type Client struct {
 	optionalFinishReason bool
 	// streamUnsupported 为 true 时 Stream 直接返回 model.ErrStreamUnsupported；见 WithStreamUnsupported。
 	streamUnsupported bool
+	// streamIdleTimeout 是流式响应的空闲超时，<= 0 不设；见 WithStreamIdleTimeout。
+	streamIdleTimeout time.Duration
 }
 
 // NewClient 创建 OpenAI ChatModel。
@@ -89,6 +91,8 @@ func NewClient(apiKey, modelName string, opts ...ClientOption) *Client {
 		baseURL: "https://api.openai.com/v1",
 		model:   modelName,
 		client:  http.DefaultClient,
+		// 默认就有：没有它时 provider 停住不关连接，没设期限的调用会一直挂着
+		streamIdleTimeout: DefaultStreamIdleTimeout,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -262,8 +266,12 @@ func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ..
 		}
 	}
 
+	body := httpResp.Body
+	if c.streamIdleTimeout > 0 {
+		body = newIdleReader(body, c.streamIdleTimeout)
+	}
 	sr, send := schema.NewStreamReader[*schema.Message](8)
-	go c.consumeStream(ctx, httpResp.Body, sr, send)
+	go c.consumeStream(ctx, body, sr, send)
 	return sr, nil
 }
 

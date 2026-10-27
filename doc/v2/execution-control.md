@@ -156,7 +156,12 @@ bld.AddSubgraphNode("enrich", sub, compose_v2.WithSubgraphNodeOptions(compose_v2
   （`agent_v2.RunSubAgent` 已完成的拿回记录、失败的续上它的存档）；节点里直接跑的嵌套图（`compose_v2.Run`）失败或
   中断过的、配了 checkpointer 时从自己的存档续，已经跑完的存档随成功清掉、下一次尝试从头再跑它（要越过它就跑完用
   `SaveStepResult` 记下、后面的尝试跳过，或经 `RunSubAgent` 调）——这些是 `RunWithRetry` 的语义，节点重试就是在
-  节点体外面套了一层它。
+  节点体外面套了一层它；
+- 交给前端的流（chunk 事件）：失败那次交出、下一次没再采用的逐个 `reset_stream` 撤回（被拿回的嵌套调用当初交出的照留，
+  它的完成记录声明了自己的流）；下一次拿回了说不清对应哪些流的东西（从存档续跑、命中节点私有态、命中没用
+  `compose_v2.WithStreams` 声明流的步骤记录）时一个都不撤——宁可留着作废的，也不删掉被采用的。判据与编排成员重试是同一个
+  （`compose_v2.StreamAttempts`）。节点体在重试之间自己缓存了产出、不再流出时，用 `compose_v2.RecordStreams` 登记它当初的
+  run_id，或用声明了流的步骤记录记它。暂停（中断）之后的续跑不撤上一次的流：续跑是接着办。
 
 不重试的（框架的闸，排在谓词之前）：中断、调用方的 ctx 已经取消或到期（问的是调用方的 ctx，不是错误链上有没有
 ctx 错）、软取消、陈旧写回、终局失败、坏存档（`ErrCheckpointNotResumable`）、档没写成（`ErrCheckpointNotPersisted`）；

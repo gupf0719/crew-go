@@ -90,7 +90,14 @@ func modelCallOf(ctx context.Context) (*modelCallRecord, bool) {
 
 // saveModelCall 记下这次模型调用（原样或定下的那份）。存不下时续跑会再调一次模型（没有记录时的行为）。
 func saveModelCall(ctx context.Context, rec *modelCallRecord) {
-	if err := compose_v2.SaveStepResult(ctx, basicModelCallStep, rec, compose_v2.Rerunnable()); err != nil {
+	// 声明这次调用的流（答复上的 run_id）：沿用原样续跑时它登记回续跑那次执行，不随被取代的那次撤回
+	var streams []string
+	if rec != nil && rec.Out != nil {
+		if rid, _ := rec.Out.Annotations[compose_v2.RunIDAnnotationKey].(string); rid != "" {
+			streams = []string{rid}
+		}
+	}
+	if err := compose_v2.SaveStepResult(ctx, basicModelCallStep, rec, compose_v2.Rerunnable(), compose_v2.WithStreams(streams)); err != nil {
 		slog.WarnContext(ctx, "agent_v2: 记下这次模型调用失败，续跑时会再调一次模型", "err", err)
 	}
 }

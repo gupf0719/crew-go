@@ -98,7 +98,7 @@ func (DefaultFailoverPolicy) ShouldFailover(ctx context.Context, err error) bool
 			// 非 429 状态码表达额度耗尽（dashscope 403 AllocationQuota.FreeTierOnly），故按
 			// body 关键词识别而非只看 StatusCode。区别于 400 参数 / 401 鉴权 / 404 模型不存在
 			// 这些"换了也白搭"的 4xx。
-			if isQuotaExhausted(apiErr.Body) {
+			if isQuotaExhausted(apiErr) {
 				return true
 			}
 			return false // 其他 4xx——请求本身有问题，换模型同样失败
@@ -113,7 +113,8 @@ func (DefaultFailoverPolicy) ShouldFailover(ctx context.Context, err error) bool
 }
 
 // shouldRetryMember 回答「在同一个候选上再试一次有没有可能好」：只重试会自己恢复的错误——5xx、429、408、
-// 网络错误（StatusCode 为 0）与不认识的错误；计费类额度用完（isBillingExhausted，等多久都不会恢复）、其余 4xx
+// 网络错误（StatusCode 为 0）与不认识的错误；计费类额度用完（model.ErrBillingExhausted，等多久都不会恢复，它实现
+// compose_v2.NonRetryable、下面那道闸就认）、其余 4xx
 // （请求本身有问题）、声明了 [compose_v2.NonRetryable] 的错误（上下文超限、内容过滤等）、再做一次不可能有用的
 // （[compose_v2.IsRetryFutile]）不重试。跟 [FailoverPolicy]（换下一个候选有没有可能好）是两个问题，见
 // callMemberWithRetry。
@@ -136,9 +137,6 @@ func shouldRetryMember(ctx context.Context, err error) bool {
 	if !errors.As(err, &apiErr) {
 		return true // 不认识的错误：跟以前一样重试
 	}
-	if isBillingExhausted(apiErr.Body) {
-		return false
-	}
 	switch {
 	case apiErr.StatusCode == 0, apiErr.StatusCode >= 500:
 		return true
@@ -149,30 +147,18 @@ func shouldRetryMember(ctx context.Context, err error) bool {
 	}
 }
 
-// isQuotaExhausted 从错误响应体判"额度/配额"类错误——这类换候选 model/provider 有用（切换判据用）。
-// 按 body 关键词识别而非只看 StatusCode：不同 provider 用不同状态码表达额度耗尽（dashscope
-// 403 "AllocationQuota.FreeTierOnly" / OpenAI 429 "insufficient_quota" / 余额不足类），且都区别
-// 于 400 参数 / 401 鉴权 / 404 模型不存在这些"换模型也白搭"的 4xx（那些 body 不含额度关键词）。
-// 包括计费类额度用完（isBillingExhausted）与按时间窗口的配额（会自己恢复，但换个候选不用等）。
-func isQuotaExhausted(body string) bool {
-	if isBillingExhausted(body) {
+// isQuotaExhausted 判「额度/配额」类错误——这类换候选 model/provider 有用（切换判据用）。按响应体识别而非只看
+// StatusCode：不同 provider 用不同状态码表达额度耗尽（dashscope 403 "AllocationQuota.FreeTierOnly" / OpenAI 429
+// "insufficient_quota" / 余额不足类），且都区别于 400 参数 / 401 鉴权 / 404 模型不存在这些"换模型也白搭"的 4xx（那些
+// body 不含额度关键词）。包括计费类额度用完（model.ErrBillingExhausted）与按时间窗口的配额（会自己恢复，但换个候选不用等）。
+func isQuotaExhausted(apiErr *model.APIError) bool {
+	if errors.Is(apiErr, model.ErrBillingExhausted) {
 		return true
 	}
-	b := strings.ToLower(body)
+	b := strings.ToLower(apiErr.Body)
 	// anchor 到具体短语而非 bare "quota"——避免误命中 "quota_limit_override" 参数错等无关 4xx
 	// （那些 body 含 "quota" 但换模型也白搭，cross-verify CLAIM 3）
 	return strings.Contains(b, "quota exceeded") || // 按时间窗口的配额（Google "Quota exceeded for ... per_minute"）
 		strings.Contains(b, "allocationquota") || // dashscope 的 AllocationQuota 类（429 Throttling.AllocationQuota 是限流）
 		strings.Contains(b, "free tier") // 免费额度相关（有的是按时间窗口的限流）
-}
-
-// isBillingExhausted 从错误响应体判「计费类额度用完」：账户额度 / 余额用完，或免费额度用完且只允许免费额度——等多久
-// 都不会恢复，要改账户设置。只认语义明确的标记；按时间窗口的配额、限流不算（见 shouldRetryMember）。
-func isBillingExhausted(body string) bool {
-	b := strings.ToLower(body)
-	return strings.Contains(b, "insufficient_quota") || // OpenAI 429：账户额度用完
-		strings.Contains(b, "freetieronly") || // dashscope 403 AllocationQuota.FreeTierOnly：免费额度用完、只允许免费额度
-		strings.Contains(b, "quota has been exhausted") || // dashscope 同上的 message
-		strings.Contains(b, "insufficient balance") || // deepseek：余额不足
-		strings.Contains(b, "credit balance is too low") // Anthropic 400 配额耗尽（同 LiteLLM#24320，换候选有用）
 }

@@ -102,7 +102,7 @@ func failoverReason(err error) string {
 			// OpenAI 用 429 表达配额耗尽（insufficient_quota）——先判 quota 再落 rate_limit，
 			// 对齐 policy.go isQuotaExhausted 意图（否则 429 quota 被误标 rate_limit 误导运维：
 			// rate_limit 退避自愈 vs quota_exhausted 需充值/换账号，runbook 不同）。
-			if isQuotaExhausted(apiErr.Body) {
+			if isQuotaExhausted(apiErr) {
 				return "quota_exhausted"
 			}
 			return "rate_limit"
@@ -112,7 +112,7 @@ func failoverReason(err error) string {
 			return "server_error"
 		case apiErr.StatusCode == 0:
 			return "network"
-		case isQuotaExhausted(apiErr.Body):
+		case isQuotaExhausted(apiErr):
 			return "quota_exhausted"
 		default:
 			return "api_error"

@@ -126,6 +126,8 @@ type Client struct {
 	betas          []anthropic.AnthropicBeta
 	extraBody      map[string]any
 	requestTimeout time.Duration
+	// streamIdleTimeout 是流式响应的空闲超时，<= 0 不设；见 WithStreamIdleTimeout。
+	streamIdleTimeout time.Duration
 
 	// sdkOptions 只在构造期收集（WithBaseURL 等），NewClient 用完即清空。
 	sdkOptions []option.RequestOption
@@ -153,6 +155,8 @@ func NewClient(apiKey, modelName string, opts ...ClientOption) *Client {
 		thinkingConfig: true,
 		fallbacks:      true,
 		caching:        true,
+
+		streamIdleTimeout: DefaultStreamIdleTimeout,
 	}
 	if c.model == "" {
 		c.model = DefaultModel
@@ -370,7 +374,11 @@ func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ..
 	// 读响应体用一个可单独取消的 ctx：消费方 Close 时取消它，正阻塞在读响应体上的 goroutine 立刻
 	// 返回，连接随之释放。
 	streamCtx, cancel := context.WithCancel(ctx)
-	stream := c.sdk.Beta.Messages.NewStreaming(streamCtx, req.params, req.opts...)
+	reqOpts := req.opts
+	if c.streamIdleTimeout > 0 {
+		reqOpts = append(append([]option.RequestOption(nil), req.opts...), idleMiddleware(c.streamIdleTimeout))
+	}
+	stream := c.sdk.Beta.Messages.NewStreaming(streamCtx, req.params, reqOpts...)
 	// SDK 在 NewStreaming 里就发出了请求：HTTP 层的错误（4xx / 5xx / 网络）此刻已在 Err 上，
 	// 同步返回给调用方，让重试层按状态码与 Retry-After 处理。
 	if err := stream.Err(); err != nil {

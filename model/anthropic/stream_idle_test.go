@@ -51,6 +51,10 @@ func TestStreamIdleTimeout_StalledStreamFails(t *testing.T) {
 	if !errors.Is(err, anthropic.ErrStreamIdleTimeout) {
 		t.Fatalf("停住的流应以 ErrStreamIdleTimeout 结束，got %v", err)
 	}
+	// 共用哨兵：按 model.ErrStreamIdleTimeout 排除空闲超时的重试谓词认得 Claude 的
+	if !errors.Is(err, model.ErrStreamIdleTimeout) {
+		t.Errorf("Claude 的空闲超时应认得成 model.ErrStreamIdleTimeout，got %v", err)
+	}
 	if d := time.Since(start); d > 3*time.Second {
 		t.Errorf("空闲超时 100ms，流过了 %v 才结束", d)
 	}
@@ -118,4 +122,36 @@ func replyEvent(w io.Writer, e sse) {
 		panic(err)
 	}
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.event, raw)
+}
+
+// TestStreamIdleTimeout_AfterMessageStopIsComplete：发完整个流（含 message_stop）之后连接不关（经代理 / 网关时会这样），
+// 空闲超时触发时答复已经完整，照常收尾、不报错。
+func TestStreamIdleTimeout_AfterMessageStopIsComplete(t *testing.T) {
+	srv, _ := newServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		replySSE(w, evMessageStart(nil), evBlockStart(0, map[string]any{"type": "text", "text": ""}),
+			evDelta(0, map[string]any{"type": "text_delta", "text": "好"}), evBlockStop(0),
+			evMessageDelta("end_turn", map[string]any{"output_tokens": 1}), evMessageStop())
+		<-r.Context().Done() // 发完不关
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sr, err := newClient(srv, anthropic.WithStreamIdleTimeout(100*time.Millisecond)).
+		Stream(ctx, []*schema.Message{schema.UserMessage("hi")})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	var content string
+	for {
+		m, err := sr.Recv(ctx)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("收到 message_stop 之后的空闲超时不该当失败，got %v（已收到 %q）", err, content)
+		}
+		content += m.Content
+	}
+	if content != "好" {
+		t.Errorf("答复 = %q，want 好", content)
+	}
 }

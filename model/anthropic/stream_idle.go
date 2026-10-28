@@ -1,27 +1,34 @@
 package anthropic
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/option"
+
+	"crew-go/model"
 )
 
 // DefaultStreamIdleTimeout 是流式响应默认的空闲超时：这么久一个字节都没收到，就当连接已经断了。
 //
-// 只算在等数据的时间：消费方读得慢、流在等消费方取走时不计。Anthropic 排队或长时间思考时发 ping 事件保活，
-// 收到 ping 也算收到数据，所以不另设「只收到心跳、没有内容」的计时器。
+// 只算在等数据的时间：消费方读得慢、流在等消费方取走时不计。收到 ping 事件也算收到数据，所以不另设「只收到心跳、
+// 没有内容」的计时器。
+//
+// 5 分钟够不够长：Anthropic 的 API 文档只说流里可能有 ping、没写间隔；Anthropic 自家的 Claude Code 在直连 API 时，对
+// 「连一个字节都没收到（含 SSE 心跳）」默认 180 秒就判连接已断（code.claude.com 的 Enterprise network configuration
+// 文档，Streaming idle watchdogs 一节），说明直连 API 在长时间思考（thinking 不显示时整段思考没有 thinking_delta）等
+// 静默期会发 ping 保活。这里比它宽。经网关 / 代理时 ping 可能不被转发，那时按需调大或关闭。
 const DefaultStreamIdleTimeout = 5 * time.Minute
 
-// ErrStreamIdleTimeout 表示流式响应超过空闲超时没收到任何数据（见 [WithStreamIdleTimeout]）。
+// ErrStreamIdleTimeout 表示流式响应超过空闲超时没收到任何数据（见 [WithStreamIdleTimeout]）。它就是
+// [model.ErrStreamIdleTimeout]（别名）：一个判据认得所有客户端的空闲超时。
 //
 // 它包在 StatusCode 为 0 的 model.APIError 里、作为流的错误交出（发生在建流之后），可重试：模型调用重试
 // （agent_v2.WithModelRetry）、编排成员重试、节点重试会接住；fallback 只在建流阶段切换候选，不因它换下一个。错误链上
 // 不带 context.DeadlineExceeded——这不是调用方的期限到了。
-var ErrStreamIdleTimeout = errors.New("anthropic: stream idle timeout")
+var ErrStreamIdleTimeout = model.ErrStreamIdleTimeout
 
 // WithStreamIdleTimeout 设流式响应的空闲超时（默认 [DefaultStreamIdleTimeout]）：provider 发了一部分之后停住、既不再发
 // 也不关连接时，超过 d 没收到任何数据就关掉连接，流以 [ErrStreamIdleTimeout] 结束。没有它时只有调用方的 ctx 兜底，

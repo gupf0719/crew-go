@@ -351,3 +351,132 @@ func TestModelRetry_TTFCFromDeliveredAttempt(t *testing.T) {
 		t.Errorf("首片时长=%v 应 ≥ 交付那次尝试首片之前等的 150ms", v.AsFloat64())
 	}
 }
+
+// panicAgentHooks 在 at 指定的业务级回调里 panic（只 panic 第一次，后面照常）。
+type panicAgentHooks struct {
+	hook.NoOpHooks
+	at    string
+	fired atomic.Bool
+}
+
+func (p *panicAgentHooks) boom(where string) {
+	if p.at == where && p.fired.CompareAndSwap(false, true) {
+		panic("业务的 " + where + " 炸了")
+	}
+}
+
+func (p *panicAgentHooks) OnAgentStart(ctx context.Context, _ *hook.AgentInfo, _ *hook.AgentInput) (context.Context, error) {
+	p.boom("OnAgentStart")
+	return ctx, nil
+}
+
+func (p *panicAgentHooks) OnModelStart(ctx context.Context, _ *hook.AgentInfo, _ *schema.ModelInput) (context.Context, error) {
+	p.boom("OnModelStart")
+	return ctx, nil
+}
+
+func (p *panicAgentHooks) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, _ *schema.ModelOutput) (context.Context, error) {
+	p.boom("OnModelEnd")
+	return ctx, nil
+}
+
+func (p *panicAgentHooks) OnToolStart(ctx context.Context, _ *hook.AgentInfo, _ *schema.ToolInput) (context.Context, error) {
+	p.boom("OnToolStart")
+	return ctx, nil
+}
+
+func (p *panicAgentHooks) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, _ *schema.ToolOutput) (context.Context, error) {
+	p.boom("OnToolEnd")
+	return ctx, nil
+}
+
+func (p *panicAgentHooks) OnAgentEnd(ctx context.Context, _ *hook.AgentInfo, _ *hook.AgentOutput) context.Context {
+	p.boom("OnAgentEnd")
+	return ctx
+}
+
+// panicOrchHooks 在 at 指定的编排级回调里 panic（只 panic 第一次）。
+type panicOrchHooks struct {
+	agent_v2.NoOpOrchestrationHooks
+	at    string
+	fired atomic.Bool
+}
+
+func (p *panicOrchHooks) boom(where string) {
+	if p.at == where && p.fired.CompareAndSwap(false, true) {
+		panic("业务的 " + where + " 炸了")
+	}
+}
+
+func (p *panicOrchHooks) OnGraphStart(ctx context.Context) (context.Context, error) {
+	p.boom("OnGraphStart")
+	return ctx, nil
+}
+
+func (p *panicOrchHooks) OnGraphEnd(ctx context.Context, _ error) context.Context {
+	p.boom("OnGraphEnd")
+	return ctx
+}
+
+func (p *panicOrchHooks) OnNodeStart(ctx context.Context, _ string) (context.Context, error) {
+	p.boom("OnNodeStart")
+	return ctx, nil
+}
+
+func (p *panicOrchHooks) OnNodeEnd(ctx context.Context, _ string, _ error) context.Context {
+	p.boom("OnNodeEnd")
+	return ctx
+}
+
+// TestInnerHookPanic_EverySpanEnds：包在 observability 里面的业务钩子在任何一个回调里 panic，框架兜住之后（转成这次调用
+// 的错误，或成功路径上的结束钩子就地兜住），observability 开过的 span 都收尾——开始一侧当场收掉刚开的，结束一侧照样收。
+func TestInnerHookPanic_EverySpanEnds(t *testing.T) {
+	agentPoints := []string{"OnAgentStart", "OnModelStart", "OnModelEnd", "OnToolStart", "OnToolEnd", "OnAgentEnd"}
+	orchPoints := []string{"OnGraphStart", "OnGraphEnd", "OnNodeStart", "OnNodeEnd"}
+	run := func(t *testing.T, ah hook.Hooks, oh agent_v2.OrchestrationHooks) {
+		h := newHarness(t)
+		base := context.Background()
+		if oh != nil {
+			base = agent_v2.WithCtxOrchHooks(base, oh)
+		}
+		opts := []agent_v2.Option{agent_v2.WithName("a"),
+			agent_v2.WithModel(&scriptModel{toolName: "get_weather", toolArgs: `{"city":"北京"}`}),
+			agent_v2.WithToolkit(weatherToolkit(sunny))}
+		if ah != nil {
+			opts = append(opts, agent_v2.WithHooks(ah))
+		}
+		ctx, all := h.obs.Install(base, opts...)
+		_, _ = agent_v2.NewBasicAgent(all...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("查天气"))
+		h.assertAllEnded(t)
+	}
+	for _, at := range agentPoints {
+		t.Run(at, func(t *testing.T) { run(t, &panicAgentHooks{at: at}, nil) })
+	}
+	for _, at := range orchPoints {
+		t.Run(at, func(t *testing.T) { run(t, nil, &panicOrchHooks{at: at}) })
+	}
+}
+
+// TestInnerGraphHookPanic_WorkflowSpanEnds：应用直接跑的图（建 invoke_workflow span 的那种）上，里面的编排钩子在
+// OnGraphStart / OnGraphEnd 里 panic 时，工作流 span 照样收尾。框架对这两处的 panic 由调用方兜住，这里用 recover 模拟。
+func TestInnerGraphHookPanic_WorkflowSpanEnds(t *testing.T) {
+	for _, at := range []string{"OnGraphStart", "OnGraphEnd"} {
+		t.Run(at, func(t *testing.T) {
+			h := newHarness(t)
+			oh := h.obs.OrchHooks(&panicOrchHooks{at: at})
+			ctx := compose_v2.WithGraphNS(context.Background(), "app")
+			func() {
+				defer func() { _ = recover() }() // 框架兜住钩子的 panic
+				c, err := oh.OnGraphStart(ctx)
+				if err != nil {
+					return
+				}
+				oh.OnGraphEnd(c, nil)
+			}()
+			if n := len(h.rec.Started()); n != 1 {
+				t.Fatalf("fixture：应开了一个工作流 span，got %d", n)
+			}
+			h.assertAllEnded(t)
+		})
+	}
+}

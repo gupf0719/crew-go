@@ -1,10 +1,11 @@
 package openai
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"time"
+
+	"crew-go/model"
 )
 
 // DefaultStreamIdleTimeout 是流式响应默认的空闲超时：这么久一个字节都没收到，就当连接已经断了。
@@ -14,12 +15,13 @@ import (
 // 「只收到心跳、没有内容」的计时器。
 const DefaultStreamIdleTimeout = 5 * time.Minute
 
-// ErrStreamIdleTimeout 表示流式响应超过空闲超时没收到任何数据（见 [WithStreamIdleTimeout]）。
+// ErrStreamIdleTimeout 表示流式响应超过空闲超时没收到任何数据（见 [WithStreamIdleTimeout]）。它就是
+// [model.ErrStreamIdleTimeout]（别名）：一个判据认得所有客户端的空闲超时。
 //
 // 它包在 StatusCode 为 0 的 model.APIError 里、作为流的错误交出（发生在建流之后），可重试：编排成员重试、
 // 节点重试（RunWithRetry）会接住，重做整个成员 / 节点；fallback 只在建流阶段切换候选，不因它换下一个。错误链上
 // 不带 context.DeadlineExceeded——这不是调用方的期限到了。
-var ErrStreamIdleTimeout = errors.New("stream idle timeout")
+var ErrStreamIdleTimeout = model.ErrStreamIdleTimeout
 
 // WithStreamIdleTimeout 设流式响应的空闲超时（默认 [DefaultStreamIdleTimeout]）：provider 发了一部分
 // 之后停住、既不再发也不关连接时，超过 d 没收到任何数据就关掉连接，流以 [ErrStreamIdleTimeout] 结束。

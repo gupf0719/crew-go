@@ -14,6 +14,15 @@ import (
 // 的话，一次 429 会立刻再打一遍、不看 Retry-After，配了 fallback 时整条候选链会再走一遍。
 var ErrStreamUnsupported = errors.New("model: streaming not supported")
 
+// ErrStreamIdleTimeout 表示流式响应超过空闲超时没收到任何数据：provider 发了一部分之后停住、既不再发也不关连接。
+// 各客户端的空闲超时都交出它（openai 兼容客户端的 openai.ErrStreamIdleTimeout、Claude 客户端的
+// anthropic.ErrStreamIdleTimeout 都是它的别名），所以 `errors.Is(err, model.ErrStreamIdleTimeout)` 一个判据认得所有
+// 客户端的空闲超时——不想为它重试付费时在 ShouldRetry 里用这个排除。
+//
+// 它包在 StatusCode 为 0 的 [APIError] 里、作为流的错误交出（发生在建流之后），可重试；错误链上不带
+// context.DeadlineExceeded——这不是调用方的期限到了。
+var ErrStreamIdleTimeout = errors.New("model: stream idle timeout")
+
 // ErrContentFiltered 表示 provider 的内容过滤截掉了输出（结束原因是 content_filter，流式与 Generate 都是）。
 //
 // 已经收到的那部分输出不完整，不能当成最终答复。它不可重试（实现 compose_v2.NonRetryable）：
@@ -90,7 +99,8 @@ type APIError struct {
 	StatusCode int
 	// Body 是 HTTP 错误响应体（StatusCode != 0 时填充）。
 	Body string
-	// Err 是底层错误（网络层 / IO 层 / 解析层），StatusCode == 0 时填充，可为 nil。
+	// Err 是底层错误（网络层 / IO 层 / 解析层）。StatusCode == 0 时一定填；HTTP 错误上有的客户端也填（model/anthropic
+	// 放 SDK 的错误），可为 nil。
 	Err error
 
 	// RetryAfter 是服务端 `Retry-After` 响应头解析出的建议等待时长；0 表示服务端
@@ -143,6 +153,8 @@ func (e *APIError) Error() string {
 //
 // 两样并列交出（多分支），不是二选一：有的客户端在 HTTP 错误上也填 Err（model/anthropic 放的是 SDK 的错误），只在
 // Err 为空时才交出计费哨兵的话，同一个计费错误在那样的客户端上认不出——不重试、不切换候选的判据都跟着失效。
+//
+// 多分支的 Unwrap 下 errors.Unwrap(apiErr) 恒为 nil：取底层错误用 errors.Is / errors.As，或直接读 Err 字段。
 func (e *APIError) Unwrap() []error {
 	if e == nil {
 		return nil

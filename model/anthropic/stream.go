@@ -109,7 +109,9 @@ func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, s
 		schema.SendError(sr, err)
 		return
 	}
-	if err := stream.Err(); err != nil {
+	// 收到 message_stop 之后才空闲超时的（经代理 / 网关时发完了却不关连接）：答复已经完整，照常收尾、不当失败——当失败的话
+	// 是可重试的错，配了重试会把一次完整的调用整个重来。别的读错照旧报错。
+	if err := stream.Err(); err != nil && !(stopped && errors.Is(err, ErrStreamIdleTimeout)) {
 		schema.SendError(sr, c.streamFailure(err))
 		return
 	}

@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"fmt"
 
 	"crew-go/agent_v2"
 	"crew-go/hook"
@@ -20,8 +21,9 @@ import (
 //   - 改写之后的值：开始一侧先开 span（父子关系要它），依赖入参内容的属性等里面的钩子跑完再记；结束一侧里面的
 //     钩子先跑、observability 后记。业务钩子可以改写 [消费] 字段（输入消息、工具名与参数、模型输出、工具结果），
 //     span 记的是改写之后、真正交下去 / 被框架用上的那份——业务在钩子里做的 PII 过滤，span 里也是过滤后的。
-//     里面的结束钩子报错时 observability 不在这里收尾：框架随后报 model_end_error / tool_end_error，OnError 以
-//     失败收尾。
+//   - 里面的钩子 panic：结束一侧的收尾放在 defer 里，里面的结束钩子报错、停下或 panic 时照样按这次调用自己的结局
+//     收尾（框架兜住结束钩子的 panic、不改调用的结局，不收的话 span 永远不结束）；开始一侧里面的钩子 panic 时
+//     当场收掉刚开的 span 再原样抛出（框架把它转成这次调用的错误，不会再调结束钩子）。
 
 // wrappedHooks 是 AgentHooks(inner...) 的返回值。
 type wrappedHooks struct {
@@ -31,9 +33,23 @@ type wrappedHooks struct {
 
 var _ hook.Hooks = (*wrappedHooks)(nil)
 
+// abortOnPanic 用在开始一侧的 defer 里：里面的开始钩子 panic 时，按这个 panic 收掉本层刚开的 span，再原样抛出。
+// 框架把开始钩子的 panic 转成这次调用的错误、之后不再调结束钩子，这里不收的话 span 永远不结束。没有 panic 时什么也不做。
+func abortOnPanic(abort func(err error)) {
+	if r := recover(); r != nil {
+		abort(fmt.Errorf("hook panic: %v", r))
+		panic(r)
+	}
+}
+
 func (w *wrappedHooks) OnAgentStart(ctx context.Context, info *hook.AgentInfo, in *hook.AgentInput) (context.Context, error) {
 	o := w.obs.o
 	ctx1, ah := o.startAgent(ctx, info)
+	defer abortOnPanic(func(err error) {
+		if ah != nil {
+			o.endAgent(agent_v2.WithEndError(ctx1, err), info, &hook.AgentOutput{})
+		}
+	})
 	ctx2, err := w.inner.OnAgentStart(ctx1, info, in)
 	if err != nil {
 		// 框架对开始失败的 agent 不再调 OnAgentEnd：按这个错误当场收尾（中断记 blocked 并留挂起记录）。
@@ -56,6 +72,7 @@ func (w *wrappedHooks) OnAgentEnd(ctx context.Context, info *hook.AgentInfo, out
 func (w *wrappedHooks) OnModelStart(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
 	o := w.obs.o
 	ctx1, mh := o.startModel(ctx, info, in)
+	defer abortOnPanic(func(err error) { o.abortLeaf(ctx1, mh, err, "model_start_error") })
 	ctx2, err := w.inner.OnModelStart(ctx1, info, in)
 	if err != nil {
 		o.abortLeaf(ctx1, mh, err, "model_start_error")
@@ -78,12 +95,12 @@ func (w *wrappedHooks) OnModelEndStream(ctx context.Context, info *hook.AgentInf
 	return w.obs.o.keepHandles(ctx1, ctx2), sr2, nil
 }
 
-// OnModelEnd 先让里面的钩子改写，再按改写之后的值收尾。里面的钩子报错（拒掉这份答复、等人、被叫停）时也收尾：模型调用
-// 本身已经完成，按它自己的结局记——用量只在这一遍交来，续跑沿用这份答复的那一遍不带用量、也不再记（见
-// hook.ModelResponseReusedKey），这里不收的话这次调用一次也记不上。
+// OnModelEnd 先让里面的钩子改写，再按改写之后的值收尾（defer）。里面的钩子报错（拒掉这份答复、等人、被叫停）或 panic
+// 时也收尾：模型调用本身已经完成，按它自己的结局记——用量只在这一遍交来，续跑沿用这份答复的那一遍不带用量、也不再记
+// （见 hook.ModelResponseReusedKey），这里不收的话这次调用一次也记不上。
 func (w *wrappedHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
+	defer w.obs.OnModelEnd(ctx, info, out)
 	ret, err := w.inner.OnModelEnd(ctx, info, out)
-	_, _ = w.obs.OnModelEnd(ctx, info, out)
 	if err != nil {
 		return ctx, err
 	}
@@ -93,6 +110,7 @@ func (w *wrappedHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out
 func (w *wrappedHooks) OnToolStart(ctx context.Context, info *hook.AgentInfo, in *schema.ToolInput) (context.Context, error) {
 	o := w.obs.o
 	ctx1, th := o.startTool(ctx, info, in)
+	defer abortOnPanic(func(err error) { o.abortLeaf(ctx1, th, err, "tool_start_error") })
 	ctx2, err := w.inner.OnToolStart(ctx1, info, in)
 	if err != nil {
 		o.abortLeaf(ctx1, th, err, "tool_start_error")
@@ -102,11 +120,11 @@ func (w *wrappedHooks) OnToolStart(ctx context.Context, info *hook.AgentInfo, in
 	return o.keepHandles(ctx1, ctx2), nil
 }
 
-// OnToolEnd 同 OnModelEnd：里面的钩子报错时工具已经执行过，照样按这次调用自己的结局收尾（续跑时它从工具账重放，带
-// agent_v2.ToolReplayedExtraKey，那一次不再记）。
+// OnToolEnd 同 OnModelEnd：里面的钩子报错或 panic 时工具已经执行过，照样按这次调用自己的结局收尾（续跑时它从工具账
+// 重放，带 agent_v2.ToolReplayedExtraKey，那一次不再记）。
 func (w *wrappedHooks) OnToolEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ToolOutput) (context.Context, error) {
+	defer w.obs.OnToolEnd(ctx, info, out)
 	ret, err := w.inner.OnToolEnd(ctx, info, out)
-	_, _ = w.obs.OnToolEnd(ctx, info, out)
 	if err != nil {
 		return ctx, err
 	}
@@ -129,6 +147,11 @@ var _ agent_v2.OrchestrationHooks = (*wrappedOrchHooks)(nil)
 func (w *wrappedOrchHooks) OnGraphStart(ctx context.Context) (context.Context, error) {
 	o := w.obs.o
 	ctx1, gh := o.startGraph(ctx)
+	defer abortOnPanic(func(err error) {
+		if gh != nil {
+			w.obs.OnGraphEnd(ctx1, err)
+		}
+	})
 	ctx2, err := w.inner.OnGraphStart(ctx1)
 	if err != nil {
 		// 框架随后用开始之前的 ctx 调 OnGraphEnd，那里取不到这个 span：当场收尾。
@@ -140,15 +163,20 @@ func (w *wrappedOrchHooks) OnGraphStart(ctx context.Context) (context.Context, e
 	return o.keepHandles(ctx1, ctx2), nil
 }
 
+// OnGraphEnd 先让里面的钩子跑，再收尾（defer）：里面的钩子 panic 时框架兜住、不改结局，span 照样收尾。
 func (w *wrappedOrchHooks) OnGraphEnd(ctx context.Context, err error) context.Context {
-	ret := w.inner.OnGraphEnd(ctx, err)
-	w.obs.OnGraphEnd(ctx, err)
-	return ret
+	defer w.obs.OnGraphEnd(ctx, err)
+	return w.inner.OnGraphEnd(ctx, err)
 }
 
 func (w *wrappedOrchHooks) OnNodeStart(ctx context.Context, nodeID string) (context.Context, error) {
 	o := w.obs.o
 	ctx1, nh := o.startNode(ctx, nodeID)
+	defer abortOnPanic(func(err error) {
+		if nh != nil {
+			w.obs.OnNodeEnd(ctx1, nodeID, err)
+		}
+	})
 	ctx2, err := w.inner.OnNodeStart(ctx1, nodeID)
 	if err != nil {
 		if nh != nil {
@@ -159,10 +187,10 @@ func (w *wrappedOrchHooks) OnNodeStart(ctx context.Context, nodeID string) (cont
 	return o.keepHandles(ctx1, ctx2), nil
 }
 
+// OnNodeEnd 同 OnGraphEnd：里面的钩子 panic 时节点 span 照样收尾。
 func (w *wrappedOrchHooks) OnNodeEnd(ctx context.Context, nodeID string, err error) context.Context {
-	ret := w.inner.OnNodeEnd(ctx, nodeID, err)
-	w.obs.OnNodeEnd(ctx, nodeID, err)
-	return ret
+	defer w.obs.OnNodeEnd(ctx, nodeID, err)
+	return w.inner.OnNodeEnd(ctx, nodeID, err)
 }
 
 func (w *wrappedOrchHooks) OnNodeEvent(ctx context.Context, nodeID string, ev agent_v2.Event) context.Context {

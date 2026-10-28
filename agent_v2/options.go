@@ -538,7 +538,7 @@ func WithToolTimeout(d time.Duration) Option {
 // WithModelRetry 设一次模型调用失败时整次重来的策略（默认不重试）。
 //
 // 重试的单位是**一次模型调用**：同一份输入再调一次，建流之前的错（5xx、限流、网络）与流开始之后的错（连接中途断开、
-// 流里的错误帧、`openai.ErrStreamIdleTimeout`）一样处理。整次重来是安全的：一次调用就是一条完整的消息，工具要等模型
+// 流里的错误帧、空闲超时 `model.ErrStreamIdleTimeout`）一样处理。整次重来是安全的：一次调用就是一条完整的消息，工具要等模型
 // 节点结束才执行，流中途出错时没有本地副作用；失败那次已交出的片段在失败那一刻撤回（`reset_stream` 事件，agui 另发
 // AG-UI 标准的 MESSAGES_SNAPSHOT），会话历史与存档只收成功那次的消息。
 //
@@ -549,7 +549,7 @@ func WithToolTimeout(d time.Duration) Option {
 //
 // 代价：重来要重发整份 prompt（命中 provider 的前缀缓存时按缓存价计），前一次已生成、被作废的输出白付；空闲超时时
 // 服务端可能还在生成，断开之后停不停、怎么计费各家没有官方说法。不想为某类错付这笔钱就在 ShouldRetry 里排除它，
-// 例如 `!errors.Is(err, openai.ErrStreamIdleTimeout)`。
+// 例如 `!errors.Is(err, model.ErrStreamIdleTimeout)`（认得所有客户端的空闲超时）。
 //
 // 只对会自己恢复的错误重试：`compose_v2.SimpleRetry(n)` / `ExponentialBackoff(...)` 带的默认谓词
 // [compose_v2.IsRetryable] 排除确定性的 HTTP 失败（400 / 401 / 403 / 404 / 422）与声明了不可重试的错误（内容过滤、

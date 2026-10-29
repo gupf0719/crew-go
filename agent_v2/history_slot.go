@@ -78,6 +78,7 @@ import (
 	"log/slog"
 	"reflect"
 	"sync/atomic"
+	"time"
 
 	"crew-go/compose_v2"
 	"crew-go/schema"
@@ -317,6 +318,39 @@ func settleHistoryTopLevel(ctx context.Context, agentName string, input, final *
 	settleHistoryAt(ctx, agentName, agentName, gateInputRecorded, input, final)
 }
 
+// deferRootInput 让顶层执行体（GraphAgent）这次 Run 的原始输入排在这次 Run 写进历史的第一批记录前面。
+//
+// 出口才结算的话，图里经 RunSubAgent 调起的子 agent 在执行中记下的问答排在用户那句话之前（探针实测）。也不能在入口
+// 直接记：节点常把这条输入原样交给子 agent（转发），子 agent 的视图只看自己名下的记录，它要自己持有这一问才完整，入口
+// 先记一份的话同一句话就记成两份。所以登记成「待补」，由写入器在下一批记录入队时决定（见 historyWriter.submit）：
+// 这条输入已经记过（那一批就是子 agent 记它）⟹ 不补；否则先补它、再写那一批。整个 Run 一批都没有时出口照旧结算。
+//
+// 门槛跟出口那次结算的输入那条相同：user 角色、不是派生输入、这条流里跨 Run 没记过；这次 Run 里已经记过（OnAgentStart 钩子
+// 里起的调用把它原样交给了会记历史的 agent）也不登记——那时记下它的调用已经跑完、已经入队。入口判过的这条，出口结算不再读
+// 一次历史（rootVetted）。
+//
+// 份数由第一批是谁的决定：被转发的子 agent 记下这条输入之前已经有别的记录入队（委派在先、它自己的钩子先起了子调用、
+// 并发扇出里委派的分支先写）时，补一份归顶层，转发的那个子 agent 再记自己的一份（每条流各自完整，同 SelfOnly 扇出各记
+// 一份）；用户那句话都排在图执行写下的第一批之前（OnAgentStart 钩子里起的调用写的排在它前面）。待补只覆盖图执行那一段：图
+// 跑完之后（含业务的输出读取器 panic、OnAgentEnd 钩子里起的调用）写的不再带出它（endRootInputWindow），记不记交给出口结算，
+// 终局失败不记。
+func deferRootInput(ctx context.Context, agentName string, input *schema.Message) {
+	w := historyWriterFrom(ctx)
+	if w == nil || historySuppressed(ctx) || agentName == "" || input == nil ||
+		input.Role != schema.RoleUser || isDerivedInput(input) || recordedInThisRun(ctx, input) ||
+		inputAlreadyInHistorySlot(ctx, agentName, input) {
+		return
+	}
+	w.deferRoot(input, w.stamp(input, historyOwner(ctx, agentName), agentName), agentName)
+}
+
+// endRootInputWindow 在顶层 GraphAgent 的图跑完时调：还没补的原始输入收回，交给出口结算（见 deferRootInput）。
+func endRootInputWindow(ctx context.Context) {
+	if w := historyWriterFrom(ctx); w != nil {
+		w.dropPendingRoot()
+	}
+}
+
 // inputGate 决定输入那条问哪个问题——两个调用方的**前提不同**，用同一个问题会错一个。
 type inputGate int
 
@@ -354,11 +388,19 @@ func settleHistoryAt(ctx context.Context, slot, agentName string, gate inputGate
 		}
 		return producedHistoryHere(ctx)
 	}
+	// 跨 Run 有没有在这条流里记过：顶层入口已经按同一条判过的（deferRootInput）不再读一次历史——这次 Run 里补没补、
+	// 记没记都在写入器的登记表上，上面那条已经问过
+	recordedBefore := func() bool {
+		if gate == gateInputRecorded && w.rootVetted(input) {
+			return false
+		}
+		return inputAlreadyInHistorySlot(ctx, slot, input)
+	}
 
 	// 认领放在**最后一个条件**：抢到就一定会记，不会登记了却没写。
 	var msgs []*schema.Message
 	if input != nil && input.Role == schema.RoleUser && !isDerivedInput(input) &&
-		!inputTakenCareOf() && !inputAlreadyInHistorySlot(ctx, slot, input) &&
+		!inputTakenCareOf() && !recordedBefore() &&
 		w.claimRecordHere(slot, input) {
 		msgs = append(msgs, input)
 	}
@@ -716,14 +758,21 @@ func resolveHistoryConfigForAbort(ctx context.Context, subs []Agent) *historyCon
 // 任务的 RunID）——任务挂着期间同一会话里别的任务写了多少都不用翻过去。补上的结果盖上声明它的那条
 // assistant 的归属与任务章：归属对上了，那个 agent 的视图里配对才是完整的。
 func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, agentName, task string) {
+	if task == "" {
+		return
+	}
 	if hc == nil || hc.store == nil {
 		return
 	}
-	key := HistoryKey{Owner: hc.resolveOwner(ctx), ConvID: compose_v2.GetThreadID(ctx)}
-	if key.Owner == "" || key.ConvID == "" {
+	closeUnansweredToolCalls(ctx, hc.store, HistoryKey{Owner: hc.resolveOwner(ctx), ConvID: compose_v2.GetThreadID(ctx)}, agentName, task)
+}
+
+// closeUnansweredToolCalls 是 closeUnansweredToolCallsOnAbort 的本体：在 store 的 key 那场对话里给任务 task 没有结果的工具调用补一条。
+func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key HistoryKey, agentName, task string) {
+	if task == "" || store == nil || key.Owner == "" || key.ConvID == "" {
 		return
 	}
-	src := historySource{store: hc.store, key: key, task: task}
+	src := historySource{store: store, key: key, task: task}
 	var msgs []*schema.Message // 新 → 旧
 	err := src.scanBackward(ctx, HistoryQuery{Task: task}, historyPageMin, true, func(m *schema.Message) bool {
 		msgs = append(msgs, m)
@@ -740,8 +789,10 @@ func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, age
 
 	answered := make(map[string]bool)
 	for _, m := range msgs {
-		if id := schema.GetToolResultID(m); id != "" {
-			answered[id] = true
+		for _, id := range toolResultIDs(m) { // 一条消息带几个结果块就答了几个调用
+			if id != "" {
+				answered[id] = true
+			}
 		}
 	}
 	var closers []*schema.Message
@@ -753,7 +804,7 @@ func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, age
 			}
 			answered[tc.ID] = true // 同一个 id 只补一次
 			closer := schema.ToolResultMessage(tc.ID,
-				"任务已被放弃（调用方 Abort），此工具调用没有结果")
+				"任务已被放弃，此工具调用没有结果")
 			owner, _ := m.Annotations[HistoryAgentAnnotation].(string)
 			display, _ := m.Annotations[HistoryAgentDisplayAnnotation].(string)
 			closers = append(closers, stampHistoryAgent(closer, owner, display, task))
@@ -762,8 +813,79 @@ func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, age
 	if len(closers) == 0 {
 		return
 	}
-	if err := hc.store.Append(ctx, key, closers); err != nil {
+	if err := store.Append(ctx, key, closers); err != nil {
 		slog.WarnContext(ctx, "agent_v2: abort 收尾补记失败，历史里留着悬空 tool_call",
 			"agent", agentName, "key", key.String(), "count", len(closers), "err", err)
+	}
+}
+
+// checkAbandonedTasks 校验 [WithAbandonedTasks] 给的任务。各编排的 Run 入口在解析完 session 之后、建历史写入器与盖任务章之前
+// 调：拒绝时什么都还没做（调用方前文也还没写），顶层的拒绝也就不带 ErrRunAborted（见 rejectCall）。
+//
+// 在哪儿给都行（顶层的 Run、顶层的自研壳经 EnterRun 透传的、节点或钩子里经 RunSubAgent 透传的）：收尾删的是被放弃任务的整份
+// 存档，不看这次调用所在的 ns（见 abandonTasksAtEntry），所以不需要判这次调用在不在嵌套位置。曾经判过两版、各被审计实测出一个
+// 反例：按「ctx 上有没有任务章」判时，顶层 EnterRun 壳的透传被当成嵌套拒掉（agui 工厂返回这种壳时每次顶掉挂起都报错）；按
+// 「在不在节点执行里」判时，顶层 agent 级钩子里经 RunSubAgent 透传的被放行、删档却用了子 ns，存档原样留着、历史里补了「被放弃」。
+//
+// 只拒被放弃的任务此刻还在执行的情形（它的调用还会有结果，补的「被放弃」排在真结果前面；删档会删掉它正在用的存档——都是审计
+// 实测）：这次 Run 自己的任务（嵌套位置上就是所在的任务——被调方的 session 属于它）、脱离出来之前所在的仍在执行的任务、本进程里
+// 此刻有执行在跑的任务（compose_v2.TaskExecuting：在节点里换了 sid 跑一张嵌套图、从那里透传这个选项时，所在任务的身份被盖掉了，
+// 前两条都认不出它，审计实测）；空 ID。别的进程里在跑的认不出。
+func checkAbandonedTasks(ctx context.Context, ids []string, session *RunSession, agentName string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	for _, id := range ids {
+		if id == "" || id == session.RunID {
+			return rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——放弃的是这次 Run 之前的任务，不能是空的，"+
+				"也不能是这次 Run 自己的任务（RunID %q）", agentName, id, session.RunID)
+		}
+		if detachedFromRunning(ctx, id) {
+			return rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——它是脱离出来之前所在的任务，此刻正在执行，不能放弃",
+				agentName, id)
+		}
+		if compose_v2.TaskExecuting(id) {
+			return rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——这个任务此刻正在执行，不能放弃", agentName, id)
+		}
+	}
+	return nil
+}
+
+// abandonEntryTimeout 是入口收尾被放弃的任务时，存储调用（补结果、删存档）一共最多等多久。这一步排在这次 Run 的一切之前，
+// 后端挂住时不该拖住整个请求（agui 每次覆盖挂起都走这里）；到点同删档失败，告警、照常开这次 Run。
+var abandonEntryTimeout = 10 * time.Second
+
+// abandonTasksAtEntry 给 [WithAbandonedTasks] 声明放弃的任务收尾（ids 已经过 checkAbandonedTasks）：在 Run 入口、盖完任务章之后，
+// 记这次的输入与触发钩子之前调。补结果写进这次 Run 正在用的那场对话（ctx 上的历史写入器：顶层是这次入口刚建的，嵌套时是父层的
+// ——被调方的历史本来就沿用它；只按被调方自己的配置找时，它没配历史就不补，审计实测）；没有写入器（没配历史、声明了不进历史）
+// 时不补。收尾是尽力而为、有上限（abandonEntryTimeout）：失败只记日志——历史是旁路，放弃一个旧任务不该让这次
+// Run 失败。先删档、删成功（或没配 checkpointer）才补结果，同 Resume 的放弃分支：「历史里写了被放弃」要推得出「档已删」，
+// 反过来档删了、补结果失败只留下悬空的调用，读侧兜得住（审计实测：共用预算在补完结果、删档之间到点时，任务还能续，续跑的
+// 真结果排在「被放弃」之后）。
+func abandonTasksAtEntry(ctx context.Context, ids []string, agentName string) {
+	if len(ids) == 0 {
+		return
+	}
+	sctx, cancel := context.WithTimeout(ctx, abandonEntryTimeout)
+	defer cancel()
+	w := historyWriterFrom(ctx)
+	cper := compose_v2.GetCheckpointer(ctx)
+	// 删被放弃任务的根：RunID 就是任务的身份、也是存档的主索引，它名下的存档整份属于它。不用这次调用所在的 ns——嵌套位置上
+	// （钩子或节点里经 RunSubAgent 透传这个选项）那是子 ns，删不到它的根档（审计实测）。
+	const ns = ""
+	for _, id := range ids {
+		if cper != nil {
+			start := time.Now()
+			n, err := cper.DeleteSubtree(sctx, id, ns)
+			compose_v2.EmitCpCleanupHelper(ctx, id, ns, "abandoned", n, time.Since(start).Milliseconds(), err)
+			if err != nil {
+				slog.WarnContext(ctx, "agent_v2: 放弃任务时删存档失败（存档可能还在、任务还能续），悬空的工具调用不补",
+					"agent", agentName, "task", id, "ns", ns, "err", err)
+				continue
+			}
+		}
+		if w != nil {
+			closeUnansweredToolCalls(sctx, w.store, w.key, agentName, id)
+		}
 	}
 }

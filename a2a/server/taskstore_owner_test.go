@@ -144,17 +144,18 @@ func TestOwnerScopedStore_UnstampedTaskIsRejected(t *testing.T) {
 	}
 }
 
-// TestOwnerScopedStore_CheckAccessLetsMissingThrough 钉住 CheckAccess 对**不存在**的
-// taskID 放行。
+// TestOwnerScopedStore_CheckAccessDeniesMissing 钉住 CheckAccess 对 store 里**没有**的 taskID 拒，跟「不是你的」同一个哨兵。
 //
-// 抢答会让「不是你的」和「不存在」在 wire 上分成两种错——那个区别本身就是存在性预言机。
-func TestOwnerScopedStore_CheckAccessLetsMissingThrough(t *testing.T) {
+// 「没有就放行、让下游报」不成立：内层 store 可能把「不是你的」也报成没有（a2a-go 的内存 store 自 v2.7.0 起照规范这么伪装），
+// 而 tasks/resubscribe 的下游不查 store——放行时租户 B 订到了 A 在途的实时输出（`TestCrossTenant_Resubscribe_CrossTenant`）。
+// 两种拒绝在 wire 上分不出来由 `TestCrossTenant_NoExistenceOracle` 钉。
+func TestOwnerScopedStore_CheckAccessDeniesMissing(t *testing.T) {
 	st := newOwnerScopedTaskStore(taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
 		Authenticator: func(context.Context) (string, error) { return "svc", nil },
 	}))
 	ctx := compose_v2.WithOwner(context.Background(), "tenant-A")
-	if err := st.CheckAccess(ctx, "never-existed"); err != nil {
-		t.Errorf("对不存在的 taskID 抢答了：%v", err)
+	if err := st.CheckAccess(ctx, "never-existed"); !errors.Is(err, a2atypes.ErrTaskNotFound) {
+		t.Errorf("store 里没有的 taskID 应拒（ErrTaskNotFound），实际 %v", err)
 	}
 	// 对照：存在但不是你的 → 拒。
 	if _, err := st.Create(compose_v2.WithOwner(context.Background(), "tenant-B"),
@@ -483,9 +484,7 @@ func (partitionedListStub) PartitionsByOwner() bool { return true }
 // fixture 上恒真（PageSize 必须小于 B 的条数，这条 conformance 里踩过）。
 func TestDefaultAssembly_TotalSizeNotDegraded(t *testing.T) {
 	inner := declaredPartitioned{taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
-		Authenticator: func(ctx context.Context) (string, error) {
-			return compose_v2.GetOwner(ctx), nil
-		},
+		Authenticator: ownerPartitionAuthenticator, // 跟默认装配同一个（曾经这里另写一个，测不到生产装配的分区撞车）
 	})}
 	st := newOwnerScopedTaskStore(inner)
 	ctxB := compose_v2.WithOwner(context.Background(), "tenant-B")

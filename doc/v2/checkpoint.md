@@ -508,6 +508,12 @@ DetachTask 连会话 ID 与软取消信号一起剥。入口拒绝恒不可重�
 由框架填（`g.ID()`），`SaveNS` 检测到不一致返 `ErrGraphIDConflict` fail-fast。确需换 graph 用
 `WithFreshRun()`。
 
+`g.ID()` 三档：`WithName` 给的名字；`WithIdentityPrefix` 给的前缀 + `:` + 结构指纹；都没给时只有结构指纹（节点 ID 与
+channel 名 + 类型的哈希，不含节点函数与边）。9 个编排用名字；BasicAgent 显式给了名字（`agent_v2.WithName`）时用第二档，
+没给时用第三档——自动名每次构造都变，带上它的话每个请求重建 agent 的调用方续不上自己的档。第二档同时挡两件事：结构相同、
+名字不同的两个 BasicAgent 进了同一个槽（经 `EnterRun` 进入的壳在自己的阶段里裸调），同名的 agent 改了配置、图的结构变了。
+代价是改名之后还挂着的旧任务续不上，载入时报冲突。
+
 判冲突以存档里最新那份 GraphID 为准：存档的与本次的都非空且不同才冲突，这份档不动；否则整份
 替换，GraphID 跟着换（换成空也照换）。Run / Resume 入口的 fail-fast 读的也是这一份，所以两边对
 同一份档给出同一个答案。判定与写入是一个原子步骤：两个带不同 GraphID 的写入同时打同一

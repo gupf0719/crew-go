@@ -24,8 +24,11 @@ func Card(agent agent_v2.Agent, baseURL string) *a2atypes.AgentCard {
 		SupportedInterfaces: []*a2atypes.AgentInterface{
 			a2atypes.NewAgentInterface(baseURL+"/invoke", a2atypes.TransportProtocolJSONRPC),
 		},
-		DefaultInputModes:  []string{"text"},
-		DefaultOutputModes: []string{"text"},
+		// 输入输出模式是媒体类型（规范：inputModes / outputModes 是 MIME 类型）：收文本与按 interruptId 作答的数据部分，
+		// 发文本与挂起清单的数据部分（见 a2a/pending.go）。自拼栈挂 a2asrv.NewAgentCardEnforcer(card) 时按它校验每条消息
+		// 的每个部分（文本推断为 text/plain、数据部分为 application/json）——曾经写的 "text" 一条也匹配不上。
+		DefaultInputModes:  []string{"text/plain", "application/json"},
+		DefaultOutputModes: []string{"text/plain", "application/json"},
 		Capabilities:       a2atypes.AgentCapabilities{Streaming: true},
 		Skills:             []a2atypes.AgentSkill{}, // A2A 1.0 schema 要求 skills 为数组（非 null）
 	}
@@ -54,7 +57,7 @@ func Handler(agent agent_v2.Agent, baseURL string, opts ...ExecutorOption) http.
 	// 同时挂 /invoke 与 /invoke/：Go ServeMux 精确匹配，客户端带尾斜杠（官方 a2a-tck 即如此）
 	// 命中不到会 404，body 非 JSON 令对端解析失败。两路径共用同一 handler。
 	exec := NewExecutor(agent, opts...)
-	// task store 包一层归属检查——**SDK 的 Get / Update 不做**，而 `tasks/get` 这个协议
+	// task store 包一层归属检查——业务经 WithTaskStore 换的后端未必做，而 `tasks/get` 这个协议
 	// 方法直接走 handler → taskStore.Get → 返回完整 Task 含 History，整条路不经过
 	// AgentExecutor，我们在那层的分区拦不住它。实测过：租户 B 拿 A 的 taskId 调
 	// tasks/get，读到 A 的原始请求和 agent 向 A 提的问题。见 ownerScopedTaskStore。
@@ -68,7 +71,7 @@ func Handler(agent agent_v2.Agent, baseURL string, opts ...ExecutorOption) http.
 		// per-owner TotalSize 降级成本页条数。实测：B 有 12 条、pageSize=5 时默认装配
 		// 给 5，裸后端给 12。
 		inner = declaredPartitioned{taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
-			Authenticator: a2asrv.NewTaskStoreAuthenticator(),
+			Authenticator: ownerPartitionAuthenticator, // 按 owner 分区，见其注释
 		})}
 	}
 	store := newOwnerScopedTaskStore(inner)

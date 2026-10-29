@@ -125,7 +125,8 @@ type CpCleanupAction struct {
 	SessionID string `json:"session_id"`
 	// NS 清的 graphNS prefix.
 	NS string `json:"ns"`
-	// Reason 清理动因: "success" (Run 干净跑完) / "abort" (终局失败, ErrRunAborted).
+	// Reason 清理动因: "success" (Run 干净跑完) / "abort" (终局失败, ErrRunAborted) / "resume_abort" (业务
+	// WithResumeAction(Abort) 弃单) / "abandoned" (agent_v2.WithAbandonedTasks 在下一次 Run 的入口放弃).
 	// 两者语义一致 ("这个 sid 的活干完了、cp 不该留"), 只是结论不同 — 业务订阅可据此区分.
 	//
 	// **是类型化字段不是 Metadata map key**: Event.Metadata 的 key 只有 graph_ns 有
@@ -177,7 +178,7 @@ func isEmitCpEventCtx(ctx context.Context) bool {
 // 散文，所以这里不写数：调用点集合由 TestDeleteSubtree_CallSitesAccountedFor 机械
 // 对账，那张表钉的是 DeleteSubtree 本身。
 //
-// reason 填 "success" / "abort" — caller 知道自己在哪条路径上, 见 CpCleanupAction.Reason.
+// reason 填 "success" / "abort" / "resume_abort" / "abandoned" — caller 知道自己在哪条路径上, 见 CpCleanupAction.Reason.
 //
 // **不守 opt-in**: caller 责任先判. 走 EmitCpEvent 内 ctx 双守 (flag + sink).
 //

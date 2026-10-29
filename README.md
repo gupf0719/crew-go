@@ -99,5 +99,5 @@ schema ← model / tool / hook / skill / mcp / prompt / store ← compose_v2 ←
 
 ## 环境要求
 
-- Go 1.25+（`go.mod` 声明 `go 1.25.0`）
+- Go 1.26+（`go.mod` 声明 `go 1.26.0`；依赖的 a2a-go v2.7.0 要求）
 - A2A ZooKeeper binding（`a2a/zk`）/ Redis（`redis`）/ SQL（`sql`）是独立 go module，按需引入

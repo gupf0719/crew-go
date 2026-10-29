@@ -3,6 +3,7 @@ package compose_v2
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 
 	"crew-go/internal/panicerr"
 )
@@ -20,13 +21,15 @@ import (
 // **panic 语义**：业务钩子 panic 由框架兜住（分工见 `panic_recovery.go`），不让 Run goroutine 崩。
 // 兜住之后怎么处置，看钩子跑在它报告的那段工作之前还是之后：
 //   - OnGraphStart / OnNodeStart 在工作之前：panic 转成这次 Run / 这个节点的错误（同返回 error）。
-//   - OnNodeEnd / OnGraphEnd 在工作之后：节点体（图）失败时 panic 转成那个节点（这次 Run）的错误；
-//     成功时就地兜住、带栈记一条 ERROR，结果与写入照常提交。
+//   - OnNodeEnd / OnGraphEnd 在工作之后：panic 就地兜住、带栈记一条 ERROR，结局不变——成功时结果与写入照常提交，
+//     失败时照旧交出原来那个错误（中断照样是中断、终局失败照样终局）。
 //   - OnNodeEvent 只作观测：任何时候 panic 都就地兜住、记 ERROR（节点里发的事件、Run 级的存档事件都是）。
 //
-// 理由是钩子出错不得让已经做完的工作再做一次：成功之后的钩子 panic 曾经一律转成错误，失败档被续跑或重试
-// 捡起，已经做完的节点体重跑、副作用重放（实测同一个节点体跑 3～4 次）。一个钩子 panic 时，链里排在它
-// 后面的钩子不再调（[ChainOrchHooks] 不逐个隔离）。
+// 理由是钩子出错不得让已经做完的工作再做一次、不得改掉已经定下的结局：成功之后的钩子 panic 曾经一律转成错误，失败档
+// 被续跑或重试捡起，已经做完的节点体重跑、副作用重放（实测同一个节点体跑 3～4 次）；失败之后的 OnNodeEnd panic 曾经
+// 把原来的错误整个换掉，节点体问的问题认不出来、终局失败被当成可重试（实测）。一个钩子 panic 时，[ChainOrchHooks] 里
+// OnGraphStart / OnNodeStart 排在它后面的不再调；OnNodeEnd / OnGraphEnd / OnNodeEvent 每个钩子都调到、调完再抛出第一个
+// panic——End 钩子能做上行信号决定，就地兜住的话排在后面的决定静默没做成、调用点又按成功收尾。
 //
 // **ctx-based 协议** (audit² 改): 每个 hook 方法返 context.Context, 入参 ctx 也
 // 由 hook 方法接收. framework 内自动 propagate 给下游 (下一个
@@ -114,7 +117,8 @@ func (NoOpOrchestrationHooks) OnNodeEvent(ctx context.Context, _ NodeID, _ Event
 // ChainOrchHooks 把多个 OrchestrationHooks 串成一个——业务想同时挂 SSE 适配 +
 // audit 日志 + metrics 等多 hook 时用。对齐 hook.ChainHooks 设计.
 //
-// **panic 语义**：链里每个钩子直接调、不逐个隔离——一个钩子 panic 时排在它后面的不再调，panic 交给
+// **panic 语义**：不逐个隔离。OnGraphStart / OnNodeStart 一个钩子 panic 时排在它后面的不再调（返回的 ctx 往后流，panic 的
+// 那个交不出 ctx）；OnNodeEnd / OnGraphEnd / OnNodeEvent 每个钩子都调到、调完再抛出第一个 panic（带它当初的栈）。panic 交给
 // 调用这条链的地方处置（转成错误还是就地兜住记日志，见 [OrchestrationHooks]「panic 语义」）。
 //
 // 用法:
@@ -161,10 +165,13 @@ func (c *ChainOrchHooks) OnGraphStart(ctx context.Context, chs Channels) (contex
 	return ctx, nil
 }
 
+// OnGraphEnd 每个钩子都调到：一个 panic 时接着调后面的，调完再把第一个 panic 抛给调用点（见 panicerr.CallEach）。End 钩子
+// 返回的 ctx 不往后流，跑完整条链没有 ctx 链断开的代价；曾经 panic 在前时后面的钩子静默跳过，它在 End 钩子里做的决定没做成、
+// 调用点又按成功收尾（审计实测）。
 func (c *ChainOrchHooks) OnGraphEnd(ctx context.Context, chs Channels, runErr error) context.Context {
-	for _, h := range c.hooks {
-		ctx = h.OnGraphEnd(ctx, chs, runErr)
-	}
+	panicerr.CallEach(ctx, len(c.hooks), func(i int) {
+		ctx = c.hooks[i].OnGraphEnd(ctx, chs, runErr)
+	})
 	return ctx
 }
 
@@ -181,20 +188,23 @@ func (c *ChainOrchHooks) OnNodeStart(ctx context.Context, id NodeID, chs Channel
 	return ctx, nil
 }
 
+// OnNodeEnd 每个钩子都调到，同 OnGraphEnd。
 func (c *ChainOrchHooks) OnNodeEnd(ctx context.Context, id NodeID, chs Channels, nodeErr error) context.Context {
-	for _, h := range c.hooks {
-		ctx = h.OnNodeEnd(ctx, id, chs, nodeErr)
-	}
+	panicerr.CallEach(ctx, len(c.hooks), func(i int) {
+		ctx = c.hooks[i].OnNodeEnd(ctx, id, chs, nodeErr)
+	})
 	return ctx
 }
 
 // OnNodeEvent 依次交给链里每个钩子，每个拿到的都摘掉了收信号处（OnNodeEvent 只作观测，见接口）。前一个钩子
 // 返回的 ctx 照常交给后一个，但前一个返回的可能是别处存下的 ctx（比如它在 OnNodeStart 存的、带着节点的收信号
 // 处）——曾经原样交下去，后一个钩子在里面做的决定照样交到了调用方（审计实测）。
+//
+// 每个钩子都调到，同 OnGraphEnd：一个观测钩子在某个片段上 panic，排在它后面的（前端适配层）照样收到这个片段。
 func (c *ChainOrchHooks) OnNodeEvent(ctx context.Context, id NodeID, ev Event) context.Context {
-	for _, h := range c.hooks {
-		ctx = h.OnNodeEvent(eventHookCtx(ctx), id, ev)
-	}
+	panicerr.CallEach(ctx, len(c.hooks), func(i int) {
+		ctx = c.hooks[i].OnNodeEvent(eventHookCtx(ctx), id, ev)
+	})
 	return ctx
 }
 
@@ -270,6 +280,8 @@ type nodeEventSink struct {
 	hooks   OrchestrationHooks
 	nodeID  NodeID
 	graphNS string // 节点入口时 ctx 内 graphNS 快照——避免每次 Send 走 ctx.Value lookup
+	// panics 是经这个 sink 投递时 OnNodeEvent 钩子 panic 的次数（Send 可能被并发调用）
+	panics atomic.Int64
 }
 
 func (s *nodeEventSink) Send(ev Event) {
@@ -297,13 +309,32 @@ func (s *nodeEventSink) Send(ev Event) {
 	// OnNodeEvent 只作观测：它 panic 时就地兜住、带栈记一条 ERROR，Send 照常返回、节点体接着跑。转成节点的错误的话
 	// 节点体在这里中途失败，失败档被续跑或重试捡起，Send 之前已经做过的副作用重放（实测）。
 	// EventSink.Send 是 fire-and-forget 不收 ctx (业务 NodeFunc 已持 ctx).
+	//
+	// 同一个 sink（一次节点执行）上只在第 1、10、100、1000… 次 panic 时各记一条：钩子的确定性 bug 会在每个流式片段上
+	// 都 panic，逐条记的话一次模型调用就是上千条带栈的 ERROR（实测 2000 个片段 2000 条）。
 	defer func() {
 		if r := recover(); r != nil {
-			panicerr.Log(s.ctx, slog.LevelError, "compose_v2: OnNodeEvent 钩子 panic（这个事件没投递完，节点照常往下跑）", panicerr.New(r),
-				"node", s.nodeID, "event_type", ev.Type)
+			n := s.panics.Add(1)
+			if !isPowerOfTen(n) {
+				return
+			}
+			msg := "compose_v2: OnNodeEvent 钩子 panic（这个事件没投递完，节点照常往下跑；同一次节点执行里之后再 panic 只在第 10、100、1000… 次各记一条）"
+			if n > 1 {
+				msg = "compose_v2: OnNodeEvent 钩子又 panic（这个事件没投递完，节点照常往下跑）"
+			}
+			panicerr.Log(s.ctx, slog.LevelError, msg, panicerr.New(r),
+				"node", s.nodeID, "event_type", ev.Type, "panic_count", n)
 		}
 	}()
 	_ = s.hooks.OnNodeEvent(s.ctx, s.nodeID, ev)
+}
+
+// isPowerOfTen 判 n 是不是 1、10、100……
+func isPowerOfTen(n int64) bool {
+	for n >= 10 && n%10 == 0 {
+		n /= 10
+	}
+	return n == 1
 }
 
 // ── RunOption 集成 ──

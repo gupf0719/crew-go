@@ -17,9 +17,9 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 )
 
-// ---- CallInterceptor：注入默认 User + 校验 A2A-Version ----
+// ---- CallInterceptor：注入默认 User + 归属检查 ----
 
-// conformanceInterceptor 补齐 A2A server 端两处 1.0 合规行为——SDK 提供机制、需业务接（不接则
+// conformanceInterceptor 补齐 A2A server 端的 1.0 合规行为——SDK 提供机制、需业务接（不接则
 // 缺省行为不合规）：
 //
 //  1. 注入已认证 User：SDK 的 taskstore 按 User 隔离（ListTasks 只返当前 User 的 task），
@@ -28,8 +28,9 @@ import (
 //     taskstore 的分区跟我们自己那张表按同一维切（曾经写死 "default"，把所有调用方压成
 //     同一个 owner，SDK 的分区形同虚设）。resolver 返空（匿名）时回落 "default" 保持
 //     SDK 侧「必须有 User」的要求。业务可再叠自己的 CallInterceptor 覆盖。
-//  2. 校验 A2A-Version：客户端 A2A-Version header 与本 server 协议版本不符时返
-//     ErrVersionNotSupported（SDK server 端无内建版本校验，走 CallInterceptor 机制补）。
+//
+// A2A-Version 的校验不在这里：SDK 自 v2.7.0 起在调拦截器之前对每个方法校验，不带这个头按 0.3 处理（规范
+// §3.6.2，a2a-python / a2a-java 同），本 server 只讲 1.0 ⟹ 不带头、带别的版本都回 VERSION_NOT_SUPPORTED。
 //
 // 另外两件事在 Before / After 里做：**归属检查**（所有指向已有 task 的请求，一处拦下）
 // 和**「不存在」错误正文归一**（防存在性预言机）——各见那两个方法。
@@ -119,18 +120,10 @@ func requestTaskID(payload any) (a2atypes.TaskID, taskIDLookup) {
 	return "", taskIDUnknown
 }
 
-// Before 在每个 method 调用前跑：先校验版本（不符早退拒绝，整个请求返错），再注入默认 User。
-// callCtx 是指针，改 User 在下游 taskstore Authenticator（读 callCtx.User.Name）处生效。
+// Before 在每个 method 调用前跑：注入已认证 User、推 owner，再做归属检查。
+// callCtx 是指针，改 User 在下游读 callCtx.User.Name 的地方生效（业务经 WithTaskStore 用 SDK 内存后端加
+// `a2asrv.NewTaskStoreAuthenticator` 时就是它；默认装配的内层按 owner 分区，见 ownerPartitionAuthenticator）。
 func (ci conformanceInterceptor) Before(ctx context.Context, callCtx *a2asrv.CallContext, req *a2asrv.Request) (context.Context, any, error) {
-	// A2A-Version 校验：ServiceParams 由 HTTP header 构造，key 已小写。客户端声明了版本且与本
-	// server 不符 → 拒绝（返 wrap 的 ErrVersionNotSupported，SDK 映射成对应 JSON-RPC 错误码）。
-	// 未带版本 header（空）视为不声明、放行。
-	if sp := callCtx.ServiceParams(); sp != nil {
-		if vs, ok := sp.Get("a2a-version"); ok && len(vs) > 0 && vs[0] != "" && vs[0] != string(a2atypes.Version) {
-			return ctx, nil, fmt.Errorf("client A2A-Version %q not supported (server speaks %s): %w",
-				vs[0], a2atypes.Version, a2atypes.ErrVersionNotSupported)
-		}
-	}
 	// 注入已认证 User——身份取自 owner resolver（跟 Executor 挂起 task 表同一个源），
 	// 让按 User 隔离的 taskstore 操作（ListTasks / Get）按真实调用方分区。
 	name := "default"
@@ -200,8 +193,8 @@ func (ci conformanceInterceptor) Before(ctx context.Context, callCtx *a2asrv.Cal
 // （get / cancel / resubscribe 各不相同），照抄就是立一份注定要漂的拷贝，而且新增方法
 // 时漏了不报错。这里做的是「凡是这个哨兵，正文一律换成哨兵本身」，跟方法数无关。
 //
-// ⚠️ Before 早退的错误**不经过 After**（SDK 的 doCall 直接返 earlyErr）——所以 Before
-// 那边必须返裸哨兵，两条路才对得上。
+// Before 早退的错误同样经过 After（SDK 对已跑过 Before 的拦截器，含本拦截器，按序调 After），两条路的正文都在这里
+// 归一；Before 那边仍返裸哨兵，拦截器链里排在前面的拦截器看到的也是同一句。
 func (ci conformanceInterceptor) After(_ context.Context, _ *a2asrv.CallContext, resp *a2asrv.Response) error {
 	if resp != nil && resp.Err != nil && errors.Is(resp.Err, a2atypes.ErrTaskNotFound) {
 		resp.Err = a2atypes.ErrTaskNotFound

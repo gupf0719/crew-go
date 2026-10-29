@@ -57,6 +57,28 @@ func TestFinalError_TransientBackupKeepsCallRetryable(t *testing.T) {
 	}
 }
 
+// 同上，主候选是 dashscope 免费额度用完的 403（状态码本身被重试层判成「重发必然一样」）：外层照样重试整次调用。
+func TestFinalError_Quota403PrimaryTransientBackupRetried(t *testing.T) {
+	var n1, n2 atomic.Int32
+	m1 := countingModel{n: &n1, err: func(int32) error {
+		return &model.APIError{Provider: "p1", StatusCode: 403,
+			Body: `{"error":{"code":"AllocationQuota.FreeTierOnly","message":"The free tier of the model has been exhausted."}}`}
+	}}
+	m2 := countingModel{n: &n2, err: func(k int32) error {
+		if k == 1 {
+			return &model.APIError{Provider: "p2", StatusCode: 503, Body: "overloaded"}
+		}
+		return nil
+	}}
+	fb := fallback.New([]model.ChatModel{m1, m2})
+	_, err := compose_v2.RunWithRetry(context.Background(), compose_v2.SimpleRetry(2), func(ctx context.Context) (*schema.Message, error) {
+		return fb.Generate(ctx, nil)
+	})
+	if err != nil || n2.Load() != 2 {
+		t.Fatalf("外层应重试整次调用、备用第二次成功，实际 err=%v 备用被调 %d 次", err, n2.Load())
+	}
+}
+
 // 两个候选都是额度用完：交出排得最靠前的那个，外层不重试。
 func TestFinalError_AllPermanentReportsFirst(t *testing.T) {
 	var n1, n2 atomic.Int32

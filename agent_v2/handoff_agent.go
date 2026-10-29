@@ -259,7 +259,12 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 	if _, ok := h.agents[h.initial]; !ok {
 		return nil, fmt.Errorf("handoff agent %q: initial %q not registered via AddAgent", h.Name(), h.initial)
 	}
+	cfg := applyRunOptions(opts)
 	if err := resolveRunSession(ctx, &session, h.Name()); err != nil {
+		return nil, err
+	}
+	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
+	if err := checkAbandonedTasks(ctx, cfg.abandoned, session, h.Name()); err != nil {
 		return nil, err
 	}
 	ctx = WithSession(ctx, session)
@@ -271,7 +276,6 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 	}
 	defer stopHistory()
 
-	cfg := applyRunOptions(opts)
 	// MED-1 fail-fast：composite 不把 per-call 覆盖透传给 inner step，传了静默 no-op，直接报错。
 	if err := rejectCompositeOverride(cfg.overrides()); err != nil {
 		return nil, err
@@ -285,7 +289,9 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 	// audit³ D1 fix: OnAgentStart Run top-level fire (跟 PlanAgent 对齐)
 	agentIn := &hook.AgentInput{Messages: []*schema.Message{input}}
 	// 「这是不是新任务」判在钩子之前：钩子里就可能发起调用（见 enterRunTask）
-	ctx = enterRunTask(ctx, session)
+	ctx = enterGraphRunTask(ctx, session)
+	// 调用方声明放弃了的任务（WithAbandonedTasks）：在记这次的输入、触发钩子之前收尾
+	abandonTasksAtEntry(ctx, cfg.abandoned, h.Name())
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return hooks.OnAgentStart(c, info, agentIn)
@@ -372,7 +378,7 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	startOffset := len(session.Events())
 	// audit³ D1 fix: OnAgentStart Resume top-level fire (跟 PlanAgent 对齐)
 	agentInResume := &hook.AgentInput{}
-	ctx = enterResumeTask(ctx, session)
+	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return hooks.OnAgentStart(c, info, agentInResume)
@@ -426,7 +432,7 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	if hooks := extractOrchHooksOrCtx(ctx, rcfg.orchHooks); hooks != nil {
 		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
-	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
+	runErr := compose_v2.Run(ctx, g, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := HandoffAgentFinalMessage(cm.Channels())
 	finalRef = final
 	info.Round = GetHandoffAgentHops(cm) // Sub-5 audit Round 2 视角 G fix
@@ -485,7 +491,7 @@ func (h *HandoffAgent) runGraph(
 	if hooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks); hooks != nil {
 		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
-	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
+	runErr := compose_v2.Run(ctx, g, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := HandoffAgentFinalMessage(cm.Channels())
 	hops := GetHandoffAgentHops(cm)
 	return final, hops, runErr

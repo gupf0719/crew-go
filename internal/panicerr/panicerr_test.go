@@ -280,3 +280,89 @@ func attr(rec slog.Record, key string) string {
 	})
 	return v
 }
+
+// CallEach：某一个 panic 时接着调后面的，那个 panic 原样交给调用点——同一个值（errors.Is 认得出）、调用点在 defer 里取的栈
+// 看得到 panic 的地方；嵌套的 CallEach（钩子链里套钩子链）也一样。排在后面的又 panic 时记一条带栈的日志。
+func TestCallEach_FirstPanicPassesThroughUnchanged(t *testing.T) {
+	logs := captureLogs(t)
+	var called []int
+	var raw any
+	var pe *panicerr.Error
+	func() {
+		defer func() {
+			raw = recover()
+			pe = panicerr.New(raw)
+		}()
+		panicerr.CallEach(context.Background(), 4, func(i int) {
+			called = append(called, i)
+			switch i {
+			case 1:
+				panicerr.CallEach(context.Background(), 1, func(int) { explodeHere(errSentinel) })
+			case 2:
+				panic("second")
+			}
+		})
+	}()
+	if fmt.Sprint(called) != "[0 1 2 3]" {
+		t.Fatalf("每个都应调到，实际 %v", called)
+	}
+	if err, ok := raw.(error); !ok || err != errSentinel || !errors.Is(err, errSentinel) {
+		t.Fatalf("调用点拿到的应是第一个 panic 的原值，实际 %T %v", raw, raw)
+	}
+	if !strings.Contains(pe.Stack, "panicerr_test.explodeHere") {
+		t.Fatalf("调用点取的栈应看得到 panic 的地方：\n%s", pe.Stack)
+	}
+	recs := logs.records()
+	if len(recs) != 1 || attr(recs[0], panicerr.KeyPanic) != "second" || attr(recs[0], panicerr.KeyHookIndex) != "2" {
+		t.Fatalf("排在后面又 panic 的那个应记一条日志（panic=second hook_index=2），实际 %d 条：%v", len(recs), recs)
+	}
+}
+
+// 排在前面的 panic、后面的调了 Goexit：第一个 panic 照样交给调用点，之后 Goexit 照常结束这个 goroutine。
+func TestCallEach_LaterGoexitStillHandsOverFirstPanic(t *testing.T) {
+	var called []int
+	var got any
+	after := false
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() { got = recover() }()
+		panicerr.CallEach(context.Background(), 3, func(i int) {
+			called = append(called, i)
+			switch i {
+			case 0:
+				panic("A")
+			case 1:
+				runtime.Goexit()
+			}
+		})
+		after = true
+	}()
+	wg.Wait()
+	if got != "A" || fmt.Sprint(called) != "[0 1]" || after {
+		t.Fatalf("应交出 A、Goexit 照常结束 goroutine，实际 got=%v called=%v after=%v", got, called, after)
+	}
+}
+
+// 某一个 Goexit：后面的照样调到，Goexit 照常结束这个 goroutine，没有 panic。
+func TestCallEach_GoexitStillCallsRest(t *testing.T) {
+	var called []int
+	var got any
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() { got = recover() }()
+		panicerr.CallEach(context.Background(), 2, func(i int) {
+			called = append(called, i)
+			if i == 0 {
+				runtime.Goexit()
+			}
+		})
+	}()
+	wg.Wait()
+	if got != nil || fmt.Sprint(called) != "[0 1]" {
+		t.Fatalf("后面的应照样调到、没有 panic，实际 got=%v called=%v", got, called)
+	}
+}

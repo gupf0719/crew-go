@@ -175,8 +175,12 @@ func NewRunSession() *RunSession {
 //
 // ⚠️ **只在「上一个任务真的结束了」时调**。任务的终结是成功、终局失败、或你决定放弃它；
 // **中断不是终结**——那时该调的是 `Resume`，换了 RunID 就再也找不到那份存档了。
-// 放弃一个中断中的任务时，存档不会自己消失（`ListPending` 还看得到），要清就在换之前
-// 显式 `DeleteSubtree(oldRunID, "")`。
+// 放弃一个中断中的任务时，在换之前对它 `Resume(ctx, sess.RunID, WithResumeAction(ResumeActionAbort))`（ctx 带上跑那个
+// 任务时的会话 ID 与调用主体，历史层按它们找那场对话；找不到就只删存档）：删存档，同时给会话历史里它没有结果的工具
+// 调用补一条结果。新消息顶掉挂起时也可以记下旧的 RunID、换完之后把 [WithAbandonedTasks] 带在下一次 Run 上：同样的收尾，
+// 在那次 Run 的入口做，不另起一次调用、不触发钩子。直接换 RunID 不放弃的话，那个任务仍然能续（`Resume(oldRunID)`），框架不替你判它放没放弃、也不补
+// 结果——还能续的时候写「被放弃」是假话：续跑执行之后真结果排在后面、被当成多余的。悬空的调用由读侧补救（一个结果
+// 都没有的那批写成一条文本记录，部分有结果的给缺的补占位），不写回历史。只删存档（`DeleteSubtree`）同样不补结果。
 //
 // ⚠️ **不是并发安全的**——`RunSession` 的其余方法（`SetValue` / `AddEvent` / `Events` …）
 // 都可并发调，这一个不行：它就地改公开字段 `RunID`，与任何并发读者构成 data race
@@ -364,6 +368,13 @@ func resolveRunSession(ctx context.Context, s **RunSession, agentName string) er
 //   - 盖上这个任务的章；不在任务里时宣告「这是新任务」：业务钩子里发起的嵌套调用认得出所在任务。
 //   - 遮住调用方留在 ctx 上的节点授予：你的 agent 级钩子跑在图外，经 [RegrantFromNode] 拿不到调用方的
 //     转交 / 路由能力（同 9 个编排）。
+//
+// 不占存档槽（9 个编排的入口占，见 `compose_v2.OccupySlot`）：自研实现多半不在自己的槽上存东西，透传给别的
+// agent 时被透传的那个跟它同一个 ns、由它来占。你的实现自己在这个槽上跑 compose_v2 图、又要挡住钩子里落进同一个槽的
+// 裸调时，在这之后调 `compose_v2.OccupySlot`，跑图时带上 `compose_v2.WithSlotClaim`。⚠️ 透传给同 ns 的 agent 时，槽里放着
+// 它的挂起档，而你自己的钩子 / 前置逻辑（透传之前、它返回之后）里没有执行占着这个槽：在那里拿同一个 session 裸调别的
+// agent，入口不拒。两张图身份不同时（BasicAgent 显式起了不同的名字）它载入那份档撞 `compose_v2.ErrGraphIDConflict`、
+// 什么都不执行；两个都没起名字、结构又相同时会把那份档读进来接着跑。在那里调别的 agent 要经 `RunSubAgent`。
 //
 // 返回的 ctx 交给业务钩子（经 `compose_v2.CallHook` 调）与后续执行。
 //

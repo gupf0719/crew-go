@@ -1113,7 +1113,7 @@ events, _ := ag.Run(ctx, sess, input)             // sessionID = sess.RunID 自�
 // 会话历史层 append-only 留存逐字消息，第二轮 prior 从它读（含上一轮工具往返）。
 // 详见「会话历史」一节 + ISSUE-98。
 
-// 场景 3：防串台——框架自动用 Graph.ID()（name 或拓扑+state fingerprint）填 cp.GraphID，业务无需显式设
+// 场景 3：防串台——框架自动用 Graph.ID()（名字 / 前缀+结构指纹 / 结构指纹，见 checkpoint.md §4.3）填 cp.GraphID，业务无需显式设
 // 同 sid 第二次 Run 用不同 graph（g.ID() 不同）→ SaveNS / Run 入口 fail-fast errors.Is(err, ErrGraphIDConflict)
 // 业务确需同 sid 跑不同 graph（如换版本）→ 用 WithFreshRun 忽略旧 cp
 ```

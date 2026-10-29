@@ -45,6 +45,47 @@ func danglingCount(msgs []*schema.Message) int {
 //
 // `subs`（历史配置从谁那儿借）是 9 个 Resume 入口**各自**传的，编译器只保证「传了」、
 // 不保证「传对」。只钉 BasicAgent 的话，某个编排传成 nil 完全测不出来。
+// 历史里那一轮的结果是一条合并消息（两个结果块，业务照 Anthropic 的样子合成的）时，放弃收尾不给第二个调用多补一条——两个
+// 调用都有结果。曾经只认第一块，b 被补了一条「被放弃」，同一个调用两条结果。
+func TestHistory_AbortCountsEveryResultBlock(t *testing.T) {
+	hs := agent_v2.NewInMemoryHistoryStore()
+	key := agent_v2.HistoryKey{Owner: "tenant1", ConvID: "conv-merged"}
+	const task = "task-merged"
+	ctx := compose_v2.WithCheckpointerCtx(compose_v2.WithThreadIDCtx(context.Background(), key.ConvID), compose_v2.NewInMemoryCheckpointer())
+	stamp := func(m *schema.Message, id string) *schema.Message {
+		m.ID = id
+		m.Annotations = map[string]any{agent_v2.HistoryAgentAnnotation: "worker", agent_v2.HistoryTaskAnnotation: task}
+		return m
+	}
+	merged := &schema.Message{Role: schema.RoleTool, ContentBlocks: []*schema.ContentBlock{
+		{Type: "tool_result", Toolresult: &schema.ToolresultContentBlock{ToolCallId: "a", Content: "ra"}},
+		{Type: "tool_result", Toolresult: &schema.ToolresultContentBlock{ToolCallId: "b", Content: "rb"}},
+	}}
+	seed := []*schema.Message{
+		stamp(schema.UserMessage("hi"), "m0"),
+		stamp(schema.AssistantToolCallMessage([]schema.ToolCall{
+			{ID: "a", Type: "function", Function: schema.FunctionCall{Name: "f", Arguments: "{}"}},
+			{ID: "b", Type: "function", Function: schema.FunctionCall{Name: "g", Arguments: "{}"}},
+		}), "m1"),
+		stamp(merged, "m2"),
+	}
+	if err := hs.Append(ctx, key, seed); err != nil {
+		t.Fatal(err)
+	}
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("worker"), agent_v2.WithHistory(hs, "tenant1"),
+		agent_v2.WithModel(&identityProbeModel{reply: "x"}))
+	if _, err := ag.Resume(ctx, task, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	after, err := agent_v2.LoadAllHistory(ctx, hs, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(seed) {
+		t.Errorf("两个调用都有结果，放弃收尾不该再补，实际历史从 %d 条变成 %d 条", len(seed), len(after))
+	}
+}
+
 func TestHistory_AbortClosesUnansweredToolCalls(t *testing.T) {
 	build := func(hs agent_v2.HistoryStore) *agent_v2.BasicAgent {
 		rt := &recordTool{name: "do_thing"}

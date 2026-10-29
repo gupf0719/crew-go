@@ -170,15 +170,18 @@ type Graph struct {
 	breakAfter  breakpointSet
 
 	// ── ISSUE-50 P0 防串台：Graph 身份字段（Phase 5.1.b 引入） ──
-	name     string // 业务可选 WithName 设置，空时 ID() 走 fingerprint 兜底
-	cachedID string // ID() 首次调用后缓存（fingerprint 计算昂贵，跨 Run 不变）
+	name string // 业务可选 WithName 设置，空时 ID() 走 fingerprint 兜底
+	// identityPrefix 见 WithIdentityPrefix：非空时 ID() 是它加上 fingerprint，与 name 互斥。
+	identityPrefix string
+	cachedID       string // ID() 首次调用后缓存（fingerprint 计算昂贵，跨 Run 不变）
 }
 
 // ID 返回 Graph 身份字符串（ISSUE-50 P0 防串台）。
 //
 // 优先级：
 //  1. 显式 WithName(...) 设置的 name —— 业务推荐，可读性高、跨进程稳定
-//  2. fingerprint 兜底：sha256(sorted(nodeIDs) || sorted(channelName:type)) 前 16 hex chars
+//  2. WithIdentityPrefix(...) 设置的前缀 + ":" + fingerprint —— 区分结构相同的不同图，结构变了身份照样变
+//  3. fingerprint 兜底：sha256(sorted(nodeIDs) || sorted(channelName:type)) 前 16 hex chars
 //
 // 为何需要：Checkpointer 按 (sessionID, ns) 二级 key 存 cp；两个不同 Graph 共享同
 // (sessionID, ns) 时旧 cp 被新 graph 覆盖、Resume 加载到"别人"的存档但 frontier
@@ -224,6 +227,9 @@ func (g *Graph) ID() string {
 
 	h := sha256.Sum256([]byte(strings.Join(ids, ",") + "|" + strings.Join(chDescs, ",")))
 	g.cachedID = hex.EncodeToString(h[:8]) // 16 hex chars = 8 bytes
+	if g.identityPrefix != "" {
+		g.cachedID = g.identityPrefix + ":" + g.cachedID
+	}
 	return g.cachedID
 }
 
@@ -255,6 +261,7 @@ func (b *GraphBuilder) Compile() (*Graph, error) {
 		breakBefore:    breakpointSet{}.with(b.interruptBefore),
 		breakAfter:     breakpointSet{}.with(b.interruptAfter),
 		name:           b.name, // ISSUE-50 P0 防串台
+		identityPrefix: b.identityPrefix,
 	}
 	if g.maxVisit <= 0 {
 		g.maxVisit = 100 // PoC 默认值
@@ -295,6 +302,7 @@ type GraphBuilder struct {
 	maxVisit       int
 	maxWidth       int
 	name           string // ISSUE-50 P0：业务可选 WithName 显式声明 graph 身份
+	identityPrefix string // 见 WithIdentityPrefix
 	// interruptBefore / interruptAfter 见 WithInterruptBefore / WithInterruptAfter（编译期断点）。
 	interruptBefore []NodeID
 	interruptAfter  []NodeID
@@ -486,10 +494,24 @@ func (b *GraphBuilder) WithName(name string) *GraphBuilder {
 	return b
 }
 
+// WithIdentityPrefix 让 Graph 身份取「prefix + ":" + fingerprint」（见 [Graph.ID]）。
+//
+// 用在「结构相同、却是不同的图」上：只靠 fingerprint 时两张结构相同的图身份相同，一张图的挂起档能被另一张读进去
+// 接着跑（节点函数不同、channel 布局相同，不报错）；只靠 [GraphBuilder.WithName] 又丢了结构这一维——同名的图改了
+// 节点或 channel 之后续跑旧档不再报冲突。两维都要时用它。前缀必须跨进程稳定（不能是每次构造都变的值），否则重建
+// 图之后续不上自己的档。与 WithName 互斥，两个都设 Compile 报错。
+func (b *GraphBuilder) WithIdentityPrefix(prefix string) *GraphBuilder {
+	b.identityPrefix = prefix
+	return b
+}
+
 // validate 编译期拓扑校验。
 func (b *GraphBuilder) validate() error {
 	if len(b.nodes) == 0 {
 		return fmt.Errorf("graph has no nodes")
+	}
+	if b.name != "" && b.identityPrefix != "" {
+		return fmt.Errorf("graph identity: WithName(%q) and WithIdentityPrefix(%q) are mutually exclusive", b.name, b.identityPrefix)
 	}
 	// audit Round 4 Bug 2 修复：所有 nodeID 必须通过 ns 命名规范校验——不含
 	// "/"（父子分隔符）/ "#"（fan-out 实例）/ "@"（重访实例）/ 不为空，否则 ns 拼装后

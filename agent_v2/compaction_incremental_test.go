@@ -224,12 +224,9 @@ func TestAutoCompactRun_LongPreviousSummaryLittleNewContentSkips(t *testing.T) {
 
 // TestAutoCompactRun_VerbatimIncrementalSummaryRejected：增量摘要时把新内容原样抄进摘要的，照样被判「缩减比不够」——
 // 上限是「上一份摘要 + 新内容的 MaxReductionRatio 倍」，不是不设上限。
-//
-// 新内容用普通文本消息：工具结果的正文在 Content 与内容块里各有一份，token 估算两处都算（见 doc/code/todo.md），
-// 原样抄一遍的摘要比估出来的新内容小一半，测不出上限。
 func TestAutoCompactRun_VerbatimIncrementalSummaryRejected(t *testing.T) {
 	s := &verbatimSummarizer{}
-	cfg := &agent_v2.AutoCompactConfig{Enabled: true, Model: s, ModelContextWindow: 7500,
+	cfg := &agent_v2.AutoCompactConfig{Enabled: true, Model: s, ModelContextWindow: 7000,
 		SummaryMaxTokens: 100, SummaryBufferTokens: 100, MinCompactableTokens: 1000}
 	msgs := []*schema.Message{prevSummary(9000), schema.UserMessage("上一个问题"),
 		schema.AssistantMessage(strings.Repeat("a", 12000))}
@@ -272,7 +269,7 @@ func TestAutoCompactRun_SpillIndexNotCountedAgainstSummaryCap(t *testing.T) {
 		SummaryMaxTokens: 1000, SummaryBufferTokens: 100, MinCompactableTokens: 1000}
 	msgs := []*schema.Message{schema.UserMessage("帮我排查日志")}
 	for i := 0; i < 50; i++ {
-		round := toolRound(fmt.Sprintf("c%d", i), "【工具输出过大，已转存】预览 "+strings.Repeat("x", 400))
+		round := toolRound(fmt.Sprintf("c%d", i), "【工具输出过大，已转存】预览 "+strings.Repeat("x", 1000))
 		round[1].Annotations = map[string]any{
 			agent_v2.ToolResultSpillAnnotation: fmt.Sprintf("sp_%016x", i),
 			"crew_tool_result_spill_info":      "grep，2000000 字节，40000 行",

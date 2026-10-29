@@ -545,6 +545,12 @@ type historyWriter struct {
 	// 读得到。两个判据各管一段，都要留。
 	claimedRootInputs map[string]bool
 
+	// pendingRoot 是顶层 GraphAgent 这次 Run 的原始输入，等着排在下一批入队的记录前面补记（见 deferRootInput）。只在
+	// 持锁时读写：submit 入队一批之前取走它、决定补不补；图跑完时收回（endRootInputWindow）。vettedRoot 是入口按跨 Run
+	// 门槛判过的那条原始输入，出口结算认得它、不再读一次历史。
+	pendingRoot *pendingRootInput
+	vettedRoot  *schema.Message
+
 	unnamedWarned bool // 「有 agent 没起名却在写历史」每条流只提醒一次
 
 	// ctx 是 Run 的 ctx。⚠️ **排空时它可能已经 Done**：Run 因调用方 ctx 超时/取消而结束
@@ -554,6 +560,13 @@ type historyWriter struct {
 	// 意义；但要知道「取消 = 这一段历史大概率丢了」。
 	ctx context.Context
 	wg  sync.WaitGroup
+}
+
+// pendingRootInput 是一条等着补记的原始输入：原件（登记表按它认）、盖好归属的那份、它所在的流。
+type pendingRootInput struct {
+	msg     *schema.Message
+	stamped *schema.Message
+	slot    string
 }
 
 // newHistoryWriter 启动单 worker。store 非 nil、key 完整由 caller 保证。
@@ -717,6 +730,20 @@ func (w *historyWriter) submit(msgs []*schema.Message) {
 			"recordHistory 只能从节点体内同步调用，不能从活过 Run 的后台 goroutine 调",
 			"key", w.key.String(), "count", len(msgs))
 		return
+	}
+	if p := w.pendingRoot; p != nil {
+		w.pendingRoot = nil
+		// 这一批里有这条输入就不补：转发形状下子 agent 收到的就是它、记在自己名下，这一份就排在最前。否则先补它（归属是
+		// 顶层），再写这一批。只看这一批、不看登记表：边界补记先认领输入、读一次历史判产出之后才入队，认领了还没入队的
+		// 那份挡不住别的分支先入队的一批（审计实测：并发扇出里原话排到了委派分支的问答之后）。更早入队过它的批次已经把
+		// 待补取走了。
+		if !batchHasInput(msgs, p.msg) {
+			w.ensureRecordMaps()
+			w.recorded[p.msg] = true
+			w.recordedHere[recordSlotKey{msg: p.msg, slot: p.slot}] = true
+			w.noteRecordedID(p.msg)
+			w.queue = append(w.queue, []*schema.Message{p.stamped})
+		}
 	}
 	w.queue = append(w.queue, msgs)
 	backlog := len(w.queue)
@@ -1127,16 +1154,57 @@ func recordHistory(ctx context.Context, owner, display string, msgs []*schema.Me
 		if isDerivedInput(m) {
 			continue
 		}
-		cp := stampHistoryAgent(m, owner, display, w.task)
-		if w.origin != "" {
-			cp.Annotations[historyOriginAnnotation] = w.origin
-		}
-		stamped = append(stamped, cp)
+		stamped = append(stamped, w.stamp(m, owner, display))
 	}
 	if len(stamped) == 0 {
 		return
 	}
 	w.submit(stamped)
+}
+
+// stamp 给一条要写进历史的消息盖归属、任务章与来源（见 stampHistoryAgent），返回拷贝。
+func (w *historyWriter) stamp(m *schema.Message, owner, display string) *schema.Message {
+	cp := stampHistoryAgent(m, owner, display, w.task)
+	if w.origin != "" {
+		cp.Annotations[historyOriginAnnotation] = w.origin
+	}
+	return cp
+}
+
+// deferRoot 登记一条待补的原始输入（见 deferRootInput）。
+func (w *historyWriter) deferRoot(m, stamped *schema.Message, slot string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pendingRoot = &pendingRootInput{msg: m, stamped: stamped, slot: slot}
+	w.vettedRoot = m
+}
+
+// dropPendingRoot 收回还没补的原始输入（见 endRootInputWindow）。
+func (w *historyWriter) dropPendingRoot() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pendingRoot = nil
+}
+
+// rootVetted 报 m 是不是入口按跨 Run 门槛判过的那条原始输入（见 deferRootInput）。
+func (w *historyWriter) rootVetted(m *schema.Message) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return m != nil && w.vettedRoot == m
+}
+
+// batchHasInput 报一批要入队的记录里有没有 in 这条输入：盖章是浅拷贝，ID 与内容都保留，按 ID 加内容键认（同 recordedIDs）。
+func batchHasInput(batch []*schema.Message, in *schema.Message) bool {
+	if in.ID == "" {
+		return false
+	}
+	k := inputContentKey(in)
+	for _, m := range batch {
+		if m.ID == in.ID && inputContentKey(m) == k {
+			return true
+		}
+	}
+	return false
 }
 
 // noteHistoryRecorded 把 msgs 登记成「这次调用里由我记过」，不写进历史：model 节点处理完之后在提交之前作废、续跑重放

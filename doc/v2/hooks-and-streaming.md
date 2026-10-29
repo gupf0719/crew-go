@@ -137,8 +137,11 @@ events, err := topAgent.Run(ctx, sess, input)
 ```go
 ctxHooks := agent_v2.GetCtxOrchHooks(ctx)
 merged := agent_v2.NewChainOrchHooks(ctxHooks, mySubHook)  // 父 hook + 子专属
-subAgent.Run(ctx, sess, in, agent_v2.WithOrchHooks(merged))
+agent_v2.RunSubAgent(ctx, "sub", subAgent, in, agent_v2.WithOrchHooks(merged))
 ```
+
+在节点、工具、钩子里调子 agent 要经 `RunSubAgent`（它给子 agent 一个自己的 ns）：拿父的 session 裸调 `subAgent.Run` 时，子 agent 的
+图落进父的存档槽，配了 checkpointer 时入口当场拒。
 
 ## 5. EventSink — 节点内主动发 event
 
@@ -237,7 +240,7 @@ agui 与 a2a 流桥已经按这套协议处理（agui 发 `MessagesSnapshot`、a
 
 详见 `agent_v2/basic_agent.go::streamOrGenerate` + `agent_v2/reset_stream_test.go` + `agent_v2/repro_round10_test.go` 实际触发.
 
-## 8. ChainHooks / ChainOrchHooks panic 语义 (audit² 改: 跟 eino 对齐 fail-fast)
+## 8. ChainHooks / ChainOrchHooks panic 语义
 
 业务装 N 个 hook (audit + billing + metrics) 时:
 
@@ -247,17 +250,17 @@ agent_v2.WithHooks(hooks)
 ```
 
 **panic 语义** (`hook.ChainHooks` / `compose_v2.NewChainOrchHooks`):
-- 单 hook panic = 业务 bug **fail-fast 中断剩余 chain handler** (audit² 删 per-handler
-  isolation — 跟 eino `internal/callbacks/inject.go` 同款哲学: 业务 hook panic 应业务
-  自己修, framework 不 silent isolate)
-- panic 冒泡到调用这条链的地方兜住, 不让 Run goroutine crash 进程。多数转 **wrapped err 返业务**;
-  跑在工作之后、只作观测的那几处 (节点体成功之后的 OnNodeEnd、图成功之后的 OnGraphEnd、任何时候的
-  OnNodeEvent、任何时候的 OnAgentEnd——调用失败时照旧交出原来那个错误) 就地兜住、带栈记一条 ERROR, 结果照常提交 (逐道分工见
-  `compose_v2/panic_recovery.go`)。转成错误的那几层:
-  1. `compose_v2.Run` 入口 outer recover (`graph_loop.go::Run`)
-  2. `runNodeWithHooks` 整函数 defer recover (覆盖 fan-out 跨 goroutine)
-  3. `agent_v2.BasicAgent.Run` + 其他 8 编排 Run/Resume 各 outer recover (`agent_v2/*.go`)
-  4. 嵌套 AgentAsTool 子 agent.Run 自带 outer recover 间接保护父 ToolsFn 路径
+- 单 hook panic = 业务 bug，框架不逐个隔离（不吞掉它、不替它兜成「没发生」）。链里排在它后面的调不调看是哪一侧：
+  - 开始一侧（OnAgentStart / OnModelStart / OnToolStart / OnGraphStart / OnNodeStart）与改得了结果的
+    OnModelEnd / OnToolEnd：**排在后面的不再调**——返回的 ctx 往后流，panic 的那个交不出 ctx，这次调用随后按失败处理。
+  - 结束与事件一侧（OnAgentEnd / OnError / OnNodeEnd / OnGraphEnd / OnNodeEvent）：**每个钩子都调到**，调完再抛出第一个
+    panic（原值与它当初的栈不变）。这几个的返回值不往后流，跑完整条链没有代价；而成功之后的 End 钩子 panic 是就地兜住的，
+    跳过后面的钩子就是静默丢掉它们的工作——End 钩子能做上行信号决定，曾经 `NewChainOrchHooks(会 panic 的观测钩子,
+    做决定的钩子)` 下后者的决定没做成、`err == nil`（审计实测）
+- panic 冒泡到调用这条链的地方兜住, 不让 Run goroutine crash 进程。跑在工作之前的转成 **wrapped err 返业务**;
+  跑在工作之后的 (OnNodeEnd、OnGraphEnd、OnNodeEvent、OnAgentEnd) 不论成败都就地兜住、带栈记一条 ERROR, 结局不变——
+  成功时结果照常提交, 失败时照旧交出原来那个错误。哪一道兜底接哪一类 panic、转成什么前缀的错误，以
+  `compose_v2/panic_recovery.go` 为准（那是唯一一份分工表，这里不复述）。
 
 **ctx propagation 协议** (audit² 加): chain 内 hook A 返的 ctx 给 hook B 用 — 业务在
 hook A `ctx = context.WithValue(ctx, spanKey{}, span)` 让 hook B `ctx.Value(spanKey{})`
@@ -307,7 +310,7 @@ session.AddEvent(NewChunkEvent(...))  // 错: chunk 污染审计流
 
 ### ⚠️ 误解：以为 ChainHooks 给 panic 隔离
 
-`hook.NewChainHooks(...)` 提供 nil/typed-nil 过滤 + 多 hook 链式串联，**不提供 panic 隔离**——一个 hook panic 仍 fail-fast 中断链内剩余 hook（audit² 删了 per-hook recover）。
+`hook.NewChainHooks(...)` 提供 nil/typed-nil 过滤 + 多 hook 链式串联，**不提供 panic 隔离**——开始一侧一个 hook panic 仍中断链内剩余 hook；结束与事件一侧每个都调到、调完照样抛出 panic（见 §8），panic 不会被链吞掉。
 
 hook panic **不会崩 Run goroutine**：框架兜住，多数转 err、成功之后的观测钩子只记 ERROR（见 §8），与是否用 ChainHooks 无关。想 per-hook panic-safe 自己在 hook 内 `defer recover()`.
 

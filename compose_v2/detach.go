@@ -204,6 +204,15 @@ func taskExecuting(sid string) bool {
 	return executingTasks.n[sid] > 0
 }
 
+// TaskExecuting 报 sid 这个任务此刻在本进程里有没有执行在跑：它的图从 Run 入口到出口（不在任何节点执行范围里、配了这个 sid
+// 的 Run——顶层的、脱离出来的根图；节点里换了 sid 跑的嵌套图属于外面那次执行，不另计）。
+//
+// 认不出：别的进程里在跑的；任务在图外的那一段（编排的 OnAgentStart 早于它的图、OnAgentEnd 晚于它的图，没有图的 agent 整段
+// 都在图外）。给「对一个任务做不可逆的事之前，确认它此刻不在跑」用（agent_v2.WithAbandonedTasks 据此拒绝放弃正在执行的任务）。
+func TaskExecuting(sid string) bool {
+	return sid != "" && taskExecuting(sid)
+}
+
 func runAliveFrom(ctx context.Context) *atomic.Bool {
 	a, _ := ctx.Value(runAliveKey{}).(*atomic.Bool)
 	return a
@@ -311,7 +320,7 @@ func isExecutionKey(key any) bool {
 		nodeStateAccessorKey, subCallCounterKey, subCallScopeKey, abnormalNodeExitKey,
 		componentKindKey, eventSinkKey, sendSinkKey, toolCategoryLookupKey, outerRerunGensKey, outerRegensKey,
 		threadIDKey, softCancelCtxKey, detachedKey, detachedFromKey, runAliveKey, signalScopeKey, taskRecipientKeyCtxKey, hookCallKey,
-		exitGraceKey, streamRecordKey:
+		exitGraceKey, streamRecordKey, runningSlotKey:
 		return true
 	}
 	_, ok := key.(ExecutionStateKey)

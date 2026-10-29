@@ -498,8 +498,9 @@ func TestHooks_PanicInOnNodeEnd_NotCrashGraph(t *testing.T) {
 				}
 				return
 			}
-			if err == nil || !strings.Contains(err.Error(), "panic") {
-				t.Fatalf("节点体失败时 Run 应返回带 panic 的错误，got %v", err)
+			// 节点体失败时照旧交出原来那个错误，OnNodeEnd 的 panic 只记日志
+			if err == nil || !strings.Contains(err.Error(), "业务错") || strings.Contains(err.Error(), "panic") {
+				t.Fatalf("节点体失败时 Run 应照旧返回原来的错误（不带 panic），got %v", err)
 			}
 		})
 	}

@@ -46,14 +46,14 @@ crew-go 基于官方 [a2a-go](https://github.com/a2aproject/a2a-go) SDK 接入
 |---|---|
 | 端点容忍尾斜杠 | `/invoke` 与 `/invoke/` 共用 handler（Go ServeMux 精确匹配，带尾斜杠 client 否则 404 + body 非 JSON 令对端解析失败）|
 | AgentCard `skills` 为数组 | `Card` 补 `Skills: []`（1.0 schema 要求非 null）|
-| ListTasks 可用 | `conformanceInterceptor` 注入默认已认证 User（SDK taskstore 按 User 隔离，无 User 返 unauthenticated）|
-| A2A-Version 校验 | 同 interceptor 校验版本头，不符返 `VersionNotSupportedError`（-32009）|
+| ListTasks 可用 | `conformanceInterceptor` 注入默认已认证 User、推 owner；默认装配的内层 task store 按 owner 分区（`ownerPartitionAuthenticator`，匿名调用方与叫 default 的租户互不相见）|
+| A2A-Version 校验 | SDK（v2.7.0 起）在调拦截器之前对每个方法校验，不符返 `VersionNotSupportedError`（-32009）；不带这个头按 0.3 处理（规范 §3.6.2），同样被拒 |
 | Content-Type 校验 | `contentTypeGuard` HTTP middleware：非 `application/json` 返 `ContentTypeNotSupportedError`（-32005，解析前拦）|
 
 **剩余 9 个 MUST 失败均非框架可改**：
 - **artifact / message 内容类（5）**：TCK 为 scenario-scripted SUT 设计（期望固定文本 `Generated text content` / file·data artifact），真 LLM agent 给真答案不照剧本——非合规缺陷。
-- **timestamp 时区（1）**：SDK `NewStatusUpdateEvent` 用 `time.Now()`（本地时区非 UTC-Z）——server 进程设 `TZ=UTC` 绕过，或待上游修。
-- **subscribe 无效/终态 task（3）**：SDK `SubscribeToTask` 已返 `-32001 task not found`（实测），但以 SSE 流内事件递送，TCK 期望即时错误响应——SDK 递送形式差异。
+- **timestamp 时区（1）**：SDK `NewStatusUpdateEvent` 用 `time.Now()`（本地时区非 UTC-Z）——server 进程设 `TZ=UTC` 绕过。a2a-go v2.7.0 起状态时间戳按 UTC 序列化（#452），这一条预计不再失败，升级后未重跑 TCK。
+- **subscribe 无效/终态 task（3）**：SDK `SubscribeToTask` 已返 `-32001 task not found`（实测），但以 SSE 流内事件递送，TCK 期望即时错误响应——SDK 递送形式差异。a2a-go v2.7.0 起流在第一个事件之前失败时以普通 JSON 错误响应返回（#463），终态任务回 `UnsupportedOperation`（#438），这三条的结果可能变了，升级后未重跑 TCK。
 
 **自跑**：`example/a2a/real_sut` 把真 BasicAgent 暴露为 server，另端跑 TCK：
 

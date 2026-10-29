@@ -266,7 +266,7 @@ func (cfg *AutoCompactConfig) shouldTrigger(entry *sessionBreakerEntry, messages
 		convStart++
 	}
 	// ⚠️ 上面只跳过**前导**块，中段的 system 还在 messages[convStart:] 里，由下面的
-	// 逐条过滤接手——它们同样不被压缩（`groupContainsProtectedMarker` 整组保护），
+	// 逐条过滤接手——它们同样不被压缩（`splitProtectedGroups` 把 system 本身留下），
 	// 算进阈值会让「大 system + 短对话」反复无效触发摘要。
 	// **R22 audit LOW-1 + R29 视角 2 LOW-1 + offload 孤儿 fix 连带**：跳带 SkillBody /
 	// StoreInjected / **MicroCompactOffloaded** marker 的 messages——
@@ -823,11 +823,26 @@ const autoCompactReinjectAnnotation = "crew_autocompact_reinject"
 //
 // **副作用 trade-off**：含保护 marker 的整组会保留所有消息（业务 tool_call / 中间
 // assistant 等也跟着保留）。token 上多花一些，换 pair 合法性。
+//
+// **含 system 的组只保 system 本身**：指令消息不能被摘要改写成散文，但它不该让同组的别的消息跟着不可压缩。组里平常
+// 只有 system（分组让它单独成组）；业务把 system 插进一次调用与它的结果之间时，这一对连同 system 同组（见
+// compose_v2.GroupMessagesByAPIRound）——这时 system 留下，其余照常进摘要输入（调用与结果拿掉 system 之后正好相邻）。
+// 曾经整组保护：钩子每一轮都在调用与结果之间插 system 时，每个工具轮都整组不可压缩，压缩完全失效；夹着 system 的那一轮
+// 落在可压缩区时被整轮挪到摘要前面、时序倒置（审计实测）。
 func splitProtectedGroups(earlyGroups [][]*schema.Message) (protectedMsgs, summarizeMsgs []*schema.Message) {
 	for _, g := range earlyGroups {
-		if groupContainsProtectedMarker(g) {
+		switch {
+		case groupContainsProtectedMarker(g):
 			protectedMsgs = append(protectedMsgs, g...)
-		} else {
+		case groupContainsSystem(g):
+			for _, m := range g {
+				if m != nil && m.Role == schema.RoleSystem {
+					protectedMsgs = append(protectedMsgs, m)
+				} else {
+					summarizeMsgs = append(summarizeMsgs, m)
+				}
+			}
+		default:
 			summarizeMsgs = append(summarizeMsgs, g...)
 		}
 	}
@@ -835,14 +850,8 @@ func splitProtectedGroups(earlyGroups [][]*schema.Message) (protectedMsgs, summa
 }
 
 // groupContainsProtectedMarker 检查组内是否含整组保留 marker（SkillBodyAnnotation /
-// MicroCompactOffloadedAnnotation）的 message。
+// MicroCompactOffloadedAnnotation）的 message。含 system 不在这里判：那只保 system 本身（见 splitProtectedGroups）。
 func groupContainsProtectedMarker(group []*schema.Message) bool {
-	// 组里含 system ⟹ 这组带着一条指令消息，摘要掉等于把调用方的指令改写成散文。
-	// 跟 `isProtectedGroup` 同一条理由，见那处 godoc（含「为什么判据写成『含』而不是
-	// 『全是』」，以及那条理由在分组改成「system 单独成组」之后变成了什么）。
-	if groupContainsSystem(group) {
-		return true
-	}
 	for _, m := range group {
 		if m == nil || m.Annotations == nil {
 			continue

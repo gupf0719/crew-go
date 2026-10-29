@@ -46,6 +46,11 @@ const (
 //   - tool_result: 字符串 len/4；image/file/audio block 固定 2000
 //   - 兜底:        len(json(block))/4
 //
+// 同一份正文只算一次：Content 非空时，第一个内容与它相同的 text / tool_result 块不再计入
+// （schema.ToolResultMessage 把正文同时放进 Content 与 tool_result 块，wire 上只发一份）。
+// 曾经两处都算，工具结果估成两倍，工具多的会话里 AutoCompact 在真实用量一半时就触发。
+// 内容不同的块照算（宁多估），同一条消息里后面的 tool_result 在 wire 上各自单独发、也照算。
+//
 // 最后 ×4/3 保守填充。
 //
 // 注意：本函数不读 message.id / RunID 等元数据，纯按 content 估算。
@@ -66,9 +71,14 @@ func EstimateMessageTokens(messages []*schema.Message) int {
 		if msg.ReasoningContent != "" {
 			total += len(msg.ReasoningContent) / charsPerToken
 		}
-		// 2. ContentBlocks（多模态 / tool_use / tool_result）
+		// 2. ContentBlocks（多模态 / tool_use / tool_result）；与 Content 同一份正文的那个块已算过
+		dupPending := msg.Content != ""
 		for _, cb := range msg.ContentBlocks {
 			if cb == nil {
+				continue
+			}
+			if dupPending && blockRepeatsContent(cb, msg.Content) {
+				dupPending = false
 				continue
 			}
 			total += estimateContentBlockTokens(cb)
@@ -76,6 +86,18 @@ func EstimateMessageTokens(messages []*schema.Message) int {
 	}
 	// 保守填充
 	return total * fillFactorNumerator / fillFactorDenominator
+}
+
+// blockRepeatsContent 判一个 text / tool_result 块的正文是不是就是消息的 Content。
+func blockRepeatsContent(cb *schema.ContentBlock, content string) bool {
+	switch {
+	case cb.Text != nil:
+		return cb.Text.Text == content
+	case cb.Toolresult != nil:
+		return cb.Toolresult.Content == content
+	default:
+		return false
+	}
 }
 
 // estimateContentBlockTokens 估算单个 ContentBlock 的 token 数。

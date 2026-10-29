@@ -436,9 +436,14 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		return
 	}
 	defer h.releaseBusy(key) // 确保 busy 清（含 panic 路径）
-	// 已有挂起 sess（用户开新对话、放弃旧中断）→ 清旧 cp 防孤儿泄漏。
+	// 已有挂起 sess（用户开新对话、放弃旧中断）→ 清旧 cp 防孤儿泄漏，并让这次 Run 在入口给它悬空的工具调用补结果
+	// （agent_v2.WithAbandonedTasks：同一场会话、这次 Run 自己的 agent 与 ctx，不另起调用、不跑钩子）。删档先在这里做：
+	// 它不依赖业务代码、有自己的上限；那个选项里再删一次是幂等的（同样有上限）。被淘汰、过期回收的是别的 thread，这里没有它的 agent 与
+	// ctx，只删存档、悬空的调用交给读侧（见 doc/code/todo.md 第 263 行附近）。
+	var abandonOpts []agent_v2.RunOption
 	if stale != nil {
 		h.dropCP(ctx, stale.RunID)
+		abandonOpts = append(abandonOpts, agent_v2.WithAbandonedTasks(stale.RunID))
 	}
 
 	adapter := newSSEAdapter(sse, in.RunID, in.Messages)
@@ -496,7 +501,7 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		_ = sse.WriteEvent(NewRunError("run terminated abnormally (goroutine exited without returning)", "agent_error"))
 	}()
 
-	_, err := ag.Run(ctx, sess, inputMsg)
+	_, err := ag.Run(ctx, sess, inputMsg, abandonOpts...)
 	settled = true
 	adapter.finish()
 

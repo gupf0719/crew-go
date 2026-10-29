@@ -52,6 +52,7 @@ var knownDeleteSubtreeCallSites = map[string]callSiteNote{
 	"compose_v2/durability.go:deleteCpSubtree":               {1, "Run 出口——嵌套 Run 有祖先；根 Run 空前缀多数 backend 原子"},
 	"compose_v2/subgraph.go:(*GraphBuilder).AddSubgraphNode": {1, "子图成功清理——父 Run 出口是更外层的清理者"},
 	"agent_v2/resume_helpers.go:commonResumePrep":            {1, "Abort——顶层空前缀；嵌套 Abort 无更外层清理者，残留留着"},
+	"agent_v2/history_slot.go:abandonTasksAtEntry":           {1, "WithAbandonedTasks 放弃旧任务——同 Abort：顶层空前缀删整个被放弃的任务；嵌套位置只删这一层，残留留着"},
 	"agui/handler.go:(*handler).dropCP":                      {1, "会话丢弃——函数体里硬编码空前缀"},
 	"example/store/redis_smoke/main.go:demoCheckpointer":     {1, "example 演示，空前缀"},
 }

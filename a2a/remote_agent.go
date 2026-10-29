@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"iter"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,7 +40,8 @@ import (
 // 那条记录，按身份（gateQuestionID）取回人的答复续那个远端任务；AUTH_REQUIRED 的凭证走带外通道，人答「已经
 // 授权」时不发消息、重新挂上那个任务（见 reattach）。在节点执行里被调起时这次调用在它自己的相位里问，不占调用它
 // 的那段代码的提问序号（见 callPhase）。引擎钩子与条件边里不能问人、不在任何节点执行里时句柄记在 session 上（见
-// WithHumanGate）。
+// WithHumanGate）。续一个远端任务之前先查它此刻的状态（见 reconcileTask）：上一次续它时响应在路上丢了、远端其实已经
+// 办完或换了一问的，不再去续一个已结束的任务、不把旧答复再发一次。
 //
 // **并发约束（默认模式下 ParallelAgent 多分支别复用同一 RemoteAgent 实例）**：默认模式（不开
 // WithHumanGate）的远程 taskID 按
@@ -247,9 +250,15 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 	byPosition := inNode && pos != ""
 	sessionHandles := !(a.humanGate && inNode) // gate 模式在节点里不用 session 上的句柄（见上）
 	var sendParts a2atypes.ContentParts        // 非 nil 时直接发它（按 interruptId 的答复），不再由 sendMsg 转
+	// handleWaiting：session 上的句柄是在远端等人（input-required）时留下的——这次的输入是答复，续之前要对账；不是（上一次
+	// 的流停在远端还在办的状态上就断了）时这次是新的请求（见下面对账那一段）。seenArtifacts：问人那一刻任务里各 artifact 的状态。
+	handleWaiting := false
+	var seenArtifacts []seenArtifact
 	if !sessionHandles {
 		taskID = ""
 	} else if taskID != "" {
+		handleWaiting = a.loadHandleWaiting(session)
+		seenArtifacts = a.loadSeenArtifacts(session)
 		if a.loadAuthWait(session) {
 			// 上一次停在远端要授权上、句柄在 session 上（不在任何节点执行里）：这次的输入是人对那一问的答复。标记在
 			// 收到远端回应之后才清（见下）：重新挂上在网络层失败、调用方超时时它留着，下一次 Run 照样重新挂上
@@ -268,6 +277,7 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 	if byPosition {
 		if p, ok := compose_v2.GetStepResult[gatePending](ctx, gateStepKey(pos)); ok && p.TaskID != "" {
 			pend = p
+			seenArtifacts = p.SeenArtifacts
 			if len(p.Items) > 1 {
 				// 远端挂着多问：每一问各是宿主这边的一个提问，答了几问就按 interruptId 发几问（远端没答到的
 				// 继续挂着，下一轮再来要人）。一问都没答：不联系远端，原样再问一次。
@@ -306,9 +316,11 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 	var (
 		result       = newRemoteOutput(a.name) // 远程应答的文本与非文本 part（raw/url/data → File/Data block）
 		lastState    a2atypes.TaskState
+		sawState     bool // 流里给过任务状态（Task / 状态更新事件），区分「状态认不出」与「远端只回了消息」
 		newTaskID    string
 		newContextID string
 		statusMsg    string
+		statusMsgID  string                // 最后一条状态消息的 ID（记进在等的那一问，对账时据它认出远端回应了没有）
 		statusParts  a2atypes.ContentParts // 最后一条状态消息的 parts（input-required 时从里面取挂起清单）
 	)
 	// 事件从哪来：续一个在等带外授权的任务、人说已经授权 ⟹ 重新挂上它；否则发一条消息（完整多模态：sendMsg 的
@@ -318,14 +330,69 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 		source iter.Seq2[a2atypes.Event, error]
 		method = "message_stream"
 	)
+	// recovered：事件来自对账取回的快照、或重新挂上的任务，而不是这次发出的消息的回应。快照里的 artifact 是任务此刻的全文，
+	// 正常续任务的流只收到这一轮的：问人之前已有的内容不算这一轮的产出，按 seenArtifacts 只取之后多出来的（见
+	// remoteOutput.taskArtifactSince）。重新挂上之后陆续到达的增量本来就只含新内容，照常收。
+	recovered := false
 	if reattach {
-		source, method = a.reattach(ctx, taskID), "subscribe_task"
+		source, method, recovered = a.reattach(ctx, taskID), "subscribe_task", true
 	} else {
 		parts := sendParts
 		if parts == nil {
 			parts = MessageToA2AParts(sendMsg)
 		}
 		msg = buildMessageFromParts(parts, taskID, contextID)
+		answering := byPosition && pend.TaskID != "" && pend.TaskID == taskID
+		switch {
+		case answering || handleWaiting:
+			// 续一个在等人的远端任务：先查它此刻的状态再决定发不发（见 reconcileTask）。答复人那一问的消息 ID 按那一问派生，
+			// 重发同一个答复是同一个 ID，对账时据它认出远端收没收到。
+			sentID, questionID := "", ""
+			if answering {
+				sentID, questionID = gateMessageID(pos, pend.TaskID, pend.Round), pend.QuestionMsgID
+				msg.ID = sentID
+			}
+			snap, how, rerr := a.reconcileTask(ctx, taskID, sentID, questionID)
+			switch how {
+			case reconcileSnapshot:
+				msg, method, recovered = nil, "get_task", true
+				source = func(yield func(a2atypes.Event, error) bool) { yield(snap, nil) }
+			case reconcileResubscribe:
+				msg, recovered = nil, true
+				source, method = a.reattach(ctx, taskID), "subscribe_task"
+			case reconcileGone:
+				// 远端没有这个任务了：清掉句柄与在等的那一问，之后再跑发原始请求（同远端任务失败）
+				if answering {
+					if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), gatePending{}); err != nil {
+						return nil, fmt.Errorf("a2a: remote agent %q: clear the question of a vanished task: %w", a.card.Name, err)
+					}
+				}
+				if sessionHandles {
+					a.clearIDs(session)
+				}
+				return nil, fmt.Errorf("a2a: remote agent %q no longer has task %s; the request starts a new task when run again", a.card.Name, taskID)
+			case reconcileInFlight:
+				// 不重发（远端收下了）、不当成新的一问；记录留着，再跑时接着对账。等的时候调用方停下了就交出它的错
+				if cerr := ctx.Err(); cerr != nil {
+					return nil, fmt.Errorf("a2a: remote agent %q: waiting for task %s to respond: %w", a.card.Name, taskID, context.Cause(ctx))
+				}
+				return nil, fmt.Errorf("a2a: remote agent %q received the answer for task %s but has not responded yet; run again to pick up its response", a.card.Name, taskID)
+			case reconcileUnknown:
+				// 查不到远端此刻的状态，又是在答人那一问：不盲发（远端可能已经收下、改问了别的，旧答复会被当成新那一问的
+				// 答复），记录留着，再跑时接着对账
+				return nil, fmt.Errorf("a2a: remote agent %q: check the state of task %s before answering it: %w", a.card.Name, taskID, rerr)
+			}
+		case sessionHandles && taskID != "":
+			// session 上的句柄不是在远端等人时留下的（上一次的流停在远端还在办的状态上就断了）：这次是新的请求，不是答复。
+			// 远端那个任务已经结束就当新任务发、只留会话线程；没结束照旧发给它（规范允许远端在任务没结束时收追加的消息）。
+			// 曾经一律按答复对账：远端已经办完时这次的请求一个字没发出去，交出的是上一个请求的结果（err == nil，审计实测）。
+			if t, err := a.client.GetTask(ctx, &a2atypes.GetTaskRequest{ID: a2atypes.TaskID(taskID)}); (err == nil && t != nil && t.Status.State.Terminal()) ||
+				errors.Is(err, a2atypes.ErrTaskNotFound) {
+				a.clearIDs(session)
+				taskID = ""
+				msg = buildMessageFromParts(parts, "", contextID)
+			}
+		}
 	}
 
 	// a2a 跨进程 trace（WithObservability 启用）：建 invoke_agent CLIENT span，把它的 trace context
@@ -368,14 +435,21 @@ stream:
 			newTaskID = string(v.ID)
 			newContextID = v.ContextID
 			lastState = v.Status.State
+			sawState = true
 			if v.Status.Message != nil {
 				statusMsg = a2aPartsText(v.Status.Message.Parts)
+				statusMsgID = v.Status.Message.ID
 				statusParts = v.Status.Message.Parts
 			}
 			for _, art := range v.Artifacts {
-				if art != nil {
-					result.taskArtifact(ctx, art.ID, art.Parts)
+				if art == nil {
+					continue
 				}
+				if recovered {
+					result.taskArtifactSince(ctx, art.ID, art.Parts, findSeen(seenArtifacts, string(art.ID)))
+					continue
+				}
+				result.taskArtifact(ctx, art.ID, art.Parts)
 			}
 			if waitsForInput(lastState) {
 				break stream
@@ -388,8 +462,10 @@ stream:
 				newContextID = v.ContextID
 			}
 			lastState = v.Status.State
+			sawState = true
 			if v.Status.Message != nil {
 				statusMsg = a2aPartsText(v.Status.Message.Parts)
+				statusMsgID = v.Status.Message.ID
 				statusParts = v.Status.Message.Parts
 			}
 			if waitsForInput(lastState) {
@@ -402,6 +478,11 @@ stream:
 		}
 	}
 
+	if lastState == a2atypes.TaskStateUnspecified && sawState {
+		// 流里给过任务状态、SDK 却认不出（规范后来加的、厂商扩展的状态值都映射成 Unspecified）：按「流停在中间状态上」处理
+		// （下面 default 那一档），不跟「远端只回了一条消息、没有任务」混成已完成。
+		lastState = unrecognizedTaskState
+	}
 	auth := lastState == a2atypes.TaskStateAuthRequired
 	if sessionHandles && !auth {
 		// 远端回应了、不再停在授权上：session 上的授权等待标记清掉。曾经在重新挂上之前就清，一次超时之后人的答复被当成
@@ -451,6 +532,7 @@ stream:
 				a.storeIDs(session, askTask, newContextID)
 				a.storePendingIDs(session, items)
 				a.storeAuthWait(session, auth)
+				a.storeHandleWaiting(session, true, a.artifactStates(ctx, askTask))
 				if auth {
 					return nil, authInterrupt("", q)
 				}
@@ -473,7 +555,8 @@ stream:
 				round = pend.Round + 1
 			}
 			// 记的是已经发生的事：远端这个任务在等人答这一问
-			rec := gatePending{TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, Question: q, Items: items, Auth: auth}
+			rec := gatePending{TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, Question: q, Items: items, Auth: auth,
+				QuestionMsgID: statusMsgID, SeenArtifacts: a.artifactStates(ctx, askTask)}
 			if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), rec); err != nil {
 				return nil, fmt.Errorf("a2a: remote agent %q: record the pending question: %w", a.card.Name, err)
 			}
@@ -491,6 +574,7 @@ stream:
 		// 远程要更多输入——存 taskID 供续跑同一 task
 		a.storeIDs(session, newTaskID, newContextID)
 		a.storePendingIDs(session, items)
+		a.storeHandleWaiting(session, true, a.artifactStates(ctx, firstNonEmpty(newTaskID, taskID)))
 		// 默认：把追问当输出返回——host BasicAgent 的 LLM 看到后补信息再调一次（续同一 task）
 		if len(items) > 1 {
 			return schema.AssistantMessage(fmt.Sprintf(
@@ -500,7 +584,7 @@ stream:
 		return schema.AssistantMessage(fmt.Sprintf(
 			"[input_required] remote agent %q needs more information: %s\n(Provide it by calling this tool again with the additional info.)",
 			a.card.Name, q)), nil
-	case a2atypes.TaskStateCompleted, a2atypes.TaskStateUnspecified:
+	case a2atypes.TaskStateCompleted, a2atypes.TaskStateUnspecified: // Unspecified：远端只回了消息、没有任务
 		if sessionHandles {
 			a.clearIDs(session)
 		}
@@ -519,9 +603,124 @@ stream:
 			"agent", a.card.Name, "state", string(lastState))
 		if sessionHandles {
 			a.storeIDs(session, newTaskID, newContextID)
+			a.storeHandleWaiting(session, false, nil)
 		}
 		return assistantWithBlocks(result.String(), result.Blocks()), nil
 	}
+}
+
+// reconcileOutcome 是续远端任务之前对账的结论。
+type reconcileOutcome int
+
+const (
+	reconcileSend        reconcileOutcome = iota // 照常发
+	reconcileSnapshot                            // 不发：按查到的这份快照收尾
+	reconcileResubscribe                         // 不发：远端已经在办，重新挂上读结果
+	reconcileGone                                // 远端没有这个任务了
+	reconcileInFlight                            // 不发：远端收下了这次的答复、等了一阵还没回应
+	reconcileUnknown                             // 不发：查不到远端此刻的状态，又是在答人那一问
+)
+
+// reconcileTask 在续一个在等人的远端任务之前查它此刻的状态（A2A GetTask）。上一次续它时远端收下答复、办完了、只是响应在路上
+// 丢了，句柄与在等的那一问按设计留着（网络失败要能续同一个任务），不对账的话之后每次都去续一个已结束的任务、远端每次都拒；
+// 远端收下答复又问了新的一问时，重发的旧答复会被当成新那一问的答复（均审计实测）。
+//
+//   - 已结束：不发，按快照收尾——完成就取回结果，失败、取消、拒绝同直接收到那个结局。
+//   - 在办（submitted / working）：它在等人时不会自己动起来，只能是收下了答复：不重发，重新挂上读结果。
+//   - 在等人、sentID 非空（答复人那一问，ID 按那一问派生）、任务历史里有它：远端收下了答复，重发的话会被当成下一问的答复。
+//     远端回应过（历史里它后面还有东西——服务端更新状态时把旧的状态消息移进历史；或状态消息已不是我们答的那一问 questionID）
+//     ⟹ 在问新的，按快照收尾、问人新的那一问；没回应过（执行器发出第一个状态之前任务一直停在原来那一问上）：轮询等它回应，
+//     最多 authReattachGrace，回应了按上面几条处置，到时仍没回应报 reconcileInFlight——不重发：远端可能只是慢，在不去重的
+//     服务端上重发会让它办两遍。历史里没有它（没收到，或远端不留历史）照常发。
+//   - 远端说没有这个任务：reconcileGone。
+//   - 查不到状态：sentID 非空时报 reconcileUnknown（不盲发，理由同上）；远端不支持 GetTask，或这次续的是 session 上的句柄
+//     （sentID 为空、答复认不出是哪一条）时照常发，跟没有这一步时一样。
+func (a *RemoteAgent) reconcileTask(ctx context.Context, taskID, sentID, questionID string) (*a2atypes.Task, reconcileOutcome, error) {
+	id := a2atypes.TaskID(taskID)
+	task, err := a.client.GetTask(ctx, &a2atypes.GetTaskRequest{ID: id})
+	if err != nil {
+		switch {
+		case errors.Is(err, a2atypes.ErrTaskNotFound):
+			return nil, reconcileGone, nil
+		case sentID != "" && !deterministicTaskQueryErr(err):
+			return nil, reconcileUnknown, err
+		}
+		return nil, reconcileSend, nil
+	}
+	if task == nil {
+		return nil, reconcileSend, nil
+	}
+	at := slices.IndexFunc(task.History, func(m *a2atypes.Message) bool { return m != nil && m.ID == sentID })
+	if !waitsForInput(task.Status.State) || sentID == "" || at < 0 {
+		return task, settledOutcome(task), nil
+	}
+	responded := func(t *a2atypes.Task) bool {
+		if questionID != "" && statusMessageID(t) != questionID {
+			return true
+		}
+		i := slices.IndexFunc(t.History, func(m *a2atypes.Message) bool { return m != nil && m.ID == sentID })
+		return i >= 0 && i < len(t.History)-1
+	}
+	if responded(task) {
+		return task, reconcileSnapshot, nil
+	}
+	task, err = a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
+		return !waitsForInput(t.Status.State) || responded(t)
+	}, authReattachGrace)
+	if err != nil || (waitsForInput(task.Status.State) && !responded(task)) {
+		return nil, reconcileInFlight, nil
+	}
+	if waitsForInput(task.Status.State) {
+		return task, reconcileSnapshot, nil
+	}
+	return task, settledOutcome(task), nil
+}
+
+// deterministicTaskQueryErr 判 GetTask 的错误是不是「再查也一样」：远端不支持这个操作、请求本身被拒（参数、鉴权、版本）。
+// 这类错误下等也查不到，照常发（跟没有对账这一步时一样）；传输错误、服务端内部错误这类瞬时的才不盲发、等下一次再查——
+// 否则 GetTask 一直被拒的远端上人的答复永远发不出去（审计推断）。
+func deterministicTaskQueryErr(err error) bool {
+	// ErrParseError 不算：它只说明「这次的响应解不开」，分不出是不是每次都一样——JSON-RPC 下是服务端回 -32700（我们发的是良构的，
+	// 多半是传输途中坏了），REST 下是 A2A 形状的错误体后面带着多余的数据。拿不准时不盲发：规范只说远端「可以」按 messageId
+	// 去重，Go / Python / Java 三家参考服务端执行都不去重（本仓依赖的 a2a-go 只是不把同一个 ID 的消息重复记进历史、执行器照跑；
+	// 2026-06 的 a2a-python / a2a-java），照发就是远端把同一个答复再处理一遍；不发是看得见的错误、有上界。
+	//
+	// 鉴权层、网关给的不是 A2A 形状的拒绝：REST 下客户端按 HTTP 状态码映射（a2a-go v2.7.0 起 401 → ErrUnauthenticated、
+	// 403 → ErrUnauthorized、404 / 405 / 501 → ErrMethodNotFound），照常发；JSON-RPC 下非 200 只给一句文本、拿不到状态码，
+	// 按瞬时处理、一直卡住（见 doc/code/todo.md「a2a 对账：拒绝 GetTask 的确定性错误」）。
+	for _, target := range []error{a2atypes.ErrMethodNotFound, a2atypes.ErrUnsupportedOperation,
+		a2atypes.ErrInvalidRequest, a2atypes.ErrInvalidParams, a2atypes.ErrVersionNotSupported, a2atypes.ErrExtensionSupportRequired,
+		a2atypes.ErrUnauthenticated, a2atypes.ErrUnauthorized} {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// settledOutcome 是不涉及「这次的答复送到没有」时按任务状态的处置：已结束按快照收尾，在办重新挂上，其余照常发。
+func settledOutcome(task *a2atypes.Task) reconcileOutcome {
+	switch st := task.Status.State; {
+	case st.Terminal():
+		return reconcileSnapshot
+	case st == a2atypes.TaskStateSubmitted || st == a2atypes.TaskStateWorking:
+		return reconcileResubscribe
+	}
+	return reconcileSend
+}
+
+// statusMessageID 取任务当前状态消息的 ID（没有状态消息时为空）。
+func statusMessageID(t *a2atypes.Task) string {
+	if t.Status.Message == nil {
+		return ""
+	}
+	return t.Status.Message.ID
+}
+
+// gateMessageID 是答复人那一问（位置 pos、远端任务 taskID、第几问 round，见 gateQuestionID）的那条消息的 ID：重发同一个
+// 答复时 ID 不变，对账时据它认出远端收没收到（见 reconcileTask）。
+func gateMessageID(pos, taskID string, round int) string {
+	return "crew-gate-" + gateQuestionID(pos, taskID, round)
 }
 
 // waitsForInput 判断远端任务停在等人的状态上（input-required / auth-required）。
@@ -578,19 +777,28 @@ var authReattachGrace = 30 * time.Second
 // authPollInterval 是等远端离开 AUTH_REQUIRED、以及远端不支持流式时轮询任务状态的间隔。
 var authPollInterval = 500 * time.Millisecond
 
+// unrecognizedTaskState 标记流里给过、但 SDK 认不出的任务状态（consume 按流停在中间状态上处理）。
+const unrecognizedTaskState a2atypes.TaskState = "unrecognized"
+
+// stalledSubscribeGrace 是订阅在任务还没结束、也不在等人时就关了流之后，再轮询多久看它有没有动。
+var stalledSubscribeGrace = 30 * time.Second
+
 // reattach 重新挂上一个在等带外授权的远端任务，事件交给 consume 的读流循环（规范 §7.6.2：客户端订阅或轮询 GetTask
 // 取后续，不需要再发消息）：
 //
 //  1. 轮询到任务离开 AUTH_REQUIRED，最多等 authReattachGrace；到时仍停在那儿就交出它（consume 据此再问一次人）。
 //  2. 已经结束、或停在别的等人状态上：交出它。
 //  3. 还在跑：远端支持流式就订阅、从它当时的快照接着读（规范 §3.1.6）；不支持就接着轮询，到结束或停在等人状态上为止。
+//  4. 订阅在任务没结束、也不在等人时关了流：远端没有执行在跑这个任务（重启之后持久 store 里留着的 working 任务——
+//     a2a-go 自 v2.7.0、a2a-js 的服务端这时交出快照就正常关流）。再轮询 stalledSubscribeGrace，动了就交出它，
+//     没动就报错、句柄留着。不当成结束：consume 会把已聚合的内容（往往是空的）当成功答复交出去（审计实测）。
 //
 // 先轮询再订阅：订阅的第一个事件是任务当时的快照，订阅时它还停在 AUTH_REQUIRED 上的话分不清是旧的还是新的一次要授权。
 func (a *RemoteAgent) reattach(ctx context.Context, taskID string) iter.Seq2[a2atypes.Event, error] {
 	return func(yield func(a2atypes.Event, error) bool) {
 		id := a2atypes.TaskID(taskID)
-		task, err := a.pollTask(ctx, id, func(st a2atypes.TaskState) bool {
-			return st != a2atypes.TaskStateAuthRequired
+		task, err := a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
+			return t.Status.State != a2atypes.TaskStateAuthRequired
 		}, authReattachGrace)
 		if err != nil {
 			yield(nil, err)
@@ -602,8 +810,8 @@ func (a *RemoteAgent) reattach(ctx context.Context, taskID string) iter.Seq2[a2a
 			return
 		}
 		if !a.card.Capabilities.Streaming {
-			task, err = a.pollTask(ctx, id, func(st a2atypes.TaskState) bool {
-				return st.Terminal() || waitsForInput(st)
+			task, err = a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
+				return t.Status.State.Terminal() || waitsForInput(t.Status.State)
 			}, 0)
 			if err != nil {
 				yield(nil, err)
@@ -613,6 +821,7 @@ func (a *RemoteAgent) reattach(ctx context.Context, taskID string) iter.Seq2[a2a
 			return
 		}
 		got := false
+		last := st
 		for ev, e := range a.client.SubscribeToTask(ctx, &a2atypes.SubscribeToTaskRequest{ID: id}) {
 			if e != nil {
 				if !got {
@@ -626,16 +835,39 @@ func (a *RemoteAgent) reattach(ctx context.Context, taskID string) iter.Seq2[a2a
 				return
 			}
 			got = true
+			switch v := ev.(type) {
+			case *a2atypes.Task:
+				last = v.Status.State
+			case *a2atypes.TaskStatusUpdateEvent:
+				last = v.Status.State
+			}
 			if !yield(ev, nil) {
 				return
 			}
 		}
+		if last.Terminal() || waitsForInput(last) {
+			return
+		}
+		// 第 4 条：流关了、任务还停在中间状态上
+		task, err = a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
+			return t.Status.State.Terminal() || waitsForInput(t.Status.State)
+		}, stalledSubscribeGrace)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		if st := task.Status.State; st.Terminal() || waitsForInput(st) {
+			yield(task, nil)
+			return
+		}
+		yield(nil, fmt.Errorf("remote task %s is %s but the remote is not working on it: the subscription closed without a final state and the task did not change within %s",
+			taskID, task.Status.State, stalledSubscribeGrace))
 	}
 }
 
-// pollTask 每隔 authPollInterval 取一次远端任务（第一次立刻取），直到 done 对它的状态为真、或过了 limit（0 不限，只受
+// pollTask 每隔 authPollInterval 取一次远端任务（第一次立刻取），直到 done 对它为真、或过了 limit（0 不限，只受
 // ctx 约束），返回最后一次取到的任务。
-func (a *RemoteAgent) pollTask(ctx context.Context, id a2atypes.TaskID, done func(a2atypes.TaskState) bool, limit time.Duration) (*a2atypes.Task, error) {
+func (a *RemoteAgent) pollTask(ctx context.Context, id a2atypes.TaskID, done func(*a2atypes.Task) bool, limit time.Duration) (*a2atypes.Task, error) {
 	var deadline time.Time
 	if limit > 0 {
 		deadline = time.Now().Add(limit)
@@ -645,7 +877,7 @@ func (a *RemoteAgent) pollTask(ctx context.Context, id a2atypes.TaskID, done fun
 		if err != nil {
 			return nil, err
 		}
-		if done(task.Status.State) || (limit > 0 && !time.Now().Before(deadline)) {
+		if done(task) || (limit > 0 && !time.Now().Before(deadline)) {
 			return task, nil
 		}
 		timer := time.NewTimer(authPollInterval)
@@ -844,6 +1076,122 @@ func (a *RemoteAgent) storeIDs(s *agent_v2.RunSession, taskID, contextID string)
 	}
 }
 
+// handleKey 是「session 上的句柄是在远端等人时留下的」在 session 上的键（任务级，同 taskKey）；seenKey 是那时任务里已有的
+// artifact（见 gatePending.SeenArtifacts）。
+func (a *RemoteAgent) handleKey(s *agent_v2.RunSession) string {
+	return "a2a:" + a.name + ":handle_waiting:" + s.RunID
+}
+
+func (a *RemoteAgent) seenKey(s *agent_v2.RunSession) string {
+	return "a2a:" + a.name + ":seen_artifacts:" + s.RunID
+}
+
+func (a *RemoteAgent) storeHandleWaiting(s *agent_v2.RunSession, waiting bool, seen []seenArtifact) {
+	if s == nil {
+		return
+	}
+	s.SetValue(a.handleKey(s), waiting)
+	s.SetValue(a.seenKey(s), seen)
+}
+
+func (a *RemoteAgent) loadHandleWaiting(s *agent_v2.RunSession) bool {
+	if s == nil {
+		return false
+	}
+	v, _ := s.GetValue(a.handleKey(s))
+	waiting, _ := v.(bool) // 别人在同 key 存了别的类型：当作不在等人，按新请求发
+	return waiting
+}
+
+func (a *RemoteAgent) loadSeenArtifacts(s *agent_v2.RunSession) []seenArtifact {
+	if s == nil {
+		return nil
+	}
+	v, _ := s.GetValue(a.seenKey(s))
+	seen, _ := v.([]seenArtifact) // 同上：取不到就按没见过收全文
+	return seen
+}
+
+// seenArtifact 是问人那一刻远端任务里一个 artifact 的状态：正文的字节数与哈希、非文本块的个数与哈希。取回快照时据此判断这一轮
+// 对它做了什么——正文与块都仍以当时的内容开头就是往后追加了，只收多出来的部分；有一样对不上就是整段替换了，收全文（同正常续
+// 任务时收到 append=false 的更新）。只记 ID 的话，远端跨轮往同一个 artifact 里追加时这一轮的内容整段被跳过（答复变空）；块
+// 只比个数的话，正文没变、只换了数据块的替换被当成没动（同样变空，均审计实测）。
+//
+// 局限：远端整段替换、而新内容恰好以旧内容开头时，快照里看不出它是替换还是追加，按追加只收后缀（正常续任务时收到的是全文）。
+// 快照只有最终全文，客户端消不掉这个歧义。
+type seenArtifact struct {
+	ID         string `json:"id"`
+	TextLen    int    `json:"text_len"`
+	TextHash   string `json:"text_hash"`
+	Blocks     int    `json:"blocks"`
+	BlocksHash string `json:"blocks_hash"`
+}
+
+// artifactStatesTimeout 是问人那一刻取 artifact 状态最多等多久。不设上限的话，卡住的远端让问人这一步挂到调用方的期限（调用方
+// 没设期限就一直挂）；设得太短又会在慢但正常的远端上取不到——取不到不是无害的：之后按快照收尾、授权之后重新挂上（正常流程，
+// 不需要响应丢失）时都不扣除，答复里静默带上问人之前的内容。所以跟等远端状态的另一处上限（authReattachGrace）同一量级，并且
+// 只取 artifact、不取历史（HistoryLength 0）。曾经是 5 秒，审计实测慢 6 秒的远端在授权流程里就把授权前的内容收进了答复。
+var artifactStatesTimeout = 30 * time.Second
+
+// artifactStates 向远端取任务此刻各 artifact 的状态（问人那一刻调）。取不到时返回 nil：之后取回快照或授权后重新挂上时不扣除，
+// 跟没有这一步一样把已有内容也收进答复（记一条告警；远端不支持 GetTask、调用方已经放弃时不记——前者本来就没有可扣的依据，
+// 后者不是远端的问题）。累积不出来：每次调用的输出只有这一次的增量，不知道远端此前对同一个 artifact 是追加还是替换。
+func (a *RemoteAgent) artifactStates(ctx context.Context, taskID string) []seenArtifact {
+	if taskID == "" {
+		return nil
+	}
+	qctx, cancel := context.WithTimeout(ctx, artifactStatesTimeout)
+	defer cancel()
+	noHistory := 0
+	task, err := a.client.GetTask(qctx, &a2atypes.GetTaskRequest{ID: a2atypes.TaskID(taskID), HistoryLength: &noHistory})
+	if err != nil || task == nil {
+		if ctx.Err() == nil && !errors.Is(err, a2atypes.ErrMethodNotFound) && !errors.Is(err, a2atypes.ErrUnsupportedOperation) {
+			slog.WarnContext(ctx, "a2a: 问人时没取到远端任务的 artifact 状态，之后按快照收尾或授权后重新挂上时，答复可能带上问人之前的内容",
+				"agent", a.card.Name, "task", taskID, "err", err)
+		}
+		return nil
+	}
+	seen := make([]seenArtifact, 0, len(task.Artifacts))
+	for _, art := range task.Artifacts {
+		if art == nil || art.ID == "" {
+			continue
+		}
+		t, bs := PartsToContent(art.Parts)
+		seen = append(seen, seenArtifact{ID: string(art.ID), TextLen: len(t), TextHash: textHash(t), Blocks: len(bs), BlocksHash: blocksHash(bs)})
+	}
+	return seen
+}
+
+// findSeen 取 id 那个 artifact 问人那一刻的状态，没有时返回 nil。
+func findSeen(seen []seenArtifact, id string) *seenArtifact {
+	for i := range seen {
+		if seen[i].ID == id {
+			return &seen[i]
+		}
+	}
+	return nil
+}
+
+// textHash 是正文的哈希（截短，只用来判断前缀是不是同一段内容）。
+func textHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:16])
+}
+
+// blocksHash 是一组非文本块的哈希（按 JSON 形状，map 键已排序）。编不成 JSON 时返回空串：对不上，按整段替换收全文。
+// 没有块时 nil 与空切片同一个哈希——问人时没有块记下的是 nil，取回时截出来的前缀是空切片，编出来一个是 null、一个是 []，
+// 曾因此把「往没有块的 artifact 里追加了块」当成整段替换、旧正文重复收进答复（审计实测）。
+func blocksHash(bs []*schema.ContentBlock) string {
+	if len(bs) == 0 {
+		bs = nil
+	}
+	raw, err := json.Marshal(bs)
+	if err != nil {
+		return ""
+	}
+	return textHash(string(raw))
+}
+
 // pendingKey 是远端挂多问时那几问的 interruptId 在 session 上的键（任务级，同 taskKey）。
 func (a *RemoteAgent) pendingKey(s *agent_v2.RunSession) string {
 	return "a2a:" + a.name + ":pending:" + s.RunID
@@ -903,6 +1251,8 @@ func (a *RemoteAgent) clearIDs(s *agent_v2.RunSession) {
 	}
 	s.SetValue(a.pendingKey(s), []string(nil))
 	s.SetValue(a.authKey(s), false)
+	s.SetValue(a.handleKey(s), false)
+	s.SetValue(a.seenKey(s), []string(nil))
 	// **只清 taskID，contextID 留着**。A2A 语义里 contextID 是会话线程标识、跨多 task
 	// 存活；taskID 才是单次任务的。
 	//
@@ -937,6 +1287,12 @@ type gatePending struct {
 	// Auth：远端停在 AUTH_REQUIRED 上要授权。凭证走带外通道：人拒绝时取消这个任务，其余答复都重新挂上它（见
 	// reattach），不发消息。
 	Auth bool `json:"auth,omitempty"`
+	// QuestionMsgID 是远端问这一问的那条状态消息的 ID：续任务之前对账时，远端的状态消息还是它就是还没回应这次的答复
+	// （见 reconcileTask）。
+	QuestionMsgID string `json:"question_msg_id,omitempty"`
+	// SeenArtifacts 是问这一问的那一刻，这个远端任务里各 artifact 的状态：对账取回快照、或重新挂上任务时，那时已有的内容不算
+	// 回应这一问的产出（正常续任务的流里只有这一轮的，见 seenArtifact）。
+	SeenArtifacts []seenArtifact `json:"seen_artifacts,omitempty"`
 }
 
 func init() {

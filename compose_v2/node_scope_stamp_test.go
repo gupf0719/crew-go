@@ -39,7 +39,9 @@ func (h nsOuterHooks) OnNodeStart(ctx context.Context, _ compose_v2.NodeID, _ co
 	sb.AddNode("x", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) { return nil, nil })
 	sb.AddEdge(compose_v2.StartNode, "x")
 	sg, _ := sb.Compile()
-	err := compose_v2.Run(ctx, sg, compose_v2.NewChannelManager(), compose_v2.WithHooks(nsInnerPause{}))
+	// 内层给自己的 ns：落进外层图自己的存档槽的嵌套 Run 在入口就被拒
+	err := compose_v2.Run(ctx, sg, compose_v2.NewChannelManager(), compose_v2.WithHooks(nsInnerPause{}),
+		compose_v2.WithRunNS(compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), "inner")))
 	*h.inner = err
 	return ctx, err // hook 把它返出去——早退路径会校验并冒泡
 }

@@ -245,16 +245,14 @@ func TestHookInterrupt_JudgmentBasisIsEngineStampNotNS(t *testing.T) {
 	if len(pending) == 0 {
 		t.Fatalf("形态 B: 放行后必须有挂起档（否则仍是假暂停）")
 	}
-	// ⚠️ **放行 ≠ 这个形态可用**（已知限制，这一段钉住它）：子层是同一个任务的一部分，却没有自己的
-	// ns——它的图跑在父图自己的槽 (sid, "") 上。续跑时父图的存档还在那个槽里，子层的图（BasicAgent，
-	// 身份跟父图不同）撞上它 ⟹ ErrGraphIDConflict。两张图身份恰好相同时（比如父图也是 BasicAgent 的）
-	// 守卫拦不住，子层直接接着跑父图的存档。给新 session 则入口直接拒（它不属于所在的任务）。真要
-	// 闭环得走 RunSubAgent（它给子层一个自己的槽）。
+	// ⚠️ **放行 ≠ 这个形态可用**：子层是同一个任务的一部分，却没有自己的 ns——它的图要落进父图自己的
+	// 存档槽 (sid, "")。续跑时钩子放行、子层跑到图那一步，compose_v2.Run 入口当场拒（ErrRunAborted，指向
+	// RunSubAgent）。曾经放行：两张图身份不同时撞 ErrGraphIDConflict，身份相同时（比如父图也是 BasicAgent 的）
+	// 子层直接接着跑父图的存档。给新 session 则 agent 入口直接拒（它不属于所在的任务）。
 	resumeErr := compose_v2.Run(context.Background(), g, compose_v2.NewChannelManager(),
 		compose_v2.WithCheckpointer(cper), compose_v2.WithSessionID(sid),
 		compose_v2.WithResumeAnswers(map[string]*schema.Message{"pause-1": schema.UserMessage("继续")}))
-	if !errors.Is(resumeErr, compose_v2.ErrGraphIDConflict) {
-		t.Fatalf("已知限制变了：裸调 sub.Run 没有自己的 ns，续跑时子层的图该撞上父图留在同一个槽里的存档"+
-			"（ErrGraphIDConflict），got %v——若这是有意修复，同步 enterRunTask 的说明与 todo 里那一条", resumeErr)
+	if !errors.Is(resumeErr, compose_v2.ErrRunAborted) || !strings.Contains(resumeErr.Error(), "RunSubAgent") {
+		t.Fatalf("裸调 sub.Run 没有自己的 ns，续跑时子层的图该在 Run 入口被拒（ErrRunAborted、指向 RunSubAgent），got %v", resumeErr)
 	}
 }

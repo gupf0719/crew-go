@@ -4,9 +4,9 @@ package compose_v2_test
 //
 // F-D: outer recover 无条件覆盖 runErr → defer 链 panic 抹掉 InterruptError →
 //      IsInterrupt=false 但 cleanup 已存 Pending cp（状态矛盾，HITL 静默失效）。
-//      fix: runErr 已有值时 errors.Join 保双链。
-//      sanity-revert: 把 graph_loop.go outer recover 改回无条件 `runErr = panicErr`
-//      → IsInterrupt(err)==false → 本测试 fail。
+//      当时的修法是 runErr 已有值时 errors.Join 保双链；现在 OnGraphEnd 的 panic 在它自己的 defer 里
+//      就地兜住、不进错误，落不到 outer recover（那道只剩兜框架自己的出口代码）。
+//      sanity-revert: 去掉 graph_loop.go OnGraphEnd defer 里的 recover → 错误里多出 panic → 本测试 fail。
 //
 // 注：原 F-C（cond "空 query" 路径漏 updateFrontier）回归测试已随「cond 禁止 interrupt」
 // 协议移除——该独立分支已并入统一的 cond-interrupt 拒绝分支，行为由
@@ -15,6 +15,7 @@ package compose_v2_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -30,8 +31,8 @@ func (engAuditPanicOnGraphEnd) OnGraphEnd(ctx context.Context, _ compose_v2.Chan
 }
 
 // TestEngineAudit_FD_DeferPanicPreservesInterrupt：节点抛 InterruptError + OnGraphEnd
-// hook panic → 返回 err 必须仍 IsInterrupt==true（errors.Join 保双链），且 panic 信息
-// 也保留（业务两个原因都能看到）。
+// hook panic → 返回 err 必须仍 IsInterrupt==true。OnGraphEnd 跑在图结束之后，它的 panic 只记日志、
+// 不并进错误（错误文本与没有 panic 时相同，见 graph_loop.go OnGraphEnd 的 defer）。
 func TestEngineAudit_FD_DeferPanicPreservesInterrupt(t *testing.T) {
 	interruptNode := func(_ context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 		return nil, &compose_v2.InterruptError{
@@ -56,8 +57,9 @@ func TestEngineAudit_FD_DeferPanicPreservesInterrupt(t *testing.T) {
 	if _, ok := compose_v2.IsInterrupt(runErr); !ok {
 		t.Errorf("F-D regression: defer 链 panic 后 IsInterrupt=false，InterruptError 被覆盖丢失。err=%v", runErr)
 	}
-	// 双链另一支：panic 信息也应保留（errors.Join 不吞 panic 诊断）。
-	if !strings.Contains(runErr.Error(), "panic recovered") {
-		t.Errorf("F-D regression: errors.Join 应保留 panic 诊断信息，err=%v", runErr)
+	// 观测钩子的 panic 不改变结局：错误文本里没有它、错误链上没有 PanicError（看得见靠 ERROR 日志）。
+	var pe *compose_v2.PanicError
+	if strings.Contains(runErr.Error(), "panic") || errors.As(runErr, &pe) {
+		t.Errorf("OnGraphEnd 的 panic 不该并进错误，err=%v", runErr)
 	}
 }

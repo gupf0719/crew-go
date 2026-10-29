@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"crew-go/a2a"
 	"crew-go/agent_v2"
@@ -39,6 +40,10 @@ type gateRemote struct {
 	got    []string
 	conts  atomic.Int32
 	onCont func(n int32) a2atypes.TaskState // 第 n 次续任务（从 1 起）怎么结束；返回 Completed 则完成
+	// contDelay 是续任务时远端收下答复之后、发出结局之前停多久（其间任务仍停在原来那一问上，contWorking 时先切到 working）
+	contDelay   time.Duration
+	contWorking bool
+	working     atomic.Bool // contWorking 时已经发出 working
 }
 
 func (g *gateRemote) record(s string) {
@@ -71,6 +76,13 @@ func (g *gateRemote) exec(execCtx *a2asrv.ExecutorContext, yield func(a2atypes.E
 		return
 	}
 	g.record("cont:" + txt)
+	if g.contWorking {
+		if !yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateWorking, nil), nil) {
+			return
+		}
+		g.working.Store(true)
+	}
+	time.Sleep(g.contDelay)
 	state := a2atypes.TaskStateCompleted
 	if g.onCont != nil {
 		state = g.onCont(g.conts.Add(1))

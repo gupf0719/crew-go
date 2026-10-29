@@ -219,7 +219,12 @@ func (p *ParallelAgent) Run(ctx context.Context, session *RunSession, input *sch
 	if len(p.branches) == 0 {
 		return nil, fmt.Errorf("parallel agent %q: no branches; call AddBranch", p.Name())
 	}
+	cfg := applyRunOptions(opts)
 	if err := resolveRunSession(ctx, &session, p.Name()); err != nil {
+		return nil, err
+	}
+	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
+	if err := checkAbandonedTasks(ctx, cfg.abandoned, session, p.Name()); err != nil {
 		return nil, err
 	}
 	ctx = WithSession(ctx, session)
@@ -231,7 +236,6 @@ func (p *ParallelAgent) Run(ctx context.Context, session *RunSession, input *sch
 	}
 	defer stopHistory()
 
-	cfg := applyRunOptions(opts)
 	// MED-1 fail-fast：composite 不把 per-call 覆盖透传给 inner step，传了静默 no-op，直接报错。
 	if err := rejectCompositeOverride(cfg.overrides()); err != nil {
 		return nil, err
@@ -248,7 +252,9 @@ func (p *ParallelAgent) Run(ctx context.Context, session *RunSession, input *sch
 	// audit³ D1 fix: OnAgentStart Run top-level fire (跟 PlanAgent 对齐)
 	agentIn := &hook.AgentInput{Messages: []*schema.Message{input}}
 	// 「这是不是新任务」判在钩子之前：钩子里就可能发起调用（见 enterRunTask）
-	ctx = enterRunTask(ctx, session)
+	ctx = enterGraphRunTask(ctx, session)
+	// 调用方声明放弃了的任务（WithAbandonedTasks）：在记这次的输入、触发钩子之前收尾
+	abandonTasksAtEntry(ctx, cfg.abandoned, p.Name())
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return hooks.OnAgentStart(c, info, agentIn)
@@ -337,7 +343,7 @@ func (p *ParallelAgent) Resume(ctx context.Context, sessionID string, opts ...Re
 	startOffset := len(session.Events())
 	// audit³ D1 fix: OnAgentStart Resume top-level fire (跟 PlanAgent 对齐)
 	agentInResume := &hook.AgentInput{}
-	ctx = enterResumeTask(ctx, session)
+	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return hooks.OnAgentStart(c, info, agentInResume)
@@ -390,7 +396,7 @@ func (p *ParallelAgent) Resume(ctx context.Context, sessionID string, opts ...Re
 	if hooks := extractOrchHooksOrCtx(ctx, rcfg.orchHooks); hooks != nil {
 		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
-	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
+	runErr := compose_v2.Run(ctx, g, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := ParallelAgentFinalMessage(cm.Channels())
 	finalRef = final
 	if runErr != nil {
@@ -439,7 +445,7 @@ func (p *ParallelAgent) runGraph(
 	if hooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks); hooks != nil {
 		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
-	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
+	runErr := compose_v2.Run(ctx, g, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := ParallelAgentFinalMessage(cm.Channels())
 	return final, runErr
 }

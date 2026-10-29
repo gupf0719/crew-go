@@ -905,11 +905,14 @@ ctx 上的位置、答案、新开信号、任务章（连同会话 ID、软取�
 独立任务挂起时它的中断不能从节点返回（引擎终局拒收——那个挂起只能在顶层用它自己的 RunID 续；原样返回、
 取出来返回、再包一层都一样）。
 
-⚠️ **裸调 `sub.Run(ctx, ...)` 完全不 push ns 的形态更糟**：传父的 session（或不传）时子层的存档
-落进父图自己的槽——两张图身份不同时 Resume 撞 `ErrGraphIDConflict`（哨兵
-`agent_v2/hook_interrupt_scope_test.go` 的形态 B），身份相同时（BasicAgent 的图不带名字，任意两个
-BasicAgent 的图身份相同）守卫拦不住、子层接着跑父图的存档；传新 session 时入口直接拒（哨兵
-`agent_v2/task_scope_test.go` 的 `TestTask_BareRunWithNewSessionInNode_IsRejected`）。
+⚠️ **裸调 `sub.Run(ctx, ...)` 完全不 push ns 的形态不能用**：传父的 session（或不传）时子层的图要落进父图自己的
+存档槽（节点、工具、图级钩子、9 个编排的 agent 级钩子里都是；经 `EnterRun` 进入的自研壳自己的阶段里入口不拦，靠图身份兜：
+BasicAgent 显式起了名字时图身份是「名字:结构指纹」，裸调的与壳透传的那个名字不同时载入撞 `ErrGraphIDConflict`、什么都不执行，
+两个都没起名字、结构又相同时照旧接着跑），配了 checkpointer 时 `compose_v2.Run` 入口当场拒（`ErrRunAborted`，子层什么都不执行，正文指向
+`RunSubAgent`；哨兵 `agent_v2/bare_nested_run_slot_test.go`、`compose_v2/nested_run_own_slot_test.go`）。曾经放行：
+两张图身份不同时 Resume 撞 `ErrGraphIDConflict`，身份相同时（当时 BasicAgent 的图只按结构指纹算身份，任意两个 BasicAgent
+的图身份相同）子层接着跑父图的存档、旁路工具多执行一次、成功时把父图的档删掉，`err == nil`。传新 session 时 agent 入口直接拒
+（哨兵 `agent_v2/task_scope_test.go` 的 `TestTask_BareRunWithNewSessionInNode_IsRejected`）。
 
 详见 [`channel-engine.md`](./channel-engine.md) §8.1–§8.2（ns 形态与 API）+ CLAUDE.md "GraphAgent 提示"。
 

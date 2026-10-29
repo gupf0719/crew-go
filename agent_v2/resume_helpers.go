@@ -126,18 +126,19 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		// abort 成功 cp 清掉但实际 persist → 多租户场景泄漏 sensitive context.
 		// slog.Warn 让业务订阅 handler 转告警 (非 fail-fast 因业务可能批量 abort
 		// 容忍部分失败).
-		// **先补历史再删 cp。** 顺序承重：补记只依赖历史层，但放在删之后的话，
-		// DeleteSubtree 失败提前 return 时补记就跟着丢了。
-		closeUnansweredToolCallsOnAbort(ctx, resolveHistoryConfigForAbort(ctx, subs), agentName, sessionID)
-
+		// **先删 cp、删成功才补历史**（给悬空的 tool_call 补一条「被放弃」）：「历史里写了被放弃」要推得出「档已删」——
+		// 删失败时任务还能续，补了的话续跑执行之后真结果排在「被放弃」之后、按先到的配对被当成多余的。反过来档删了、补
+		// 结果失败只留下悬空的调用，读侧兜得住。
 		delStart := time.Now()
 		delCount, dErr := cper.DeleteSubtree(ctx, sessionID, ns)
 		// reason="resume_abort"：业务主动弃单（WithResumeAction(Abort)）——跟引擎的
 		// "abort"（ErrRunAborted 终局失败，graph_loop Run 出口 purge）不同源，别混成一个值
 		compose_v2.EmitCpCleanupHelper(ctx, sessionID, ns, "resume_abort", delCount, time.Since(delStart).Milliseconds(), dErr)
 		if dErr != nil {
-			slog.WarnContext(ctx, "agent resume abort: cper.DeleteSubtree failed (cp 可能未清)",
+			slog.WarnContext(ctx, "agent resume abort: cper.DeleteSubtree failed (cp 可能未清)，悬空的 tool_call 不补",
 				"agent", agentName, "sessionID", sessionID, "ns", ns, "err", dErr)
+		} else {
+			closeUnansweredToolCallsOnAbort(ctx, resolveHistoryConfigForAbort(ctx, subs), agentName, sessionID)
 		}
 
 		// **audit MED fix**：补 push sid——Abort 分支在下方 WithSession（step 6）之前就

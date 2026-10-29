@@ -26,6 +26,9 @@ func rolesOf(g []*schema.Message) string {
 // 摘要跑完**反而变大**（入 30016 字节、出 30059），还白烧一次 LLM，且下一轮再触发。
 //
 // 断言选在「那一组的长度」上——只断言「system 开了新组」抓不到「它没关上」。
+//
+// 例外：system 夹在一次调用与它的结果之间时跟这一对同组（见 TestGroupMessagesByAPIRound_PairNeverSplit）——切开会把
+// 调用与结果分到两组。
 func TestGroupMessagesByAPIRound_SystemIsAlwaysAlone(t *testing.T) {
 	tc := schema.AssistantToolCallMessage([]schema.ToolCall{{
 		ID: "c1", Type: "function", Function: schema.FunctionCall{Name: "f", Arguments: "{}"},
@@ -35,9 +38,9 @@ func TestGroupMessagesByAPIRound_SystemIsAlwaysAlone(t *testing.T) {
 			schema.UserMessage("u1"), schema.SystemMessage("MID"),
 			schema.AssistantMessage("紧跟其后"), schema.UserMessage("u2"),
 		},
-		"system 后跟 tool_result": {
-			schema.UserMessage("u1"), tc, schema.SystemMessage("MID"),
-			schema.ToolResultMessage("c1", "结果"),
+		"system 后跟 tool_result（调用的结果已经到齐）": {
+			schema.UserMessage("u1"), tc, schema.ToolResultMessage("c1", "结果"),
+			schema.SystemMessage("MID"), schema.ToolResultMessage("c9", "没有对应调用的结果"),
 		},
 		"两条相邻 system": {
 			schema.UserMessage("u1"), schema.SystemMessage("A"),
@@ -95,5 +98,60 @@ func TestGroupMessagesByAPIRound_NonSystemGroupingUnchanged(t *testing.T) {
 			t.Errorf("组%d 形态变了：期望 [%s]，实际 [%s]——tool_result 必须跟它的 assistant 同组",
 				i, want[i], rolesOf(got[i]))
 		}
+	}
+}
+
+// 一次调用与它的结果总在同一组：业务把 system / user 插进它们之间时（qwen 照收，DeepSeek / OpenAI 拒），曾在 system 旁边
+// 切开——压缩层整组拎出、摘要、丢弃时把调用与结果分到两边，输出里留下孤儿 tool_result、摘要输入里带着悬空的调用。结果到齐
+// 之后照常切组；没收到结果的调用不拖住后面的分组；同一个 ID 被后面重新声明时，后面的结果配给后面那次。
+func TestGroupMessagesByAPIRound_PairNeverSplit(t *testing.T) {
+	tcOf := func(ids ...string) *schema.Message {
+		calls := make([]schema.ToolCall, 0, len(ids))
+		for _, id := range ids {
+			calls = append(calls, schema.ToolCall{ID: id, Type: "function", Function: schema.FunctionCall{Name: "f", Arguments: "{}"}})
+		}
+		return schema.AssistantToolCallMessage(calls)
+	}
+	tr := func(id string) *schema.Message { return schema.ToolResultMessage(id, "结果") }
+	// multi：一条 tool 消息里放几个结果块（业务照 Anthropic 的样子合并结果；openai 转换时拆成几条）
+	multi := func(ids ...string) *schema.Message {
+		m := &schema.Message{Role: schema.RoleTool}
+		for _, id := range ids {
+			m.ContentBlocks = append(m.ContentBlocks, &schema.ContentBlock{Type: "tool_result",
+				Toolresult: &schema.ToolresultContentBlock{ToolCallId: id, Content: "结果"}})
+		}
+		return m
+	}
+	u, sys := schema.UserMessage, schema.SystemMessage
+	for _, tc := range []struct {
+		name string
+		msgs []*schema.Message
+		want []string
+	}{
+		{"system 夹在调用与结果之间", []*schema.Message{u("u1"), tcOf("c1"), sys("MID"), tr("c1"), u("u2")},
+			[]string{"user assistant system tool", "user"}},
+		{"user 夹在调用与结果之间", []*schema.Message{u("u1"), tcOf("c1"), u("插话"), tr("c1"), u("u2")},
+			[]string{"user assistant user tool", "user"}},
+		{"两个调用的结果被 system 隔开", []*schema.Message{u("u1"), tcOf("a", "b"), tr("a"), sys("MID"), tr("b"), u("u2")},
+			[]string{"user assistant tool system tool", "user"}},
+		{"没收到结果的调用不拖住后面", []*schema.Message{u("u1"), tcOf("c1"), u("u2"), tcOf("c2"), tr("c2")},
+			[]string{"user assistant", "user assistant tool"}},
+		{"复用 ID：后面的结果配给后面那次", []*schema.Message{u("u1"), tcOf("c1"), u("u2"), tcOf("c1"), tr("c1")},
+			[]string{"user assistant", "user assistant tool"}},
+		{"结果块不在第一块", []*schema.Message{u("u1"), tcOf("a", "b"), tr("a"), sys("MID"), multi("x", "b"), u("u2")},
+			[]string{"user assistant tool system tool", "user"}},
+		{"合法形态不受影响", []*schema.Message{u("u1"), tcOf("c1"), tr("c1"), sys("MID"), u("u2")},
+			[]string{"user assistant tool", "system", "user"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			groups := compose_v2.GroupMessagesByAPIRound(tc.msgs)
+			got := make([]string, 0, len(groups))
+			for _, g := range groups {
+				got = append(got, rolesOf(g))
+			}
+			if strings.Join(got, " | ") != strings.Join(tc.want, " | ") {
+				t.Fatalf("分组 %q，want %q", got, tc.want)
+			}
+		})
 	}
 }

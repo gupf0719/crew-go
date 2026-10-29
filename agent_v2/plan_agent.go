@@ -396,7 +396,12 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 		return nil, fmt.Errorf("plan agent %q: input message must not be nil", p.name)
 	}
 	input = ownRunInput(input)
+	cfg := applyRunOptions(opts)
 	if err := resolveRunSession(ctx, &session, p.Name()); err != nil {
+		return nil, err
+	}
+	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
+	if err := checkAbandonedTasks(ctx, cfg.abandoned, session, p.Name()); err != nil {
 		return nil, err
 	}
 	ctx = WithSession(ctx, session)
@@ -408,7 +413,6 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 	}
 	defer stopHistory()
 
-	cfg := applyRunOptions(opts)
 	// MED-1 fail-fast：composite 不把 per-call 覆盖透传给 inner step，传了静默 no-op，直接报错。
 	if err := rejectCompositeOverride(cfg.overrides()); err != nil {
 		return nil, err
@@ -437,7 +441,9 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 	// 修后从 agentIn.Messages 取末条作 input, 与 BasicAgent 协议对称.
 	agentIn := &hook.AgentInput{Messages: []*schema.Message{input}}
 	// 「这是不是新任务」判在钩子之前：钩子里就可能发起调用（见 enterRunTask）
-	ctx = enterRunTask(ctx, session)
+	ctx = enterGraphRunTask(ctx, session)
+	// 调用方声明放弃了的任务（WithAbandonedTasks）：在记这次的输入、触发钩子之前收尾
+	abandonTasksAtEntry(ctx, cfg.abandoned, p.Name())
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return p.hooks.OnAgentStart(c, info, agentIn)
@@ -544,7 +550,7 @@ func (p *PlanAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 	// AgentIn.Messages 退化 nil (Resume 没有新 input — 走 cp 重建), 业务 hook 若依赖
 	// messages 可从 sess.Events 取 ResumeContext.UserInputs.
 	agentIn := &hook.AgentInput{}
-	ctx = enterResumeTask(ctx, session)
+	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return p.hooks.OnAgentStart(c, info, agentIn)
@@ -600,7 +606,7 @@ func (p *PlanAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 
-	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
+	runErr := compose_v2.Run(ctx, g, cm, append(runOpts, slotClaimOpt(ctx))...)
 	if runErr != nil {
 		// review-v6 H-05 fix: 业务错 fire OnError (非控制流)
 		if _, isInt := compose_v2.IsInterrupt(runErr); !isInt && ctx.Err() == nil {
@@ -650,7 +656,7 @@ func (p *PlanAgent) runPlanGraph(ctx context.Context, runCfg *runConfig, session
 		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
 	}
 
-	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
+	runErr := compose_v2.Run(ctx, g, cm, append(runOpts, slotClaimOpt(ctx))...)
 	if runErr != nil {
 		return "", runErr
 	}

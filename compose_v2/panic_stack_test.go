@@ -214,8 +214,8 @@ func TestPanicStack_HooksKeepOpaqueJudgement(t *testing.T) {
 	}
 }
 
-// TestPanicStack_OnGraphEnd：图失败时 OnGraphEnd panic 落在 Run 入口那道兜底，错误上挂着栈、只记一条日志。（图成功时它的 panic
-// 就地兜住、不改结果，见 observer_hook_panic_test.go。）
+// TestPanicStack_OnGraphEnd：图失败时 OnGraphEnd panic 就地兜住，记一条带栈的日志、栈指向钩子，错误照旧是节点那个、不挂
+// PanicError。（图成功时同样不改结果，见 observer_hook_panic_test.go。）
 func TestPanicStack_OnGraphEnd(t *testing.T) {
 	logs := psCaptureLogs(t)
 	err := compose_v2.Run(context.Background(), psSingleNodeGraph(t, func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
@@ -223,9 +223,9 @@ func TestPanicStack_OnGraphEnd(t *testing.T) {
 	}), compose_v2.NewChannelManager(),
 		compose_v2.WithHooks(psHooks{at: "OnGraphEnd"}))
 
-	psAssertPanicStack(t, err, "psGraphEndExplodes")
-	if !strings.Contains(err.Error(), "compose_v2.Run panic recovered") {
-		t.Errorf("该落在 Run 入口那道兜底，实际 %q", err.Error())
+	var pe *compose_v2.PanicError
+	if err == nil || err.Error() != `node "n": 业务错` || errors.As(err, &pe) {
+		t.Errorf("错误应照旧是节点那个、不挂 PanicError，实际 %v", err)
 	}
 	if n := logs.countStack("psGraphEndExplodes"); n != 1 {
 		t.Errorf("该恰好记一条带栈的日志，实际 %d 条", n)

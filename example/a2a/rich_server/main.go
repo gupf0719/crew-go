@@ -86,8 +86,8 @@ func main() {
 		SupportedInterfaces: []*a2a.AgentInterface{
 			a2a.NewAgentInterface(addr, a2a.TransportProtocolJSONRPC),
 		},
-		DefaultInputModes:  []string{"text"},
-		DefaultOutputModes: []string{"text"},
+		DefaultInputModes:  []string{"text/plain"}, // 媒体类型（规范要求）
+		DefaultOutputModes: []string{"text/plain"},
 		Capabilities:       a2a.AgentCapabilities{Streaming: true},
 		Skills:             []a2a.AgentSkill{}, // A2A 1.0 schema 要求 skills 为数组（非 null）
 	}

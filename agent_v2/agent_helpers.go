@@ -149,9 +149,10 @@ func stampTask(ctx context.Context, sid string, fresh bool) context.Context {
 // 读同一个信号（这个坑本仓踩过五次，形状每次一样：同一个问题在两处各判各的）。
 //
 // ⚠️ 这个判据不会让「NodeFunc 里裸调 `sub.Run`、不 push ns」这个形态变得可用：传父的 session
-// 时子层没有自己的 ns，它的存档落进父图自己的槽 ⟹ 两张图身份不同时 Resume 撞
-// `ErrGraphIDConflict`，身份相同时（BasicAgent 的图不带名字，任意两个 BasicAgent 的图身份相同）
-// 守卫拦不住、子层直接接着跑父图的存档。出路只有走 `RunSubAgent`。
+// 时子层没有自己的 ns，它的图会落进父图自己的存档槽——配了 checkpointer 时 compose_v2.Run 入口当场拒
+// （`ErrRunAborted`，什么都不执行）。曾经放行：两张图身份不同时 Resume 撞 `ErrGraphIDConflict`，身份相同时
+// （当时 BasicAgent 的图只按结构指纹算身份，任意两个 BasicAgent 的图身份相同）子层直接接着跑父图的存档、成功时把父图的档删掉。
+// 出路是走 `RunSubAgent`。
 func enterRunTask(ctx context.Context, session *RunSession) context.Context {
 	ctx = shadowNodeGrants(ctx)
 	if _, ok := enclosingTask(ctx); ok {
@@ -170,6 +171,39 @@ func enterRunTask(ctx context.Context, session *RunSession) context.Context {
 // （在一个正在执行的任务里调会被 commonResumePrep 拒掉）。
 func enterResumeTask(ctx context.Context, session *RunSession) context.Context {
 	return stampTask(shadowNodeGrants(ctx), session.RunID, false)
+}
+
+// enterGraphRunTask / enterGraphResumeTask 是在自己的存档槽上跑图的 agent（本包 9 个编排）的入口：先占槽（[occupySlot]），
+// 再做 enterRunTask / enterResumeTask 那件事。[EnterRun] 不占槽——自研实现（`a2a.RemoteAgent`、透传给别的 agent 的壳）
+// 不在自己的槽上存东西，占了只会挡掉它透传的那个 agent：被透传的 agent 跟它同一个 ns，入口发现槽被占、拿不到凭证，
+// 跑图时被拒（曾经 EnterRun 也占，按文档写的壳透传给 BasicAgent 一律被拒，审计实测）。⚠️ 代价：透传之后槽里放着被透传那个
+// agent 的档，而壳自己的阶段里（透传之前、它返回之后）没有执行占着这个槽——那里裸调落进同一个槽的 agent 入口不拒。兜住它的
+// 是图身份：裸调的与被透传的图身份不同时（BasicAgent 显式起了不同的名字，见 buildComposeGraph），载入那份档撞
+// `ErrGraphIDConflict`、什么都不执行；两个都没起名字、结构又相同时照旧把那份档读进来接着跑。
+func enterGraphRunTask(ctx context.Context, session *RunSession) context.Context {
+	return enterRunTask(occupySlot(ctx, session), session)
+}
+
+func enterGraphResumeTask(ctx context.Context, session *RunSession) context.Context {
+	return enterResumeTask(occupySlot(ctx, session), session)
+}
+
+// slotClaimKey 存这次 agent 调用占槽的凭证（见 compose_v2.OccupySlot）；每个 agent 入口都重写它——占不到时写 nil，宿主钩子里
+// 裸调的 agent 就拿不到宿主的凭证。执行状态（见 detach_task.go）：钩子换不掉、伪造不了。
+type slotClaimKey struct{}
+
+// occupySlot 在 9 个编排的入口（OnAgentStart 之前）占住这次调用的存档槽：从这里到出口，钩子与钩子里调起的执行落进同一个槽的
+// 嵌套 Run 被拒——那期间槽里放着这次调用自己的挂起档（续跑之前、问人之后）。曾经只在图跑着的时候占，宿主在 OnAgentStart /
+// OnAgentEnd 里拿自己的 session 裸调别的 agent 时，子层把宿主的挂起档读进来接着跑、成功时删掉（审计实测）。
+func occupySlot(ctx context.Context, session *RunSession) context.Context {
+	ctx, claim := compose_v2.OccupySlot(ctx, session.RunID)
+	return context.WithValue(ctx, slotClaimKey{}, claim)
+}
+
+// slotClaimOpt 是这次 agent 调用跑自己的图时出示的占槽凭证。
+func slotClaimOpt(ctx context.Context) compose_v2.RunOption {
+	c, _ := ctx.Value(slotClaimKey{}).(*compose_v2.SlotClaim) // 没占（没有槽）时为 nil，等于不出示
+	return compose_v2.WithSlotClaim(c)
 }
 
 // shouldEmitInputEvent 判断 wrapper 编排（8 个非 BasicAgent 编排）Run 入口是否应加 input
@@ -357,10 +391,10 @@ func (e *errUncatchableHookInterrupt) NonRetryable() {}
 // ⟹ 误判嵌套 ⟹ 假暂停放行；NodeFunc 里裸调 sub.Run 不 push ns ⟹ 误判顶层 ⟹
 // 中断被拒。换章后这两侧的**判定**都对了。
 //
-// ⚠️ **但「判定对了」不等于那个形态可用**：裸调形态续不上——传父的 session 时子层的存档落进
-// 父图自己的槽，传新 session 时入口直接拒（见 [enterRunTask] 的同名说明）。
-// 所以这里放行只意味着**中断本身不再被误拒**，整条闭环仍要求走 `RunSubAgent`。别把这段读成
-// 「裸调形态被支持了」。
+// ⚠️ **但「判定对了」不等于那个形态可用**：裸调形态续不上——传父的 session 时子层的图落进父图
+// 自己的存档槽，配了 checkpointer 时跑到图那一步被 compose_v2.Run 入口拒；传新 session 时入口直接拒（见
+// [enterRunTask] 的同名说明）。所以这里放行只意味着**中断本身不再被误拒**，整条闭环仍要求走 `RunSubAgent`。
+// 别把这段读成「裸调形态被支持了」。
 //
 // # 转出的错误不 `%w` 原中断，且不可重试
 //

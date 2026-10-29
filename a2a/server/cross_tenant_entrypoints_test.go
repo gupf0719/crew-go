@@ -114,9 +114,16 @@ func probeServerWithOpts(t *testing.T, ag agent_v2.Agent, extra ...server.Execut
 // 只查 localManager.executions[taskID] 这张按 taskID 单键的内存表。我们的归属检查在
 // (a) 挂起表（Executor）和 (b) taskStore 包装层——两处都在这条路之外。
 func TestCrossTenant_Resubscribe_CrossTenant(t *testing.T) {
+	assertResubscribeDoesNotLeak(t)
+}
+
+// assertResubscribeDoesNotLeak：A 发起长跑执行，B 拿 A 的 taskId 调 tasks/resubscribe，B 不能收到 A 的任何输出。
+// opts 透传给 server（换 task store 后端用）。
+func assertResubscribeDoesNotLeak(t *testing.T, opts ...server.ExecutorOption) {
+	t.Helper()
 	m := &probeBlockModel{secret: "SECRET-OF-A", started: make(chan struct{}), gate: make(chan struct{})}
 	ag := agent_v2.NewBasicAgent(agent_v2.WithName("blocker"), agent_v2.WithModel(m))
-	_, mk := probeServer(t, ag)
+	_, mk := probeServerWithOpts(t, ag, opts...)
 
 	ca, cb := mk("tenant-A"), mk("tenant-B")
 	ctx := context.Background()

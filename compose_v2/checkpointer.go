@@ -548,18 +548,24 @@ var ErrNoPendingCheckpoint = errors.New("no pending checkpoint for resume")
 // # 嵌套子 agent 撞上时，业务两个杠杆都没有
 //
 // `agent_v2` 的 sub-agent 走的是「父 sid + 框架算出来的 ns」，业务既传不了 [WithFreshRun]、
-// 也换不了 sid（两者都不是它给的）。这条路上撞上本错有两个含义：
+// 也换不了 sid（两者都不是它给的）。这条路上撞上本错有几个含义：
 //
-//   - **节点里裸调了 `sub.Run(ctx, ...)`**，没走 `agent_v2.RunSubAgent`：子 agent 没有自己的 ns，
-//     存档落进父图自己的槽（实测，常见）——出路是改走 `RunSubAgent`；
+//   - **裸调了 `sub.Run(ctx, ...)`**，没走 `agent_v2.RunSubAgent`：子 agent 没有自己的 ns，存档落进别人的槽。
+//     节点、工具体、图级钩子与编排的 agent 级钩子里的裸调在入口就被拒（报的是 [ErrRunAborted]）；走到这里的是
+//     经 `agent_v2.EnterRun` 进入的自研壳在自己的钩子或前置逻辑里裸调——它跟壳透传的那个 agent 同一个槽，载入对方的
+//     挂起档时撞上。出路是改走 `RunSubAgent`；
+//   - **同一个位置上 Run 与续跑调的不是同一个 agent**（按运行时条件挑被调方、续跑前改了 agent 的名字或 skill 的
+//     `agent:`）——出路是续跑时调回原来那个，或放弃这个任务；
 //   - 同一个父 sid 上先后跑了拓扑不同的两棵编排树——出路在编排侧（换一个 `RunSession`），
 //     不在本次调用的参数里。
+//
+// 这几种都是代码里的结构问题：不改代码，每次续跑都撞在同一处，那个任务续不上（槽里的档不清）。
 //
 // # 不可重试，也不能被吞
 //
 // 它实现 [NonRetryable]：槽里那份存档还在，重跑必然撞同一个槽。曾经是 `errors.New`，
 // [IsRetryable] 把它当可重试——配了重试的编排会把整个成员连同副作用再跑几遍、每次都撞上。
-// 它也在 [MustPropagate] 的集合里：两个含义都是编排结构出了问题，转成给模型看的工具失败无济于事
+// 它也在 [MustPropagate] 的集合里：上面几个含义都是编排结构出了问题，转成给模型看的工具失败无济于事
 // ——模型换不换参数都修不了它，冲突的那份存档也还留在槽里。
 var ErrGraphIDConflict error = &graphIDConflictError{}
 

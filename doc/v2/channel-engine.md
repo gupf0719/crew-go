@@ -1175,17 +1175,18 @@ recover) 对齐, 改成 **framework 4 层 outer defer recover 兜底**:
 3. `agent_v2.BasicAgent.Run / Resume` + 其他 8 编排 Run/Resume 各 outer recover
 4. 嵌套 AgentAsTool 子 agent.Run 自带 outer recover 间接保护父 ToolsFn 路径
 
-业务 hook panic 多数转 wrapped err 返业务；跑在工作之后、只作观测的那几处（节点体成功之后的 OnNodeEnd、图成功
-之后的 OnGraphEnd、任何时候的 OnNodeEvent、任何时候的 OnAgentEnd——调用失败时照旧交出原来那个错误）就地兜住、带栈记一条 ERROR，结果与写入照常
-提交——观测钩子出错不得让已经做完的工作再做一次（逐道的分工见 `compose_v2/panic_recovery.go`）:
+业务 hook panic：跑在工作之前的（OnGraphStart / OnNodeStart 等）转 wrapped err 返业务；跑在工作之后的（OnNodeEnd、
+OnGraphEnd、OnNodeEvent、OnAgentEnd）不论成败都就地兜住、带栈记一条 ERROR，结局不变——成功时结果与写入照常提交，失败时
+照旧交出原来那个错误；观测钩子出错不得让已经做完的工作再做一次、不得改掉已经定下的结局。上面四层如今主要兜框架自己的代码，
+逐道的分工见 `compose_v2/panic_recovery.go`:
 
 **`Run` 出口有两个 recover，分工不同**（一个满足不了两件事）：
 
 ```go
 func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (runErr error) {
-    // ① 注册最早 ⟹ LIFO 下最后跑：专收 **defer 链自身**抛的 panic
-    //    （图失败时的业务 OnGraphEnd hook、出口记账的日志；出口的 SaveNS / DeleteSubtree
-    //     由出口存储调用那道单独兜，见 exit_checkpoint.go）
+    // ① 注册最早 ⟹ LIFO 下最后跑：专收 **defer 链自身**抛的 panic——只剩框架自己的出口代码
+    //    （业务 OnGraphEnd 成败都有自己那道 recover；出口记账的日志与 cp 事件由 recoverObserver 兜；
+    //     出口的 SaveNS / DeleteSubtree 由出口存储调用那道单独兜，见 exit_checkpoint.go）
     defer func() {
         if r := recover(); r != nil {
             // runErr 已有值时 errors.Join 保双链，不无条件覆盖

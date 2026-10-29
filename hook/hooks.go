@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"crew-go/internal/panicerr"
 	specModel "crew-go/modules/model"
 
 	"crew-go/schema"
@@ -71,7 +72,9 @@ type AgentOutput struct {
 // **业务无 ctx mutation 需求时**: 直接 `return ctx, nil` 一行即可.
 //
 // ─── panic 语义 ───
-// 业务 hook panic = 业务 bug, framework **不做 per-hook isolation**（链里排在它后面的不再调）。框架在调用
+// 业务 hook panic = 业务 bug, framework **不做 per-hook isolation**：开始一侧与 OnModelEnd / OnToolEnd（改得了结果）链里排在
+// 它后面的不再调；只作观测的 OnAgentEnd / OnError 链上每个钩子都调到、调完再把第一个 panic 抛出（返回的 ctx 不往后流，跑完
+// 整条链没有代价；见 ChainHooks.OnAgentEnd）。框架在调用
 // 钩子的地方兜住、不让 goroutine 崩：OnAgentStart / OnModel* / OnTool*（跑在工作之前或改得了结果）与
 // OnError（调用已经失败）panic 转成这次调用的错误；OnAgentEnd 跑在工作之后、只作观测，它 panic 就地兜住、带栈记一条
 // ERROR，这次调用的结局不变：成功照旧成功（转成错误的话调用方的重试 / 续跑会把已经做完的再做一次），失败照旧交出原来
@@ -85,7 +88,10 @@ type AgentOutput struct {
 //
 //	OnAgentStart                input.Messages —— 整个调用的原始输入（可做 PII filter / 模板包装；Resume 时为空）
 //	OnModelStart                input.Preamble —— agent 前言（system prompt / 提示词模板渲染结果，含 skill 正文）；改内容 / 删条 / 整段换都生效
-//	OnModelStart                input.Messages —— 被上下文压缩处置的那条对话流（⚠️ 它不是最终发出去的那份：四层压缩在本 hook 之后才跑）
+//	OnModelStart                input.Messages —— 被上下文压缩处置的那条对话流（⚠️ 它不是最终发出去的那份：四层压缩在本 hook 之后才跑）。
+//	                            ⚠️ 把消息插进一次工具调用与它的结果之间时各家 provider 不一样：DeepSeek / OpenAI 400（要求结果紧跟
+//	                            调用），qwen 照收。框架不替 provider 判，压缩层把这一对连同夹在中间的消息整组处置、不切开。要补
+//	                            指令又想各家都收，放在这一批结果之后（「插在最后一条之前」在第 2 轮起正好落在调用与结果之间）
 //	OnModelEnd                  output.Message —— 替换本轮输出（写 channel + 前端 reset_stream event）。改写在这一轮第一次
 //	                            处理完时定下：之后这次执行在提交之前作废（节点成功之后的钩子 Goexit、提交出错）、续跑时这一轮
 //	                            不再处理——不调模型，OnModelStart / OnModelEnd 都不触发，交出定下的答复与它当时做出的决定。
@@ -288,10 +294,13 @@ func (c *ChainHooks) OnAgentStart(ctx context.Context, info *AgentInfo, input *A
 	return ctx, nil
 }
 
+// OnAgentEnd 每个钩子都调到：一个 panic 时接着调后面的，调完再把第一个 panic 抛给调用点（框架在那里兜住、只记日志）。
+// OnAgentEnd 只作观测、返回的 ctx 不往后流，跑完整条链没有代价；曾经 panic 在前时排在后面的观测钩子（计时、计费、前端
+// 收尾）静默跳过。
 func (c *ChainHooks) OnAgentEnd(ctx context.Context, info *AgentInfo, output *AgentOutput) context.Context {
-	for _, h := range c.hooks {
-		ctx = h.OnAgentEnd(ctx, info, output)
-	}
+	panicerr.CallEach(ctx, len(c.hooks), func(i int) {
+		ctx = c.hooks[i].OnAgentEnd(ctx, info, output)
+	})
 	return ctx
 }
 
@@ -385,9 +394,10 @@ func (c *ChainHooks) OnToolEnd(ctx context.Context, info *AgentInfo, output *sch
 	return ctx, nil
 }
 
+// OnError 每个钩子都调到，同 OnAgentEnd：一个钩子 panic，排在后面的（错误计数、告警）照样收到这个错误。
 func (c *ChainHooks) OnError(ctx context.Context, info *AgentInfo, err *schema.CommError) context.Context {
-	for _, h := range c.hooks {
-		ctx = h.OnError(ctx, info, err)
-	}
+	panicerr.CallEach(ctx, len(c.hooks), func(i int) {
+		ctx = c.hooks[i].OnError(ctx, info, err)
+	})
 	return ctx
 }

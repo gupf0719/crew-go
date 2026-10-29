@@ -460,8 +460,13 @@ func priorWindowSatisfied(win []*schema.Message, need int) bool {
 		}
 	}
 	for _, m := range kept {
-		if id := schema.GetToolResultID(m); m.Role == schema.RoleTool && id != "" && !declared[id] {
-			return false
+		if m.Role != schema.RoleTool {
+			continue
+		}
+		for _, id := range toolResultIDs(m) { // 每个结果块都要有声明它的调用
+			if id != "" && !declared[id] {
+				return false
+			}
 		}
 	}
 	for _, m := range win {

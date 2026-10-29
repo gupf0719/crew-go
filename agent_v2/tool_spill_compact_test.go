@@ -61,7 +61,7 @@ func spillDumpGrepToolkit() *tool.Toolkit {
 func TestToolResultSpill_IDSurvivesAutoCompact(t *testing.T) {
 	for _, withMicro := range []bool{false, true} {
 		t.Run(fmt.Sprintf("micro=%v", withMicro), func(t *testing.T) {
-			const rounds = 40
+			const rounds = 80
 			m := &spillThenGrepModel{rounds: rounds}
 			s := &countingSummarizer{}
 			st := store.NewInMemoryStore()
@@ -140,7 +140,7 @@ func TestToolResultSpill_IDSurvivesReactiveCompact(t *testing.T) {
 // TestToolResultSpill_IDSurvivesRepeatedAutoCompact：摘要了不止一次时取回 id 也还在——第一次摘要把转存的结果摘掉、
 // 附上索引；之后每一次增量摘要把上一份摘要也摘掉，索引要从它的标注接着带（摘要模型不一定保留正文里那段）。
 func TestToolResultSpill_IDSurvivesRepeatedAutoCompact(t *testing.T) {
-	const rounds = 120
+	const rounds = 240
 	m := &spillThenGrepModel{rounds: rounds}
 	s := &countingSummarizer{}
 	ag := spillAgent(m, store.NewInMemoryStore(), spillDumpGrepToolkit(),

@@ -11,10 +11,11 @@ package agent_v2_test
 // 所以两件事各自解决：
 //   - **配置**走运行入口声明 `WithHistoryCtx`（那个出口本来就是为「一个 BasicAgent 都
 //     没有」这种形状留的），不另开专属 option
-//   - **输入在两个出口都结算**（成功 + 可 Resume 的退出），不等成功——Resume 入口拿不到
-//     原始 input（它被 inputWriter 交给业务 channel 了，框架不知道是哪个），只在成功时记
-//     = 中断过的会话永远没有用户那句话。⚠️ 代价：它在历史里排在图内子 agent 的问答**之后**
-//     （子 agent 执行中就记了自己的），见 `doc/code/todo.md` 同名条目
+//   - **输入不等成功**：入口登记成待补，排在这次 Run 写进历史的第一批记录前面（图里的子
+//     agent 执行中就记自己的问答，到出口才记的话用户那句话排在它们之后）；一批都没有时在
+//     两个出口结算（成功 + 可 Resume 的退出）——Resume 入口拿不到原始 input（它被 inputWriter
+//     交给业务 channel 了，框架不知道是哪个），只在成功时记 = 中断过的会话永远没有用户那句话。
+//     排序的哨兵在 history_graphagent_order_test.go
 //
 // # 为什么要 ownsHistory 闸门
 //

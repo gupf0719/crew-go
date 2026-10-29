@@ -28,7 +28,7 @@ import (
 //   4) 全保护时仍允许丢最旧组（兜底）
 //   5) 解析错误的 token gap：有 gap 累加到 >= gap；无 gap 用 EmergencyDropPercent
 //   6) 永远保留至少 1 个 droppable 组
-//   7) 删后首条若 assistant，前补 user marker（API 要求 user-first）
+//   7) 删后第一条不是 system 的若是 assistant，在它前面补 user marker（API 要求 user-first）
 //   8) sys 拼回最前
 // 删完用压缩后 messages 重试，最多 MaxAttempts 次（compacted == nil 或长度 >= curMsgs 时提前 break）。
 // **不写回 channel** —— 仅 retry 循环局部变量 curMsgs 上覆盖，下轮 model Get 还是原 messages。
@@ -45,7 +45,7 @@ type ReactiveCompactConfig struct {
 	// <= 0 时使用默认值 20。
 	EmergencyDropPercent int
 
-	// UserMarker 删消息后若首条是 assistant，前面补这条 user 消息（API 要求 user 开头）。
+	// UserMarker 删消息后第一条不是 system 的若是 assistant，在它前面补这条 user 消息（API 要求 user 开头）。
 	// 空时使用 defaultUserMarker。
 	UserMarker string
 }
@@ -140,7 +140,7 @@ func ParsePromptTooLongGap(err error) int {
 //  3. gap > 0：按 token 估算从最旧累加直到达到 gap
 //     gap == 0：删最旧 dropPercent %
 //  4. 至少保留 1 组——单组对话也要能跑下去
-//  5. 删后首条若是 assistant，前面补 user marker（API 要求 user 开头）
+//  5. 删后第一条不是 system 的若是 assistant，在它前面补 user marker（API 要求 user 开头）
 //  6. 把 system 重新拼回最前
 func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap int, marker string) []*schema.Message {
 	if len(messages) == 0 {
@@ -176,6 +176,7 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 	// 步骤 1.5：识别 droppable 组——含 AutoCompactSummaryAnnotation 的组保护
 	// （丢 summary 等于丢早期所有压缩历史，比丢一个普通 round 严重得多）。
 	// droppableIdx 按从旧到新的顺序记录可丢弃组的全局索引。
+	// 混着 system 的组可以丢，丢的时候 system 原地留下（见 isProtectedGroup 的「只有 system 的组」那一条）。
 	var droppableIdx []int
 	for i, g := range groups {
 		if isProtectedGroup(g) {
@@ -199,7 +200,8 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 	if gap > 0 {
 		acc := 0
 		for _, i := range droppableIdx {
-			acc += compose_v2.EstimateMessageTokens(groups[i])
+			_, rest := splitSystem(groups[i])
+			acc += compose_v2.EstimateMessageTokens(rest)
 			dropCount++
 			if acc >= gap {
 				break
@@ -231,9 +233,13 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 	for i, g := range groups {
 		if !toDrop[i] {
 			keptGroups = append(keptGroups, g)
-		} else {
-			dropped = append(dropped, g...)
+			continue
 		}
+		sysMsgs, rest := splitSystem(g)
+		if len(sysMsgs) > 0 {
+			keptGroups = append(keptGroups, sysMsgs)
+		}
+		dropped = append(dropped, rest...)
 	}
 	kept := dropOrphanToolResults(compose_v2.FlattenGroups(keptGroups))
 	// 丢掉的组里带取回 id 的（转存过的工具结果、摘要附的索引）：全文还在 store 里，补一条索引放在最前，模型照样取得回
@@ -244,10 +250,19 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 		kept = append([]*schema.Message{indexMsg}, kept...)
 	}
 
-	// 删后首条是 assistant → 前补 user marker（API 要求 user-first，system 之后）
-	if len(kept) > 0 && kept[0].Role == schema.RoleAssistant {
-		userMarker := schema.UserMessage(marker)
-		kept = append([]*schema.Message{userMarker}, kept...)
+	// 删后第一条不是 system 的是 assistant → 在它前面补 user marker（API 要求 user-first，system 之后；丢掉的组里留下的
+	// system 可能排在它前面）
+	for i, m := range kept {
+		if m.Role == schema.RoleSystem {
+			continue
+		}
+		if m.Role == schema.RoleAssistant {
+			withMarker := make([]*schema.Message, 0, len(kept)+1)
+			withMarker = append(withMarker, kept[:i]...)
+			withMarker = append(withMarker, schema.UserMessage(marker))
+			kept = append(withMarker, kept[i:]...)
+		}
+		break
 	}
 
 	// 步骤 6：sys 拼回最前
@@ -274,11 +289,12 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 //     offload 到 store 的占位符 — 删了 LLM 永久丢失 store key reference, 业务
 //     "可重读 store 全文" 协议破裂。占位符 token 小 (~200 byte preview), 删了
 //     换不来多少 token 节省, 代价是破坏 offload 协议
-//   - **含 system 的组**（无 marker 也保护）：`GroupMessagesByAPIRound` 让每条中段
-//     system 单独成组，所以「一组全是 system」就等于「这是一条指令消息」。**位置无关**——
-//     曾经只保护**前导**块，而那时 agent 自己的 system prompt 就在里面；它已经搬出这条
-//     消息流了（见 `BasicAgentPreambleOutput`），这里剩下的是长期记忆注入（另有 marker）
-//     和**调用方自己塞的 system**。后者按位置判会漏：塞在中段就成了普通可丢组。
+//   - **只有 system 的组**（无 marker 也保护）：`GroupMessagesByAPIRound` 让中段 system 平常单独成组，「一组全是
+//     system」就是「这是一条指令消息」。**位置无关**——曾经只保护**前导**块，而那时 agent 自己的 system prompt
+//     就在里面；它已经搬出这条消息流了（见 `BasicAgentPreambleOutput`），这里剩下的是长期记忆注入（另有 marker）
+//     和**调用方自己塞的 system**。后者按位置判会漏：塞在中段就成了普通可丢组。业务把 system 插进一次调用与它的
+//     结果之间时，它跟这一对同组：这种组**可以丢，丢的时候 system 原地留下**（保的是指令本身，不让它连带同组的
+//     消息一起不可丢——曾经整组保护，钩子每轮都这么插时紧急压缩一条也丢不掉，审计实测）。
 //   - **MicroCompactClearedAnnotation** (HIGH-2 audit B 修): MicroCompact 纯清
 //     占位符 — 同上, 删了破坏审计 marker 链; 占位符 token 小不值得删
 //
@@ -288,7 +304,7 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 // prompt_too_long → ReactiveCompact exhausted error, 业务可观测 (这是 expected
 // behavior — 业务应启 Read tool 让 LLM 重读 offloaded 全文降 token).
 func isProtectedGroup(group []*schema.Message) bool {
-	if groupContainsSystem(group) {
+	if sysMsgs, rest := splitSystem(group); len(sysMsgs) > 0 && len(rest) == 0 {
 		return true
 	}
 	for _, m := range group {
@@ -385,19 +401,11 @@ func ReactiveCompactRun(ctx context.Context, cfg *ReactiveCompactConfig, message
 
 // groupContainsSystem 判断一组里**有没有** system 消息。
 //
-// ⚠️ **是「含」不是「全是」**，这一点是量出来的。`compose_v2.GroupMessagesByAPIRound` 里
-// `RoleSystem` 恒开新组，所以中段 system 通常自成一组——但 `RoleAssistant` **不**开新组，
-// 于是「system 后面紧跟一条无 RunID 的 assistant」会混成同一组。按「全是 system」判，
-// 那种组就漏保护了。又是「N=1 对、遇到第二种形状静默错」。
-//
-// ⚠️ **这段论证的前半在 2026-09-08 之后已经不成立，留着是为了讲清判据为什么是「含」**：
-// 分组层后来改成「system 既开新组也关新组」（见 `compose_v2.GroupMessagesByAPIRound`），
-// 所以今天含 system 的组**恒为单条**、「含」与「全是」等价、**附带保护归零**。
-// 判据保留「含」的写法是防御性的：哪天分组规则再动，它仍然是对的一侧。
-//
-// 当初「整组保护会多带上同组里的非 system 消息」那个取舍**已经不存在**了——而它曾经
-// 是真代价：一条 system 会把整轮 assistant + tool_result 变成永久不可压缩，实测摘要
-// 跑完入 30016 出 30059 字节反而变大。
+// 分组让中段 system 平常单独成组（「system 既开新组也关新组」，见 `compose_v2.GroupMessagesByAPIRound`）；例外是
+// system 被插进一次调用与它的结果之间，那时它跟这一对同组。两层压缩据此**只保 system 本身**：AutoCompact 把 system
+// 拿出来留下、其余照常摘要（`splitProtectedGroups`），ReactiveCompact 丢这种组时 system 原地留下（`splitSystem`）。
+// 整组保护会让一条 system 把同组的别的消息一起变成不可压缩——曾经是真代价：实测摘要跑完入 30016 出 30059 字节反而
+// 变大；分组改成按配对不切组之后，钩子每轮都在调用与结果之间插 system 时压缩完全失效。
 //
 // ⚠️ **它取代不了 marker 判据**：长期记忆注入**也是 system**，所以两条判据在它身上
 // 结论一致（都说保护）——但**理由不同，别把 marker 那条当成冗余删掉**。marker 那条护的是
@@ -412,6 +420,18 @@ func groupContainsSystem(group []*schema.Message) bool {
 		}
 	}
 	return false
+}
+
+// splitSystem 把一组拆成其中的 system 消息与其余消息，各保持原顺序。
+func splitSystem(group []*schema.Message) (sysMsgs, rest []*schema.Message) {
+	for _, m := range group {
+		if m != nil && m.Role == schema.RoleSystem {
+			sysMsgs = append(sysMsgs, m)
+		} else {
+			rest = append(rest, m)
+		}
+	}
+	return sysMsgs, rest
 }
 
 // giveUpOrShrink 是**「一组也丢不动」时的统一兜底**：先试着就地把超大的单条挖空，
@@ -547,10 +567,10 @@ func shrinkOneToolResult(m *schema.Message) *schema.Message {
 
 // dropOrphanToolResults 丢掉「发起它的那条 assistant 已经被丢了」的 tool_result。
 //
-// **为什么按组丢之后必须再过这一道**：分组是启发式的，它保证不了「一次 tool_call 往返
-// 落在同一组里」。实测形态 `[user][assistant tool_call][system][assistant][tool_result]`
-// 会切成三组，中间那条 system 把往返劈成两半——丢掉最旧那组之后剩下一条孤儿
-// `tool_result`，**真实 API 直接 400/422**，而框架这边一声不吭。
+// **为什么按组丢之后还要再过这一道**：分组按配对不切组（调用还在等后面的结果时不切，见
+// `compose_v2.GroupMessagesByAPIRound`），往返本身不会被丢组劈开；这一道兜的是配对认不出的情形（结果的 ID 对不上任何
+// 调用、输入里本来就有的孤儿）。曾经分组在 system 旁边切开，`[user][assistant tool_call][system][assistant][tool_result]`
+// 切成三组，丢掉最旧那组之后剩下一条孤儿 `tool_result`，真实 API 直接 400/422，而框架这边一声不吭。
 //
 // ⚠️ **别把这道校验换成「不许在工具轮中间插 system」那种前提**。那是个会漂的假设：
 // 今天框架自己不插，业务、历史回放、以及任何一次分组规则调整都可能让它成立。查过的

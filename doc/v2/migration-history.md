@@ -95,7 +95,7 @@ v1 `agent/` + `compose/` 已删（Stage 7 commit `ad2743e`）。新代码一律�
 | `Checkpoint{ID, NS, ParentNS, Status, SchemaVer, GraphID, TaskID, Epoch, ...}` | cp 物理结构。**`ThreadID` 不在 cp 里**——它是 ctx 维度（`WithThreadIDCtx`），cp 这层不认识会话；全字段见 [checkpoint.md](checkpoint.md) |
 | `InMemoryCheckpointer` | 内置实现 |
 | `OrchestrationHooks` | 5 回调签名都带 `Channels`（不带 GraphState）|
-| `ChainOrchHooks`, `NewChainOrchHooks(hooks...)` | 多 OrchHooks 链（fail-fast，**无** per-hook panic 隔离——audit² 删过度设计；钩子 panic 由调用这条链的地方处置：工作之前的、失败路径上的转成错误，成功之后的观测钩子就地兜住记 ERROR，见 `compose_v2/panic_recovery.go`；ISSUE-63 P1 增量）|
+| `ChainOrchHooks`, `NewChainOrchHooks(hooks...)` | 多 OrchHooks 链（**无** per-hook panic 隔离——audit² 删过度设计：OnGraphStart / OnNodeStart 一个钩子 panic 中断剩余链，OnNodeEnd / OnGraphEnd / OnNodeEvent 每个钩子都调到、调完再抛出第一个 panic；钩子 panic 由调用这条链的地方处置：工作之前的、失败路径上的转成错误，成功之后的观测钩子就地兜住记 ERROR，见 `compose_v2/panic_recovery.go`；ISSUE-63 P1 增量）|
 | `NoOpOrchestrationHooks`, `RecordingHooks` | 空 hook + 测试 helper |
 | `Event{Type, Content, Metadata}` | OnNodeEvent 简化版 event（不用 *AgentEvent）|
 | `EventSink`, `GetEventSink(ctx)` | 节点内主动发 event |

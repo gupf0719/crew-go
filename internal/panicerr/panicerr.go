@@ -2,7 +2,7 @@
 // 把「panic 值 + 栈」作为一条记录并列挂到兜底点返回的错误上，再记一条带栈的日志。
 //
 // 全仓把 panic 转成错误、或在兜底点记日志的 recover() 都经这里。例外有两类：补归因或清理后原样重抛的几道
-// （compose_v2 的 composeRead / reduceFor、hook 的 ChainHooks.OnModelEndStream——栈由最后接住它的那一道取），
+// （compose_v2 的 composeRead / reduceFor、hook 的 ChainHooks.OnModelEndStream、钩子链用的 [CallEach]——栈由最后接住它的那一道取），
 // 和有意不记的 agent_v2 marshalRecovered（算输入摘要时把 MarshalJSON 的 panic 当成「这个值编码不了」）。
 // compose_v2 内谁兜底什么见 compose_v2/panic_recovery.go，其余包的兜底点在各自的 recover 处说明。
 // 对外导出的名字是 compose_v2.PanicError（本包的 Error 的类型别名），调用方用 errors.As 取。
@@ -35,6 +35,8 @@ const (
 	KeyPanic = "panic" // panic 的值（已格式化成文本）
 	KeyStack = "stack" // panic 发生时的调用栈
 	KeyError = "err"   // 兜底点据此造出的错误文本（带着是哪一处兜住的；已有错误时是那个错误）
+	// KeyHookIndex 是钩子链里第几个钩子（从 0 数），见 [CallEach]。
+	KeyHookIndex = "hook_index"
 )
 
 // Error 记一次被兜住的 panic：panic 的值与调用栈。
@@ -56,6 +58,50 @@ func (e *Error) Error() string { return fmt.Sprintf("panic: %v", e.Value) }
 // panic 发生处的栈帧还没展开；defer 返回之后再取，就只剩调用方自己的栈了。
 func New(v any) *Error {
 	return &Error{Value: v, Stack: string(debug.Stack())}
+}
+
+// CallEach 依次调 call(0), …, call(n-1)，给钩子链的观测一侧用：一个钩子 panic 不该让排在它后面的钩子静默跳过。
+//
+// 某一个 panic 时，后面的在这个 panic 自己的 defer 里接着调，调完它照常往上走：调用点拿到的就是原来那个值，panic 现场的栈帧
+// 也还在（调用点在 defer 里取栈看得到 panic 的那个钩子），跟没有这条链时一样。曾经先兜住、调完其余的再抛一个带栈的包装：
+// 业务自己 recover 钩子链时拿到的是不导出的类型，r.(error)、errors.Is、== 都对不上，JSON 日志打成 {}（审计实测）。
+//
+// 排在后面的又 panic 时记一条带栈的日志（ctx 只用来记日志），交给调用点的仍是第一个。排在后面的调了 runtime.Goexit 时，第一个
+// panic 照样交给调用点，之后 Goexit 照常结束这个 goroutine。某一个 Goexit 时后面的照样调到。
+func CallEach(ctx context.Context, n int, call func(i int)) {
+	i := 0
+	defer func() {
+		if i >= n {
+			return
+		}
+		r := recover() // nil：call(i) 调了 Goexit（或在 GODEBUG=panicnil=1 下 panic(nil)，同样当作没有 panic）
+		rest := func() {
+			for j := i + 1; j < n; j++ {
+				callLogged(ctx, j, call)
+			}
+		}
+		if r == nil {
+			rest()
+			return
+		}
+		// 在这个 defer 里原样再抛：panic 现场的栈帧此刻还没展开。放进 defer 是为了排在后面的 Goexit 时也照样抛出。
+		defer panic(r)
+		rest()
+	}()
+	for ; i < n; i++ {
+		call(i)
+	}
+}
+
+// callLogged 调 call(j)，它 panic 时记一条带栈的日志、到此为止（排在前面的已经 panic，交给调用点的是那一个）。
+func callLogged(ctx context.Context, j int, call func(i int)) {
+	defer func() {
+		if r := recover(); r != nil {
+			Log(ctx, slog.LevelError, "panicerr: 钩子链里排在前面的钩子已经 panic，这个钩子又 panic（只记日志，交给调用点的是前面那个）",
+				New(r), KeyHookIndex, j)
+		}
+	}()
+	call(j)
 }
 
 // Wrap 按「panic 值进链」的写法造兜底点返回的错误：文本是 "<prefix>: <panic 值>"，panic 值是 error 时

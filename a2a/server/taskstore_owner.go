@@ -41,12 +41,21 @@ func ownerDigest(owner string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// ownerPartitionAuthenticator 是默认装配给 SDK 内存后端的 Authenticator：按 owner 分区，分区键跟 owner 一一对应。
+//
+// 不用 `a2asrv.NewTaskStoreAuthenticator`（读 CallContext 的 User.Name）：拦截器给匿名调用方把 User.Name 回落成
+// "default"，跟真叫 "default" 的租户撞进同一个分区，而包装层信任这个后端按 owner 分区、原样透传它的 TotalSize ⟹
+// 匿名调用方拿到对方的条数（审计实测）。空 owner 也映射成非空值：后端对空 user 的 List 报 ErrUnauthenticated。
+func ownerPartitionAuthenticator(ctx context.Context) (string, error) {
+	return "owner:" + compose_v2.GetOwner(ctx), nil
+}
+
 // ownerScopedTaskStore 给底层 task store 包一层归属检查。
 //
 // # 为什么必须包这一层
 //
-// SDK 的 task store 只在 `Create` 时记录 owner、在 `List` 时按 owner 过滤；**`Get` 和
-// `Update` 完全不做归属检查**（读一遍 taskstore 的实现即可确认）。而 `tasks/get` 这个
+// 后端自己做不做归属检查靠不住：SDK 的 store 接口没有这个要求，业务经 `WithTaskStore` 换的后端未必做（SDK 自带的
+// 内存后端早先只在 `List` 时按 user 过滤、`Get` / `Update` 不看，v2.7.0 起才都看）。而 `tasks/get` 这个
 // 协议方法的处理链是「handler 直接 taskStore.Get → 返回完整 Task 含 History」——
 // **整条路不经过 AgentExecutor**，所以我们在 Executor 那层按 (owner, taskID) 分区的
 // 挂起表拦不住它。
@@ -184,7 +193,7 @@ func (s *ownerScopedTaskStore) Get(ctx context.Context, taskID a2atypes.TaskID) 
 // [ownerScopedTaskStore.Get] 和 [ownerScopedTaskStore.CheckAccess] 共用，两边不各写一遍。
 //
 // stored 为 nil / Task 为 nil 时返 true：那不是「归属不符」，是后端返了个空壳，
-// 交给调用方按自己的语义处置（Get 原样返、CheckAccess 放行让下游报）。
+// 交给调用方按自己的语义处置（Get 原样返；CheckAccess 在调它之前就把空结果当成没有、拒掉）。
 func belongsToCaller(ctx context.Context, stored *taskstore.StoredTask, taskID a2atypes.TaskID) bool {
 	if stored == nil || stored.Task == nil {
 		return true
@@ -281,11 +290,12 @@ type OwnerPartitionedTaskStore interface {
 // 统一调，见 conformanceInterceptor。
 //
 // 返回：
-//   - nil：够得着。**「这个 task 根本不存在」也返 nil**——那种请求放下去让下游自己报
-//     「不存在」，我们这一层不抢答；抢答会让「不是你的」和「不存在」在 wire 上分成两种
-//     错，而那个区别本身就是信息泄漏（能拿它探测别人的 taskId 存不存在）。
-//   - [a2atypes.ErrTaskNotFound]：不是你的。跟下游「不存在」用同一个哨兵，且
-//     conformanceInterceptor 的 After 会把两条路径的错误正文归一（见那里的注释）。
+//   - nil：store 确认这个 task 归当前调用方。
+//   - [a2atypes.ErrTaskNotFound]：不是你的，或 store 里没有它——两种一律拒。「没有」不能放下去让下游自己报：内层 store
+//     可能把「不是你的」也报成没有（规范 §3.3.2 要求这样伪装，a2a-go 的内存 store 自 v2.7.0 起照做），而 `tasks/resubscribe`
+//     的下游根本不查 store、只看在途执行表——「没有就放行」时，租户 B 凭 A 的 taskId 订到了 A 在途的实时输出
+//     （`TestCrossTenant_Resubscribe_CrossTenant`，升级到 v2.7.0 时实测）。拒绝用的哨兵跟下游「不存在」相同，
+//     conformanceInterceptor 的 After 把下游的错误正文归一成它（见那里的注释），wire 上分不出两种。
 //   - 其它：后端读失败，原样上抛。
 //
 // ⚠️ 它**读一次后端**。归属不再有进程内缓存（那正是多实例下失效的那张表），所以
@@ -294,10 +304,15 @@ type OwnerPartitionedTaskStore interface {
 func (s *ownerScopedTaskStore) CheckAccess(ctx context.Context, taskID a2atypes.TaskID) error {
 	stored, err := s.inner.Get(ctx, taskID)
 	if errors.Is(err, a2atypes.ErrTaskNotFound) {
-		return nil // 不存在——放下去让下游自己报，别在这儿抢答
+		return a2atypes.ErrTaskNotFound // 可能是「不是你的」被伪装成了没有，拒（见上）
 	}
 	if err != nil {
 		return err
+	}
+	if stored == nil || stored.Task == nil {
+		// 后端用 `(nil, nil)` 表示没有（Go 常见写法；store 接口对 Get 只说 SHOULD 返 ErrTaskNotFound）：同样拒。
+		// 放行的话 resubscribe 照样泄漏——SDK 的订阅遇到空快照直接跳过、接着推在途事件（审计实测）
+		return a2atypes.ErrTaskNotFound
 	}
 	if !belongsToCaller(ctx, stored, taskID) {
 		return a2atypes.ErrTaskNotFound

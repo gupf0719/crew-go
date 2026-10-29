@@ -23,8 +23,8 @@ type probeWhoKey struct{}
 // (owner, taskID) 分区，拒绝时只回一句与「task 不存在」一致的话。
 //
 // **路径 2 `tasks/get` 直接读**：这条**整条不经过 AgentExecutor**——handler 直接
-// taskStore.Get 后返回完整 Task 含 History。SDK 的 store 只在 Create 记 owner、
-// List 时过滤，**Get / Update 不做归属检查**，所以必须由 ownerScopedTaskStore 补。
+// taskStore.Get 后返回完整 Task 含 History。当时 SDK 的 store 只在 Create 记 owner、
+// List 时过滤，**Get / Update 不做归属检查**；业务换的后端仍可能不做，所以由 ownerScopedTaskStore 补。
 //
 // ⚠️ 修这条时踩到的时序坑：owner 一开始只在 Executor.Execute 里 push，而 task store 的
 // Create **早于** Execute、tasks/get 更是完全不经过它 ⟹ 记的归属恒空、校验两边都空

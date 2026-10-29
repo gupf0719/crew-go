@@ -222,6 +222,9 @@ type BasicAgentBuilder struct {
 	// turnGates / turnGateMaxVetoes 见 WithTurnGates：回合结束闸门（空 = 不建闸门节点）。
 	turnGates         []TurnGateFunc
 	turnGateMaxVetoes int
+	// identityName 非空时进图身份（compose_v2.GraphBuilder.WithIdentityPrefix）：BasicAgent 显式给了名字时设，见
+	// buildComposeGraph。空 = 图身份只有结构指纹。
+	identityName string
 }
 
 // ReturnDirectAnnotation 是 tool result message 上的 marker——某工具声明"调用后立即
@@ -1707,6 +1710,9 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	// LoopAgent(`maxIter+5`) / ReflectAgent(`maxRounds*3+5`) 各有优雅轮次退出条件，其 maxVisit 是
 	// 永不触发的 dead headroom，不受此修影响（本修仅针对无优雅退出的 BasicAgent）。
 	bld := compose_v2.NewBuilder().WithMaxVisit(maxRounds + 1)
+	if b.identityName != "" {
+		bld = bld.WithIdentityPrefix(b.identityName)
+	}
 	bld = compose_v2.WithChannel(bld, basicMessagesCh)
 	bld = compose_v2.WithChannel(bld, basicRoundCh)
 	bld = compose_v2.WithChannel(bld, basicRevealedCh)

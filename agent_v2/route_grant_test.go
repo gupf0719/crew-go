@@ -98,7 +98,8 @@ func TestRouteGrant_ConsultedAgentDoesNotDecide(t *testing.T) {
 }
 
 // TestRouteGrant_ToolConsultDoesNotDecide：分类器 BasicAgent 有一件 RunnableAsTool 包的「请教」工具，
-// 工具里裸调一个带 route_to 的 agent（它选 math）；分类器自己随后 route_to(chat)。被请教的那个不算。
+// 工具里经 RunSubAgent 调一个带 route_to 的 agent（它选 math）；分类器自己随后 route_to(chat)。被请教的那个不算。
+// （工具里裸调 `helper.Run(ctx, nil, …)` 会让它的图落进分类器自己的存档槽，Run 入口拒。）
 //
 // 曾经两个决定都交进分类器那段执行，工具那个排在前面——同一批之后的下一批 route_to(chat) 后到为准，
 // 而先请教、后自己没定的话就是 math（审计实测 R4 形态：请教里定的 math 生效）。这里分两批，钉住的是
@@ -109,7 +110,7 @@ func TestRouteGrant_ToolConsultDoesNotDecide(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			helper, helperModel := effRouter("helper_llm", "math")
 			consult := agent_v2.RunnableAsTool("consult", "请教另一个路由器", func(ctx context.Context, input string) (string, error) {
-				if _, err := helper.Run(ctx, nil, schema.UserMessage(input)); err != nil {
+				if _, err := agent_v2.RunSubAgent(ctx, "consult", helper, schema.UserMessage(input)); err != nil {
 					return "", err
 				}
 				return "参考意见已拿到", nil

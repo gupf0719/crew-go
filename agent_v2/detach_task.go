@@ -86,6 +86,7 @@ func detachedFromRunning(ctx context.Context, runID string) bool {
 // compose_v2.EnvironmentKey（调用方配的环境，见本组最后两个）——机械测试扫全包的
 // context.WithValue / Value 调用，两边都没实现就红。
 func (sessionKey) ExecutionState()               {}
+func (slotClaimKey) ExecutionState()             {}
 func (taskScopeKey) ExecutionState()             {}
 func (callApprovalKey) ExecutionState()          {}
 func (finalRoundKey) ExecutionState()            {}

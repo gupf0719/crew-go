@@ -34,7 +34,8 @@ func countBoundaries(msgs []*schema.Message) int {
 // 把整场历史重新摘要一遍。
 //
 // 断言选在三个量上：Run 2 读回了多少条历史（没有边界时是整场）；Run 2 第一次模型调用里有没有上次的摘要；
-// Run 2 第一轮有没有调摘要（没有边界时 prior 是整场原文、必然超阈值）。
+// Run 2 要摘要时摘的是哪一段（没有边界时 prior 是整场原文、必然超阈值，摘要输入里是整场的工具结果）。Run 1 收尾时
+// 离阈值多近随轮数而定，Run 2 摘不摘要不是断言的量。
 func TestCompactionBoundary_NextRunStartsFromBoundary(t *testing.T) {
 	ctx := compose_v2.WithThreadIDCtx(context.Background(), "conv-boundary")
 	key := agent_v2.HistoryKey{Owner: "t", ConvID: "conv-boundary"}
@@ -64,9 +65,11 @@ func TestCompactionBoundary_NextRunStartsFromBoundary(t *testing.T) {
 	if strings.Contains(first, "第一件事") && !strings.Contains(first, "SUMMARY") {
 		t.Fatalf("Run 2 看到的是 Run 1 的原文而不是摘要")
 	}
-	if s2.count() > 0 && strings.Count(inputText(s2.inputs[0]), "src/a.go:12") > 20 {
-		t.Fatalf("Run 2 在整场原文上重新摘要了一遍（摘要输入里 %d 条旧工具结果）",
-			strings.Count(inputText(s2.inputs[0]), "src/a.go:12"))
+	if s2.count() > 0 {
+		total := strings.Count(inputText(all), "src/a.go:12")
+		if got := strings.Count(inputText(s2.inputs[0]), "src/a.go:12"); got*3 > total {
+			t.Fatalf("Run 2 在整场原文上重新摘要了一遍（摘要输入里 %d 行旧工具结果，整场 %d 行）", got, total)
+		}
 	}
 	if n := st.msgs.Load(); n*3 > int64(len(all)) {
 		t.Fatalf("会话 %d 条，Run 2 读回 %d 条——没从压缩边界开始读", len(all), n)

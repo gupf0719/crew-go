@@ -112,8 +112,8 @@ func adaptHooks(h OrchestrationHooks) compose_v2.OrchestrationHooks {
 // 缺 helper 业务自管 chain 易漏 nil 过滤. 本 helper 过滤 nil/typed-nil 后复用底层
 // compose_v2.ChainOrchHooks.
 //
-// **panic 语义**：chain 内 hook 直接调、不逐个隔离——单 hook panic 中断剩余链，由调用这条链的地方处置
-// （转成错误还是就地兜住记日志，见 compose_v2.OrchestrationHooks「panic 语义」）。
+// **panic 语义**：同 compose_v2.ChainOrchHooks——Start 一侧单 hook panic 中断剩余链；End 与 Event 一侧每个钩子都调到、调完
+// 再抛出第一个 panic。处置交给调用这条链的地方（转成错误还是就地兜住记日志，见 compose_v2.OrchestrationHooks「panic 语义」）。
 //
 // 用法:
 //

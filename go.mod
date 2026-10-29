@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.4
 
 require (
-	github.com/a2aproject/a2a-go/v2 v2.3.2-0.20260515131113-c8cc0c1c5b10
+	github.com/a2aproject/a2a-go/v2 v2.7.0
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/anthropics/anthropic-sdk-go v1.84.0
 	github.com/redis/go-redis/v9 v9.20.0

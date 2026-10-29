@@ -75,6 +75,11 @@ type GraphOutputReader func(chs compose_v2.Channels) *schema.Message
 // NewGraphAgent 创建 GraphAgent 包装 compose_v2.Graph。
 //
 // **必填**：graph + InputWriter + OutputReader。
+//
+// 存档冲突检查用的是图自己的身份（[compose_v2.Graph.ID]），GraphAgent 的名字不进去。两个 GraphAgent 包着结构相同、
+// 没设名字的图（同样的节点 ID 与 channel）时身份相同，一个进了另一个的存档槽（经 [EnterRun] 进入的壳在自己的阶段里
+// 裸调）会把对方的挂起档读进来接着跑，`err == nil`。建图时用 `WithName` 或 `WithIdentityPrefix` 区分它们，撞上时报
+// `compose_v2.ErrGraphIDConflict`、不执行。
 func NewGraphAgent(graph *compose_v2.Graph, opts ...GraphAgentOption) *GraphAgent {
 	g := &GraphAgent{graph: graph}
 	for _, opt := range opts {
@@ -228,7 +233,12 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	if g.outputReader == nil {
 		return nil, fmt.Errorf("graph agent %q: output reader required (use WithGraphOutputReader)", g.Name())
 	}
+	cfg := applyRunOptions(opts)
 	if err := resolveRunSession(ctx, &session, g.Name()); err != nil {
+		return nil, err
+	}
+	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
+	if err := checkAbandonedTasks(ctx, cfg.abandoned, session, g.Name()); err != nil {
 		return nil, err
 	}
 	if err := g.checkBreakpointsResumable(ctx); err != nil {
@@ -260,11 +270,11 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 		//
 		// 回执是 `settleHistoryAt` 判「这次调用范围内有没有产生记录」的依据，必须在范围
 		// **开始**时开、不能等结算时补。图里的子 agent 经 RunSubAgent 记的每一笔都顺着
-		// 回执链上溯记一笔，于是出口那次结算知道「里面已经有人记过了，别再补一遍输入」。
+		// 回执链上溯记一笔，于是出口那次结算知道里面已经有人记过，产出是子 agent 记过的那条时不再补一遍
+		// （输入那条另按「本 Run 记过没有」判，见 gateInputRecorded）。
 		ctx = openHistoryReceipt(ctx)
 	}
 
-	cfg := applyRunOptions(opts)
 	// MED-1 fail-fast：composite 不把 per-call 覆盖透传给 inner step，传了静默 no-op，直接报错。
 	if err := rejectCompositeOverride(cfg.overrides()); err != nil {
 		return nil, err
@@ -287,7 +297,9 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	// 透给 runGraph, 与 BasicAgent 协议对称.
 	agentIn := &hook.AgentInput{Messages: []*schema.Message{input}}
 	// 「这是不是新任务」判在钩子之前：钩子里就可能发起调用（见 enterRunTask）
-	ctx = enterRunTask(ctx, session)
+	ctx = enterGraphRunTask(ctx, session)
+	// 调用方声明放弃了的任务（WithAbandonedTasks）：在记这次的输入、触发钩子之前收尾
+	abandonTasksAtEntry(ctx, cfg.abandoned, g.Name())
 	var hookErr error
 	ctx, hookErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return hooks.OnAgentStart(c, info, agentIn)
@@ -300,6 +312,11 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	}
 	// 消费 hook 改写: 空 Messages 时保持原 input (避免 inputWriter 拿 nil panic).
 	input = adoptHookInput(agentIn, input)
+	// 原始输入排在这次 Run 第一批记录的前面（见 deferRootInput）：图里经 RunSubAgent 调起的子 agent 在执行中就记下自己
+	// 的问答，到出口才记的话用户那句话排在子 agent 的回答之后。
+	if ownsHistory {
+		deferRootInput(ctx, g.Name(), input)
+	}
 
 	// 注入 user input 审计事件——在 OnAgentStart 消费**之后**（四编排 review GA-M1 fix，
 	// 对齐其余 7 编排 "OnAgentStart → 消费改写 → AddEvent" 序）：hook 改写（如 PII
@@ -325,24 +342,34 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 		// panic 兜底(recover 与 OnAgentEnd 调用同块,见 agent_helpers.go recoverPanicToErr):
 		// 闭包内直接 recover() 设 retErr 让 OnAgentEnd 看到框架自身 wrapper panic.
 		recoverPanicToErr(ctx, "GraphAgent.OnAgentEnd", recover(), &retErr)
+		// 待补的原始输入在钩子之前收回：业务的输入写入器 / 输出读取器 panic 时走不到 runGraph 之后那一次，OnAgentEnd 钩子里
+		// 起的调用会把它带出来（审计实测）
+		if ownsHistory {
+			endRootInputWindow(ctx)
+		}
 		ctxOut := WithEndError(ctx, retErr)
 		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: msgs}, retErr)
 	}()
 
 	final, err := g.runGraph(ctx, &cfg, session, input)
+	if ownsHistory {
+		endRootInputWindow(ctx)
+	}
 	if err != nil {
 		if final != nil {
 			finalRef = final
 		}
 		// **可 Resume 的退出都要结算输入**：Resume 入口拿不到原始 input（它被 inputWriter
 		// 交给业务 channel 了，框架不知道是哪个），不在这儿记，这条会话就永远没有用户那
-		// 句话。其余 7 编排不需要这一手——它们的补记写在图体内，Resume 会连着重跑。
+		// 句话。其余 7 编排不需要这一手——它们的补记写在图体内，Resume 会连着重跑。图里的
+		// 子 agent 已经记过东西时，输入在那第一批记录之前已经补过（deferRootInput），这里按
+		// 「本 Run 记过没有」跳过。
 		//
-		// **判据是「框架对这个错的处置意图」不是错的类型**。原来只认 `IsInterrupt`，实测
-		// 漏两档：软取消返 `ErrSoftCanceled`、`CondFailRerunFrom` 返的是**业务错**，两档
-		// cp 都留 Pending 且之后真能 Resume 成功——漏了就落成「有答无问」。纯业务硬错不在
-		// 此列（cp 标 Failed，`Resume` 直接返 `ErrNoPendingCheckpoint`，这一层压根不可
-		// Resume），跟「报错的外部执行体叶子」一档，不记是站得住的。
+		// **判据是「这次退出还有没有下文」不是错的类型**（`LeavesResumableCheckpoint`）：中断、
+		// 软取消、`CondFailRerunFrom` 返的业务错、普通业务错都留档、之后能续（失败档 Resume =
+		// 重试失败分支）；只有终局失败（`ErrRunAborted`，档已清）不在这里记——图里已有记录时原话
+		// 已在第一批之前补过。原来只认 `IsInterrupt`，实测漏了软取消与 `CondFailRerunFrom` 两档，
+		// 落成「有答无问」。
 		// 嵌套时（ownsHistory=false）不在这里结算：交给调起它的那道边界——编排的成员派发与
 		// 嵌套调用执行器在「可 Resume 的退出」时都结算输入（settleHistoryOnPause），嵌套调用
 		// 还按调用身份记下「输入已落过」，续跑完成、再次暂停时都不再记。这里曾经也结算一份
@@ -362,8 +389,9 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	if final != nil {
 		session.AddEvent(NewExitEvent(g.Name(), final))
 	}
-	// 输入 + 产出一起结算。判据自己决定记不记：图里的子 agent 已经记过的，输入这条会被
-	// 范围回执挡掉、产出这条会被全局登记表挡掉（透传的跳过、加工过的照记）。
+	// 输入 + 产出一起结算。判据自己决定记不记：输入这条按「本 Run 记过没有」判（图里的子
+	// agent 原样收到它、记在自己名下的，或在第一批记录之前补过的，都跳过）；产出这条在范围里
+	// 有过记录时按全局登记表判（透传的跳过、加工过的照记）。
 	if ownsHistory {
 		settleHistoryTopLevel(ctx, g.Name(), input, final)
 	}
@@ -461,7 +489,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	// 8-method 协议：Resume 入口 fire OnAgentStart 与 Run 协议对称（各 1 次）.
 	// AgentIn.Messages 退化 nil (Resume 没新 input — 走 cp 重建).
 	agentIn := &hook.AgentInput{}
-	ctx = enterResumeTask(ctx, session)
+	ctx = enterGraphResumeTask(ctx, session)
 	var hookErr error
 	ctx, hookErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return hooks.OnAgentStart(c, info, agentIn)
@@ -492,7 +520,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 
 	// Resume 拿不到授予：放一份空的，遮住外层放的那份。
 	ctx = withNodeGrants(ctx, memberGrants{})
-	runErr := compose_v2.Run(ctx, g.graph, cm, runOpts...)
+	runErr := compose_v2.Run(ctx, g.graph, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := g.outputReader(cm.Channels())
 	finalRef = final
 	if runErr != nil {
@@ -563,7 +591,7 @@ func (g *GraphAgent) runGraph(
 	// opts，要把能力交给它调起的 agent 时经 RegrantFromNode 显式转授。不自动往下传——节点里请教的
 	// agent 不该凭在这张图里跑就替上层做决定（见 routeGrant）。
 	ctx = withNodeGrants(ctx, runCfg.grantsFor(g))
-	runErr := compose_v2.Run(ctx, g.graph, cm, runOpts...)
+	runErr := compose_v2.Run(ctx, g.graph, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := g.outputReader(cm.Channels())
 	return final, runErr
 }

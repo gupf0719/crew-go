@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"maps"
 	"reflect"
 	"sort"
 	"strconv"
@@ -248,6 +249,10 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	if err := resolveRunSession(ctx, &session, a.config.Name); err != nil {
 		return nil, err
 	}
+	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
+	if err := checkAbandonedTasks(ctx, cfg.abandoned, session, a.config.Name); err != nil {
+		return nil, err
+	}
 	ctx = WithSession(ctx, session)
 	ctx = pushStoreCtx(ctx, a.config.Store)
 	ctx = withOffloadDedup(ctx) // MicroCompact offload 的 per-Run 跨轮去重集合
@@ -274,7 +279,9 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	_, nested := enclosingTask(ctx)
 	ctx = withBackgroundScope(ctx, &a.config, !nested)
 	// 「这是不是新任务」判在钩子之前：钩子里就可能发起调用（见 enterRunTask）
-	ctx = enterRunTask(ctx, session)
+	ctx = enterGraphRunTask(ctx, session)
+	// 调用方声明放弃了的任务（WithAbandonedTasks）：在记这次的输入、触发钩子之前收尾
+	abandonTasksAtEntry(ctx, cfg.abandoned, a.config.Name)
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return a.config.Hooks.OnAgentStart(c, info, agentIn)
@@ -444,7 +451,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	// messages 可从 sess.Events 取 ResumeContext.UserInputs.
 	agentInResume := &hook.AgentInput{}
 	ctx = withBackgroundScope(ctx, &a.config, true) // Resume 只在顶层调（见 commonResumePrep）
-	ctx = enterResumeTask(ctx, session)
+	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return a.config.Hooks.OnAgentStart(c, info, agentInResume)
@@ -516,7 +523,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 
 	// 这次续跑取走的插话记一本账，续不了时还回收件箱（见 Inbox「取走之后」）
 	ctx, ledger := withInterjectionLedger(ctx)
-	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
+	runErr := compose_v2.Run(ctx, g, cm, append(runOpts, slotClaimOpt(ctx))...)
 	settleInterjections(ctx, ledger, cper, runErr)
 	finalMsgs, _ := compose_v2.Get(cm.Channels(), basicMessagesChan)
 	finalMessagesRef = finalMsgs
@@ -672,7 +679,7 @@ func (a *BasicAgent) runGraph(ctx context.Context, runCfg *runConfig, session *R
 	}
 	// 这次 Run 取走的插话记一本账，续不了时（没配存档、终局失败）还回收件箱（见 Inbox「取走之后」）
 	ctx, ledger := withInterjectionLedger(ctx)
-	runErr := compose_v2.Run(ctx, g, cm, runOpts...)
+	runErr := compose_v2.Run(ctx, g, cm, append(runOpts, slotClaimOpt(ctx))...)
 	settleInterjections(ctx, ledger, cper, runErr)
 	finalMsgs, _ := compose_v2.Get(cm.Channels(), basicMessagesChan)
 	lastRound := GetBasicAgentRound(cm)
@@ -1308,6 +1315,57 @@ func describeUnresolvedCalls(tcs []schema.ToolCall) string {
 	return b.String()
 }
 
+// toolResultIDs 返回一条消息里每个结果块的 tool_call ID，按块的顺序（schema.GetToolResultID 只取第一块）。
+func toolResultIDs(m *schema.Message) []string {
+	if m == nil {
+		return nil
+	}
+	var ids []string
+	for _, cb := range m.ContentBlocks {
+		if cb != nil && cb.Toolresult != nil {
+			ids = append(ids, cb.Toolresult.ToolCallId)
+		}
+	}
+	return ids
+}
+
+// splitToolResultBlocks 把带多个结果块的 tool 消息拆成每块一条，拆法同 openai 适配层发请求时（OpenAI 兼容的接口一条 tool
+// 消息只带一个 tool_call_id）：第一块留在原消息的拷贝上，连同非结果块与原消息的文本（文本为空时取这一块的）；其余每块一条，
+// 文本取各自块的，标注拷一份，消息 ID 在原 ID 后接上 tool_call ID（同一条消息每次拆出来的 ID 都一样）。只有一块或没有时
+// 原样返回。不改 m。
+func splitToolResultBlocks(m *schema.Message) []*schema.Message {
+	if len(toolResultIDs(m)) <= 1 {
+		return []*schema.Message{m}
+	}
+	var out []*schema.Message
+	for _, cb := range m.ContentBlocks {
+		if cb == nil || cb.Toolresult == nil {
+			continue
+		}
+		cp := *m
+		if len(out) == 0 {
+			cp.ContentBlocks = make([]*schema.ContentBlock, 0, len(m.ContentBlocks))
+			for _, b := range m.ContentBlocks {
+				if b != nil && (b.Toolresult == nil || b == cb) {
+					cp.ContentBlocks = append(cp.ContentBlocks, b)
+				}
+			}
+			if cp.Content == "" {
+				cp.Content = cb.Toolresult.Content
+			}
+		} else {
+			cp.ContentBlocks = []*schema.ContentBlock{cb}
+			cp.Content = cb.Toolresult.Content
+			cp.Annotations = maps.Clone(m.Annotations)
+			if m.ID != "" {
+				cp.ID = m.ID + "/" + cb.Toolresult.ToolCallId
+			}
+		}
+		out = append(out, &cp)
+	}
+	return out
+}
+
 // pairToolResults 建立 tool_call ↔ tool_result 的配对索引：每个 id → 它的结果**队列**，
 // 按出现顺序。
 //
@@ -1325,6 +1383,9 @@ func describeUnresolvedCalls(tcs []schema.ToolCall) string {
 // ⚠️ **全仓已有 6 份独立的配对实现**（重建、截断守卫、切点调整、三层压缩各一）。
 // 这是给「视图重建」和「历史修复」两处共用的那一份——**别再加第七份**：两套规则一旦
 // 分叉，视图层会自愈（重建时多余的被丢），而历史层不会（append-only 删不掉）。
+//
+// 一条 tool 消息带多个结果块（业务照 Anthropic 的样子合并了结果）时逐块配对，配上的是拆开之后的单块消息（见
+// splitToolResultBlocks）——只认第一块的话其余的调用被判成没有结果、多补一条占位，发出去同一个调用两条结果。
 func pairToolResults(msgs []*schema.Message) map[string][]*schema.Message {
 	resultsOf := make(map[string][]*schema.Message)
 	declared := make(map[string]int)
@@ -1333,9 +1394,11 @@ func pairToolResults(msgs []*schema.Message) map[string][]*schema.Message {
 			continue
 		}
 		if m.Role == schema.RoleTool {
-			id := schema.GetToolResultID(m)
-			if declared[id] > len(resultsOf[id]) {
-				resultsOf[id] = append(resultsOf[id], m)
+			for _, piece := range splitToolResultBlocks(m) {
+				id := schema.GetToolResultID(piece)
+				if declared[id] > len(resultsOf[id]) {
+					resultsOf[id] = append(resultsOf[id], piece)
+				}
 			}
 			continue
 		}
@@ -2294,6 +2357,13 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	bld.finalizeToolMemo = finalizeToolMemo
 	if len(a.config.TurnGates) > 0 {
 		bld = bld.WithTurnGates(a.config.TurnGates, a.config.TurnGateMaxVetoes)
+	}
+	// 图身份：显式给的名字 + 结构指纹。只有指纹时任意两个结构相同的 BasicAgent 身份相同，一个进了另一个的存档槽
+	// （经 EnterRun 进入的壳在自己的阶段里裸调、跟它透传的那个同一个 ns）就把对方的挂起档读进来、用自己的工具接着跑，
+	// err == nil；名字不同时载入撞 ErrGraphIDConflict。自动名每次构造都变，不进身份——每个请求重建 agent 的调用方
+	// （agui）续不上自己的档。指纹留着：同名的 agent 改了配置、图多了或少了节点时，续跑旧档照样报冲突。
+	if a.config.nameExplicit {
+		bld.identityName = a.config.Name
 	}
 	g, err := bld.Compile()
 	return g, dispatchToolkit, err

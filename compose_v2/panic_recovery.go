@@ -31,6 +31,14 @@ import (
 // 用 errors.Is / errors.As。
 type PanicError = panicerr.Error
 
+// Run 两道兜底给错误加的前缀，刻意不同：主体那道（bodyPanicPrefix）兜住时存档已正确存成 failed、可续跑；入口那道
+// （runPanicPrefix）兜的是出口 defer 链自身——框架自己的代码，业务钩子与存储调用都另有兜底、落不到这里——存档状态以
+// 错误链上的结论为准。两个前缀曾被一次不限次数的字符串替换抹平，哨兵见 panic_prefix_internal_test.go。
+const (
+	bodyPanicPrefix = "compose_v2: graph body panic recovered"
+	runPanicPrefix  = "compose_v2.Run panic recovered"
+)
+
 // abnormalNodeExitKey / abnormalNodeExitSlot —— 本次 Run 的「节点异常终止」记录位。
 //
 // `runtime.Goexit` 掐断节点时函数**永不返回**，错误没法走返回值——但 defer 会跑，
@@ -102,9 +110,9 @@ func (s *abnormalNodeExitSlot) take() error {
 //
 // # 按层看：谁接谁
 //
-// 本包非测试代码共 **21 处 `recover()`**，散在 8 个文件（2026-10-22 核对；之前写的「16 处、5 个文件」漏了出口
-// 记账的 `exitStorageOp`、只作观测的 `recoverObserver`、async worker 的 loop、`ApplyPendingSendsAndClear` 几道，后来又加了
-// 成功路径观测钩子的几道）。下面按「出事时谁先接到」分层，**不写行号**（行号本身就是最容易漂的东西，按函数名找）。
+// 本包非测试代码共 **20 处 `recover()`**，散在 8 个文件（2026-10-28 核对：OnNodeEnd 早退路径那道并进了 `notifyNodeEnd`；
+// 之前写的「16 处、5 个文件」漏了出口记账的 `exitStorageOp`、只作观测的 `recoverObserver`、async worker 的 loop、
+// `ApplyPendingSendsAndClear` 几道，后来又加了观测钩子的几道）。钩子链里的 `panicerr.CallEach` 不在本包、不计入。下面按「出事时谁先接到」分层，**不写行号**（行号本身就是最容易漂的东西，按函数名找）。
 //
 // ## 第 1 层：单个成员的执行内部
 //
@@ -112,14 +120,14 @@ func (s *abnormalNodeExitSlot) take() error {
 //     **这是最常见的一类**，`runNodeWithHooks` 调它，所以本体 panic 在里层就被接走了。
 //   - `OnNodeStart` 的 inner defer —— 收该 hook 的 panic，转 `startErr` 走早退路径，
 //     好让 `OnNodeEnd` 仍被配对调用。前缀 `OnNodeStart panic: `。
-//   - `OnNodeEnd` **早退路径**的 inner defer —— ⚠️ **只打 WARN 日志，返回值里一个字都没有**。
-//     早退时错误已定（`startErr`），这道只保证 hook 的 panic 不把它顶掉。
-//   - `notifyNodeEnd` —— **节点体成功之后**的 `OnNodeEnd`：就地兜住、带栈记一条 ERROR，**不进错误**，
-//     节点结果与写入照常提交（转成错误的话失败档被续跑或重试捡起，已经做完的节点体重跑、副作用重放）。
-//     触发：节点成功、OnNodeEnd panic ⟹ Run 返 nil，日志里一条「OnNodeEnd 钩子 panic（节点体已经成功…）」。
+//   - `notifyNodeEnd` —— `OnNodeEnd`（节点体成功、节点体失败、OnNodeStart 早退三条路都经它）：就地兜住、带栈记一条
+//     ERROR，**不进错误**，结局不变。成功时节点结果与写入照常提交（转成错误的话失败档被续跑或重试捡起，已经做完的节点体
+//     重跑、副作用重放）；失败时照旧交出原来那个错误（换成 panic 的错误的话，节点体问的问题认不出来、终局失败的标记丢了
+//     被当成可重试）。触发：节点成功、OnNodeEnd panic ⟹ Run 返 nil，日志里一条「OnNodeEnd 钩子 panic（节点体已经成功…）」；
+//     节点体返回中断、OnNodeEnd panic ⟹ Run 照旧返回那个中断。
 //   - `nodeEventSink.Send` —— 节点里发事件时的 `OnNodeEvent`：同样就地兜住、只记 ERROR，Send 照常返回。
-//   - `runNodeWithHooks` 整函数 defer —— 兜上面几道**之外**剩下的，实际主要是**节点体失败时的
-//     `OnNodeEnd`**。前缀 `node %q hook/run panic recovered: `。
+//   - `runNodeWithHooks` 整函数 defer —— 兜上面几道**之外**剩下的：业务钩子都另有兜底，落到这里的是框架自己在节点执行
+//     收尾段的代码。前缀 `node %q hook/run panic recovered: `。
 //     它跑在每个成员自己的 goroutine 里，所以跨 goroutine 也覆盖。
 //     **它还有第三支**：`bodyReturned` 旗（testing.tRunner 的 `finished` 同款，由正常
 //     控制流的普通语句置位——defer 里置位没用，Goexit 也跑 defer）。NodeFunc / OnNodeStart
@@ -175,13 +183,13 @@ func (s *abnormalNodeExitSlot) take() error {
 //     从 `abnormalNodeExitSlot` 取带身份的错（节点层记的），没有就给通用错。这一格是
 //     **完整**的：图主体里任何位置（NodeFunc / hook / cond / 框架自身）的 Goexit 都落
 //     在这儿，不必逐个调用点设防——节点层那道只是让错误带上身份、让 span 配对。
-//   - **入口那道**（注册最早 ⟹ 最后跑）—— 收 **defer 链自身**抛的 panic，实际主要是**图失败时**的业务 `OnGraphEnd`
-//     hook。出口记账的存储调用（写档、清档、清档前的检查）由 `exitStorageOp` 自己兜，cp 事件的钩子与出口
-//     日志由 `recoverObserver` 兜（见第 4 层），都不落这道。
-//     前缀 `compose_v2.Run panic recovered: `。
-//   - **`OnGraphEnd` 成功路径那道** —— 图成功跑完时 `OnGraphEnd` 的 panic 就地兜住、带栈记一条 ERROR，
-//     **不进错误**（理由同 `notifyNodeEnd`：它跑在出口记账之前，转成错误的话成功收尾时档已清掉，重试从头
-//     再跑一遍）。
+//   - **入口那道**（注册最早 ⟹ 最后跑）—— 收 **defer 链自身**抛的 panic，只剩框架自己的出口代码：业务的 `OnGraphEnd`
+//     有自己那道（下一条），出口记账的存储调用（写档、清档、清档前的检查）由 `exitStorageOp` 自己兜，cp 事件的钩子与出口
+//     日志由 `recoverObserver` 兜（见第 4 层），都不落这道。业务代码触发不到它。
+//     前缀 `compose_v2.Run panic recovered: `（`runPanicPrefix`）。
+//   - **`OnGraphEnd` 那道** —— 图结束之后（成败都是）`OnGraphEnd` 的 panic 就地兜住、带栈记一条 ERROR，
+//     **不进错误**（理由同 `notifyNodeEnd`：图成功时它跑在出口记账之前，转成错误的话成功收尾时档已清掉，重试从头
+//     再跑一遍；图失败时曾经并进错误，错误文本多出一行钩子的 panic，交给前端、对端、模型的都是它）。
 //
 // `OnGraphStart` 另有自己的 inner defer（前缀 `OnGraphStart panic: `），同样是为了让
 // `OnGraphEnd` 的配对承诺不被跳过。
@@ -227,12 +235,12 @@ func (s *abnormalNodeExitSlot) take() error {
 // 业务据此区分是哪一段炸的：
 //
 //   - `graph body panic recovered` —— 图主体炸了，**存档已正确存成 failed**，可 Resume
-//   - `Run panic recovered` —— 收尾段（图失败时的 OnGraphEnd 钩子）炸了。出口的存档读写不在这里
-//     兜（出口存储调用那道单独兜，结论按存储调用的结果定：写档 panic 报 `ErrCheckpointNotPersisted`），存档
-//     状态以错误链上的结论为准
+//   - `Run panic recovered` —— 出口 defer 链里框架自己的代码炸了（业务钩子与出口存储调用都另有兜底，落不到这里；出口
+//     存储调用那道的结论按存储调用的结果定：写档 panic 报 `ErrCheckpointNotPersisted`），存档状态以错误链上的结论为准
 //
 // 这两个前缀曾被一次无边界的字符串替换抹平，而**全套测试照常全绿**——没有任何用例断言过
-// 它们可区分。现在有了（out_edge_panic_test.go 里那条），改前缀时它会红。
+// 它们可区分。现在两个前缀是常量（`bodyPanicPrefix` / `runPanicPrefix`），panic_prefix_internal_test.go 守它们互不相同；
+// 入口那道业务代码触发不到，主体那道由 out_edge_panic_test.go 实际触发。
 //
 // # 不由 recover 兜的那些（有意）
 //

@@ -57,6 +57,28 @@ func (o *remoteOutput) taskArtifact(ctx context.Context, id a2atypes.ArtifactID,
 		return
 	}
 	t, bs := PartsToContent(parts)
+	o.applyTaskArtifact(ctx, id, t, bs)
+}
+
+// taskArtifactSince 同 taskArtifact，但扣掉问人那一刻已有的内容（seen 为 nil 时不扣）：快照里的正文仍以当时那段开头，只收
+// 多出来的部分（这一轮追加的）；对不上就是这一轮整段替换了，收全文。见 seenArtifact。
+func (o *remoteOutput) taskArtifactSince(ctx context.Context, id a2atypes.ArtifactID, parts a2atypes.ContentParts, seen *seenArtifact) {
+	if id == "" || seen == nil {
+		o.taskArtifact(ctx, id, parts)
+		return
+	}
+	t, bs := PartsToContent(parts)
+	if len(t) >= seen.TextLen && textHash(t[:seen.TextLen]) == seen.TextHash &&
+		len(bs) >= seen.Blocks && seen.BlocksHash != "" && blocksHash(bs[:seen.Blocks]) == seen.BlocksHash {
+		t, bs = t[seen.TextLen:], bs[seen.Blocks:]
+	}
+	if t == "" && len(bs) == 0 {
+		return // 这一轮没动它
+	}
+	o.applyTaskArtifact(ctx, id, t, bs)
+}
+
+func (o *remoteOutput) applyTaskArtifact(ctx context.Context, id a2atypes.ArtifactID, t string, bs []*schema.ContentBlock) {
 	seg, ok := o.byArtifact[id]
 	if !ok {
 		seg = &outputSeg{blocks: bs}

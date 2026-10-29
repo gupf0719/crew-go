@@ -63,6 +63,15 @@ const runIDKey = RunIDAnnotationKey
 // 边界情况：
 //   - 空输入返回空切片
 //   - 单条消息单独成组
+//
+// **一次调用与它的结果总在同一组**：组里还有调用没收到结果、而结果排在后面时，上面几条本来要开新组的消息（插进来的
+// system / user、RunID 不同的 assistant）留在当前组，直到结果到齐。合法的线上形态（结果紧跟调用）不受影响——那时每个
+// 组边界上都没有未闭合的调用。业务改写消息列表时把消息插进一次调用与它的结果之间，各家 provider 处置不同（DeepSeek /
+// OpenAI 直接 400，qwen 照收，原生 Anthropic 这类适配器把中途的 system 提出去照收、但不收孤儿 tool_result）：曾经在
+// system 旁边切开，压缩层整组拎出 / 摘要 / 丢弃时把调用与结果分到两边——输出里留下孤儿 tool_result、摘要输入里带着
+// 悬空的调用，把一个本来被接受的请求变成被拒的。框架不替 provider 判这种输入合不合法，只保证压缩不让它变得更糟。
+// 配对按调用 ID 顺序消费（同一个 ID 被后面的 assistant 重新声明时，前面没收到结果的那份作废：有的 provider 复用 ID），
+// 一条 tool 消息里有几个结果块就认几个。
 func GroupMessagesByAPIRound(messages []*schema.Message) [][]*schema.Message {
 	if len(messages) == 0 {
 		return nil
@@ -71,8 +80,10 @@ func GroupMessagesByAPIRound(messages []*schema.Message) [][]*schema.Message {
 	var groups [][]*schema.Message
 	var current []*schema.Message
 	var currentRunID string // 当前组的 RunID（assistant 消息携带，tool/user 不带）
+	answeredAt := lastAnswerIndex(messages)
+	pendingUntil := -1 // 当前组里的调用，结果最晚排在哪；在它之前不切组
 
-	for _, msg := range messages {
+	for i, msg := range messages {
 		if msg == nil {
 			continue
 		}
@@ -114,23 +125,28 @@ func GroupMessagesByAPIRound(messages []*schema.Message) [][]*schema.Message {
 		//
 		// **配对校验本身不看 system**：那套不变量只看 `RoleAssistant` 的 tool_calls 和
 		// `RoleTool` 的 result id（见 `safe_truncate.go`），`RoleSystem` 一个字都不参与。
-		// ⚠️ **但这不代表「在 system 旁边切组」是安全的**：`[user][assistant tc][system][tool]`
-		// 会被切成**三组** `[user assistant]` + `[system]` + `[tool]`（system 既开新组也关新组，
-		// 所以 tool_result 自己单独一组），丢掉第一组就留下孤儿 tool_result。
-		// 第 3 层紧急压缩丢完会再数一遍配对（`dropOrphanToolResults`），AutoCompact 那条路
-		// 还没有——见 `doc/code/todo.md` 同名条目。框架自己不会在工具轮中间插 system，
-		// 业务在 hook 里插才会遇到。
+		// ⚠️ **但在 system 旁边切组不一定安全**：`[user][assistant tc][system][tool]` 照上面两条会切成
+		// `[user assistant]` + `[system]` + `[tool]`，丢掉或摘要掉第一组就留下孤儿 tool_result——下面
+		// pendingUntil 那一段让调用还在等结果时不切。框架自己不会在工具轮中间插 system，业务在 hook 里插才会遇到。
 		if len(current) > 0 && current[len(current)-1].Role == schema.RoleSystem {
 			startNewGroup = true
+		}
+		// 组里还有调用在等后面的结果：不切（见函数 godoc）
+		if startNewGroup && i <= pendingUntil {
+			startNewGroup = false
 		}
 
 		if startNewGroup {
 			groups = append(groups, current)
 			current = nil
 			currentRunID = ""
+			pendingUntil = -1
 		}
 
 		current = append(current, msg)
+		if at, ok := answeredAt[i]; ok && at > pendingUntil {
+			pendingUntil = at
+		}
 		// 更新当前组 RunID（仅 assistant 携带）
 		if msg.Role == schema.RoleAssistant {
 			if id := getRunID(msg); id != "" {
@@ -143,6 +159,51 @@ func GroupMessagesByAPIRound(messages []*schema.Message) [][]*schema.Message {
 		groups = append(groups, current)
 	}
 	return groups
+}
+
+// lastAnswerIndex 给每条带 tool_calls 的 assistant（按下标）算出它的调用的结果最晚排在哪一条（下标），没有收到任何结果的
+// 不在表里。配对按调用 ID 顺序消费：先声明的先配；同一个 ID 被后面的 assistant 重新声明时，前面的声明还没配上的作废
+// （provider 复用 ID 时，后一轮的结果不能配给前一轮悬空的调用）。一条 tool 消息里的每个结果块各配一次。
+func lastAnswerIndex(messages []*schema.Message) map[int]int {
+	var out map[int]int
+	pending := map[string][]int{} // 调用 ID → 还没配上结果的声明所在的 assistant 下标（按声明顺序）
+	for i, m := range messages {
+		if m == nil {
+			continue
+		}
+		switch m.Role {
+		case schema.RoleAssistant:
+			calls := schema.GetToolCalls(m)
+			redeclared := make(map[string]bool, len(calls))
+			for _, c := range calls {
+				if !redeclared[c.ID] {
+					redeclared[c.ID] = true
+					pending[c.ID] = nil
+				}
+				pending[c.ID] = append(pending[c.ID], i)
+			}
+		case schema.RoleTool:
+			for _, cb := range m.ContentBlocks {
+				if cb == nil || cb.Toolresult == nil {
+					continue
+				}
+				id := cb.Toolresult.ToolCallId
+				q := pending[id]
+				if len(q) == 0 {
+					continue
+				}
+				owner := q[0]
+				pending[id] = q[1:]
+				if out == nil {
+					out = make(map[int]int)
+				}
+				if i > out[owner] {
+					out[owner] = i
+				}
+			}
+		}
+	}
+	return out
 }
 
 // getRunID 从消息 Annotations 提取 run_id；不存在返回空串。

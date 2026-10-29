@@ -729,6 +729,8 @@ MicroCompact → AutoCompact → ChatModel.WithTools(toolkit) → LLM 调用
 //   - image/file/audio: 各自独立顶层 block，固定 2000
 //   - 其他 ContentBlock 类型：默认 JSON marshal 后 len/4 兜底
 //   - 兜底:        len(json(block))/4
+// 同一份正文只算一次：Content 非空时，第一个内容与它相同的 text / tool_result 块不计入
+// （schema.ToolResultMessage 两处都放、wire 上只发一份；内容不同的块照算）
 // 最后 ×4/3 保守填充（API 实际 token 通常比字符估算多 ~33%）
 func EstimateMessageTokens(messages []*schema.Message) int { ... }
 

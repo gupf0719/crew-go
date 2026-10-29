@@ -18,6 +18,8 @@ import (
 type RunOption func(*runOptions)
 
 type runOptions struct {
+	// slotClaim 见 WithSlotClaim——这次 Run 就是占着这个槽的那次 agent 调用自己的。
+	slotClaim *SlotClaim
 	// importOverlay 见 withImportOverlay——**两条路径都摆**成 baseline（子图同步父图 import 值）。
 	importOverlay []ChannelWrite
 	// initialWrites 见 WithInitialWrites——**只在新开路径** apply 的种子写入。
@@ -439,7 +441,9 @@ func WithResumeFrom(cp *Checkpoint) RunOption {
 // # 在节点里跑嵌套图
 //
 // 节点体（或它的钩子）里再调 Run，那张图是这个节点这次执行的一部分：它的图级钩子与入口条件边记在
-// 这次执行名下，按「同一个 ns 在这次执行里是第几遍」编号（节点重跑时从 0 重新数）。⚠️ 所以同一次
+// 这次执行名下，按「同一个 ns 在这次执行里是第几遍」编号（节点重跑时从 0 重新数）。⚠️ 配了 checkpointer、带着 sid 时要给它
+// 自己的 ns（[WithRunNS]，如 `JoinNS(GetGraphNS(ctx), "<name>")`）：不给的话它落进外层图自己的存档槽，入口当场拒
+// （`ErrRunAborted`）——放过去的话它会把外层正挂着的存档读进来接着跑、成功时把它删掉。⚠️ 所以同一次
 // 执行里对同一个 ns 跑好几遍时，**每一遍都照跑，别按进度跳过已经跑完的**：跳过前一遍的话后一遍的
 // 编号往前挪一位，拿回的是前一遍记下的东西（入口条件边记的路由被照搬，实测）。要按进度跳过，给每一遍
 // 不同的 ns（比如带上工单号）。
@@ -567,8 +571,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	defer func() {
 		if r := recover(); r != nil {
 			pe := panicerr.New(r)
-			panicErr := panicerr.Wrap("compose_v2.Run panic recovered", pe)
-			panicerr.Log(ctx, slog.LevelError, "compose_v2: Run 收尾段（图失败时的 OnGraphEnd 钩子）panic，已转成错误", pe)
+			panicErr := panicerr.Wrap(runPanicPrefix, pe)
+			panicerr.Log(ctx, slog.LevelError, "compose_v2: Run 收尾段 panic，已转成错误", pe)
 			if runErr != nil {
 				runErr = errors.Join(runErr, panicErr)
 			} else {
@@ -673,6 +677,27 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	}
 	if cfg.graphNS == "" {
 		cfg.graphNS = GetGraphNS(ctx)
+	}
+	// 一个存档槽 (sid, ns) 同一时刻只归一个执行：一张正在跑的图，或一次在这个槽上跑图的 agent 调用从入口到出口（它的 agent 级钩子期间槽里
+	// 放着它自己的挂起档，见 OccupySlot）。在占着它的执行里发起、落进同一个槽的嵌套 Run 会把那份档当成自己的读进来接着跑
+	// （两张图的 GraphID 相同时——两个 BasicAgent 的图都是——用自己的节点跑别人的 frontier，实测旁路工具多执行一次），成功收尾时
+	// 按自己成功清掉那个槽、把别人的档一起删了，err == nil；这里当场拒。占着槽的那次 agent 调用自己的这次 Run 带着它的凭证
+	// （WithSlotClaim），放行。没配 checkpointer 或 sid 为空时没有槽：既不占、也不拦。在清档的 defer 注册之前返回：这个槽是别人的，
+	// 出口不能按终局失败去清它。占着的槽记在 ctx 上（runningSlotKey，执行状态：钩子返回别的 ctx 时照样取框架的）。
+	if cfg.checkpointer != nil && cfg.sessionID != "" {
+		slot := runningSlot{sessionID: cfg.sessionID, graphNS: cfg.graphNS}
+		if cur, ok := ctx.Value(runningSlotKey{}).(runningSlot); ok && cur.sessionID == slot.sessionID && cur.graphNS == slot.graphNS &&
+			(cur.claim == nil || cur.claim != cfg.slotClaim) {
+			where := "a hook or edge condition"
+			if id := GetCurrentNodeID(outerCtx); id != "" { // ctx 上的节点身份进图时已清掉（clearInheritedNodePosition）
+				where = fmt.Sprintf("node %q", id)
+			}
+			return fmt.Errorf("%w: %s started a nested run of graph %q on the checkpoint slot of the execution it runs in (session=%q ns=%q); "+
+				"call the other agent through agent_v2.RunSubAgent, or give a nested graph its own namespace with "+
+				"compose_v2.WithRunNS(compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), \"<name>\"))",
+				ErrRunAborted, where, g.ID(), cfg.sessionID, cfg.graphNS)
+		}
+		ctx = context.WithValue(ctx, runningSlotKey{}, slot)
 	}
 	// 图级相位（OnGraphStart / OnGraphEnd / 入口条件边）的名字：这张图的 ns，嵌套时再加「外层这次
 	// 执行里第几次跑这个 ns 的图」。它们记在承载这张图的外层节点执行名下，同一次外层执行在循环里
@@ -1060,16 +1085,15 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		}
 		sc := graphHookScope("OnGraphEnd", graphPhaseNS)
 		endCtx := withSignalScope(withHookPhase(ctx, sc, scopedOf(outerAcc, sc)), endHookSignals)
-		if runErr == nil {
-			// 图已经成功跑完：OnGraphEnd 是观测钩子，它 panic 不把这次成功报成失败——就地兜住、带栈记一条 ERROR。转成错误的话
-			// 存档已经按成功清掉，调用方一重试（或外层节点失败续跑）整张图从头再跑、副作用重放（实测）。失败时照旧交给 Run
-			// 入口那道兜底并进错误里。
-			defer func() {
-				if r := recover(); r != nil {
-					panicerr.Log(ctx, slog.LevelError, "compose_v2: OnGraphEnd 钩子 panic（图已经成功跑完，结果不变）", panicerr.New(r))
-				}
-			}()
-		}
+		// OnGraphEnd 跑在图结束之后：它 panic 不改变这次 Run 的结局——就地兜住、带栈记一条 ERROR。图成功时转成错误的话，存档
+		// 已经按成功清掉，调用方一重试（或外层节点失败续跑）整张图从头再跑、副作用重放（实测）；图失败时曾经把 panic 并进错误，
+		// 错误文本多出一行钩子的 panic（交给前端、对端、模型的都是它），错误链上多一个 PanicError。
+		defer func() {
+			if r := recover(); r != nil {
+				panicerr.Log(ctx, slog.LevelError, "compose_v2: OnGraphEnd 钩子 panic（图已经结束，结局不变）", panicerr.New(r),
+					"run_failed", runErr != nil)
+			}
+		}()
 		_ = cfg.hooks.OnGraphEnd(endCtx, cm.Channels(), runErr)
 	}()
 
@@ -1094,7 +1118,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	defer func() {
 		if r := recover(); r != nil {
 			pe := panicerr.New(r)
-			panicErr := panicerr.Wrap("compose_v2: graph body panic recovered", pe)
+			panicErr := panicerr.Wrap(bodyPanicPrefix, pe)
 			panicerr.Log(ctx, slog.LevelError, "compose_v2: 图主体 panic，已转成错误", pe)
 			if runErr != nil {
 				runErr = errors.Join(runErr, panicErr)
@@ -2658,15 +2682,59 @@ func validateInterrupt(ctx context.Context, id NodeID, err error, ie *InterruptE
 	return nil
 }
 
-// notifyNodeEnd 在节点体成功之后调 OnNodeEnd：它 panic 时就地兜住、带栈记一条 ERROR，这次执行照旧算成功（理由见
-// runNodeWithHooks 的调用点）。
-func notifyNodeEnd(logCtx context.Context, hooks OrchestrationHooks, hookCtx context.Context, id NodeID, chs Channels) {
+// runningSlotKey 记着这段执行占着的存档槽（session ID + ns）：Run 入口推（正在跑的图）、OccupySlot 推（一次 agent 调用），
+// Run 入口比（见 Run 里那道守卫）。
+type runningSlotKey struct{}
+
+// runningSlot 是被占着的槽；claim 非 nil 时它是一次 agent 调用占的，带着同一张凭证的 Run 是那次调用自己的。
+type runningSlot struct {
+	sessionID, graphNS string
+	claim              *SlotClaim
+}
+
+// SlotClaim 是 OccupySlot 发的凭证：占着槽的那次 agent 调用自己跑图时经 WithSlotClaim 出示，证明这次 Run 是它的。
+type SlotClaim struct{ _ byte }
+
+// OccupySlot 声明 ctx 往下这段执行（一次 agent 调用，从入口到出口）占着存档槽 (sessionID, GetGraphNS(ctx))：这段执行里——
+// 它的 agent 级钩子、钩子里调起的别的 agent、直接跑的嵌套图——发起、落进同一个槽的嵌套 Run 在入口被拒，那时槽里放着它
+// 自己的挂起档。它自己跑图时带上返回的凭证（WithSlotClaim）。
+//
+// ctx 上没有 checkpointer、或 sessionID 为空时没有槽，原样返回、凭证为 nil。这个槽已经被外面的执行占着（落进了别人的槽）时
+// 也原样返回、凭证为 nil：之后在这个槽上跑图入口会拒。
+//
+// 给在自己的槽上跑图的 agent 实现用（agent_v2 的 9 个编排入口已调）。只在你自己要在这个槽上跑图时调：占了槽之后把调用
+// 透传给另一个同 ns 的 agent，那个 agent 的入口拿不到凭证、跑图时被拒（同一个槽只归一个执行）。凭证只证明「这次 Run 是我
+// 的」，别交给别的执行。
+func OccupySlot(ctx context.Context, sessionID string) (context.Context, *SlotClaim) {
+	if GetCheckpointer(ctx) == nil || sessionID == "" {
+		return ctx, nil
+	}
+	ns := GetGraphNS(ctx)
+	if cur, ok := ctx.Value(runningSlotKey{}).(runningSlot); ok && cur.sessionID == sessionID && cur.graphNS == ns {
+		return ctx, nil
+	}
+	claim := &SlotClaim{}
+	return context.WithValue(ctx, runningSlotKey{}, runningSlot{sessionID: sessionID, graphNS: ns, claim: claim}), claim
+}
+
+// WithSlotClaim 出示 OccupySlot 发的凭证：这次 Run 是占着这个槽的那次调用自己的，入口不拒。nil 等于不出示。
+func WithSlotClaim(c *SlotClaim) RunOption {
+	return func(o *runOptions) { o.slotClaim = c }
+}
+
+// notifyNodeEnd 在节点这次执行结束之后调 OnNodeEnd（nodeErr 是它的结局）：钩子 panic 时就地兜住、带栈记一条 ERROR，结局不变——
+// 成功照旧算成功、结果与写入照常提交，失败照旧交出原来那个错误（理由见 runNodeWithHooks 的调用点）。
+func notifyNodeEnd(logCtx context.Context, hooks OrchestrationHooks, hookCtx context.Context, id NodeID, chs Channels, nodeErr error) {
 	defer func() {
 		if r := recover(); r != nil {
-			panicerr.Log(logCtx, slog.LevelError, "compose_v2: OnNodeEnd 钩子 panic（节点体已经成功，结果与写入照常提交）", panicerr.New(r), "node", id)
+			msg := "compose_v2: OnNodeEnd 钩子 panic（节点体已经成功，结果与写入照常提交）"
+			if nodeErr != nil {
+				msg = "compose_v2: OnNodeEnd 钩子 panic（节点这次执行已经失败，照旧交出原来的错误）"
+			}
+			panicerr.Log(logCtx, slog.LevelError, msg, panicerr.New(r), "node", id)
 		}
 	}()
-	_ = hooks.OnNodeEnd(hookCtx, id, chs, nil)
+	_ = hooks.OnNodeEnd(hookCtx, id, chs, nodeErr)
 }
 
 // runNodeWithHooks 是单节点执行的 hook 集成 helper：
@@ -2685,9 +2753,9 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 	// audit² 修 (B-HIGH-3 + C-HIGH-2): 整函数 defer recover 兜底 hook panic. 跨
 	// goroutine (fan-out frontier N>=2 时 executeFrontier 内 spawn worker
 	// goroutine 调本函数) 不能依赖 compose_v2.Run 入口 outer recover (cross-
-	// goroutine 不 cover). 这道兜节点体失败时的 OnNodeEnd（OnNodeStart 另有 inner recover
-	// 转 startErr、走配对）；节点体成功之后的 OnNodeEnd（notifyNodeEnd）与 nodeEventSink.Send
-	// 只作观测，各自就地兜住、只记日志，到不了这里.
+	// goroutine 不 cover). 业务钩子都另有兜底：OnNodeStart 的 inner recover 转 startErr、走配对；OnNodeEnd
+	// （notifyNodeEnd，成败与早退三条路）与 nodeEventSink.Send 跑在工作之后，各自就地兜住、只记日志。落到这道的是
+	// 框架自己在节点执行收尾段的代码.
 	//
 	// **第三支：`runtime.Goexit`**（`bodyReturned` 是 testing.tRunner 的 `finished`
 	// 同款——旗必须由**正常控制流的普通语句**置位，不能放 defer 里置，Goexit 也跑
@@ -2722,7 +2790,7 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 		if r := recover(); r != nil {
 			pe := panicerr.New(r)
 			err = panicerr.Wrap(fmt.Sprintf("node %q hook/run panic recovered", id), pe)
-			panicerr.Log(ctx, slog.LevelError, "compose_v2: 节点钩子（节点体失败时的 OnNodeEnd）panic，已转成错误", pe, panicerr.KeyError, err.Error())
+			panicerr.Log(ctx, slog.LevelError, "compose_v2: 节点执行的收尾段 panic，已转成错误", pe, panicerr.KeyError, err.Error())
 			return
 		}
 		if bodyReturned {
@@ -2830,16 +2898,8 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 	})
 	if startErr != nil {
 		bodyReturned = true // 正常早退，不是 Goexit（见函数头 defer 第三支）
-		// 早退用入参 ctx 调 OnNodeEnd (业务 OnNodeStart 返 (nil, err) 时 newCtx=nil)
-		// audit³ A2: OnNodeEnd 也用 inner recover——避免 panic 跳过 return
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					panicerr.Log(ctx, slog.LevelWarn, "compose_v2: OnNodeEnd panic in early-exit path", panicerr.New(r), "node", id)
-				}
-			}()
-			_ = hooks.OnNodeEnd(hookPhase(ctx, "OnNodeEnd"), id, chs, startErr)
-		}()
+		// 早退用入参 ctx 调 OnNodeEnd (业务 OnNodeStart 返 (nil, err) 时 newCtx=nil)；它 panic 就地兜住，照旧交出 startErr
+		notifyNodeEnd(ctx, hooks, hookPhase(ctx, "OnNodeEnd"), id, chs, startErr)
 		// **hook 抛的中断走同一套校验**——它原先整条绕过（早退在这儿、校验在下面几十行），
 		// 于是空 ID 的挂起照样落进存档：实测两个分支各抛一次 ⟹ 两条挂起 ID 都是空、
 		// 彼此不可区分。那正是空 ID 拒绝要消灭的形态，从这个入口原样存活。
@@ -2896,17 +2956,15 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 	// 永不返回、这一行执行不到 ⟹ 旗保持 false ⟹ 函数头 defer 第三支接手；panic 则被
 	// safeNodeRun 转成 err 正常返回到这里 ⟹ 旗置位 ⟹ 不误判。
 	bodyReturned = true
-	// 节点体成功时，OnNodeEnd 是观测钩子（返回值不往后流、不影响执行）：它 panic 不让这次执行作废——就地兜住、带栈记一条
-	// ERROR，结果与写入照常提交（见 notifyNodeEnd）。节点体失败时照旧：panic 交给函数头那道兜底、转成这个节点的错误。
+	// OnNodeEnd 跑在工作之后（返回值不往后流；能做上行信号决定，那些跟着这个成员提交）：它 panic 不改变这次执行的结局——就地
+	// 兜住、带栈记一条 ERROR（见 notifyNodeEnd）。节点体成功时结果与写入照常提交；钩子链上排在它后面的照样调到、它们的决定照常
+	// 生效（ChainOrchHooks 跑完整条链再抛出第一个 panic）。节点体失败时照旧交出原来那个错误。
 	//
 	// 曾经成功路径也转成错误（「钩子 bug 要让业务看见，损 writes 可接受」）：失败档会被续跑与重试捡起（auto-load 按内容
-	// 判、RunWithRetry 默认判据认它可重试），已经做完的节点体重跑、副作用重放——实测同一个节点体跑 3～4 次。看得见靠那条
-	// ERROR 日志。
-	if err == nil {
-		notifyNodeEnd(ctx, hooks, hookPhase(ctx, "OnNodeEnd"), id, chs)
-	} else {
-		_ = hooks.OnNodeEnd(hookPhase(ctx, "OnNodeEnd"), id, chs, err)
-	}
+	// 判、RunWithRetry 默认判据认它可重试），已经做完的节点体重跑、副作用重放——实测同一个节点体跑 3～4 次。失败路径曾经
+	// 把原来的错误整个换成 panic 的错误：节点体问的问题认不出来（IsInterrupt 为假、调用方不知道要答）、终局失败的标记丢了
+	// 被当成可重试（实测）。看得见靠那条 ERROR 日志。
+	notifyNodeEnd(ctx, hooks, hookPhase(ctx, "OnNodeEnd"), id, chs, err)
 
 	if err != nil {
 		// 业务抛的中断先过一道形状校验（没有 query / Query 与 Queries 同时填 /

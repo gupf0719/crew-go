@@ -183,8 +183,8 @@ func (h *endCapture) OnGraphEnd(ctx context.Context, _ compose_v2.Channels, err 
 	return ctx
 }
 
-// panicAtGraphEnd 让业务 OnGraphEnd hook 抛 panic——那属于「defer 链自身的 panic」，
-// 归 Run **入口**那道 recover。
+// panicAtGraphEnd 让业务 OnGraphEnd hook 抛 panic——它跑在图结束之后，panic 就地兜住、只记日志，
+// 图成没成都不改变结局。
 type panicAtGraphEnd struct {
 	compose_v2.NoOpOrchestrationHooks
 }
@@ -200,7 +200,8 @@ func (panicAtGraphEnd) OnGraphEnd(context.Context, compose_v2.Channels, error) c
 // 业务据这行前缀区分两件**处置相反**的事：
 //
 //   - `graph body panic recovered` —— 图主体炸了，**存档已正确存成 failed**，可 Resume
-//   - `Run panic recovered` —— 存档写 / hook 炸了，**存档可能压根没落盘**
+//   - `Run panic recovered` —— 出口 defer 链里框架自己的代码炸了（业务钩子与出口存储调用另有兜底，落不到这一道），
+//     存档状态以错误链上的结论为准
 //
 // 前者该续跑，后者该先确认存档到底在不在。前缀一样时业务只能靠猜。
 //
@@ -210,7 +211,8 @@ func (panicAtGraphEnd) OnGraphEnd(context.Context, compose_v2.Channels, error) c
 // 一起改了。而当时**全套测试仍然全绿**——没有任何用例守这一维，它是被人工比对代码时
 // 才发现的。这正是「断言选在不承重的维度上等于没测」的反面：没测的维度连假绿都算不上。
 //
-// sanity-revert：把两处前缀改成同一个 → 本用例红。
+// 入口那道业务代码触发不到之后，「两个前缀互不相同」改由 panic_prefix_internal_test.go 比两个常量；本用例守主体那道的
+// 前缀确实出现、图失败时业务 OnGraphEnd 的 panic 不改变结局。
 func TestPanicRecovery_TwoPrefixesStayDistinct(t *testing.T) {
 	mk := func(bodyPanic bool) *compose_v2.Graph {
 		b := compose_v2.NewBuilder().WithName("prefix_distinct")
@@ -241,7 +243,8 @@ func TestPanicRecovery_TwoPrefixesStayDistinct(t *testing.T) {
 		t.Errorf("图主体 panic 应带 `graph body panic recovered` 前缀，实际 %v", bodyErr)
 	}
 
-	// ② defer 链自身 panic（图失败时的业务 OnGraphEnd hook；图成功时它的 panic 就地兜住、只记日志）—— 归入口那道
+	// ② 图失败时的业务 OnGraphEnd hook panic：就地兜住、只记日志，错误照旧是节点那个（入口那道只兜框架自己的出口代码，
+	// 业务代码触发不到；两个前缀不同由 panic_prefix_internal_test.go 守）
 	fb := compose_v2.NewBuilder().WithName("prefix_distinct_fail")
 	fb.AddNode("n", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 		return nil, errors.New("业务错")
@@ -254,15 +257,8 @@ func TestPanicRecovery_TwoPrefixesStayDistinct(t *testing.T) {
 	}
 	hookErr := compose_v2.Run(context.Background(), failing, compose_v2.NewChannelManager(),
 		compose_v2.WithHooks(panicAtGraphEnd{}))
-	if hookErr == nil || !strings.Contains(hookErr.Error(), "compose_v2.Run panic recovered") {
-		t.Errorf("defer 链自身的 panic 应带 `compose_v2.Run panic recovered` 前缀，实际 %v", hookErr)
-	}
-
-	// **承重**：两者必须能被区分开——前缀一样时业务分不清存档在不在
-	if bodyErr != nil && hookErr != nil &&
-		strings.Contains(hookErr.Error(), "graph body panic recovered") {
-		t.Error("两道 recover 吐了同一个前缀——业务无法区分「主体炸了（存档已存成 failed、可续）」" +
-			"与「存档写/hook 炸了（存档可能没落盘）」，而这两件事的处置相反")
+	if hookErr == nil || hookErr.Error() != `node "n": 业务错` {
+		t.Errorf("图失败时 OnGraphEnd 的 panic 不改变结局，应照旧返回节点的错误，实际 %v", hookErr)
 	}
 	t.Logf("主体 panic: %v", bodyErr)
 	t.Logf("hook panic: %v", hookErr)

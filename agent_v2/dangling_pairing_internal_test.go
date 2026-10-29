@@ -214,3 +214,78 @@ func TestDropDangling_PureToolCallRoundKeepsTheRecord(t *testing.T) {
 		t.Errorf("记录那条不该带 tool_call：%v", schema.GetToolCalls(rec))
 	}
 }
+
+// multiResultMsg 造一条带多个结果块的 tool 消息（业务照 Anthropic 的样子把几个调用的结果合成一条）。
+func multiResultMsg(content string, results ...[2]string) *schema.Message {
+	m := &schema.Message{ID: "merged", Role: schema.RoleTool, Content: content,
+		Annotations: map[string]any{HistoryAgentAnnotation: "x"}}
+	for _, r := range results {
+		m.ContentBlocks = append(m.ContentBlocks, &schema.ContentBlock{Type: "tool_result",
+			Toolresult: &schema.ToolresultContentBlock{ToolCallId: r[0], Content: r[1]}})
+	}
+	return m
+}
+
+// 一条 tool 消息带两个结果块时，两个调用都算有结果：读侧补救逐块配对、把它拆成每块一条（同 openai 适配层发请求时的拆法），
+// 不再给第二个调用补占位。曾经只认第一块：b 被判成没有结果、多补一条占位，发出去 b 有两条结果（审计实测）。
+func TestDropDangling_MultiResultBlockMessageAnswersEveryCall(t *testing.T) {
+	merged := multiResultMsg("", [2]string{"a", "ra"}, [2]string{"b", "rb"})
+	in := []*schema.Message{schema.UserMessage("q"), tcMsg(tc("a", "f"), tc("b", "g")), merged}
+	if got := danglingToolCalls(in); len(got) != 0 {
+		t.Errorf("两个调用都有结果，不该报悬空：%v", got)
+	}
+	out := dropDanglingToolCalls(in)
+	if len(out) != 4 {
+		t.Fatalf("应是 user + assistant + 两条单块结果，实际 %d 条：%v", len(out), out)
+	}
+	for i, want := range []struct{ id, content string }{{"a", "ra"}, {"b", "rb"}} {
+		r := out[2+i]
+		if r.Role != schema.RoleTool || schema.GetToolResultID(r) != want.id || r.Content != want.content || len(toolResultIDs(r)) != 1 {
+			t.Errorf("第 %d 条结果应是 %s 的单块消息、内容 %q，实际 id=%q content=%q 块数=%d", i, want.id, want.content,
+				schema.GetToolResultID(r), r.Content, len(toolResultIDs(r)))
+		}
+		if strings.Contains(r.Content, "未完成") {
+			t.Errorf("%s 有真结果，不该补占位", want.id)
+		}
+	}
+	if out[2].ID == out[3].ID {
+		t.Errorf("拆出来的两条消息 ID 应不同，都是 %q", out[2].ID)
+	}
+	if len(merged.ContentBlocks) != 2 || merged.Content != "" {
+		t.Error("拆块不该改原消息")
+	}
+}
+
+// 读 prior 时判「这个窗口够不够」：合并消息里有一块的调用不在窗口里声明（b 的声明更早、在窗口外），窗口不够，要再往前读。
+// 曾经只看第一块：a 有声明就算够，b 那块成了孤儿。
+func TestPriorWindowSatisfied_EveryResultBlockNeedsItsCall(t *testing.T) {
+	win := []*schema.Message{schema.UserMessage("u0"), tcMsg(tc("a", "f")),
+		multiResultMsg("", [2]string{"a", "ra"}, [2]string{"b", "rb"})}
+	if priorWindowSatisfied(win, 2) {
+		t.Error("b 的结果块在窗口里没有声明它的调用，窗口不该算够")
+	}
+	ok := []*schema.Message{schema.UserMessage("u0"), tcMsg(tc("a", "f"), tc("b", "g")),
+		multiResultMsg("", [2]string{"a", "ra"}, [2]string{"b", "rb"})}
+	if !priorWindowSatisfied(ok, 2) {
+		t.Error("两块都有声明时窗口够")
+	}
+}
+
+// 拆法同 openai 适配层：第一块带着原消息的文本（原消息有文本时），其余各取自己块的文本；标注各拷一份。
+func TestSplitToolResultBlocks_MirrorsOpenAIAdapter(t *testing.T) {
+	merged := multiResultMsg("合并的说明", [2]string{"a", "ra"}, [2]string{"b", "rb"})
+	pieces := splitToolResultBlocks(merged)
+	if len(pieces) != 2 {
+		t.Fatalf("应拆成 2 条，实际 %d", len(pieces))
+	}
+	if pieces[0].Content != "合并的说明" || pieces[1].Content != "rb" {
+		t.Errorf("第一条应带原消息的文本、第二条取自己块的，实际 %q / %q", pieces[0].Content, pieces[1].Content)
+	}
+	pieces[1].Annotations["k"] = "v"
+	if _, leaked := merged.Annotations["k"]; leaked {
+		t.Error("拆出来的消息改标注不该写回原消息")
+	}
+	if single := schema.ToolResultMessage("a", "r"); splitToolResultBlocks(single)[0] != single {
+		t.Error("只有一个结果块时应原样返回")
+	}
+}

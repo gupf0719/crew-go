@@ -161,7 +161,7 @@ invoke_agent assistant
 | node | `crew.node.id`、`crew.graph.ns`、`crew.node.instance`（扇出实例）、`crew.node.component`；有流式片段时 `crew.stream.chunks`、`crew.stream.first_chunk_seconds` |
 | chat | `gen_ai.agent.name`、`crew.agent.round`、`gen_ai.request.model` / `.temperature` / `.max_tokens` / `.top_p`（有才记）、`gen_ai.request.stream`（流式时为 true，非流式不记）、`gen_ai.conversation.id`；结束时 `gen_ai.provider.name`、`gen_ai.response.model`、`gen_ai.response.finish_reasons`、`gen_ai.usage.input_tokens` / `.output_tokens`（有用量就记，含 0；输出含推理 token）、`gen_ai.usage.cache_read.input_tokens` / `.cache_write.input_tokens` / `.reasoning.output_tokens`（大于 0 才记）、`gen_ai.response.time_to_first_chunk`（流式） |
 | execute_tool | `gen_ai.tool.name`、`gen_ai.tool.type`（`function`）、`gen_ai.tool.call.id`、`gen_ai.agent.name`、`gen_ai.conversation.id`、`crew.tool.category`（`retrieval` / `embedding` / `guardrail` / `skill`）、`gen_ai.skill.name`（`activate_skill` 调用）、`crew.tool.outcome`（`denied`：被审批拒绝）、`crew.tool.replayed`（续跑时从工具账重放） |
-| A2A client | `gen_ai.provider.name`=`a2a`、`gen_ai.agent.name`、`crew.a2a.method`、`crew.a2a.transport`、`gen_ai.conversation.id`（A2A contextId）、`crew.a2a.task_id` |
+| A2A client | `gen_ai.provider.name`=`a2a`、`gen_ai.agent.name`、`crew.a2a.method`（这次调用最终怎么跟远端交互：`message_stream` / `get_task` / `subscribe_task`；span 覆盖续任务前的对账请求）、`crew.a2a.transport`（名片只声明一种协议时记，如 `jsonrpc` / `http+json`；声明了多种时不记）、`gen_ai.conversation.id`（A2A contextId）、`crew.a2a.task_id` |
 | A2A server | `crew.a2a.operation`、`gen_ai.conversation.id`、`crew.a2a.task_id` |
 
 `gen_ai.provider.name` 来自模型客户端填的 `Message.Metadata.System`（`openai.WithSystem`；deepseek /
@@ -379,6 +379,8 @@ mp := sdkmetric.NewMeterProvider(
 - 调 `obs.CleanupSession(sid)` 丢掉这个会话的记录（`a2a/server` 的 executor 在任务结束、取消时已经调）；
 - 放弃续跑（`ResumeActionAbort`）时框架只在最外层触发开始 / 结束钩子，observability 在那里把这棵 ns 子树里各层
   的记录一起丢掉；
+- 新消息顶掉挂起任务（`agent_v2.WithAbandonedTasks`、agui 覆盖挂起会话）不走钩子，记录不会被丢——要及时清就调
+  `obs.CleanupSession(被放弃任务的 sid)`，不调的话等下面那道一天的清理；
 - 不调也不会无界增长：每记 256 次挂起顺手清一遍超过一天的记录，只是被清掉的那次等待时长不再记；
 - `obs.PendingInterrupts()` 返回当前记录数，可以拿来监控泄漏。
 

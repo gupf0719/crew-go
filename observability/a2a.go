@@ -58,7 +58,10 @@ func (o *Observability) StartA2AClientSpan(ctx context.Context, remoteName, meth
 		return ctx, &A2AClientSpan{}
 	}
 	attrs := []attribute.KeyValue{AttrOperationName.String(OpInvokeAgent), AttrProviderName.String("a2a"),
-		AttrAgentName.String(remoteName), AttrA2AMethod.String(method), AttrA2ATransport.String(transport)}
+		AttrAgentName.String(remoteName), AttrA2AMethod.String(method)}
+	if transport != "" { // 不知道用的是哪种传输时不记，记错比不记更糟
+		attrs = append(attrs, AttrA2ATransport.String(transport))
+	}
 	if contextID != "" {
 		attrs = append(attrs, AttrConversationID.String(contextID))
 	}
@@ -72,6 +75,15 @@ func (o *Observability) StartA2AClientSpan(ctx context.Context, remoteName, meth
 // End 结束 client span，ctx 是发请求用的那个：nil 是成功；远端要更多输入（中断）是挂起；ctx 被取消 / 到期
 // 是 cancelled / timeout；其余是失败（error.type=a2a_remote_error）。远端的错误详情不写进 span，它可能含对端的
 // 敏感信息。
+// SetMethod 改记这次调用最终用的 A2A 方法：span 要在调用方决定怎么跟远端交互之前开（决定的过程本身也要发请求，
+// 那些请求要落在 span 里），定下之后再补上。
+func (s *A2AClientSpan) SetMethod(method string) {
+	if s == nil || s.o == nil || s.span == nil {
+		return
+	}
+	s.span.SetAttributes(AttrA2AMethod.String(method))
+}
+
 func (s *A2AClientSpan) End(ctx context.Context, err error) {
 	if s == nil || s.o == nil {
 		return

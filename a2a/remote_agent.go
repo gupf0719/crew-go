@@ -333,6 +333,16 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 	// recovered：事件来自对账取回的快照、或重新挂上的任务，而不是这次发出的消息的回应。快照里的 artifact 是任务此刻的全文，
 	// 正常续任务的流只收到这一轮的：问人之前已有的内容不算这一轮的产出，按 seenArtifacts 只取之后多出来的（见
 	// remoteOutput.taskArtifactSince）。重新挂上之后陆续到达的增量本来就只含新内容，照常收。
+	// a2a 跨进程 trace（WithObservability 启用）：建 invoke_agent CLIENT span，覆盖这次调用跟远端的全部交互——续任务前的
+	// 对账（取任务、轮询）、发消息、读流到终态（defer 按 retErr 收尾；远端要更多输入不算失败）。开在对账之前：对账失败提前
+	// 返回时这次远端调用也要在 trace 上（曾经开在对账之后，对账出错时整个调用不见了，审计实测）。方法等交互方式定下再补。
+	// span 用远程 AgentCard.Name（远程声明的真实 agent 名），而非 a.name（host 端 WithName 可能设的本地占位名）——trace 上
+	// 一眼看出实际调的是哪个远程 agent。a.card 在 NewRemoteAgentFromCard 时必非 nil。
+	var cliSpan *observability.A2AClientSpan
+	if a.obs != nil {
+		ctx, cliSpan = a.obs.StartA2AClientSpan(ctx, a.card.Name, method, cardTransport(a.card), contextID, taskID)
+		defer func() { cliSpan.End(ctx, retErr) }()
+	}
 	recovered := false
 	if reattach {
 		source, method, recovered = a.reattach(ctx, taskID), "subscribe_task", true
@@ -395,21 +405,17 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 		}
 	}
 
-	// a2a 跨进程 trace（WithObservability 启用）：建 invoke_agent CLIENT span，把它的 trace context
-	// （W3C traceparent / tracestate / baggage）写进出站 Message.metadata，远端的 span 树挂在它下面。重新挂上
-	// 一个远端任务时没有外发的消息，不注入。span 覆盖整个流的消费到终态（defer 按 retErr 收尾；远端要更多输入不算失败）。
+	// 定下了怎么跟远端交互（发消息 / 取任务快照 / 重新挂上）：方法补进 span；要发消息时把 span 的 trace context
+	// （W3C traceparent / tracestate / baggage）写进出站 Message.metadata，远端的 span 树挂在它下面。重新挂上、取快照时
+	// 没有外发的消息，不注入。
 	if a.obs != nil {
-		// span 用远程 AgentCard.Name（远程声明的真实 agent 名），而非 a.name（host 端 WithName 可能设的
-		// 本地占位名）——trace 上一眼看出实际调的是哪个远程 agent。a.card 在 NewRemoteAgentFromCard 时必非 nil。
-		var cliSpan *observability.A2AClientSpan
-		ctx, cliSpan = a.obs.StartA2AClientSpan(ctx, a.card.Name, method, "jsonrpc", contextID, taskID)
+		cliSpan.SetMethod(method)
 		if msg != nil {
 			if msg.Metadata == nil {
 				msg.Metadata = map[string]any{}
 			}
 			a.obs.InjectToMetadata(ctx, msg.Metadata)
 		}
-		defer func() { cliSpan.End(ctx, retErr) }()
 	}
 	if msg != nil {
 		source = a.client.SendStreamingMessage(ctx, &a2atypes.SendMessageRequest{Message: msg})
@@ -1340,4 +1346,23 @@ func eventsSince(s *agent_v2.RunSession, startOffset int) []*agent_v2.AgentEvent
 		return nil
 	}
 	return append([]*agent_v2.AgentEvent(nil), all[startOffset:]...)
+}
+
+// cardTransport 是记在 client span 上的传输方式：名片上声明的接口只有一种协议时取它（小写，如 jsonrpc、http+json、grpc），
+// 声明了多种时返回空串（不记）——客户端最终选了哪一种 a2a-go 不对外交出，按名片猜会记错。
+func cardTransport(card *a2atypes.AgentCard) string {
+	if card == nil {
+		return ""
+	}
+	var binding a2atypes.TransportProtocol
+	for _, ifc := range card.SupportedInterfaces {
+		if ifc == nil || ifc.ProtocolBinding == "" {
+			continue
+		}
+		if binding != "" && ifc.ProtocolBinding != binding {
+			return ""
+		}
+		binding = ifc.ProtocolBinding
+	}
+	return strings.ToLower(string(binding))
 }

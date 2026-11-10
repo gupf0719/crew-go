@@ -250,9 +250,11 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	if err := checkAbandonedTasks(ctx, cfg.abandoned, session, a.config.Name); err != nil {
+	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, a.config.Name)
+	if err != nil {
 		return nil, err
 	}
+	defer activity.Release()
 	ctx = WithSession(ctx, session)
 	ctx = pushStoreCtx(ctx, a.config.Store)
 	ctx = withOffloadDedup(ctx) // MicroCompact offload 的 per-Run 跨轮去重集合
@@ -282,6 +284,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	ctx = enterGraphRunTask(ctx, session)
 	// 调用方声明放弃了的任务（WithAbandonedTasks）：在记这次的输入、触发钩子之前收尾
 	abandonTasksAtEntry(ctx, cfg.abandoned, a.config.Name)
+	activity.FinishAbandon()
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return a.config.Hooks.OnAgentStart(c, info, agentIn)
@@ -424,6 +427,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	if prep.AbortDone {
 		return nil, nil
 	}
+	defer prep.activity.Release()
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	ctx = newCtx
 	// ResumeActionReplan：BasicAgent 自身无 plan 节点，但内嵌 sub-agent（如
@@ -1108,84 +1112,73 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	return sysPreamble, msgs, nil
 }
 
-// truncatePriorPreservingMarkers 第 0 层简单截断——保留最后 limit 条 prior，但**保护**带
-// SkillBodyAnnotation 的消息不被计数截断（对齐 4 层压缩：autocompact/microcompact/
-// reactive_compact 都尊重这个 marker 一致保护关键内容）。
-//
-// **why**：skill body 是激活后注入对话流的内容，纯计数截断（prior[len-limit:]）会把早期
-// 激活的 body 切掉，而 LLM 并不知道自己"曾经看过"——它只会表现得像没激活过那个 skill。
-//
-// **带 marker 的 tool_result 要连它的 assistant 一起抽**：prior 换源到会话历史层
-// （ISSUE-98）之后，历史存的是逐字完整流，activate_skill 的 tool_result 就在里面——只抽
-// 结果不抽声明它的 assistant 会造出孤儿，下面那段处理的正是这个形状。
-//
-// protected 不占截断预算。**注意它不再是「极小」**：每成功激活一次 skill 就会多进 2 条
-// （assistant + 它的 result），随激活次数线性增长——第 0 层防 ctx 爆的效果会被稀释。
-// 真出现「激活很多次 + 窗口很小」时靠后面几层压缩兜。
+// truncatePriorPreservingMarkers 保留最后 limit 条普通历史，同时保留受保护消息及其完整工具往返。
+// 保留的消息按原顺序输出，普通历史的切点还要避开工具往返和 RunID 块。
 func truncatePriorPreservingMarkers(prior []*schema.Message, limit int) []*schema.Message {
 	if len(prior) <= limit {
 		return prior
 	}
-	// **带 marker 的 tool_result 要连它的 assistant 一起抽**——单抽一条 role=tool 拼到
-	// 最前，就是把它挪到了声明它的 assistant 前面 = 制造孤儿，出口的 dropDanglingToolCalls
-	// 会把它整条丢掉，于是这条「保护」反转成了删除，而且完全静默。
-	//
-	// 而 SkillBodyAnnotation 恰恰打在 activate_skill 的 **tool_result** 上——**两种模式都打**：
-	// 非 inline 是全文 tool_result，inline 是 terse-ack tool_result（R19 audit HIGH-1 fix，
-	// 见本文件 makeToolsFn 内 P2.D 分支）。换源到历史层之前它进不了 prior（events 不含
-	// tool_result），所以这个形状是换源之后才可能出现的。
-	//
-	// 先扫一遍认亲：哪些带 marker 的 tool_result、以及声明它们的 assistant 在哪。
-	declaredBy := make(map[string]int)
-	keepIdx := make(map[int]bool)
+	links := make([][]int, len(prior))
+	for _, p := range pairToolResults(prior) {
+		if p.result != nil {
+			links[p.declaredAt] = append(links[p.declaredAt], p.resultAt)
+			links[p.resultAt] = append(links[p.resultAt], p.declaredAt)
+		}
+	}
+	protected := make([]bool, len(prior))
+	var queue []int
 	for i, m := range prior {
-		if m == nil {
-			continue
+		if m != nil && isPriorProtected(m) && (m.Role != schema.RoleTool || len(links[i]) > 0) {
+			protected[i] = true
+			queue = append(queue, i)
 		}
-		if m.Role == schema.RoleTool {
-			if !hasSkillMarker(m) {
-				continue
+	}
+	// 保住同一条声明的所有已配对结果。剪掉其中一条时，那个调用可能领走下一轮复用 ID 的结果。
+	for head := 0; head < len(queue); head++ {
+		for _, i := range links[queue[head]] {
+			if !protected[i] {
+				protected[i] = true
+				queue = append(queue, i)
 			}
-			if ai, ok := declaredBy[schema.GetToolResultID(m)]; ok {
-				keepIdx[ai] = true // 声明者
-				keepIdx[i] = true  // 结果本身
-			}
-			// 找不到声明者说明它本来就是孤儿，不特殊保护（出口会清掉）
-			continue
-		}
-		for _, tc := range schema.GetToolCalls(m) {
-			declaredBy[tc.ID] = i
 		}
 	}
 
-	protected := make([]*schema.Message, 0)
-	rest := make([]*schema.Message, 0, len(prior))
+	rest := make([]*schema.Message, 0, len(prior)-len(queue))
+	restPos := make([]int, len(prior))
+	original := make([]int, 0, cap(rest))
 	for i, m := range prior {
-		// 按原下标顺序入 protected ⟹ assistant 恒在它的 tool_result 之前，配对不破。
-		if keepIdx[i] {
-			protected = append(protected, m)
-			continue
+		if !protected[i] {
+			restPos[i] = len(rest)
+			rest = append(rest, m)
+			original = append(original, i)
 		}
-		if m != nil && m.Role != schema.RoleTool && isPriorProtected(m) {
-			protected = append(protected, m)
-			continue
+	}
+	if len(rest) <= limit {
+		return prior
+	}
+
+	// 通用切点保留同 RunID 块，再用实际配对补齐跨任务的工具关联。
+	start := len(rest) - limit
+	for {
+		start = compose_v2.AdjustIndexToPreserveAPIInvariants(rest, start)
+		before := start
+		for i := len(rest) - 1; i >= start; i-- {
+			for _, linked := range links[original[i]] {
+				// 同一关联组要么全在 rest，要么都已保护。
+				start = min(start, restPos[linked])
+			}
 		}
-		rest = append(rest, m)
+		if start == before {
+			break
+		}
 	}
-	// protected 不占预算：保留全部 protected + 最后 limit 条 rest。
-	//
-	// **切点走配对感知**：按条数硬切会落进 assistant(tool_call) 和它的 tool_result 之间
-	// ——assistant 被切走、tool_result 留在头部成孤儿。换源前 prior 里没有 tool_result，
-	// 这个问题不存在；换源后它是默认配置（MaxHistoryPairs 默认 20 且默认开启）就会踩的。
-	// AdjustIndexToPreserveAPIInvariants 把切点**向前**拉到安全位置（保 tool_use↔tool_result
-	// 配对 + 同 RunID 块连续），索引单调减小 ⟹ 只会多留几条，不会多丢。
-	if len(rest) > limit {
-		start := compose_v2.AdjustIndexToPreserveAPIInvariants(rest, len(rest)-limit)
-		rest = rest[start:]
+
+	out := make([]*schema.Message, 0, len(queue)+len(rest)-start)
+	for i, m := range prior {
+		if protected[i] || restPos[i] >= start {
+			out = append(out, m)
+		}
 	}
-	out := make([]*schema.Message, 0, len(protected)+len(rest))
-	out = append(out, protected...)
-	out = append(out, rest...)
 	return out
 }
 
@@ -1366,8 +1359,29 @@ func splitToolResultBlocks(m *schema.Message) []*schema.Message {
 	return out
 }
 
-// pairToolResults 建立 tool_call ↔ tool_result 的配对索引：每个 id → 它的结果**队列**，
-// 按出现顺序。
+type historyToolCallKey struct {
+	task  string
+	agent string
+	id    string
+}
+
+// historyToolKey 用存档时写入的任务章和流归属隔开复用的 ID。无任务章的前文、事件和旧记录仍按 ID 配对。
+func historyToolKey(m *schema.Message, id string) historyToolCallKey {
+	key := historyToolCallKey{id: id}
+	if key.task, _ = m.Annotations[HistoryTaskAnnotation].(string); key.task != "" {
+		key.agent, _ = m.Annotations[HistoryAgentAnnotation].(string)
+	}
+	return key
+}
+
+type historyToolPair struct {
+	id         string
+	declaredAt int
+	resultAt   int
+	result     *schema.Message
+}
+
+// pairToolResults 按声明顺序返回 tool_call 及其结果。每个身份键下，结果由还未配对的最早声明认领。
 //
 // **判据是「结果排在声明之后」，不要求紧跟**。这一条是刻意的，别改严：会话历史是
 // append-only 的，补出来的合成结果只能追加到流末尾、跟它的声明之间可能隔着任意多条
@@ -1381,32 +1395,41 @@ func splitToolResultBlocks(m *schema.Message) []*schema.Message {
 // 前面的是错位（不是应答），声明数用完之后多出来的也不算。
 //
 // ⚠️ **全仓已有 6 份独立的配对实现**（重建、截断守卫、切点调整、三层压缩各一）。
-// 这是给「视图重建」和「历史修复」两处共用的那一份——**别再加第七份**：两套规则一旦
+// 这是给视图重建、历史截断和放弃收尾共用的那一份。两套规则一旦
 // 分叉，视图层会自愈（重建时多余的被丢），而历史层不会（append-only 删不掉）。
 //
 // 一条 tool 消息带多个结果块（业务照 Anthropic 的样子合并了结果）时逐块配对，配上的是拆开之后的单块消息（见
 // splitToolResultBlocks）——只认第一块的话其余的调用被判成没有结果、多补一条占位，发出去同一个调用两条结果。
-func pairToolResults(msgs []*schema.Message) map[string][]*schema.Message {
-	resultsOf := make(map[string][]*schema.Message)
-	declared := make(map[string]int)
-	for _, m := range msgs {
+func pairToolResults(msgs []*schema.Message) []historyToolPair {
+	var pairs []historyToolPair
+	waiting := make(map[historyToolCallKey][]int)
+	for i, m := range msgs {
 		if m == nil {
 			continue
 		}
 		if m.Role == schema.RoleTool {
 			for _, piece := range splitToolResultBlocks(m) {
-				id := schema.GetToolResultID(piece)
-				if declared[id] > len(resultsOf[id]) {
-					resultsOf[id] = append(resultsOf[id], piece)
+				key := historyToolKey(piece, schema.GetToolResultID(piece))
+				if queue := waiting[key]; len(queue) > 0 {
+					pairs[queue[0]].result = piece
+					pairs[queue[0]].resultAt = i
+					waiting[key] = queue[1:]
 				}
 			}
 			continue
 		}
 		for _, tc := range schema.GetToolCalls(m) {
-			declared[tc.ID]++
+			key := historyToolKey(m, tc.ID)
+			waiting[key] = append(waiting[key], len(pairs))
+			pairs = append(pairs, historyToolPair{id: tc.ID, declaredAt: i})
 		}
 	}
-	return resultsOf
+	return pairs
+}
+
+type unansweredHistoryCall struct {
+	ID          string
+	declaration *schema.Message
 }
 
 // danglingToolCalls 返回这批消息里**没有配对结果**的 tool_call 声明，按出现顺序。
@@ -1436,20 +1459,11 @@ func pairToolResults(msgs []*schema.Message) map[string][]*schema.Message {
 //
 // （曾经不一致：零真结果那条 assistant 会被整条丢掉、一个占位都不补，而本函数照报悬空。
 // 那是条独立缺陷，已修——见 `TestDropDangling_PureToolCallRoundKeepsTheRecord`。）
-func danglingToolCalls(msgs []*schema.Message) []schema.ToolCall {
-	resultsOf := pairToolResults(msgs)
-	next := make(map[string]int)
-	var out []schema.ToolCall
-	for _, m := range msgs {
-		if m == nil || m.Role == schema.RoleTool {
-			continue
-		}
-		for _, tc := range schema.GetToolCalls(m) {
-			if next[tc.ID] < len(resultsOf[tc.ID]) {
-				next[tc.ID]++ // 这个声明有自己的结果
-				continue
-			}
-			out = append(out, tc)
+func danglingToolCalls(msgs []*schema.Message) []unansweredHistoryCall {
+	var out []unansweredHistoryCall
+	for _, p := range pairToolResults(msgs) {
+		if p.result == nil {
+			out = append(out, unansweredHistoryCall{ID: p.id, declaration: msgs[p.declaredAt]})
 		}
 	}
 	return out
@@ -1487,7 +1501,7 @@ func danglingToolCalls(msgs []*schema.Message) []schema.ToolCall {
 //
 //   - 第 0 层 `truncatePriorPreservingMarkers` 保留末尾 N 条——切点落在 assistant 和它的
 //     tool_result 之间，assistant 被切走、tool_result 留在头部成孤儿；
-//   - 同一函数把带 marker 的消息抽出前置，而 `SkillBodyAnnotation` 恰恰打在 `activate_skill`
+//   - 同一函数曾把带 marker 的消息抽出前置，而 `SkillBodyAnnotation` 恰恰打在 `activate_skill`
 //     的 tool_result 上——一抽就搬到了声明它的 assistant 前面；
 //   - Raw 视图下父的 tool_call 与 tool_result 之间会夹着子 agent 那一段。
 //
@@ -1498,7 +1512,7 @@ func dropDanglingToolCalls(msgs []*schema.Message) []*schema.Message {
 	// 一遍扫描建索引，一遍重建——**不做「两个 map 各判各的」**，那样两边对「谁被应答了」
 	// 的多重性理解会分歧（同 id 复用、同 id 被两条 assistant 声明时各自给出不同答案）。
 	//
-	// 索引：每个 tool_call id → 它的结果**队列**，按出现顺序。
+	// 每个任务、流里的 tool_call ID 对应按出现顺序排列的结果队列。
 	//
 	// **为什么是队列不是单条**：id 会跨轮复用——业务 stub 和固定 id 的 mock 天然如此，
 	// 真实模型也不保证换。只记第一条的话，第二轮的声明认领不到自己的结果，于是那条
@@ -1507,8 +1521,7 @@ func dropDanglingToolCalls(msgs []*schema.Message) []*schema.Message {
 	//
 	// 顺序敏感：一条结果只有在**已经有一个还没配上结果的声明排在它前面**时才算数。
 	// 排在所有声明前面的是错位（不是应答），声明数用完之后多出来的也不算。
-	resultsOf := pairToolResults(msgs)
-	nextResult := make(map[string]int) // 该 id 下一个待认领结果的下标，避免一果多用
+	pairs := pairToolResults(msgs)
 
 	out := make([]*schema.Message, 0, len(msgs))
 	for _, m := range msgs {
@@ -1540,16 +1553,21 @@ func dropDanglingToolCalls(msgs []*schema.Message) []*schema.Message {
 		block := make([]*schema.Message, 0, len(tcs)+1)
 		block = append(block, m)
 		anyReal := false
-		for _, tc := range tcs {
-			if i := nextResult[tc.ID]; i < len(resultsOf[tc.ID]) {
-				nextResult[tc.ID] = i + 1
-				block = append(block, resultsOf[tc.ID][i])
+		for _, p := range pairs[:len(tcs)] {
+			if p.result != nil {
+				block = append(block, p.result)
 				anyReal = true
 				continue
 			}
 			// 这个 id 的结果用完了（或压根没有）→ 补占位，保证这一块自洽
-			block = append(block, schema.ToolResultMessage(tc.ID, unfinishedToolResultText))
+			placeholder := schema.ToolResultMessage(p.id, unfinishedToolResultText)
+			key := historyToolKey(m, p.id)
+			if key.task != "" {
+				placeholder.Annotations = map[string]any{HistoryTaskAnnotation: key.task, HistoryAgentAnnotation: key.agent}
+			}
+			block = append(block, placeholder)
 		}
+		pairs = pairs[len(tcs):]
 
 		if anyReal {
 			out = append(out, block...)
@@ -3582,6 +3600,9 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			invokeWith := func(record bool) func(c, guard context.Context) (*tool.Result, error) {
 				return func(c, guard context.Context) (*tool.Result, error) {
 					callTool := ToolEndpoint(func(ctx context.Context, name string, a map[string]any) (*tool.Result, error) {
+						if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
+							return nil, err
+						}
 						return dispatchToolkit.Call(ctx, name, a)
 					})
 					if len(cfg.ToolMiddlewares) == 0 || minted {
@@ -4000,6 +4021,7 @@ func streamOrGenerate(ctx context.Context, llm model.ChatModel, in []*schema.Mes
 	if err != nil {
 		return nil, err
 	}
+	defer reader.Close() // 在调用业务钩子前接管原始流，钩子 panic 或替换 reader 时都要释放。
 
 	// **OnModelEndStream hook 接入**：业务可在 Recv 链路插入观测/转换/审计
 	// 路径：原始 reader → schemaStreamAdapter 包成 spec interface → hooks 链 wrap →
@@ -4020,22 +4042,20 @@ func streamOrGenerate(ctx context.Context, llm model.ChatModel, in []*schema.Mes
 			if wrapped != nil {
 				_ = wrapped.Close() // 钩子报错时它返回的流也不用了；关流的错误没有下文，忽略
 			}
-			reader.Close()
 			return nil, fmt.Errorf("OnModelEndStream: %w", hookErr)
 		}
 		// 返回值是替换之后的流，nil 表示流没了：协议违例，跟钩子链（hook.ChainHooks）同一个判据。
 		// 两处判据不同的话，同一个钩子单独挂能用、一接上观测（链式安装）就让每次模型调用失败。
 		if wrapped == nil {
-			reader.Close()
 			return nil, errors.New("OnModelEndStream: hook returned nil reader without error")
 		}
 		// hook 返了同一 adapter（NoOp）→ 走原始 reader 直接消费（避免 goroutine 桥接开销）
 		// hook 返了新 wrapped reader → 桥接到 schema.StreamReader 让 streamOrGenerate 消费
 		if wrapped != specModel.MessageStreamReader(adapted) {
 			reader = streamReaderToSchema(ctx, wrapped)
+			defer reader.Close()
 		}
 	}
-	defer reader.Close()
 
 	sink := compose_v2.GetEventSink(ctx)
 	var (

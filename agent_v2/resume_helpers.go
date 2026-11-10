@@ -2,6 +2,7 @@ package agent_v2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -16,10 +17,11 @@ import (
 // abort 路径含 DeleteSubtree + cp.cleanup event + slog.Warn). caller 不再做
 // 后续 Run / hook fire 等业务逻辑.
 type resumePrep struct {
-	Cper      compose_v2.Checkpointer // 已从 ctx 取出, caller build Run opts 时复用
-	Rcfg      resumeConfig            // 已解析的 ResumeOption
-	Session   *RunSession             // 已初始化 (nil 时 helper 新建 RunID = sessionID)
-	AbortDone bool                    // ResumeActionAbort 已处理 (caller 直接 return nil, nil)
+	Cper      compose_v2.Checkpointer  // 已从 ctx 取出, caller build Run opts 时复用
+	Rcfg      resumeConfig             // 已解析的 ResumeOption
+	Session   *RunSession              // 已初始化 (nil 时 helper 新建 RunID = sessionID)
+	AbortDone bool                     // ResumeActionAbort 已处理 (caller 直接 return nil, nil)
+	activity  *compose_v2.TaskActivity // 续跑时由入口 defer 释放，覆盖历史写入器收尾
 }
 
 // commonResumePrep 抽取 9 编排 Resume 共享 boilerplate (audit #5 阶段 1 补审 MED-2 fix).
@@ -66,7 +68,7 @@ type resumePrep struct {
 // (各编排 Resume 自己在 commonResumePrep 之后 fire OnAgentStart / OnAgentEnd).
 // hooks 为 nil 或 NoOpHooks 时 Abort 路径 skip fire — 业务未注入 Observability 时
 // 零开销.
-// ⚠️ **subs 是「历史配置从谁那儿借」**——Abort 分支要在删 cp 之前给历史补上悬空 tool_call
+// ⚠️ **subs 是「历史配置从谁那儿借」**——整任务 Abort 删档成功后给历史补上悬空 tool_call
 // 的结果，而那时写入器还没起（`startHistory` 在本函数返回之后）。编排传自己的
 // `historySubs()`，BasicAgent 传 `[]Agent{a}`（它自己就实现了 historyConfigProvider）。
 // 传 nil 表示这条路不接历史。
@@ -112,6 +114,25 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		return nil, ctx, rejectCall(ctx, "%s %q: Resume 的 sessionID %q 与 WithResumeSession 传入的 session.RunID %q 不一致；两者是同一个任务的身份，传同一个值",
 			agentTypeName, agentName, sessionID, s.RunID)
 	}
+	// 续跑在预读存档前登记，覆盖钩子和历史收尾。显式放弃与 WithAbandonedTasks 使用同一套许可。
+	runID := sessionID
+	var abandoned []string
+	if rcfg.action == ResumeActionAbort {
+		runID = ""
+		if sessionID != "" {
+			abandoned = []string{sessionID}
+		}
+	}
+	ctx, activity, err := compose_v2.BeginTaskActivity(ctx, runID, abandoned)
+	if err != nil {
+		return nil, ctx, fmt.Errorf("%s %q: %w", agentTypeName, agentName, err)
+	}
+	var transferActivity bool
+	defer func() {
+		if !transferActivity {
+			activity.Release()
+		}
+	}()
 
 	// P0 observability: push Resume action 到 ctx — observability OnAgentStart
 	// 通过 GetResumePhase 识别 + 记 crew.resumes{crew.resume.action=continue/replan/abort}.
@@ -135,11 +156,16 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		// "abort"（ErrRunAborted 终局失败，graph_loop Run 出口 purge）不同源，别混成一个值
 		compose_v2.EmitCpCleanupHelper(ctx, sessionID, ns, "resume_abort", delCount, time.Since(delStart).Milliseconds(), dErr)
 		if dErr != nil {
+			if errors.Is(dErr, compose_v2.ErrTaskLeaseLost) {
+				return nil, ctx, dErr
+			}
 			slog.WarnContext(ctx, "agent resume abort: cper.DeleteSubtree failed (cp 可能未清)，悬空的 tool_call 不补",
 				"agent", agentName, "sessionID", sessionID, "ns", ns, "err", dErr)
-		} else {
+		} else if ns == "" {
+			// 历史按整个任务查，只有清完整个任务才可补写放弃结果。
 			closeUnansweredToolCallsOnAbort(ctx, resolveHistoryConfigForAbort(ctx, subs), agentName, sessionID)
 		}
+		activity.FinishAbandon()
 
 		// **audit MED fix**：补 push sid——Abort 分支在下方 WithSession（step 6）之前就
 		// return，不在此 push 则下面 OnAgentStart/End 的 ctx 无 sid → observability 的 span
@@ -168,7 +194,7 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 	// GraphAgent 空 channels 跑出垃圾 final 且 err=nil；BasicAgent 报误导性
 	// "PreambleInput nil" 框架内部错；拼错 sid 还会经 defer SaveNS 写垃圾 Pending
 	// cp 污染该 sid。校验放 Abort 分支**之后**：Abort 是幂等清理（DeleteSubtree
-	// 对不存在 ns 也合法），a2a/server Cancel 协调依赖"框架编排 abort 恒返 nil"。
+	// 对不存在 ns 也合法）。
 	// **判据与引擎 auto-load 同一个谓词**（`HasResumableWork`，按内容判）——这道闸门
 	// 的唯一职责是让「引擎会拒的」在这里提前变成可读的哨兵错，所以它必须和引擎判
 	// **同一件事**。两处判据分叉的实测后果：这边放行、那边不捡 ⟹ 没有初始写入的
@@ -206,5 +232,6 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 	// 6. WithSession push
 	newCtx := WithSession(ctx, session)
 
-	return &resumePrep{Cper: cper, Rcfg: rcfg, Session: session}, newCtx, nil
+	transferActivity = true
+	return &resumePrep{Cper: cper, Rcfg: rcfg, Session: session, activity: activity}, newCtx, nil
 }

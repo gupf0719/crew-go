@@ -155,3 +155,31 @@ func TestStreamIdleTimeout_AfterMessageStopIsComplete(t *testing.T) {
 		t.Errorf("答复 = %q，want 好", content)
 	}
 }
+
+func TestStream_MessageStopClosesResponseBeforeDeadline(t *testing.T) {
+	closed := make(chan struct{})
+	srv, _ := newServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		replySSE(w, sseFor([]any{map[string]any{"type": "text", "text": "完整答复"}}, "end_turn")...)
+		<-r.Context().Done() // 完整答复发完后仍保持连接，直到客户端关闭。
+		close(closed)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	sr, err := newClient(srv, anthropic.WithStreamIdleTimeout(0)).Stream(ctx, []*schema.Message{schema.UserMessage("hi")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := collect(t, sr)
+	msg := aggregate(chunks)
+	if !errors.Is(err, io.EOF) || msg.Content != "完整答复" || msg.Metadata == nil || msg.Metadata.Usage == nil || msg.Metadata.Usage.OutputTokens != 5 {
+		t.Fatalf("message_stop 后应收到完整答复、用量和 EOF，实际 msg=%+v err=%v", msg, err)
+	}
+	select {
+	case <-closed:
+		if ctx.Err() != nil {
+			t.Fatalf("连接应由客户端主动关闭，实际请求已超时：%v", ctx.Err())
+		}
+	case <-ctx.Done():
+		t.Fatal("客户端未及时关闭连接")
+	}
+}

@@ -390,7 +390,7 @@ func newCheckpointNotPersisted(exitErr, cause error) *checkpointNotPersistedErro
 		keepExit: !shouldStayPending(exitErr),
 		cause:    cause,
 		// 槽属于别人（别的执行推进了它 / 它是另一张图的档）时不删：那份档不是这次执行的。
-		aborted: !errors.Is(cause, ErrCheckpointStale) && !errors.Is(cause, ErrGraphIDConflict),
+		aborted: !errors.Is(cause, ErrCheckpointStale) && !errors.Is(cause, ErrGraphIDConflict) && !errors.Is(cause, ErrTaskLeaseLost),
 	}
 }
 

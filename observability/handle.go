@@ -152,7 +152,11 @@ func (o *Observability) scopeFrom(ctx context.Context) *agentScope {
 // keepHandles 在里面的钩子返回的 ctx（to）里没有本层句柄时把它挂回去：钩子返回外来的 ctx（缓存下来的、
 // Background）时，框架采纳它、业务值先查钩子那份——不挂回去的话本层的 span 就丢了（永不结束、在途数多 1），
 // 缓存的 ctx 还会让本次的结束收掉上一次的 span。同时挂回 OTel 的当前 span，下游 span 才挂在本层下面。
+// 钩子成功返回 nil 时沿用它收到的 ctx（from），与引擎对未包装钩子的处理一致。
 func (o *Observability) keepHandles(from, to context.Context) context.Context {
+	if to == nil {
+		return from
+	}
 	h := o.handleFrom(from)
 	if h == nil || o.handleFrom(to) == h {
 		return to

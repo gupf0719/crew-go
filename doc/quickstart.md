@@ -5,18 +5,18 @@
 
 ## 环境
 
-- **Go 1.23+**
-- 一个 LLM API key（默认 qwen/dashscope，环境变量 `QWEN_API_KEY`；或 deepseek `DEEPSEEK_API_KEY`）。**没 key 也能用 `-mock` 离线跑**。
+- 最低 Go 1.26.0，仓库声明工具链 Go 1.26.4。
+- `-mock` 离线运行无需 API key。真模型默认读取 `QWEN_API_KEY`，示例也支持 `-provider=deepseek`，读取 `DEEPSEEK_API_KEY`。
 
 ## 0. 先跑通（0 配置感受效果）
 
 ```bash
 go run ./example/orchestration/basic_chat -mock          # 离线 mock，不调真 LLM，看 ReAct 循环
-# 有 key（真 LLM）:
-QWEN_API_KEY=xxx go run ./example/orchestration/basic_chat
+# 已设置 QWEN_API_KEY 时可用真模型
+go run ./example/orchestration/basic_chat
 ```
 
-输入「北京天气如何？」→ 看 agent 自动调 `get_weather` 工具；再输入「明天呢？」→ 看它从上下文推断「北京明天」。
+在 mock 模式输入「北京天气如何？」可以看到 Agent 调用 `get_weather`。接着问「刚才问的是哪个城市？」可以看到它从历史中找回北京。用真模型时可以试「明天呢？」这样的省略问法。
 
 ## 1. 第一个 Agent（最小，纯对话）
 
@@ -35,7 +35,7 @@ import (
 func main() {
 	ag := agent_v2.NewBasicAgent(
 		agent_v2.WithName("assistant"),
-		agent_v2.WithModel(qwen.NewTestClient("")), // 读 QWEN_API_KEY，模型 qwen3.6-flash
+		agent_v2.WithModel(qwen.NewTestClient("")), // 读 QWEN_API_KEY，取测试候选首位
 	)
 
 	events, err := ag.Run(context.Background(),
@@ -43,7 +43,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(agent_v2.FinalMessage(events).Content)
+	final := agent_v2.FinalMessage(events)
+	if final == nil {
+		panic("agent returned no final message")
+	}
+	fmt.Println(final.Content)
 }
 ```
 
@@ -95,7 +99,11 @@ for _, q := range []string{"北京天气？", "明天呢？", "刚才问的是�
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Q: %s\nA: %s\n", q, agent_v2.FinalMessage(events).Content)
+	final := agent_v2.FinalMessage(events)
+	if final == nil {
+		panic("agent returned no final message")
+	}
+	fmt.Printf("Q: %s\nA: %s\n", q, final.Content)
 	// 第 2/3 轮 LLM 看得到前面对话 → 能推断「明天」=北京明天、「刚才」=北京
 }
 ```

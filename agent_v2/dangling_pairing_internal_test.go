@@ -11,6 +11,7 @@ package agent_v2
 // 历史无限增长且完全静默。下面「隔着消息也算应答」那条就是这个不变量的哨兵。
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -268,6 +269,42 @@ func TestPriorWindowSatisfied_EveryResultBlockNeedsItsCall(t *testing.T) {
 		multiResultMsg("", [2]string{"a", "ra"}, [2]string{"b", "rb"})}
 	if !priorWindowSatisfied(ok, 2) {
 		t.Error("两块都有声明时窗口够")
+	}
+}
+
+func TestHistoryTruncationKeepsScopedToolPairs(t *testing.T) {
+	for _, c := range []struct{ name, task, agent string }{
+		{"不同任务", "task-b", "worker-a"},
+		{"同任务不同流", "task-a", "worker-b"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			a := stampHistoryAgent(tcMsg(tc("shared", "first")), "worker-a", "worker-a", "task-a")
+			b := stampHistoryAgent(tcMsg(tc("shared", "second")), c.agent, c.agent, c.task)
+			ar := stampHistoryAgent(schema.ToolResultMessage("shared", "a"), "worker-a", "worker-a", "task-a")
+			br := stampHistoryAgent(schema.ToolResultMessage("shared", "b"), c.agent, c.agent, c.task)
+			kept := truncatePriorPreservingMarkers([]*schema.Message{a, b, br, ar}, 2)
+			out := dropDanglingToolCalls(kept)
+			if len(out) != 4 || out[0] != a || out[1] != ar || out[2] != b || out[3] != br {
+				t.Fatalf("应保留两组各自的调用和结果，截断后 %d 条，送模 %d 条", len(kept), len(out))
+			}
+		})
+	}
+}
+
+func TestHistoryTruncationPreservesMarkerBatchWithReusedID(t *testing.T) {
+	stamp := func(m *schema.Message) *schema.Message { return stampHistoryAgent(m, "worker", "worker", "task") }
+	a := stamp(tcMsg(tc("shared", "first"), tc("skill", "activate_skill")))
+	ar := stamp(schema.ToolResultMessage("shared", "first result"))
+	markerA := stamp(schema.ToolResultMessage("skill", "skill A"))
+	markerA.Annotations[SkillBodyAnnotation] = true
+	b := stamp(tcMsg(tc("shared", "activate_skill")))
+	markerB := stamp(schema.ToolResultMessage("shared", "skill B"))
+	markerB.Annotations[SkillBodyAnnotation] = true
+	old, latest := schema.UserMessage("超出窗口"), schema.UserMessage("保留")
+	kept := truncatePriorPreservingMarkers([]*schema.Message{old, a, ar, markerA, b, markerB, latest}, 1)
+	out := dropDanglingToolCalls(kept)
+	if !slices.Equal(out, []*schema.Message{a, ar, markerA, b, markerB, latest}) {
+		t.Fatalf("截断应保留整批工具往返及原顺序，实际送模 %v", contentsOf(out))
 	}
 }
 

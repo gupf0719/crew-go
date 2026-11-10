@@ -3,11 +3,16 @@ package agui
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/hook"
+	"crew-go/schema"
 )
 
 // ttlFixture 造一个带 TTL 的 handler + 一个 checkpointer，返回「某个 sid 还有没有存档」的探针。
@@ -63,15 +68,73 @@ func TestSessionTTL_ReclaimsAbandonedAndDropsCP(t *testing.T) {
 	if !ok {
 		t.Fatalf("acquireForRun 应成功")
 	}
+	// caller 负责清 cp——这里手动走一遍它那段
+	h.cleanupEvicted(t.Context(), evicted)
 	if _, still := h.sessions[gone]; still {
 		t.Errorf("闲置 2 小时（TTL=1 小时）的会话没被回收")
 	}
-	// caller 负责清 cp——这里手动走一遍它那段
-	for _, s := range evicted {
-		h.dropCP(context.Background(), s)
-	}
 	if hasCP(sid) {
 		t.Errorf("会话回收了但 cp 还在——那正是这个特性要清的东西")
+	}
+}
+
+func TestServeRun_RetainsPendingTaskWhenCheckpointCleanupIsBusy(t *testing.T) {
+	h, cp, hasCP := ttlFixture(t, 0)
+	key := sessionKey{owner: "o", threadID: "busy-task"}
+	sid := seedPending(t, h, cp, key, 0)
+	previous := h.sessions[key]
+	touchedAt := previous.touchedAt
+	previous.open = map[string]bool{"q1": true}
+	_, activity, err := compose_v2.BeginTaskActivity(t.Context(), sid, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer activity.Release()
+
+	w := httptest.NewRecorder()
+	sse, ok := NewSSEWriter(w)
+	if !ok {
+		t.Fatal("测试需要支持 SSE 的 ResponseWriter")
+	}
+	h.serveRun(t.Context(), sse, &RunAgentInput{ThreadID: key.threadID,
+		Messages: []AGUIMessage{{Role: "user", Content: "开新任务"}}}, key)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"code":"busy"`) {
+		t.Fatalf("应拒绝覆盖正在执行的任务，实际 HTTP %d %s", w.Code, w.Body.String())
+	}
+	if !hasCP(sid) || h.sessions[key] != previous || previous.busy || !previous.open["q1"] || previous.touchedAt != touchedAt {
+		t.Fatal("应保留旧任务的存档、挂起问题、续跑入口和闲置时间")
+	}
+	activity.Release()
+	if err := h.dropCP(t.Context(), sid); err != nil || hasCP(sid) {
+		t.Fatal("任务执行结束后应能清理存档")
+	}
+}
+
+func TestServeRun_DoesNotRestoreEntryDeletedBeforeTaskConflict(t *testing.T) {
+	h, cp, hasCP := ttlFixture(t, 0)
+	key := sessionKey{owner: "o", threadID: "late-conflict"}
+	sid := seedPending(t, h, cp, key, 0)
+	h.build = func(hooks hook.Hooks) agent_v2.Agent {
+		if hasCP(sid) {
+			t.Fatal("旧存档应在构造新 Agent 前清理")
+		}
+		_, activity, err := compose_v2.BeginTaskActivity(t.Context(), sid, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(activity.Release)
+		return agent_v2.NewBasicAgent(agent_v2.WithName("busy-replace"), agent_v2.WithModel(&capModel{}), agent_v2.WithHooks(hooks))
+	}
+	w := httptest.NewRecorder()
+	sse, ok := NewSSEWriter(w)
+	if !ok {
+		t.Fatal("测试需要支持 SSE 的 ResponseWriter")
+	}
+	ctx := compose_v2.WithCheckpointerCtx(t.Context(), cp)
+	h.serveRun(ctx, sse, &RunAgentInput{ThreadID: key.threadID,
+		Messages: []AGUIMessage{{Role: "user", Content: "开新任务"}}}, key)
+	if !strings.Contains(w.Body.String(), `"code":"busy"`) || h.sessions[key] != nil {
+		t.Fatalf("删档后的任务冲突应报 busy，旧入口应移除，实际 %s", w.Body.String())
 	}
 }
 
@@ -88,6 +151,52 @@ func TestSessionTTL_BusyEntryNeverReclaimed(t *testing.T) {
 	_, _, _ = h.acquireForRun(sessionKey{owner: "other", threadID: "t2"})
 	if _, still := h.sessions[busyKey]; !still {
 		t.Errorf("在途会话被回收了——它正被一个请求驱动着，删了之后那个请求的挂起会静默丢失")
+	}
+}
+
+func TestSessionReclaim_RetriesAfterActiveTask(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ttl  time.Duration
+		max  int
+	}{
+		{name: "TTL", ttl: time.Hour, max: DefaultMaxSessions},
+		{name: "LRU", max: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, cp, hasCP := ttlFixture(t, tc.ttl)
+			h.maxSessions = tc.max
+			h.build = func(hook.Hooks) agent_v2.Agent { return nil }
+			old := sessionKey{owner: "o", threadID: "old"}
+			sid := seedPending(t, h, cp, old, 2*time.Hour)
+			_, activity, err := compose_v2.BeginTaskActivity(t.Context(), sid, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer activity.Release()
+
+			trigger := func() {
+				t.Helper()
+				key := sessionKey{owner: "o", threadID: "new"}
+				sse, ok := NewSSEWriter(httptest.NewRecorder())
+				if !ok {
+					t.Fatal("测试需要支持 SSE 的 ResponseWriter")
+				}
+				h.serveRun(t.Context(), sse, &RunAgentInput{ThreadID: key.threadID,
+					Messages: []AGUIMessage{{Role: "user", Content: "开新任务"}}}, key)
+			}
+
+			trigger()
+			if h.sessions[old] == nil || !hasCP(sid) {
+				t.Fatal("回收应保留仍在执行的任务的会话和存档")
+			}
+			activity.Release()
+			h.lastSweep = 0
+			trigger()
+			if h.sessions[old] != nil || hasCP(sid) {
+				t.Fatal("任务执行结束后应能回收会话和存档")
+			}
+		})
 	}
 }
 
@@ -118,6 +227,7 @@ func TestSessionTTL_BusyEarlyReturnStillReportsExpired(t *testing.T) {
 	h.sessions[target] = &sessionEntry{busy: true, touchedAt: time.Now().UnixNano()}
 
 	_, evicted, ok := h.acquireForRun(target)
+	h.cleanupEvicted(t.Context(), evicted)
 	if ok {
 		t.Fatalf("fixture 没搭对：目标键在途，应走 busy 早退")
 	}
@@ -125,8 +235,8 @@ func TestSessionTTL_BusyEarlyReturnStillReportsExpired(t *testing.T) {
 		t.Fatalf("fixture 没搭对：过期那条该已被 sweep 删掉")
 	}
 	found := false
-	for _, s := range evicted {
-		if s == sid {
+	for _, task := range evicted {
+		if task.sid == sid {
 			found = true
 		}
 	}
@@ -143,14 +253,16 @@ func TestSessionTTL_SweepIsThrottled(t *testing.T) {
 	seedPending(t, h, cp, sessionKey{owner: "o", threadID: "a"}, 2*time.Hour)
 
 	// 第一次请求触发扫描
-	_, _, _ = h.acquireForRun(sessionKey{owner: "x", threadID: "1"})
+	_, evicted, _ := h.acquireForRun(sessionKey{owner: "x", threadID: "1"})
+	h.cleanupEvicted(t.Context(), evicted)
 	first := h.lastSweep
 	if first == 0 {
 		t.Fatalf("fixture 没搭对：第一次请求该扫一遍")
 	}
 	// 紧接着再来一个 → 在 TTL/4 内，不该重扫
 	seedPending(t, h, cp, sessionKey{owner: "o", threadID: "b"}, 2*time.Hour)
-	_, _, _ = h.acquireForRun(sessionKey{owner: "x", threadID: "2"})
+	_, evicted, _ = h.acquireForRun(sessionKey{owner: "x", threadID: "2"})
+	h.cleanupEvicted(t.Context(), evicted)
 	if h.lastSweep != first {
 		t.Errorf("TTL/4 内重复扫了：每请求 O(n) 在一万条的表上就是每请求一万次比较")
 	}
@@ -211,4 +323,156 @@ func TestMaxSessions_LimitIsSoftAcrossTenants(t *testing.T) {
 	}
 	t.Logf("maxSessions=5，%d 个租户各挂 1 条 → 表里实际 %d 条（上限是软的，"+
 		"增量挂在**身份数**上不挂在请求数上）", tenants, len(h.sessions))
+}
+
+func TestSessionTTL_InFlightReclaimDoesNotCountForLRU(t *testing.T) {
+	h, cp, hasCP := ttlFixture(t, time.Hour)
+	h.maxSessions = 3
+	expired := sessionKey{owner: "victim", threadID: "expired"}
+	live := sessionKey{owner: "victim", threadID: "live"}
+	busy := sessionKey{owner: "busy", threadID: "busy"}
+	newcomer := sessionKey{owner: "newcomer", threadID: "newcomer"}
+	seedPending(t, h, cp, expired, 2*time.Hour)
+	liveSID := seedPending(t, h, cp, live, 0)
+	h.sessions[busy] = &sessionEntry{busy: true, touchedAt: time.Now().UnixNano()}
+	_, first, ok := h.acquireForRun(busy)
+	if ok || len(first) != 1 || first[0].key != expired {
+		t.Fatalf("fixture: first request must claim expired cleanup only: ok=%v evictions=%+v", ok, first)
+	}
+	t.Cleanup(func() { h.cleanupEvicted(t.Context(), first) })
+	_, second, ok := h.acquireForRun(newcomer)
+	if !ok {
+		t.Fatal("fixture: new request must start")
+	}
+	h.cleanupEvicted(t.Context(), second)
+	if h.sessions[live] == nil || !hasCP(liveSID) {
+		t.Fatalf("pending eviction was double charged; live tenant checkpoint destroyed: evictions=%+v", second)
+	}
+}
+
+type remoteBusyCheckpointer struct {
+	compose_v2.Checkpointer
+	t          *testing.T
+	h          *handler
+	remoteSID  string
+	remoteBusy bool
+	token      string
+}
+
+func (c *remoteBusyCheckpointer) CheckpointTaskLeases() compose_v2.TaskLeaseStore { return c }
+func (c *remoteBusyCheckpointer) TryAcquireTaskLease(_ context.Context, sid, token string, _ time.Duration) (bool, error) {
+	c.t.Helper()
+	if !c.h.mu.TryLock() {
+		c.t.Fatal("lease backend called under session lock")
+	}
+	c.h.mu.Unlock()
+	if sid == c.remoteSID && c.remoteBusy {
+		return false, nil
+	}
+	c.token = token
+	return true, nil
+}
+func (c *remoteBusyCheckpointer) RenewTaskLease(_ context.Context, _, _ string, _ time.Duration) (bool, error) {
+	return true, nil
+}
+func (c *remoteBusyCheckpointer) ReleaseTaskLease(_ context.Context, _, token string) error {
+	c.token = ""
+	return nil
+}
+func (c *remoteBusyCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+	c.t.Helper()
+	if c.token == "" || c.token != compose_v2.CheckpointTaskLeaseToken(ctx, c, sid) {
+		c.t.Fatal("DeleteSubtree missing lease token")
+	}
+	return c.Checkpointer.DeleteSubtree(ctx, sid, ns)
+}
+
+func TestSessionTTL_RemoteBusyKeepsEntryUntilReclaim(t *testing.T) {
+	h, cp, hasCP := ttlFixture(t, time.Hour)
+	old := sessionKey{owner: "o", threadID: "old"}
+	sid := seedPending(t, h, cp, old, 2*time.Hour)
+	h.cp = &remoteBusyCheckpointer{Checkpointer: cp, t: t, h: h, remoteSID: sid, remoteBusy: true}
+	oldEntry := h.sessions[old]
+	h.build = func(hook.Hooks) agent_v2.Agent { return nil }
+	run := func(key sessionKey) int {
+		w := httptest.NewRecorder()
+		sse, _ := NewSSEWriter(w)
+		h.serveRun(t.Context(), sse, &RunAgentInput{ThreadID: key.threadID, Messages: []AGUIMessage{{Role: "user", Content: "new"}}}, key)
+		return w.Code
+	}
+	if code := run(old); code != http.StatusConflict || h.sessions[old] != oldEntry || !hasCP(sid) {
+		t.Fatalf("same-thread remote conflict should keep old entry, got code=%d", code)
+	}
+	h.lastSweep = 0
+	run(sessionKey{owner: "o", threadID: "new"})
+	if h.sessions[old] != oldEntry || oldEntry.busy || !hasCP(sid) {
+		t.Fatal("remote busy TTL sweep should leave old entry idle for retry")
+	}
+	h.cp.(*remoteBusyCheckpointer).remoteBusy = false
+	h.lastSweep = 0
+	run(sessionKey{owner: "o", threadID: "new"})
+	if h.sessions[old] != nil || hasCP(sid) {
+		t.Fatal("TTL retry did not reclaim checkpoint")
+	}
+}
+
+func TestSessionCapacity_SkipsRemoteBusyOldest(t *testing.T) {
+	h, cp, hasCP := ttlFixture(t, 0)
+	h.maxSessions = 2
+	busy := sessionKey{owner: "one-owner", threadID: "oldest"}
+	idle := sessionKey{owner: "one-owner", threadID: "idle"}
+	new1 := sessionKey{owner: "one-owner", threadID: "new1"}
+	busySID := seedPending(t, h, cp, busy, 2*time.Hour)
+	idleSID := seedPending(t, h, cp, idle, time.Hour)
+	h.cp = &remoteBusyCheckpointer{Checkpointer: cp, t: t, h: h, remoteSID: busySID, remoteBusy: true}
+	_, evicted, ok := h.acquireForRun(new1)
+	if !ok {
+		t.Fatal("fixture must reserve new run")
+	}
+	h.cleanupEvicted(t.Context(), evicted)
+	if h.sessions[busy] == nil || !hasCP(busySID) {
+		t.Fatal("busy remote task was evicted")
+	}
+	if h.sessions[idle] != nil || hasCP(idleSID) {
+		t.Fatal("remote-busy oldest blocked eviction of an eligible idle task")
+	}
+}
+
+func TestServeRun_NestedBusyDropsOwnCheckpoint(t *testing.T) {
+	h, cp, _ := ttlFixture(t, 0)
+	child := agent_v2.NewRunSession()
+	_, activity, err := compose_v2.BeginTaskActivity(t.Context(), "", []string{child.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(activity.Release)
+	var rootSID string
+	h.build = func(hooks hook.Hooks) agent_v2.Agent {
+		b := compose_v2.NewBuilder().WithName("parent")
+		b.AddNode("child", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+			rootSID = agent_v2.GetSession(ctx).RunID
+			sub := agent_v2.NewBasicAgent(agent_v2.WithName("child"), agent_v2.WithModel(&capModel{}))
+			_, err := sub.Run(agent_v2.DetachTask(ctx), child, schema.UserMessage("go"))
+			return nil, err
+		})
+		b.AddEdge(compose_v2.StartNode, "child")
+		b.AddEdge("child", compose_v2.EndNode)
+		graph, err := b.Compile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return agent_v2.NewGraphAgent(graph, agent_v2.WithGraphAgentName("parent"), agent_v2.WithGraphInputWriter(func(*schema.Message) []compose_v2.ChannelWrite { return nil }), agent_v2.WithGraphOutputReader(func(compose_v2.Channels) *schema.Message { return schema.AssistantMessage("done") }))
+	}
+	w := httptest.NewRecorder()
+	sse, _ := NewSSEWriter(w)
+	key := sessionKey{owner: "o", threadID: "busy-child"}
+	ctx := compose_v2.WithCheckpointerCtx(t.Context(), cp)
+	h.serveRun(ctx, sse, &RunAgentInput{ThreadID: key.threadID, Messages: []AGUIMessage{{Role: "user", Content: "new"}}}, key)
+	if rootSID == "" || !strings.Contains(w.Body.String(), `"code":"busy"`) {
+		t.Fatalf("fixture expected nested busy SSE: %s", w.Body.String())
+	}
+	all, err := cp.LoadAllInSession(t.Context(), rootSID)
+	if err != nil || len(all) > 0 {
+		t.Fatalf("nested busy left own checkpoint with no entry: len=%d entry=%v err=%v", len(all), h.sessions[key], err)
+	}
 }

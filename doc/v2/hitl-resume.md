@@ -578,9 +578,13 @@ const (
 | `Replan` | 用户指示走 `WithResumeUserText`（**非寻址通道**），下游 Planner 用 `GetResumeUserText` 取出重规划 | PlanAgent 用户中途说"换个方向" |
 | `Abort` | DeleteSubtree 清 cp 退出，Resume 返 (nil, nil) 让 caller 区分于"自然跑完"（caller 显式发 aborted 事件）| 用户主动取消任务 |
 
+内建 Agent 的 `Run`、`Resume` 和图执行按任务 ID 登记。显式 `Abort` 与 `WithAbandonedTasks` 在删档及补历史期间占用放弃许可。
+共享 Redis 或内建 SQL Checkpointer 时，这些入口同时使用 [存储端任务租约](checkpoint.md#61-共享存档的任务租约)。
+执行与放弃在登记或申请租约时冲突，后到的调用返回 `compose_v2.ErrTaskBusy`。调用方可在在途操作结束后重试。
+
 **Abort 清理范围 (review-v6 H-03 fix 后行为)**：DeleteSubtree 用 `compose_v2.GetGraphNS(ctx)` 作 nsPrefix——
 - **顶层调用** (ctx 无父 graphNS, e.g. 业务直接调 `agent.Resume(ctx, sid, Abort)`): nsPrefix="" 清整 sid 所有 ns
-- **nested 调用** (ctx 已被父 push graphNS, e.g. parent agent 调 `subAgent.Resume(ctx, sid, Abort)`): 只清本 sub-agent 子树, 父 cp + sibling sub-agent cp 保留. 业务想清整树需调根 agent.Resume 或显式 `compose_v2.WithGraphNS(ctx, "")` 重置
+- **指定子树**（调用者从任务外通过 `compose_v2.WithGraphNS` 指定非空 namespace）只清对应子树。整任务历史的补写仅在根 namespace 的 Abort 删档成功后执行。
 
 ### 5.3 业务侧用法
 
@@ -1130,15 +1134,13 @@ go run ./example/orchestration/nested_smoke
 `example/orchestration/plan_chat_web` 是 v2 HITL 实战完整 demo——Web 服务跑 PlanAgent，用户中途按
 "暂停"按钮触发 hook 主动抛 InterruptError，Resume 时 user 答 continue / abort。
 
-> ⚠️ **这个范式只在「hook 挂在嵌套成员上」时成立**。`OnAgentStart` 在**顶层** agent 上抛
+> **在 `OnAgentStart` 触发中断需要外层节点接住**。`OnAgentStart` 在顶层 agent 上抛
 > 中断会被**拒**——那一刻图还没开始跑、本层没有能挂这条中断的地方，框架转成一个不可重试
 > 的接线错误（`errUncatchableHookInterrupt`，实现 `compose_v2.NonRetryable`；不用
 > `ErrRunAborted` 是因为那捆绑「清 cp 子树」，而这个错抛在图执行之前、什么档都没写，
 > 清档会误伤同 sid 下无关的残档）。哨兵 `agent_v2/hook_interrupt_scope_test.go`。
 >
-> plan_chat_web 能用，是因为这个 hook 挂在 PlanAgent 的**子 agent** 链上（见下方「Hook 挂到
-> 所有 sub-agent 和 planner 的 hooks 链上」）。照抄到一个顶层 `BasicAgent` 上会拿到错误，
-> 不是挂起。要在顶层表达「暂停」，用 `WithSoftCancel`（超步边界优雅停 + 存档可续）。
+> Web 示例用顶层 BasicAgent 的 `OnModelEnd` 和嵌套成员的 `OnAgentStart` 响应暂停。要在超步边界停止，使用 `WithSoftCancel`。
 
 ### 11.1 interruptHook 实现
 
@@ -1193,42 +1195,14 @@ func (h *interruptHook) maybeInterrupt(ctx context.Context, info *hook.AgentInfo
 
 ### 11.2 完整 HTTP 流程
 
-```bash
-# 1. 启服务（mock 模式不依赖真 LLM）
-/tmp/web -mock -addr :19999 &
-
-# 2. 启 chat 后台（mode=plan 走 PlanAgent；不传或 mode=normal 走单 BasicAgent chat_entry）
-curl -sN "http://localhost:19999/api/chat?q=plan+budget+report&mode=plan" > /tmp/chat_intr.log &
-sleep 0.5
-
-# 3. 抓 sessionID
-SID=$(grep -o 'session_id":"[^"]*' /tmp/chat_intr.log | head -1 | cut -d'"' -f3)
-
-# 4. 立即触发 hook interrupt（用户按"暂停"按钮）
-curl -X POST "http://localhost:19999/api/interrupt?session_id=$SID"
-
-# 5. SSE 流收到 interrupted 事件
-grep '"type":"interrupted"' /tmp/chat_intr.log
-# data: {"type":"interrupted","data":{"checkpoint":{"frontier":["model"],"status":"pending"},
-#        "query":{"question":"已挂起，请点继续或换方向。","interrupt_id":"7cae64d9786ea7cf"},
-#        "reason":"user requested pause","session_id":"..."}}
-
-# 6. Resume continue（用户点"继续"按钮）
-curl -sN "http://localhost:19999/api/chat?session_id=$SID&action=continue"
-# data: {"type":"final","data":{"content":"[mock chat_entry · Plan mode] 已通过工具完成任务：plan budget report"}}
-# data: {"type":"done","data":{"history_size":2}}
-
-# 7. cp 已自动清（cleanupOnSuccess）
-curl "http://localhost:19999/api/chat?session_id=$SID"
-# → "session not found (likely already completed or never started)"
-```
+运行 [plan_chat_web mock 冒烟](../description/smoke-test-recipes.md#2-plan_chat_web-mock--hitl-resume30-秒)。脚本依次打开 SSE、请求挂起、等待存档、续跑并校验 HTTP 终态。
 
 ### 11.3 关键验证点
 
 - ✅ `interrupted` 事件含 `query.interrupt_id` + `query.question`（v2 严格契约 — `InterruptError.AllQueries()` 必须非空，单 query 填 `Query` 字段或多 query 填 `Queries`）
 - ✅ cp 含 `frontier:["model"]` + `status:"pending"`（顶层 BasicAgent 的 `["model"]` cp 来自 **OnModelEnd** 命中——顶层 `OnAgentStart` 抛 Interrupt 在 graph 启动前 `return` 不产 graph cp，故 §11.1 双触发里的 OnModelEnd 才是产 cp 那条；嵌套深处子 agent 的 OnAgentStart 在父 graph 内执行则会产其他节点名 cp）
 - ✅ Resume continue → 出 `final` + `done` 事件，history_size 累积
-- ✅ 第二次同 sessionID 请求返 "session not found"（cleanupOnSuccess 工作）
+- ✅ 完成后立即请求同一会话返回 HTTP 410。存档清理由 `nested_smoke` 直接验证。
 
 ---
 

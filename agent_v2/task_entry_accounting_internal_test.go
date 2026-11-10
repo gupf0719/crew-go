@@ -17,7 +17,7 @@ import (
 // 判定排在钩子之后的后果实测过：钩子里经 RunSubAgent 发起的调用用上一个任务的 approve_always 静默
 // 执行工具、续上被放弃任务留下的存档；不占槽的话钩子里裸调的子层把宿主的挂起档读进来接着跑、成功时删掉。
 // 这条规矩长在九个入口各自的代码里，第 10 个编排漏写不会报错，所以机械对账。Run 入口另有放弃任务（WithAbandonedTasks）
-// 的两步：校验（checkAbandonedTasks）在建历史写入器与盖章之前，收尾（abandonTasksAtEntry）在钩子之前。
+// 的两步：校验并登记（beginRunActivity）在建历史写入器与盖章之前，收尾（abandonTasksAtEntry）在钩子之前。
 func TestTaskEntry_EveryEntryDecidesBeforeOnAgentStart(t *testing.T) {
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
@@ -57,7 +57,7 @@ func TestTaskEntry_EveryEntryDecidesBeforeOnAgentStart(t *testing.T) {
 						if fn.Name == "abandonTasksAtEntry" && abandonPos == token.NoPos {
 							abandonPos = ce.Pos()
 						}
-						if fn.Name == "checkAbandonedTasks" && checkPos == token.NoPos {
+						if fn.Name == "beginRunActivity" && checkPos == token.NoPos {
 							checkPos = ce.Pos()
 						}
 						if strings.HasPrefix(fn.Name, "startHistory") && historyPos == token.NoPos {
@@ -79,7 +79,7 @@ func TestTaskEntry_EveryEntryDecidesBeforeOnAgentStart(t *testing.T) {
 				}
 				// 放弃的声明在建历史写入器、盖任务章之前校验：排在后面的话嵌套位置认不出（章已经盖上）、拒绝前调用方前文已经写进历史
 				if fd.Name.Name == "Run" && (checkPos == token.NoPos || historyPos == token.NoPos || checkPos > historyPos || checkPos > entryPos) {
-					t.Errorf("%s 没有在建历史写入器与 %s 之前调 checkAbandonedTasks", where, want)
+					t.Errorf("%s 没有在建历史写入器与 %s 之前调 beginRunActivity", where, want)
 				}
 				checked[fd.Name.Name]++
 			}

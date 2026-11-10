@@ -581,6 +581,81 @@ func TestCancel_NotAnError(t *testing.T) {
 	}
 }
 
+type nilModelStartContextHook struct{ hook.NoOpHooks }
+
+func (nilModelStartContextHook) OnModelStart(context.Context, *hook.AgentInfo, *schema.ModelInput) (context.Context, error) {
+	return nil, nil
+}
+
+func TestInstall_PreservesNilHookContextFallback(t *testing.T) {
+	for _, observed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("observed=%t", observed), func(t *testing.T) {
+			h := newHarness(t)
+			ctx := context.Background()
+			llm := &scriptModel{}
+			opts := []agent_v2.Option{agent_v2.WithName("nil_hook_ctx"), agent_v2.WithModel(llm), agent_v2.WithHooks(nilModelStartContextHook{})}
+			if observed {
+				ctx, opts = h.obs.Install(ctx, opts...)
+			}
+			events, err := agent_v2.NewBasicAgent(opts...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("继续"))
+			if msg := agent_v2.FinalMessage(events); err != nil || msg == nil || msg.Content != "最终答复：继续" || llm.calls.Load() != 1 {
+				t.Fatalf("nil ctx 应沿用钩子入参，实际 final=%+v calls=%d err=%v", msg, llm.calls.Load(), err)
+			}
+			if observed {
+				h.assertAllEnded(t)
+				chat := h.span(t, "chat mock-model")
+				if outcome := strAttr(t, chat, observability.AttrOutcome); outcome != "success" {
+					t.Errorf("chat span outcome=%q，期望 success", outcome)
+				}
+			}
+		})
+	}
+}
+
+type interruptDetailsHook struct {
+	hook.NoOpHooks
+	interrupt *compose_v2.InterruptError
+}
+
+func (h interruptDetailsHook) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, _ *schema.ModelOutput) (context.Context, error) {
+	return ctx, h.interrupt
+}
+
+func TestInterruptEventRedactsDetailsWithContentDisabled(t *testing.T) {
+	const secret = "synthetic-approval-token"
+	prefix := strings.Repeat("x", 1020)
+	ie := &compose_v2.InterruptError{
+		Reason: prefix + secret,
+		Query:  &compose_v2.AskQuery{InterruptID: "label-" + secret, Question: "继续吗 " + secret},
+	}
+	h := newHarness(t, observability.WithRedactPatterns(regexp.MustCompile(secret)))
+	ctx, opts := h.obs.Install(compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer()),
+		agent_v2.WithName("redacted_interrupt"),
+		agent_v2.WithModel(&scriptModel{}),
+		agent_v2.WithHooks(interruptDetailsHook{interrupt: ie}),
+	)
+	_, err := agent_v2.NewBasicAgent(opts...).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("开始"))
+	if _, ok := compose_v2.IsInterrupt(err); !ok {
+		t.Fatalf("应挂起，实际 %v", err)
+	}
+	ev, ok := hasEvent(h.span(t, "invoke_agent redacted_interrupt"), "crew.interrupt")
+	if !ok {
+		t.Fatal("缺少 crew.interrupt 事件")
+	}
+	attrs := attribute.NewSet(ev.Attributes...)
+	reason, _ := attrs.Value("crew.interrupt.reason")
+	if want := prefix + "[RED…[truncated]"; reason.AsString() != want {
+		t.Errorf("中断原因应先脱敏再截断，实际 %q", reason.AsString())
+	}
+	id, _ := attrs.Value(observability.AttrInterruptID)
+	if want := "label-[REDACTED]"; id.AsString() != want {
+		t.Errorf("中断标签应脱敏，实际 %q", id.AsString())
+	}
+	if _, ok := attrs.Value("crew.interrupt.question"); ok {
+		t.Error("内容采集关闭时不应导出问题正文")
+	}
+}
+
 // TestInterruptResume：ask_user 中断时 agent span 记 blocked（不是失败）并带 crew.interrupt 事件；
 // 续跑时新的 agent span 带 crew.resume 事件与等待时长，等待时长与续跑次数进指标，挂起记录被取走。
 func TestInterruptResume(t *testing.T) {

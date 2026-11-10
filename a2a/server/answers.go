@@ -75,7 +75,7 @@ func joinQuestions(qs []*compose_v2.AskQuery) string {
 // resumeInputs 按挂起提问解析续发消息里的答复，返回这条消息答了哪几问（interruptId → 答复）；executor 把它并进
 // 这个任务里已经答过的那些，整份交给 Resume。answered 是这个任务里已经答过的提问，只用来把「重发了答过的」跟
 // 「认不出的 ID」分开说。答复不可用时返回 nil 和请对端重答的原因（不调 Resume）。
-func resumeInputs(qs []*compose_v2.AskQuery, answered map[string]*schema.Message, msg *schema.Message) (map[string]*schema.Message, string) {
+func resumeInputs(qs []*compose_v2.AskQuery, answered map[string]*schema.Message, msg *schema.Message, metadata map[string]any) (map[string]*schema.Message, string) {
 	byID, bare, problem := a2a.AnswersFromMessage(msg)
 	if problem != "" {
 		return nil, "The answer was not understood: " + problem + "."
@@ -89,6 +89,9 @@ func resumeInputs(qs []*compose_v2.AskQuery, answered map[string]*schema.Message
 		if q != nil {
 			pending[q.InterruptID] = q
 		}
+	}
+	if ids, exists := metadata[a2a.ReplyToInterruptIDsKey]; exists && !samePendingQuestions(ids, pending) {
+		return nil, "The reply refers to a different set of questions; answer the questions currently waiting."
 	}
 	inputs := make(map[string]*schema.Message, len(qs))
 	if len(byID) > 0 {
@@ -153,6 +156,23 @@ func resumeInputs(qs []*compose_v2.AskQuery, answered map[string]*schema.Message
 	}
 	inputs[q.InterruptID] = schema.UserMessage(option)
 	return inputs, ""
+}
+
+// samePendingQuestions 核对续发消息携带的提问清单，避免上一轮的裸答复被用在新的一轮上。
+func samePendingQuestions(raw any, pending map[string]*compose_v2.AskQuery) bool {
+	ids, ok := raw.([]any)
+	if !ok || len(ids) == 0 || len(ids) != len(pending) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(ids))
+	for _, value := range ids {
+		id, ok := value.(string)
+		if !ok || id == "" || pending[id] == nil {
+			return false
+		}
+		seen[id] = struct{}{}
+	}
+	return len(seen) == len(pending)
 }
 
 // answerFor 把一个答复 DataPart 转成交给 Resume 的消息；不可用时返回 nil 和原因。审批的 approved 与 answer 都给了

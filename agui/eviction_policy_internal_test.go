@@ -194,7 +194,7 @@ func TestEvictPolicy(t *testing.T) {
 			for i := 0; i < 200; i++ {
 				h := newPolicyHandler(tc.max)
 				h.seed(tc.entries)
-				gotSIDs := h.evictIfNeededLocked(tc.inserter)
+				gotSIDs := h.evictIfNeededLocked(tc.inserter, nil)
 				gotVictim := missingKey(tc.entries, h.sessions)
 
 				if gotVictim != tc.wantVictim {
@@ -204,7 +204,7 @@ func TestEvictPolicy(t *testing.T) {
 					t.Fatalf("第 %d 次：待清 cp 的 sid %v，期望 %v", i, gotSIDs, tc.wantSIDs)
 				}
 				for j := range gotSIDs {
-					if gotSIDs[j] != tc.wantSIDs[j] {
+					if gotSIDs[j].sid != tc.wantSIDs[j] {
 						t.Fatalf("第 %d 次：待清 cp 的 sid %v，期望 %v", i, gotSIDs, tc.wantSIDs)
 					}
 				}
@@ -236,7 +236,7 @@ func TestEvictPolicy_ShareCountsBusyEntries(t *testing.T) {
 		{owner: "E", threadID: "e1", at: 3, busy: true}, // 到达者手上只有这条
 	}
 	h.seed(entries)
-	if got := h.evictIfNeededLocked("E"); got != nil {
+	if got := h.evictIfNeededLocked("E", nil); got != nil {
 		t.Fatalf("到达者只有一条在途 entry 时不该淘汰任何人，却清了 %v", got)
 	}
 	// 正向：A、V 都还在（不是「表被清空了所以没返 sid」）。

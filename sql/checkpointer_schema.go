@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-// Setup 创建 Checkpointer 表 + 索引. 业务一次调一次, `CREATE TABLE IF NOT EXISTS`
+// Setup 创建存档表、索引和任务租约表. 业务部署时调用，`CREATE TABLE IF NOT EXISTS`
 // 重复调幂等.
 //
 // **schema 设计**:
@@ -32,16 +32,27 @@ func (c *Checkpointer) Setup(ctx context.Context) error {
 }
 
 func (c *Checkpointer) cpMigrations() ([]string, error) {
+	var migrations []string
+	var sidType, tokenType, tableOptions string
 	switch c.dialect.(type) {
 	case Postgres:
-		return postgresCheckpointMigrations(c.table), nil
+		migrations = postgresCheckpointMigrations(c.table)
+		sidType, tokenType = `TEXT COLLATE "C"`, `TEXT COLLATE "C"`
 	case MySQL:
-		return mysqlCheckpointMigrations(c.table), nil
+		migrations = mysqlCheckpointMigrations(c.table)
+		sidType, tokenType = "VARBINARY(1020)", "VARBINARY(64)"
+		tableOptions = " ENGINE=InnoDB"
 	case SQLite:
-		return sqliteCheckpointMigrations(c.table), nil
+		migrations = sqliteCheckpointMigrations(c.table)
+		sidType, tokenType = "TEXT", "TEXT"
 	default:
 		return nil, errors.New("sql cp Setup: 业务自定义 dialect 不支持 Setup, 业务自管 schema")
 	}
+	return append(migrations, fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+    sid %s NOT NULL PRIMARY KEY,
+    owner_token %s NOT NULL,
+    expires_at BIGINT NOT NULL
+)%s;`, c.taskLeaseTable(), sidType, tokenType, tableOptions)), nil
 }
 
 // postgresCheckpointMigrations 返 PG cp 表 DDL.
@@ -78,8 +89,7 @@ func postgresCheckpointMigrations(table string) []string {
 
 // mysqlCheckpointMigrations 返 MySQL cp 表 DDL.
 //
-// audit iter-5 视角 2 HIGH-1 修: 同款回滚 stored procedure 到简单 CREATE INDEX.
-// 见 store_schema.go::mysqlStoreMigrations 详细说明.
+// 索引随表创建，已有存档表再次 Setup 时可继续创建租约表。
 //
 // **sid / ns / parent_ns / graph_id 用二进制串 (VARBINARY)**, 理由同 store 表: utf8mb4_bin
 // 是 PAD SPACE, 主键把只差尾随空格的 (sid, ns) 当成同一行——真 MySQL 8.0.35 实测, 会话 "s "
@@ -96,9 +106,9 @@ func mysqlCheckpointMigrations(table string) []string {
     graph_id     VARBINARY(1020) NOT NULL DEFAULT '',
     created_at   BIGINT NOT NULL DEFAULT 0,
     payload      JSON NOT NULL,
-    PRIMARY KEY (sid, ns)
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;`, table),
-		fmt.Sprintf(`CREATE INDEX %s_sid_status_idx ON %s (sid, status);`, table, table),
+    PRIMARY KEY (sid, ns),
+    INDEX sid_status_idx (sid, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;`, table),
 	}
 }
 

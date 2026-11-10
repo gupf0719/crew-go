@@ -178,6 +178,13 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 		// 1. 检查 Checkpointer 是否有本子图的 saved cp（Resume 路径）
 		var savedSubCp *Checkpoint
 		if cper != nil && sid != "" {
+			// 节点钩子可选择独立的 Checkpointer。子树从预读到出口清理共用该存储域的租约。
+			subCtx, activity, err := beginTaskActivity(ctx, cper, sid, nil)
+			if err != nil {
+				return nil, fmt.Errorf("subgraph %q: %w", id, err)
+			}
+			defer activity.Release()
+			ctx = subCtx
 			// Phase 2 Sub-3 audit fix: subgraph LoadNS fire cp.load event
 			loadStart := time.Now()
 			cp, err := cper.LoadNS(ctx, sid, childNS)

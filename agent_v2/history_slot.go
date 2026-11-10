@@ -77,6 +77,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -787,28 +788,17 @@ func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key Histo
 		return
 	}
 
-	answered := make(map[string]bool)
-	for _, m := range msgs {
-		for _, id := range toolResultIDs(m) { // 一条消息带几个结果块就答了几个调用
-			if id != "" {
-				answered[id] = true
-			}
-		}
-	}
+	slices.Reverse(msgs) // 历史扫描从新到旧，配对需要追加顺序。
 	var closers []*schema.Message
-	for i := len(msgs) - 1; i >= 0; i-- { // 旧 → 新：补上的结果按调用出现的顺序排
-		m := msgs[i]
-		for _, tc := range schema.GetToolCalls(m) {
-			if tc.ID == "" || answered[tc.ID] {
-				continue
-			}
-			answered[tc.ID] = true // 同一个 id 只补一次
-			closer := schema.ToolResultMessage(tc.ID,
-				"任务已被放弃，此工具调用没有结果")
-			owner, _ := m.Annotations[HistoryAgentAnnotation].(string)
-			display, _ := m.Annotations[HistoryAgentDisplayAnnotation].(string)
-			closers = append(closers, stampHistoryAgent(closer, owner, display, task))
+	for _, call := range danglingToolCalls(msgs) {
+		if call.ID == "" {
+			continue
 		}
+		m := call.declaration
+		owner, _ := m.Annotations[HistoryAgentAnnotation].(string)
+		display, _ := m.Annotations[HistoryAgentDisplayAnnotation].(string)
+		closer := schema.ToolResultMessage(call.ID, "任务已被放弃，此工具调用没有结果")
+		closers = append(closers, stampHistoryAgent(closer, owner, display, task))
 	}
 	if len(closers) == 0 {
 		return
@@ -819,43 +809,30 @@ func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key Histo
 	}
 }
 
-// checkAbandonedTasks 校验 [WithAbandonedTasks] 给的任务。各编排的 Run 入口在解析完 session 之后、建历史写入器与盖任务章之前
-// 调：拒绝时什么都还没做（调用方前文也还没写），顶层的拒绝也就不带 ErrRunAborted（见 rejectCall）。
-//
-// 在哪儿给都行（顶层的 Run、顶层的自研壳经 EnterRun 透传的、节点或钩子里经 RunSubAgent 透传的）：收尾删的是被放弃任务的整份
-// 存档，不看这次调用所在的 ns（见 abandonTasksAtEntry），所以不需要判这次调用在不在嵌套位置。曾经判过两版、各被审计实测出一个
-// 反例：按「ctx 上有没有任务章」判时，顶层 EnterRun 壳的透传被当成嵌套拒掉（agui 工厂返回这种壳时每次顶掉挂起都报错）；按
-// 「在不在节点执行里」判时，顶层 agent 级钩子里经 RunSubAgent 透传的被放行、删档却用了子 ns，存档原样留着、历史里补了「被放弃」。
-//
-// 只拒被放弃的任务此刻还在执行的情形（它的调用还会有结果，补的「被放弃」排在真结果前面；删档会删掉它正在用的存档——都是审计
-// 实测）：这次 Run 自己的任务（嵌套位置上就是所在的任务——被调方的 session 属于它）、脱离出来之前所在的仍在执行的任务、本进程里
-// 此刻有执行在跑的任务（compose_v2.TaskExecuting：在节点里换了 sid 跑一张嵌套图、从那里透传这个选项时，所在任务的身份被盖掉了，
-// 前两条都认不出它，审计实测）；空 ID。别的进程里在跑的认不出。
-func checkAbandonedTasks(ctx context.Context, ids []string, session *RunSession, agentName string) error {
-	if len(ids) == 0 {
-		return nil
-	}
+// beginRunActivity 校验放弃声明，再原子登记本次执行和要放弃的任务。排在建历史写入器和盖章之前。
+func beginRunActivity(ctx context.Context, ids []string, session *RunSession, agentName string) (context.Context, *compose_v2.TaskActivity, error) {
 	for _, id := range ids {
 		if id == "" || id == session.RunID {
-			return rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——放弃的是这次 Run 之前的任务，不能是空的，"+
+			return ctx, nil, rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——放弃的是这次 Run 之前的任务，不能是空的，"+
 				"也不能是这次 Run 自己的任务（RunID %q）", agentName, id, session.RunID)
 		}
 		if detachedFromRunning(ctx, id) {
-			return rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——它是脱离出来之前所在的任务，此刻正在执行，不能放弃",
+			return ctx, nil, rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——它是脱离出来之前所在的任务，此刻正在执行，不能放弃",
 				agentName, id)
 		}
-		if compose_v2.TaskExecuting(id) {
-			return rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——这个任务此刻正在执行，不能放弃", agentName, id)
-		}
 	}
-	return nil
+	ctx, activity, err := compose_v2.BeginTaskActivity(ctx, session.RunID, ids)
+	if err != nil {
+		return ctx, nil, fmt.Errorf("agent %q: %w", agentName, err)
+	}
+	return ctx, activity, nil
 }
 
 // abandonEntryTimeout 是入口收尾被放弃的任务时，存储调用（补结果、删存档）一共最多等多久。这一步排在这次 Run 的一切之前，
 // 后端挂住时不该拖住整个请求（agui 每次覆盖挂起都走这里）；到点同删档失败，告警、照常开这次 Run。
 var abandonEntryTimeout = 10 * time.Second
 
-// abandonTasksAtEntry 给 [WithAbandonedTasks] 声明放弃的任务收尾（ids 已经过 checkAbandonedTasks）：在 Run 入口、盖完任务章之后，
+// abandonTasksAtEntry 给 [WithAbandonedTasks] 声明放弃的任务收尾：调用方持有 beginRunActivity 取得的放弃许可。盖完任务章之后，
 // 记这次的输入与触发钩子之前调。补结果写进这次 Run 正在用的那场对话（ctx 上的历史写入器：顶层是这次入口刚建的，嵌套时是父层的
 // ——被调方的历史本来就沿用它；只按被调方自己的配置找时，它没配历史就不补，审计实测）；没有写入器（没配历史、声明了不进历史）
 // 时不补。收尾是尽力而为、有上限（abandonEntryTimeout）：失败只记日志——历史是旁路，放弃一个旧任务不该让这次

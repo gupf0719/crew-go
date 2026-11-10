@@ -151,9 +151,9 @@ func (o *Observability) endAgent(ctx context.Context, info *hook.AgentInfo, out 
 			o.inst.interrupts.Add(ctx, 1, metric.WithAttributes(AttrAgentName.String(info.Name), AttrAgentKind.String(info.Type)))
 			o.markInterrupted(interruptKey(compose_v2.GetSessionID(ctx), ah.graphNS, info.Name), time.Now())
 			qs := ie.AllQueries()
-			evAttrs := []attribute.KeyValue{AttrInterruptCount.Int(len(qs)), attribute.String("crew.interrupt.reason", ie.Reason)}
+			evAttrs := []attribute.KeyValue{AttrInterruptCount.Int(len(qs)), attribute.String("crew.interrupt.reason", o.errText(ie.Reason))}
 			if len(qs) > 0 && qs[0] != nil {
-				evAttrs = append(evAttrs, AttrInterruptID.String(qs[0].InterruptID))
+				evAttrs = append(evAttrs, AttrInterruptID.String(o.errText(qs[0].InterruptID)))
 				if o.recordContent {
 					evAttrs = append(evAttrs, attribute.String("crew.interrupt.question", o.text(qs[0].Question)))
 				}

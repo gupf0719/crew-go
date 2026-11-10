@@ -33,7 +33,7 @@ type runConfig struct {
 	// routeGrant 是上层交给本次调用的路由能力授予（见 routeGrant），规矩同 handoffGrant。
 	routeGrant *routeGrant
 
-	// abandoned 见 WithAbandonedTasks——各编排的 Run 入口读它（checkAbandonedTasks 校验、abandonTasksAtEntry 收尾）。
+	// abandoned 见 WithAbandonedTasks。beginRunActivity 校验并登记，abandonTasksAtEntry 收尾。
 	abandoned []string
 
 	// callKey 见 WithCallKey——只有 RunSubAgent 读它。
@@ -240,8 +240,7 @@ func WithRunMaxRounds(n int) RunOption {
 }
 
 // WithAbandonedTasks 声明这次 Run 开在调用方放弃了这几个任务之后——同一场会话里，新消息顶掉了挂起的审批或提问。入口在记
-// 这次的输入、触发 agent 级钩子之前，同 ResumeActionAbort 一样收尾每个被放弃的任务：给会话历史里它没有结果的工具调用补一条
-// 结果，再删它的存档；只是不另起一次调用、不触发钩子。
+// 这次的输入、触发 agent 级钩子之前收尾旧任务：先删存档，成功后给会话历史里的悬空工具调用补一条结果。
 //
 // 放没放弃只有调用方知道（同一场会话里可以同时挂着几个任务），框架不替你判：不给这个选项，旧任务照样能续（`Resume(oldRunID)`），
 // 它悬空的调用只在读侧补救、不写回历史。补的结果只在放弃的这一刻写——任务还能续的时候写「被放弃」是假话：续跑执行之后真结果
@@ -253,9 +252,9 @@ func WithRunMaxRounds(n int) RunOption {
 //
 // 删的是被放弃任务的整份存档（它的 RunID 名下的全部），不看这次 Run 所在的 ns，所以在哪儿给都行：顶层的 Run、顶层的自研壳经
 // EnterRun 透传的、节点或钩子里经 RunSubAgent 透传的。拒这几种：空的 RunID、这次 Run 自己的任务（嵌套位置上就是所在的任务）、
-// 脱离（DetachTask）出来之前所在的仍在执行的任务、本进程里此刻正在执行的任务（它的图在跑，compose_v2.TaskExecuting）。别的进程里
-// 在跑的、正处在图外那一段（编排的 agent 级钩子里）的任务认不出，别给。补结果写进这次 Run 正在用的那场对话（嵌套时是父层的）。
-// 先删存档、删成功才补结果：删失败时任务还能续，不写「被放弃」。
+// 脱离（DetachTask）出来之前所在的仍在执行的任务。入口登记整批放弃许可，支持租约的 Checkpointer 还需取得存储端许可。
+// 登记或申请许可时与在途执行或放弃冲突会返回 [compose_v2.ErrTaskBusy]。许可持有到删档和历史收尾完成。
+// 补结果写进这次 Run 正在用的那场对话（嵌套时是父层的）。
 //
 //	old := sess.RunID
 //	sess.NextTask()

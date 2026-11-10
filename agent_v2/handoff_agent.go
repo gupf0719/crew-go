@@ -264,9 +264,11 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	if err := checkAbandonedTasks(ctx, cfg.abandoned, session, h.Name()); err != nil {
+	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, h.Name())
+	if err != nil {
 		return nil, err
 	}
+	defer activity.Release()
 	ctx = WithSession(ctx, session)
 	// 历史写入器由**编排这一层**拥有：子里可能有不是 BasicAgent 的执行体（远程 / 自研 /
 	// 别的框架的壳），它们不会建也不会写。见 startHistoryForOrchestration。
@@ -292,6 +294,7 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 	ctx = enterGraphRunTask(ctx, session)
 	// 调用方声明放弃了的任务（WithAbandonedTasks）：在记这次的输入、触发钩子之前收尾
 	abandonTasksAtEntry(ctx, cfg.abandoned, h.Name())
+	activity.FinishAbandon()
 	var startErr error
 	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return hooks.OnAgentStart(c, info, agentIn)
@@ -358,6 +361,7 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	if prep.AbortDone {
 		return nil, nil
 	}
+	defer prep.activity.Release()
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	// MED-1 fail-fast：composite Resume 同样不透传 per-call 覆盖给 inner step。
 	if err := rejectCompositeOverride(rcfg.overrides()); err != nil {

@@ -338,7 +338,7 @@ func IsControlFlowSignal(err error) bool {
 	// 陈旧写回：**重试是有害的**——它的语义是"另一个执行者已经推进了这个会话，你这次
 	// 的账没记上"。重跑不会让账记上（对方还在那儿），只会把有副作用的节点再跑一遍。
 	// 实测过后果：编排 retry 静默重跑已成功的子 agent，扣款做了两次而业务拿到 err=nil。
-	if errors.Is(err, ErrCheckpointStale) {
+	if errors.Is(err, ErrCheckpointStale) || errors.Is(err, ErrTaskLeaseLost) {
 		return true
 	}
 	// 软取消：跟 ctx 取消**同族**，只是优雅版（当前超步跑完再停 + 存档）。业务在
@@ -355,13 +355,13 @@ func IsControlFlowSignal(err error) bool {
 //
 // 它跟 [IsControlFlowSignal] 的差别**只在 ctx 那一档，而那一档是承重的**：
 //
-//   - 三个**框架自铸的哨兵**（*InterruptError / ErrCheckpointStale / ErrSoftCanceled）
+//   - 框架的控制流信号（[InterruptError]、[ErrCheckpointStale]、[ErrTaskLeaseLost]、[ErrSoftCanceled]）
 //     照旧按 error 判——它们只可能由框架产出，第三方后端伪造不出来。
-//   - **ctx 那一档改成问 `ctx.Err()`**，因为 `context.Canceled` / `DeadlineExceeded`
+//   - **ctx 那一档改成问 `ctx.Err()`**，因为 `context.Canceled` / `context.DeadlineExceeded`
 //     是**全生态每个网络库都在产**的东西。「错误链上有 ctx 错」跟「我的 ctx 死了」是
 //     两回事，而只有后者才意味着「再做一次必然立即再失败」。
 //
-// ⚠️ 为什么不能反过来「只看 ctx」把三个哨兵那半也删掉：**软取消不动 ctx**（它在超步
+// ⚠️ 为什么还要按错误判框架信号：**软取消不动 ctx**（它在超步
 // 边界优雅停、`ctx.Err()` 恒 nil），只看 ctx 的话业务点了停、框架还会重试。
 //
 // 判别式（这条值得推广）：**`errors.Is(err, context.X)` 可以用来「贴标签 / 报状态 /
@@ -375,7 +375,7 @@ func IsRetryFutile(ctx context.Context, err error) bool {
 	if errors.As(err, &ie) {
 		return true
 	}
-	if errors.Is(err, ErrCheckpointStale) || errors.Is(err, ErrSoftCanceled) {
+	if errors.Is(err, ErrCheckpointStale) || errors.Is(err, ErrTaskLeaseLost) || errors.Is(err, ErrSoftCanceled) {
 		return true
 	}
 	// **问 ctx，不问 error。** ctx 为 nil 时退回 error 判据——调用方没给 ctx 就没有
@@ -429,9 +429,9 @@ func retriesExhausted(err error) bool {
 //
 // 四类不重试（对应函数体的四道闸）：
 //
-//   - **按错误本身就认得出的控制流信号**——中断（要等答案）、[ErrCheckpointStale]（重跑只会再造一份副作用）、
-//     [ErrSoftCanceled]（业务说了停）。**调用方的 ctx 结束了这一档不在这里判**：错误链上有
-//     `context.DeadlineExceeded` / `Canceled` 不等于调用方的 ctx 死了——pgx、`http.Client{Timeout}` 这类后端自己的
+//   - **按错误本身就认得出的控制流信号**包括中断、[ErrCheckpointStale]、[ErrTaskLeaseLost] 和
+//     [ErrSoftCanceled]。错误链上的
+//     `context.DeadlineExceeded` 或 `context.Canceled` 也可能来自 pgx、`http.Client{Timeout}` 这类后端自己的
 //     超时也是这个形状，按错误判会让它们一律不重试（曾经如此，实测只调 1 次）。调用方的 ctx 归 [RunWithRetry] 在调
 //     谓词之前用 [IsRetryFutile] 判；**自己写重试循环时也先问 `IsRetryFutile(ctx, err)`**，再问本函数
 //
@@ -461,7 +461,7 @@ func IsRetryable(err error) bool {
 	}
 	// 只认错误本身就说明了的信号；ctx 那一档问的是调用方的 ctx，见上面 godoc
 	var ie *InterruptError
-	if errors.As(err, &ie) || errors.Is(err, ErrCheckpointStale) || errors.Is(err, ErrSoftCanceled) {
+	if errors.As(err, &ie) || errors.Is(err, ErrCheckpointStale) || errors.Is(err, ErrTaskLeaseLost) || errors.Is(err, ErrSoftCanceled) {
 		return false
 	}
 	// provider 用标准状态码明说了「这个请求本身有问题」时，别再发一遍。
@@ -601,7 +601,8 @@ func isDeterministicHTTPFailure(code int) bool {
 // 这里重试用完时同样给最后那个错误打上它，外层的重试不再重做。
 //
 // **ctx cancel**：调用方 ctx 已取消 / 超时时，fn 的失败在第 2 步直接返（[IsRetryFutile]
-// 按调用方 ctx 判，不按错误链）；等待期间 ctx 取消时返 ctx 的错。
+// 按调用方 ctx 判，不按错误链）。Retry-After 达到或超过剩余期限时直接返回 fn 的错误，
+// 已开始等待时由 ctx 取消结束等待。
 func RunWithRetry[T any](ctx context.Context, cfg RetryConfig, fn func(ctx context.Context) (T, error)) (T, error) {
 	var zero T
 	// audit²³ HIGH-1 fix: nil fn 检 (协议二十三复证). 业务传 typed nil func → fn(ctx) 远 stack nil deref.
@@ -709,11 +710,12 @@ func RunWithRetry[T any](ctx context.Context, cfg RetryConfig, fn func(ctx conte
 		// 服务端明示 `Retry-After` 时**以它为准**——它是权威的，我们猜的指数退避要么
 		// 太早（再吃一次 429，部分 provider 还会因此延长封禁）要么太晚（白等）。
 		//
-		// **有意不受 MaxDelay 约束**：那个字段管的是指数退避别失控增长，不是用来推翻
-		// 服务端指令。外层边界交给 ctx——SleepWithContext 在 ctx 取消 / 超时时立即返回，
-		// 所以业务想给「最多等多久」兜底就设 ctx deadline（长跑场景本来就该设）。
+		// MaxDelay 只约束计算退避。服务端要求的等待到调用方期限才结束时，直接保留这次错误。
 		delay := BackoffDelay(cfg.BackoffPolicy, attempt+1)
 		if ra := RetryAfterFromError(err); ra > 0 {
+			if deadline, ok := ctx.Deadline(); ok && ra >= time.Until(deadline) {
+				return out, err
+			}
 			delay = ra
 		}
 		if err := SleepWithContext(ctx, delay); err != nil {

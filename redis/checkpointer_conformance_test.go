@@ -2,6 +2,7 @@ package redis_test
 
 import (
 	"testing"
+	"time"
 
 	"crew-go/compose_v2"
 	"crew-go/compose_v2/checkpointer_conformance"
@@ -22,5 +23,15 @@ func TestRedisCheckpointer_Conformance(t *testing.T) {
 		rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = rdb.Close() })
 		return redis.NewCheckpointer(rdb)
+	})
+}
+
+func TestRedisCheckpointer_TaskLeases(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	peer := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close(); _ = peer.Close() })
+	checkpointer_conformance.RunTaskLeaseTests(t, redis.NewCheckpointer(client), redis.NewCheckpointer(peer), func(string) {
+		mr.FastForward(2 * time.Minute)
 	})
 }

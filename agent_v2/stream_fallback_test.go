@@ -31,6 +31,7 @@ type streamProbeModel struct {
 	name        string
 	streamErr   error
 	nilReader   bool
+	reader      *schema.StreamReader[*schema.Message]
 	streamCalls atomic.Int32
 	genCalls    atomic.Int32
 }
@@ -47,6 +48,9 @@ func (m *streamProbeModel) Stream(context.Context, []*schema.Message, ...model.O
 	}
 	if m.streamErr != nil {
 		return nil, m.streamErr
+	}
+	if m.reader != nil {
+		return m.reader, nil
 	}
 	return schema.NewSingleChunkReader(schema.AssistantMessage(m.name + " stream")), nil
 }
@@ -120,6 +124,30 @@ func TestStreamOrGenerate_EndStreamHookErrorFailsCall(t *testing.T) {
 	}
 	if n := m.genCalls.Load(); n != 0 {
 		t.Fatalf("钩子报错不该改调 Generate，实际 Generate 被调 %d 次", n)
+	}
+}
+
+type panickingEndStreamHook struct{ hook.NoOpHooks }
+
+func (panickingEndStreamHook) OnModelEndStream(context.Context, *hook.AgentInfo, specModel.MessageStreamReader) (context.Context, specModel.MessageStreamReader, error) {
+	panic("stream hook panic")
+}
+
+func TestStreamOrGenerate_EndStreamHookPanicClosesProviderReader(t *testing.T) {
+	reader, _ := schema.NewStreamReader[*schema.Message](0)
+	defer reader.Close()
+	m := &streamProbeModel{reader: reader}
+	_, err := runStreamProbe(t, m, agent_v2.WithHooks(panickingEndStreamHook{}))
+	if err == nil || !strings.Contains(err.Error(), "stream hook panic") {
+		t.Fatalf("Run 应返回钩子 panic，实际 %v", err)
+	}
+	select {
+	case <-reader.Done():
+	default:
+		t.Error("Run 返回时应已关闭原始模型流")
+	}
+	if n := m.genCalls.Load(); n != 0 {
+		t.Errorf("钩子 panic 不应回退 Generate，实际调用 %d 次", n)
 	}
 }
 

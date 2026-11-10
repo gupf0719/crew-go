@@ -291,9 +291,10 @@ type sessionKey struct {
 
 // sessionEntry 是一个会话（owner + threadId）的挂起状态。
 type sessionEntry struct {
-	sess      *agent_v2.RunSession // 中断挂起的 sess（待续发 Resume 续用）；busy 壳期间可能 nil
-	busy      bool                 // 有在途 Run/Resume——防并发续发 + 覆盖竞态
-	touchedAt int64                // 最后活动 Unix nano，LRU 淘汰用
+	sess       *agent_v2.RunSession // 中断挂起的 sess（待续发 Resume 续用）；busy 壳期间可能 nil
+	busy       bool                 // 有在途 Run/Resume 或正在回收
+	reclaiming bool                 // 正在回收的条目暂不计入淘汰配额
+	touchedAt  int64                // 最后活动 Unix nano，LRU 淘汰用
 	// open 是挂起的那个 run 交给前端的全部中断（InterruptID → 是不是工具审批）。续跑的 resume 列表必须恰好覆盖它们
 	// （AG-UI：不支持只答一部分，也不能答不在其中的）；审批的答复先校验再开跑，认不出的整批拒绝、这些问题保持
 	// 挂起（交给审批层的话认不出就按拒绝处理，`{"approved":true}`、`Yes.` 曾都被当成拒绝）。
@@ -426,24 +427,30 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	// ServeHTTP 没给就铸一个，见那里的说明。
 	// key 含 owner 维——map 键一律用它，wire 事件仍用裸 ThreadID（前端只认自己给的那个）。
 	stale, evicted, ok := h.acquireForRun(key)
-	// 过期回收出来的 cp 要清，**这条早退路径上也要**——acquireForRun 已经把那些 entry
-	// 从表里删了，这儿不清就没有第二次机会。
-	for _, sid := range evicted {
-		h.dropCP(ctx, sid)
+	if ok {
+		defer h.releaseBusy(key)
 	}
+	// 目标键忙时也要清理已回收条目的存档，并释放回收许可。
+	h.cleanupEvicted(ctx, evicted)
 	if !ok {
 		_ = sse.Reject(http.StatusConflict, "busy", "run already in progress for this thread")
 		return
 	}
-	defer h.releaseBusy(key) // 确保 busy 清（含 panic 路径）
 	// 已有挂起 sess（用户开新对话、放弃旧中断）→ 清旧 cp 防孤儿泄漏，并让这次 Run 在入口给它悬空的工具调用补结果
 	// （agent_v2.WithAbandonedTasks：同一场会话、这次 Run 自己的 agent 与 ctx，不另起调用、不跑钩子）。删档先在这里做：
 	// 它不依赖业务代码、有自己的上限；那个选项里再删一次是幂等的（同样有上限）。被淘汰、过期回收的是别的 thread，这里没有它的 agent 与
 	// ctx，只删存档、悬空的调用交给读侧（见 doc/code/todo.md 第 263 行附近）。
 	var abandonOpts []agent_v2.RunOption
-	if stale != nil {
-		h.dropCP(ctx, stale.RunID)
-		abandonOpts = append(abandonOpts, agent_v2.WithAbandonedTasks(stale.RunID))
+	var staleMayBeResumable bool
+	if stale != nil && stale.sess != nil {
+		dropErr := h.dropCP(ctx, stale.sess.RunID)
+		if errors.Is(dropErr, compose_v2.ErrTaskBusy) {
+			h.restoreEntry(key, stale)
+			_ = sse.Reject(http.StatusConflict, "busy", "an operation on the previous task is in progress")
+			return
+		}
+		staleMayBeResumable = dropErr != nil
+		abandonOpts = append(abandonOpts, agent_v2.WithAbandonedTasks(stale.sess.RunID))
 	}
 
 	adapter := newSSEAdapter(sse, in.RunID, in.Messages)
@@ -504,6 +511,17 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	_, err := ag.Run(ctx, sess, inputMsg, abandonOpts...)
 	settled = true
 	adapter.finish()
+	if errors.Is(err, compose_v2.ErrTaskBusy) {
+		// 内层任务也可能返回 busy，父图此时可能已给本次新任务写档。
+		h.dropCP(ctx, sess.RunID)
+		if staleMayBeResumable {
+			h.restoreEntry(key, stale)
+		} else {
+			h.removeEntry(key)
+		}
+		_ = sse.Reject(http.StatusConflict, "busy", "an operation on this or the previous task is in progress")
+		return
+	}
 
 	h.handleOutcome(ctx, sse, key, runID, sess, prior, err)
 }
@@ -633,13 +651,17 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 	}()
 
 	// 全 cancelled（用户放弃、无任何有效答复）→ 终止整个 run，对齐官方 AG-UI cancelled
-	// 语义 "user abandoned"。ResumeActionAbort 清 cp + 退出（返 nil error）。
+	// 语义 "user abandoned"。ResumeActionAbort 清 cp 后退出。
 	if hasCancelled && !hasResolved {
 		_, err := ag.Resume(ctx, sess.RunID,
 			agent_v2.WithResumeSession(sess),
 			agent_v2.WithResumeAction(agent_v2.ResumeActionAbort))
 		settled = true
 		adapter.finish()
+		if errors.Is(err, compose_v2.ErrTaskBusy) {
+			_ = sse.Reject(http.StatusConflict, "busy", "an operation on this task is in progress")
+			return
+		}
 		h.removeEntry(key) // run 终止，清挂起 entry
 		if err != nil {
 			_ = sse.WriteEvent(NewRunError(err.Error(), "abort_failed"))
@@ -664,6 +686,10 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 		agent_v2.WithResumeUserInputs(h.recordAnswers(key, answers)))
 	settled = true
 	adapter.finish()
+	if errors.Is(err, compose_v2.ErrTaskBusy) {
+		_ = sse.Reject(http.StatusConflict, "busy", "an operation on this task is in progress")
+		return
+	}
 
 	h.handleOutcome(ctx, sse, key, wireRunID, sess, prior, err)
 }
@@ -787,34 +813,23 @@ func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key session
 // ── sessions map 并发 + 生命周期 helpers ──
 
 // acquireForRun 为 serveRun 占用会话键（标 busy）。已 busy（在途 Run/Resume）返
-// ok=false。返旧挂起 sess（stale，非 nil 时 caller 清其 cp）+ 因上限淘汰的旧 sid 列表
-// （caller 清其 cp）。
-func (h *handler) acquireForRun(key sessionKey) (stale *agent_v2.RunSession, evicted []string, ok bool) {
+// ok=false。返回待覆盖的旧条目和待回收任务。调用方用 cleanupEvicted 完成回收。
+func (h *handler) acquireForRun(key sessionKey) (stale *sessionEntry, evicted []evictedTask, ok bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	// **expired 必须无条件带出去**，包括下面 busy 早退那条：sweep 已经把 entry 从表里
-	// 删了，RunID 掉在地上就是一堆没人清的 cp 孤儿。
-	expired := h.sweepExpiredLocked()
+	// busy 早退也要把已回收任务带出去，交给调用方删档并释放许可。
+	expired := h.sweepExpiredLocked(key)
 	if e := h.sessions[key]; e != nil {
 		if e.busy {
 			return nil, expired, false
 		}
-		stale = e.sess // 旧挂起（覆盖前 caller 清其 cp）
+		stale = e
 	}
 	h.sessions[key] = &sessionEntry{busy: true, touchedAt: time.Now().UnixNano()}
 	// 淘汰要知道「这一次是谁把表撑过上限的」——刚插进去的这条就是它，账记在它头上。
-	evicted = append(expired, h.evictIfNeededLocked(key.owner)...)
+	evicted = append(expired, h.evictIfNeededLocked(key.owner, nil)...)
 	return stale, evicted, true
 }
-
-// sweepExpiredLocked 回收闲置超过 sessionTTL 的空闲挂起会话，返回它们的 RunID 供 caller
-// 清 cp。调用方必须持锁。
-//
-// **惰性 + 限频**：只在请求进来时顺手扫，且最多每 TTL/4 扫一次——扫一次是 O(n)，每个请求
-// 都扫会让 10000 条的表变成每请求一万次比较。限频的代价是回收最晚迟到 TTL/4，无所谓。
-//
-// 在途（busy）的跳过：它正被一个请求驱动着，删了那个请求的 releaseBusy / storeInterrupt
-// 就写到一个已经不在表里的 entry 上（那两处对 nil 都是 no-op，不会 panic，但会静默丢挂起）。
 
 // expiredLocked 判一条会话是不是已经闲置超过 sessionTTL。TTL<=0（默认）恒 false。
 // 调用方必须持锁。
@@ -825,7 +840,9 @@ func (h *handler) expiredLocked(e *sessionEntry) bool {
 	return time.Now().UnixNano()-e.touchedAt > int64(h.sessionTTL)
 }
 
-func (h *handler) sweepExpiredLocked() []string {
+// sweepExpiredLocked 回收闲置超过 sessionTTL 的挂起会话。每 TTL/4 至多扫描一次。
+// 在途请求或任务冲突保留条目，留待下次扫描。调用方须持 h.mu。
+func (h *handler) sweepExpiredLocked(target sessionKey) []evictedTask {
 	if h.sessionTTL <= 0 {
 		return nil
 	}
@@ -834,17 +851,16 @@ func (h *handler) sweepExpiredLocked() []string {
 		return nil
 	}
 	h.lastSweep = now
-	var sids []string
+	var tasks []evictedTask
 	for k, e := range h.sessions {
-		if e.busy || !h.expiredLocked(e) {
+		if k == target || e.busy || !h.expiredLocked(e) {
 			continue
 		}
-		delete(h.sessions, k)
-		if e.sess != nil {
-			sids = append(sids, e.sess.RunID)
+		if task, ok := h.tryEvictLocked(k, e); ok && task.sid != "" {
+			tasks = append(tasks, task)
 		}
 	}
-	return sids
+	return tasks
 }
 
 // acquireForResume 为 serveResume 占用挂起会话（标 busy），返回挂起的中断（InterruptID → 是不是工具审批）与 Run 时的
@@ -969,6 +985,106 @@ func (h *handler) removeEntry(key sessionKey) {
 	delete(h.sessions, key)
 }
 
+// restoreEntry 恢复因任务冲突而无法覆盖的挂起会话，busy 由当前请求退出时释放。
+func (h *handler) restoreEntry(key sessionKey, entry *sessionEntry) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	entry.busy = true
+	h.sessions[key] = entry
+}
+
+type evictedTask struct {
+	key      sessionKey
+	entry    *sessionEntry
+	sid      string
+	activity *compose_v2.TaskActivity
+	capacity bool
+	inserter string
+}
+
+// tryEvictLocked 先取得进程内许可。需要清档的条目保持 busy，等锁外取得共享租约并完成删档。
+func (h *handler) tryEvictLocked(key sessionKey, entry *sessionEntry) (evictedTask, bool) {
+	task := evictedTask{key: key, entry: entry}
+	if entry.sess != nil {
+		task.sid = entry.sess.RunID
+		if h.cp != nil && task.sid != "" {
+			_, activity, err := compose_v2.BeginTaskActivity(context.Background(), "", []string{task.sid})
+			if err != nil {
+				return evictedTask{}, false
+			}
+			task.activity = activity
+			entry.busy = true
+			entry.reclaiming = true
+			return task, true
+		}
+	}
+	delete(h.sessions, key)
+	return task, true
+}
+
+// cleanupEvicted 在 h.mu 外申请共享租约并清档。失败时恢复条目的可回收状态。
+func (h *handler) cleanupEvicted(ctx context.Context, tasks []evictedTask) {
+	defer func() {
+		for _, task := range tasks {
+			h.finishEviction(task, false)
+		}
+	}()
+	var capacityCtx context.Context
+	var skipped map[sessionKey]bool
+	for len(tasks) > 0 {
+		task := tasks[0]
+		leaseCtx := context.WithoutCancel(ctx)
+		if task.capacity {
+			if capacityCtx == nil {
+				var cancel context.CancelFunc
+				capacityCtx, cancel = context.WithTimeout(leaseCtx, dropCPTimeout)
+				defer cancel()
+			}
+			leaseCtx = capacityCtx
+		}
+		var err error
+		if task.activity != nil {
+			var cleanupCtx context.Context
+			cleanupCtx, err = task.activity.WithCheckpointLeases(leaseCtx, h.cp)
+			if err == nil {
+				err = h.deleteCP(cleanupCtx, task.sid)
+			} else if !errors.Is(err, compose_v2.ErrTaskBusy) {
+				slog.WarnContext(ctx, "agui: 无法取得任务回收租约", "sid", task.sid, "err", err)
+			}
+			h.finishEviction(task, err == nil)
+		}
+		tasks = tasks[1:]
+		if task.capacity && errors.Is(err, compose_v2.ErrTaskBusy) && capacityCtx.Err() == nil {
+			if skipped == nil {
+				skipped = make(map[sessionKey]bool)
+			}
+			skipped[task.key] = true
+			h.mu.Lock()
+			next := h.evictIfNeededLocked(task.inserter, skipped)
+			h.mu.Unlock()
+			tasks = append(tasks, next...)
+		}
+	}
+}
+
+func (h *handler) finishEviction(task evictedTask, removed bool) {
+	if task.activity == nil {
+		return
+	}
+	defer task.activity.Release()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.sessions[task.key] != task.entry {
+		return
+	}
+	if removed {
+		delete(h.sessions, task.key)
+	} else {
+		task.entry.busy = false
+		task.entry.reclaiming = false
+	}
+}
+
 // evictCandidate 是一条「可以拿来抵账」的空闲 entry（连同它那个 owner 当前占的份额）。
 type evictCandidate struct {
 	key   sessionKey
@@ -992,7 +1108,7 @@ func (c evictCandidate) beats(o evictCandidate) bool {
 	}
 }
 
-// evictIfNeededLocked 超上限时淘汰一条空闲（非 busy）entry，返其 sid 供 caller 清 cp。
+// evictIfNeededLocked 超上限时淘汰一条空闲 entry，返回删档许可。
 // inserter 是刚把表撑过上限的那个 owner。调用方须持 h.mu。
 //
 // 两条规矩，缺一条就漏一种跨租户 DoS：
@@ -1010,7 +1126,7 @@ func (c evictCandidate) beats(o evictCandidate) bool {
 // 平局时到达者自己付账，可它手上只有刚插入的那条 busy entry ⟹ **没有可淘汰的**，
 // 这时**不淘汰**（返 nil，表暂时超出上限），不回落去找别人。代价见 WithMaxSessions
 // 的 godoc：上限因此是软的。
-func (h *handler) evictIfNeededLocked(inserter string) []string {
+func (h *handler) evictIfNeededLocked(inserter string, skipped map[sessionKey]bool) []evictedTask {
 	if h.maxSessions <= 0 || len(h.sessions) <= h.maxSessions {
 		return nil
 	}
@@ -1018,48 +1134,75 @@ func (h *handler) evictIfNeededLocked(inserter string) []string {
 	// ——刚插入的那条算进到达者头上，它才会跟受害者「平局」而不是「份额 0」。不算的话
 	// 到达者恒是最小的那个，第 2 条规矩就形同虚设（实测：不算就退回原来的 DoS）。
 	shares := make(map[string]int, len(h.sessions))
-	for k := range h.sessions {
+	total := 0
+	for k, e := range h.sessions {
+		if e.reclaiming {
+			continue
+		}
 		shares[k.owner]++
+		total++
+	}
+	if total <= h.maxSessions {
+		return nil
 	}
 	mine := shares[inserter]
 
-	var best evictCandidate
+	var candidates []evictCandidate
 	for k, e := range h.sessions {
-		if e.busy {
+		if e.busy || skipped[k] {
 			continue // 在途，动不得
 		}
 		s := shares[k.owner]
 		if k.owner != inserter && s <= mine {
 			continue // 到达者不赢平局
 		}
-		c := evictCandidate{key: k, entry: e, share: s}
-		if best.entry == nil || c.beats(best) {
-			best = c
+		candidates = append(candidates, evictCandidate{key: k, entry: e, share: s})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].beats(candidates[j]) })
+	for _, candidate := range candidates {
+		task, ok := h.tryEvictLocked(candidate.key, candidate.entry)
+		if !ok {
+			continue
 		}
+		if task.sid == "" {
+			return nil
+		}
+		task.capacity = true
+		task.inserter = inserter
+		return []evictedTask{task}
 	}
-	if best.entry == nil {
-		return nil // 无可淘汰（到达者自己没有空闲会话 / 别人都在途）——表暂时超出上限
-	}
-	delete(h.sessions, best.key)
-	if best.entry.sess == nil {
-		return nil // 空壳（还没挂起过），没有 cp 要清
-	}
-	return []string{best.entry.sess.RunID}
+	return nil // 无可淘汰时允许表暂时超出上限。
 }
 
-// dropCP 清一个 sid 的 cp 子树（覆盖旧挂起 / 淘汰时防 cp 孤儿泄漏）。cp 未配则 no-op。
+// dropCP 尽力清一个 sid 的 cp 子树（覆盖旧挂起 / 淘汰时防 cp 孤儿泄漏）。任务正忙时返回 ErrTaskBusy。
 // 用 DeleteSubtree 直删而非 Resume(Abort)——淘汰场景不需 agent 层 emit，省 build 开销。
-func (h *handler) dropCP(ctx context.Context, sid string) {
+func (h *handler) dropCP(ctx context.Context, sid string) error {
 	if h.cp == nil || sid == "" {
-		return
+		return nil
 	}
+	cleanupCtx := compose_v2.WithCheckpointerCtx(context.WithoutCancel(ctx), h.cp)
+	cleanupCtx, activity, err := compose_v2.BeginTaskActivity(cleanupCtx, "", []string{sid})
+	if err != nil {
+		slog.WarnContext(ctx, "agui: 跳过仍有操作在途的任务存档清理", "sid", sid, "err", err)
+		return err
+	}
+	defer activity.Release()
+	return h.deleteCP(cleanupCtx, sid)
+}
+
+// deleteCP 在持有任务的删档许可时调用。
+func (h *handler) deleteCP(ctx context.Context, sid string) error {
 	// detached ctx——cp 清理不受 request ctx 取消影响（client 断开时仍要清孤儿 cp；honor-ctx
 	// 的 backend 如 PG/Redis 尤其需要，否则 ctx 取消让 DeleteSubtree 失败反而漏清）。对齐
 	// a2a executor 的 context.WithoutCancel。另加上限：后端挂住时 handler 不一直卡着（同引擎出口的宽限期）。
 	// best-effort：失败不阻断主流程（cp 泄漏优于崩）。
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropCPTimeout)
 	defer cancel()
-	_, _ = h.cp.DeleteSubtree(dctx, sid, "")
+	_, err := h.cp.DeleteSubtree(dctx, sid, "")
+	if err != nil {
+		slog.WarnContext(ctx, "agui: 存档清理失败", "sid", sid, "err", err)
+	}
+	return err
 }
 
 // dropCPTimeout 是 dropCP 最多等多久。

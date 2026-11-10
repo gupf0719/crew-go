@@ -67,6 +67,77 @@ func TestNestedRun_OnOwnSlotRejectedWithoutPurging(t *testing.T) {
 	}
 }
 
+func TestNestedRun_OnAncestorSlotRejectedWithoutPurging(t *testing.T) {
+	const outerNS = "tenant/outer"
+	for _, ns := range []string{outerNS, "tenant"} {
+		t.Run(ns, func(t *testing.T) { checkNestedRunOnAncestorSlot(t, outerNS, ns) })
+	}
+}
+
+func checkNestedRunOnAncestorSlot(t *testing.T, outerNS, targetNS string) {
+	t.Helper()
+	const sid = "ancestor-session"
+	middleNS := compose_v2.JoinNS(outerNS, "middle")
+	cp := compose_v2.NewInMemoryCheckpointer()
+	var innerErr error
+	var ancestorClaim *compose_v2.SlotClaim
+	var ran int
+	var slotKept bool
+	// 内外层图拓扑相同。若错误读入了外层的挂起档，内层会从同一 frontier 续跑并执行副作用。
+	build := func(ask, delegate compose_v2.NodeFunc) *compose_v2.Graph {
+		b := compose_v2.NewBuilder().WithName("ancestor_slot")
+		b.AddNode("ask", ask)
+		b.AddNode("delegate", delegate)
+		b.AddEdge(compose_v2.StartNode, "ask")
+		b.AddEdge("ask", "delegate")
+		b.AddEdge("delegate", compose_v2.EndNode)
+		return rsCompile(t, b)
+	}
+	inner := build(func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		return nil, nil
+	}, func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		ran++
+		return nil, nil
+	})
+	b := compose_v2.NewBuilder().WithName("ancestor_slot_middle")
+	b.AddNode("nested", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		_, ancestorClaim = compose_v2.OccupySlot(compose_v2.WithGraphNS(ctx, targetNS), sid)
+		innerErr = compose_v2.Run(ctx, inner, compose_v2.NewChannelManager(), compose_v2.WithRunNS(targetNS))
+		var err error
+		slotKept, err = cp.ExistsNS(ctx, sid, outerNS)
+		return nil, err
+	})
+	b.AddEdge(compose_v2.StartNode, "nested")
+	b.AddEdge("nested", compose_v2.EndNode)
+	middle := rsCompile(t, b)
+	outer := build(func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		_, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "继续吗"})
+		return nil, err
+	}, func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		return nil, compose_v2.Run(ctx, middle, compose_v2.NewChannelManager(), compose_v2.WithRunNS(middleNS))
+	})
+	if outer.ID() != inner.ID() {
+		t.Fatal("内外层图应共享 GraphID")
+	}
+	ctx := context.Background()
+	opts := []compose_v2.RunOption{compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID(sid), compose_v2.WithRunNS(outerNS)}
+	err := compose_v2.Run(ctx, outer, compose_v2.NewChannelManager(), opts...)
+	ie, ok := compose_v2.IsInterrupt(err)
+	if !ok {
+		t.Fatalf("外层图应挂起，实际 %v", err)
+	}
+	if exists, err := cp.ExistsNS(ctx, sid, outerNS); err != nil || !exists {
+		t.Fatalf("应已写入外层存档，exists=%v err=%v", exists, err)
+	}
+	answers := map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("是")}
+	if err := compose_v2.Run(ctx, outer, compose_v2.NewChannelManager(), append(opts, compose_v2.WithResumeAnswers(answers))...); err != nil {
+		t.Fatalf("外层图应能续跑完成，实际 %v", err)
+	}
+	if ancestorClaim != nil || !errors.Is(innerErr, compose_v2.ErrRunAborted) || ran != 0 || !slotKept {
+		t.Fatalf("祖先槽被重用，claim=%v err=%v 副作用次数=%d 存档保留=%v", ancestorClaim, innerErr, ran, slotKept)
+	}
+}
+
 // 没配 checkpointer、或给了自己的 ns：照常跑。
 func TestNestedRun_NoCheckpointerOrOwnNSRuns(t *testing.T) {
 	for _, tc := range []struct {

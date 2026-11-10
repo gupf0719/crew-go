@@ -5,8 +5,8 @@ CLAUDE.md "交付纪律" 提到的两个 binary 冒烟具体操作。改 cp / �
 ## 1. nested_smoke（约 30 秒）
 
 验证 **7 编排** (BasicAgent + Sequential + Loop + Reflect + Handoff + Parallel + Routing；
-含 BasicAgent 顶层) HITL Resume 闭环 + cleanup + ns 物理分离 + GraphID 防串台 + ThreadID
-跨 run。**PlanAgent / GraphAgent 嵌套 HITL 走独立单测** (`agent_v2/plan_nested_resume_test.go`
+含 BasicAgent 顶层) HITL Resume 闭环、存档清理、namespace 隔离和 GraphID 防串台。
+**PlanAgent / GraphAgent 嵌套 HITL 走独立单测** (`agent_v2/plan_nested_resume_test.go`
 + `r30_graph_agent_hook_order_test.go` + `r31_graph_resume_test.go`)，本 smoke 不覆盖。
 
 ```bash
@@ -42,52 +42,77 @@ go run ./example/orchestration/nested_smoke
 
 ## 2. plan_chat_web mock + HITL Resume（30 秒）
 
-验证 BasicAgent + hook 主动 interrupt + Resume Continue + SSE 流连贯 + cleanupOnSuccess。
+验证 BasicAgent 经 HTTP 挂起、SSE 报告中断、Resume Continue 产出最终消息，以及已完成的会话拒绝再次续跑。存档清理由 `nested_smoke` 直接查询 Checkpointer 验证。
+
+从仓库根目录运行下面的 Bash 命令。默认监听 `127.0.0.1:19999`，可用 `SMOKE_PORT` 换端口。
 
 ```bash
-# 1. 启服务（mock 模式不依赖真 LLM）
-go build -o /tmp/web ./example/orchestration/plan_chat_web
-/tmp/web -mock -addr :19999 -compaction-window 1000 > /tmp/web.log 2>&1 &
-SERVER_PID=$!
-sleep 1
+(
+  set -eu
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/crew-go-web-smoke.XXXXXX")
+  server_pid= chat_pid=
+  cleanup() {
+    result=$?
+    for pid in "$chat_pid" "$server_pid"; do
+      if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+      fi
+    done
+    if [ "$result" -eq 0 ]; then
+      rm -rf "$tmp"
+    else
+      printf '冒烟失败，日志目录 %s\n' "$tmp" >&2
+    fi
+  }
+  trap cleanup EXIT
 
-# 2. 启 chat 后台抓 sessionID（scenario 模式让 PlanAgent 多步比 chat_entry 慢）
-rm -f /tmp/chat_intr.log
-(curl -sN "http://localhost:19999/api/chat?q=plan+budget+report&mode=budget" --max-time 60 > /tmp/chat_intr.log 2>&1) &
-INTR_PID=$!
-sleep 0.5
+  port=${SMOKE_PORT:-19999}
+  base="http://127.0.0.1:$port"
+  curl_local() { curl --noproxy 127.0.0.1 "$@"; }
+  go build -o "$tmp/web" ./example/orchestration/plan_chat_web
+  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    printf '端口 %s 已占用，请设置 SMOKE_PORT\n' "$port" >&2
+    exit 1
+  fi
+  "$tmp/web" -mock -addr "127.0.0.1:$port" -compaction-window 1000 > "$tmp/server.log" 2>&1 &
+  server_pid=$!
 
-# 3. grab SID
-SID=$(grep -o 'session_id":"[^"]*' /tmp/chat_intr.log | head -1 | cut -d'"' -f3)
-echo "SID=$SID"
+  ready=
+  for ((i=0; i<100; i++)); do
+    kill -0 "$server_pid"
+    if curl_local -fs --max-time 1 "$base/" > /dev/null; then ready=1; break; fi
+    sleep 0.05
+  done
+  test "$ready" = 1
+  kill -0 "$server_pid"
 
-# 4. 立即触发 hook interrupt
-curl -s -w "interrupt HTTP=%{http_code}\n" -X POST "http://localhost:19999/api/interrupt?session_id=$SID" -o /dev/null
+  curl --noproxy 127.0.0.1 -fsSN --max-time 60 "$base/api/chat?q=plan+budget+report&mode=budget" > "$tmp/chat.sse" &
+  chat_pid=$!
+  # 等模型节点开始执行，再请求挂起。
+  for ((i=0; i<100; i++)); do
+    if grep -Fq '"type":"model_start"' "$tmp/chat.sse"; then break; fi
+    sleep 0.05
+  done
+  grep -Fq '"type":"model_start"' "$tmp/chat.sse"
+  sid=$(grep -m 1 -oE '"session_id":"[^"]+"' "$tmp/chat.sse" | cut -d'"' -f4)
+  test -n "$sid"
+  curl_local -fsS --max-time 5 -X POST "$base/api/interrupt?session_id=$sid" -o /dev/null
+  wait "$chat_pid"
+  chat_pid=
+  grep -F '"type":"interrupted"' "$tmp/chat.sse" | grep -Fq '"status":"pending"'
 
-# 5. 等 chat 收 interrupted 事件后退出
-wait $INTR_PID 2>/dev/null
-
-# 6. 验证 interrupted 事件
-grep -E '"type":"interrupted"' /tmp/chat_intr.log | head -1
-
-# 7. Resume continue
-rm -f /tmp/chat_resume.log
-curl -sN "http://localhost:19999/api/chat?session_id=$SID&action=continue" --max-time 30 > /tmp/chat_resume.log 2>&1
-grep -E '"type":"(final|done)"' /tmp/chat_resume.log | head -2
-
-# 8. 验证 session 完成后清理
-curl -s "http://localhost:19999/api/chat?session_id=$SID" | head -1
-# 预期: "session already completed (status=success)"（HTTP 410）
-
-# 9. 收尾
-kill $SERVER_PID 2>/dev/null
+  curl_local -fsSN --max-time 30 "$base/api/chat?session_id=$sid&action=continue" > "$tmp/resume.sse"
+  grep -Fq '"type":"final"' "$tmp/resume.sse"
+  grep -F '"type":"done"' "$tmp/resume.sse" | grep -Fq '"status":"success"'
+  status=$(curl_local -sS --max-time 5 -o "$tmp/terminal.txt" -w '%{http_code}' "$base/api/chat?session_id=$sid")
+  test "$status" = 410
+  grep -Fxq 'session already completed (status=success)' "$tmp/terminal.txt"
+  printf 'plan_chat_web mock 冒烟通过\n'
+)
 ```
 
-**关键验证点**：
-- ✅ `interrupted` 事件含 `query.interrupt_id="..."` + `query.question="已挂起，请点继续或换方向。"`（v2 严格契约 — InterruptError.Query 必须非 nil）
-- ✅ cp 含 `frontier:["model"]` + `status:"pending"`
-- ✅ Resume continue → 出 `final` + `done` 事件，history_size 累积
-- ✅ 第二次同 sessionID 请求返 "session not found"（cleanupOnSuccess 工作）
+脚本检查 `interrupted` 事件中的 pending 存档、续跑的 `final` 和成功 `done` 事件，以及后续请求的 HTTP 410。会话 slot 在完成后由 TTL sweeper 回收。
 
 ## 3. a2a 冒烟（3a/3b 必跑；3c/3d 可选）
 

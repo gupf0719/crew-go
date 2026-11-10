@@ -35,6 +35,10 @@ import (
 // PendingQuestionsKey 是 input-required 状态消息里挂起清单那个 DataPart 的键。
 const PendingQuestionsKey = "crew.pending"
 
+// ReplyToInterruptIDsKey 是续发消息的 metadata 键，值是发送方已看到的挂起 interruptId 的 JSON 数组。
+// 服务端用它校验答复仍属于同一轮提问，答复正文和附件保留在原 parts。
+const ReplyToInterruptIDsKey = "crew.replyToInterruptIds"
+
 // PendingQuestion 是远端挂起的一问。
 type PendingQuestion struct {
 	InterruptID string   `json:"interruptId"`

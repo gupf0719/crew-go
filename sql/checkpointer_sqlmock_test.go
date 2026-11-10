@@ -219,6 +219,8 @@ func TestCheckpointer_Setup_PG_DDL(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("CREATE INDEX IF NOT EXISTS crew_checkpoint_sid_status_idx")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("CREATE TABLE IF NOT EXISTS crew_checkpoint_task_lease")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	if err := cp.Setup(context.Background()); err != nil {
 		t.Errorf("Setup: %v", err)
@@ -237,10 +239,9 @@ func TestCheckpointer_Setup_MySQL_DDL(t *testing.T) {
 
 	cp := agentSQL.NewCheckpointer(db, agentSQL.MySQL{})
 
-	// audit iter-5: 回滚 iter-4 stored procedure — 简单 CREATE TABLE + 2 索引
-	mock.ExpectExec(regexp.QuoteMeta("CREATE TABLE IF NOT EXISTS crew_checkpoint")).
+	mock.ExpectExec(`(?s)CREATE TABLE IF NOT EXISTS crew_checkpoint \(.*INDEX sid_status_idx \(sid, status\).+ENGINE=InnoDB`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec(regexp.QuoteMeta("CREATE INDEX crew_checkpoint_sid_status_idx")).
+	mock.ExpectExec(regexp.QuoteMeta("CREATE TABLE IF NOT EXISTS crew_checkpoint_task_lease")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	if err := cp.Setup(context.Background()); err != nil {

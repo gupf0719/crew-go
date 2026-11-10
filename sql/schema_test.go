@@ -104,6 +104,7 @@ func TestCheckpointer_Setup_PG_PayloadIsJSONNotJSONB(t *testing.T) {
 	cp := agentSQL.NewCheckpointer(db, agentSQL.Postgres{})
 	mock.ExpectExec(`payload\s+JSON NOT NULL`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS crew_checkpoint_task_lease").WillReturnResult(sqlmock.NewResult(0, 0))
 	if err := cp.Setup(context.Background()); err != nil {
 		t.Errorf("Setup: %v（payload 列若是 JSONB，存档里任何带 NUL 的值都会让整份写入失败）", err)
 	}
@@ -160,7 +161,7 @@ func TestSetup_IdentityColumnsCompareBytes(t *testing.T) {
 				return agentSQL.NewCheckpointer(db, agentSQL.MySQL{}).Setup(context.Background())
 			},
 			`sid\s+VARBINARY\(1020\) NOT NULL,\s+ns\s+VARBINARY\(2048\) NOT NULL,\s+parent_ns\s+VARBINARY\(2048\) NOT NULL DEFAULT '',(?s).*graph_id\s+VARBINARY\(1020\) NOT NULL DEFAULT '',`,
-			false,
+			true,
 		},
 		{
 			"history/PG",
@@ -188,6 +189,9 @@ func TestSetup_IdentityColumnsCompareBytes(t *testing.T) {
 			mock.ExpectExec(c.pattern).WillReturnResult(sqlmock.NewResult(0, 0))
 			if !c.inlineIndex {
 				mock.ExpectExec("CREATE INDEX").WillReturnResult(sqlmock.NewResult(0, 0))
+			}
+			if strings.HasPrefix(c.name, "checkpointer/") {
+				mock.ExpectExec("CREATE TABLE IF NOT EXISTS crew_checkpoint_task_lease").WillReturnResult(sqlmock.NewResult(0, 0))
 			}
 			if err := c.setup(db); err != nil {
 				t.Errorf("Setup 的建表语句里身份列不是按字节比较的类型 / 排序规则: %v", err)

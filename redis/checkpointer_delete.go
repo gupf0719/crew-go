@@ -20,6 +20,7 @@ import (
 //	[1] = nsidx key {prefix}:cp:nsidx:{sid}
 //	[2] = pending key {prefix}:cp:pending:{sid}
 //	[3] = sids key {prefix}:cp:sids
+//	[4] = 任务租约 key
 //
 // **ARGV**:
 //
@@ -28,6 +29,7 @@ import (
 //	[3] = item_key_prefix
 //	[4] = meta_key_prefix
 //	[5] = 层级分隔符 (compose_v2.NSSubtreeSeparator(), 划定子树用)
+//	[6] = 任务租约 token（空表示调用方直接操作）
 var deleteSubtreeScript = redis.NewScript(`
 local nsidx_key   = KEYS[1]
 local pending_key = KEYS[2]
@@ -37,6 +39,11 @@ local sid               = ARGV[1]
 local ns_prefix         = ARGV[2]
 local item_key_prefix   = ARGV[3]
 local meta_key_prefix   = ARGV[4]
+local owner             = ARGV[6]
+
+if owner ~= "" and redis.call("GET", KEYS[4]) ~= owner then
+    return -1
+end
 
 -- 判据的单一真相源是 compose_v2.IsNSInSubtree：前缀自身 + 经层级分隔符往下的后代；
 -- 同一个节点的 fan-out 实例 / 重访实例段是兄弟执行，不删。此处是它的 Lua 复刻，两边
@@ -102,6 +109,7 @@ func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix st
 		cpNSIndexKey(c.prefix, sessionID),
 		cpPendingKey(c.prefix) + ":" + sessionID,
 		c.cpSidsKey(),
+		taskLeaseKey(c.prefix, sessionID),
 	}
 	args := []any{
 		sessionID,
@@ -109,8 +117,7 @@ func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix st
 		c.cpItemKeyPrefix(sessionID),
 		cpMetaKeyPrefix(c.prefix, sessionID),
 	}
-	// ARGV[5] = 划定子树的层级分隔符，来自唯一真相源（见脚本里 subtree_sep）。
-	args = append(args, compose_v2.NSSubtreeSeparator())
+	args = append(args, compose_v2.NSSubtreeSeparator(), compose_v2.CheckpointTaskLeaseToken(ctx, c.CheckpointTaskLeases(), sessionID))
 
 	result, err := deleteSubtreeScript.Run(ctx, c.rdb, keys, args...).Result()
 	if err != nil {
@@ -128,6 +135,9 @@ func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix st
 		} else {
 			return 0, fmt.Errorf("redis cp DeleteSubtree: unexpected result type %T", result)
 		}
+	}
+	if n == -1 {
+		return 0, fmt.Errorf("redis cp DeleteSubtree: %w", compose_v2.ErrTaskLeaseLost)
 	}
 	return int32(n), nil
 }

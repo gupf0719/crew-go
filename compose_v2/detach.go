@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"sync"
 	"sync/atomic"
 )
 
@@ -85,7 +84,7 @@ type detachedOrigin struct {
 }
 
 // stillExecuting 报这一项所指的任务此刻是否仍在执行：脱离那一刻所在的那次执行还在跑（没有标记的按还在跑算），
-// 或者这个任务此刻在本进程里有执行在跑（[executingTasks]）。
+// 或者这个任务此刻在本进程里有执行在跑（[TaskExecuting]）。
 func (o detachedOrigin) stillExecuting() bool {
 	if o.alive == nil || o.alive.Load() {
 		return true
@@ -150,9 +149,7 @@ type detachedFromKey struct{}
 // 在图外（编排的 agent 级钩子里）存下的 ctx 经 [DetachExecutionFrom]（`agent_v2.DetachTask`）脱离，那一项没有
 // 存活标记、按还在跑算：挂起之后拿它续跑这个任务也被拒；用 [DetachExecution] 脱离不记这一项。
 //
-// ⚠️ 判得到的只有本进程里、图在跑的那一段：别的进程在跑这个任务看不到；任务在图外的那一段不登记（编排的
-// OnAgentStart 早于图、OnAgentEnd 晚于图，没有图的 agent 如 `a2a.RemoteAgent` 整段都是），那时拿上一次执行存下的
-// ctx 脱离不算。链上只有 ctx 自己带着的来源：`context.Background()`、别的任务存下的 ctx 上没有这个任务，拿它们
+// ⚠️ 本进程中的图执行和内建 Agent 调用都会登记（见 [TaskExecuting]）。链上只有 ctx 自己带着的来源：`context.Background()`、别的任务存下的 ctx 上没有这个任务，拿它们
 // 跑一个正在执行的任务，这里认不出。别跨执行留着 ctx；在节点里开独立任务用节点当前的 ctx。
 func DetachedFrom(ctx context.Context) []string {
 	v, _ := ctx.Value(detachedFromKey{}).([]detachedOrigin)
@@ -167,51 +164,9 @@ func DetachedFrom(ctx context.Context) []string {
 
 // runAliveKey 携带「这次执行还在跑」的标记：不在任何节点执行范围里的那次 Run（顶层的、脱离出来的根图）在
 // 入口铸一个、出口置否，它里面嵌套的 Run 沿 ctx 继承同一个。执行状态：脱离时剥掉，脱离出来的根图铸自己的。
-// 从一次执行里存下来的 ctx 带着它，执行结束之后读到的是否；那个任务是不是又在别的执行里跑，另看 [executingTasks]。
-// 没配 sid 的执行只能靠它（[executingTasks] 按 sid 登记）。
+// 从一次执行里存下来的 ctx 带着它，执行结束之后读到的是否；那个任务是不是又在别的执行里跑，另看 [TaskExecuting]。
+// 没配 sid 的执行只能靠它（[TaskExecuting] 按 sid 登记）。
 type runAliveKey struct{}
-
-// executingTasks 登记本进程里此刻有执行在跑的任务（sid → 在跑的执行数）：不在任何节点执行范围里、配了 sid 的
-// Run 入口加一、出口减一，嵌套的 Run 属于外面那次执行、不另计。[DetachedFrom] 据此按任务判「仍在执行」。
-//
-// 进程级、按 sid 计：同一个 sid 同时有两次执行本来就违反「一枚 RunID 只服务一个任务」的契约，这里不区分它们。
-// 只有来源链里记着某个 sid 时才查它，没脱离过的执行不读这张表。
-var executingTasks = struct {
-	mu sync.Mutex
-	n  map[string]int
-}{n: map[string]int{}}
-
-// enterExecutingTask 登记 sid 有一次执行开始了，返回出口时调的注销函数。
-func enterExecutingTask(sid string) (exit func()) {
-	executingTasks.mu.Lock()
-	executingTasks.n[sid]++
-	executingTasks.mu.Unlock()
-	return func() {
-		executingTasks.mu.Lock()
-		defer executingTasks.mu.Unlock()
-		if executingTasks.n[sid] <= 1 {
-			delete(executingTasks.n, sid)
-			return
-		}
-		executingTasks.n[sid]--
-	}
-}
-
-// taskExecuting 报 sid 此刻在本进程里有没有执行在跑。
-func taskExecuting(sid string) bool {
-	executingTasks.mu.Lock()
-	defer executingTasks.mu.Unlock()
-	return executingTasks.n[sid] > 0
-}
-
-// TaskExecuting 报 sid 这个任务此刻在本进程里有没有执行在跑：它的图从 Run 入口到出口（不在任何节点执行范围里、配了这个 sid
-// 的 Run——顶层的、脱离出来的根图；节点里换了 sid 跑的嵌套图属于外面那次执行，不另计）。
-//
-// 认不出：别的进程里在跑的；任务在图外的那一段（编排的 OnAgentStart 早于它的图、OnAgentEnd 晚于它的图，没有图的 agent 整段
-// 都在图外）。给「对一个任务做不可逆的事之前，确认它此刻不在跑」用（agent_v2.WithAbandonedTasks 据此拒绝放弃正在执行的任务）。
-func TaskExecuting(sid string) bool {
-	return sid != "" && taskExecuting(sid)
-}
 
 func runAliveFrom(ctx context.Context) *atomic.Bool {
 	a, _ := ctx.Value(runAliveKey{}).(*atomic.Bool)
@@ -320,7 +275,7 @@ func isExecutionKey(key any) bool {
 		nodeStateAccessorKey, subCallCounterKey, subCallScopeKey, abnormalNodeExitKey,
 		componentKindKey, eventSinkKey, sendSinkKey, toolCategoryLookupKey, outerRerunGensKey, outerRegensKey,
 		threadIDKey, softCancelCtxKey, detachedKey, detachedFromKey, runAliveKey, signalScopeKey, taskRecipientKeyCtxKey, hookCallKey,
-		exitGraceKey, streamRecordKey, runningSlotKey:
+		exitGraceKey, streamRecordKey, runningSlotKey, checkpointTaskLeaseKey:
 		return true
 	}
 	_, ok := key.(ExecutionStateKey)

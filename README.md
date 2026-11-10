@@ -2,6 +2,16 @@
 
 Go 原生 LLM Agent 编排框架。用最少的抽象把「单个 Agent」和「多 Agent 协作」统一在 channel-based BSP 图执行引擎里。
 
+## 开始使用
+
+在仓库根目录运行离线示例，输入天气问题后用 `/exit` 退出。
+
+```bash
+go run ./example/orchestration/basic_chat -mock
+```
+
+接入模型和编写第一个 Agent 见 [快速上手](doc/quickstart.md)，按功能找示例见 [SDK 示例索引](doc/sdk-guide.md)。
+
 ## 特性
 
 - **统一执行引擎**：所有编排模式内部编译为同一 channel-based `Graph` 执行（`compose_v2.GraphBuilder`），Checkpointing / OrchestrationHooks / InterruptError / 4 层上下文压缩等横切能力一次实现、全模式受益
@@ -57,11 +67,7 @@ crew-go/
 
 ## 依赖方向
 
-```
-schema ← model / tool / hook / skill / mcp / prompt / store ← compose_v2 ← agent_v2 ← a2a / agui / decision
-```
-
-（右依赖左）`compose_v2` 是底层 channel-based 图运行时，`agent_v2` 在其上构建。`a2a`（跨进程协议接入）/ `agui`（前端接入）/ `decision`（决策模型接入）和 `observability`（横切观测）建在 `agent_v2` 之上；`sandbox`（tool 层沙箱 seam）/ `fallback`（model 装饰器）/ `schedule`（定时任务）是框架核心不依赖、业务按需引入的可选能力包；`redis` / `sql` / `a2a/zk` 是隔离外部依赖的独立 go module——完整依赖图（含 a2a 各子包）见 [架构总览](doc/description/architecture.md)。
+`compose_v2` 是通用 channel-based 图运行时，仓内直接依赖 `schema` 和 `internal/panicerr`。`agent_v2` 在图引擎上组合模型、工具、钩子、技能、提示词和存储。`a2a`、`agui`、`decision` 和 `observability` 在集成层，`sandbox`、`fallback` 和 `schedule` 可按需引入。`redis`、`sql` 和 `a2a/zk` 用独立 Go 模块隔离外部依赖。按主题查阅 [架构导航](doc/description/architecture.md)。
 
 ## 文档
 
@@ -93,11 +99,19 @@ schema ← model / tool / hook / skill / mcp / prompt / store ← compose_v2 ←
 - [v2 设计原理 channel-based-design](doc/v2/channel-based-design.md)（PoC 期设计稿 / 5 大难点 / API 草案）
 - [Channel-based Graph 引擎详细设计 channel-engine](doc/v2/channel-engine.md)（核心抽象 / graphLoop / cp + Resume / fan-out / 嵌套 / 9 编排编译产物 / 关键不变量速查）
 
-**测试**
+## 本地验证
+
+```bash
+make test              # 根模块及 redis、sql、a2a/zk 的默认测试
+make test-integration  # 启用 integration 标签，运行 example 下匹配 TestAdv 的测试
+```
+
+默认测试无需外部服务，部分用例使用本地监听端口。`go test ./...` 在仓库根目录只覆盖根模块。`make test-integration` 也会运行匹配的 mock 测试，真模型用例需要相应凭据。
+
 - [冒烟测试速查 smoke-test-recipes](doc/description/smoke-test-recipes.md)
 - [测试规约 testing-conventions](doc/description/testing-conventions.md)
 
 ## 环境要求
 
-- Go 1.26+（`go.mod` 声明 `go 1.26.0`；依赖的 a2a-go v2.7.0 要求）
+- 最低 Go 1.26.0，仓库声明工具链 Go 1.26.4，CI 使用同一版本。
 - A2A ZooKeeper binding（`a2a/zk`）/ Redis（`redis`）/ SQL（`sql`）是独立 go module，按需引入

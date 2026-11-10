@@ -99,6 +99,7 @@ func (c *Checkpointer) cpItemKeyPrefix(sid string) string {
 //	[3] = nsidx key
 //	[4] = pending key
 //	[5] = sids key
+//	[6] = 任务租约 key
 //
 // **ARGV**:
 //
@@ -109,6 +110,7 @@ func (c *Checkpointer) cpItemKeyPrefix(sid string) string {
 //	[5] = new created_at (int64 as string)
 //	[6] = is_pending ("1" / "0")
 //	[7] = sid
+//	[8] = 任务租约 token（空表示调用方直接操作）
 var saveNSScript = redis.NewScript(`
 local item_key   = KEYS[1]
 local meta_key   = KEYS[2]
@@ -123,6 +125,11 @@ local new_status   = ARGV[4]
 local new_created_at = ARGV[5]
 local is_pending   = ARGV[6]
 local sid          = ARGV[7]
+local owner        = ARGV[8]
+
+if owner ~= "" and redis.call("GET", KEYS[6]) ~= owner then
+    return "TASK_LEASE_LOST"
+end
 
 -- HGET meta graph_id (单字段, 不需 cjson 解析 — iter-5-K Redis Hash 思路)
 local existing_graph_id = redis.call("HGET", meta_key, "graph_id")
@@ -185,12 +192,13 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 		cpNSIndexKey(c.prefix, sessionID),
 		cpPendingKey(c.prefix) + ":" + sessionID,
 		c.cpSidsKey(),
+		taskLeaseKey(c.prefix, sessionID),
 	}
 	args := []any{
 		ns, payload, cp.GraphID,
 		fmt.Sprintf("%d", int(cp.Status)),
 		fmt.Sprintf("%d", cp.CreatedAt),
-		isPending, sessionID,
+		isPending, sessionID, compose_v2.CheckpointTaskLeaseToken(ctx, c.CheckpointTaskLeases(), sessionID),
 	}
 
 	result, err := saveNSScript.Run(ctx, c.rdb, keys, args...).Result()
@@ -198,7 +206,10 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 		return fmt.Errorf("redis cp SaveNS eval: %w", err)
 	}
 
-	if resultStr, ok := result.(string); ok && resultStr == "GRAPH_ID_CONFLICT" {
+	switch result {
+	case "TASK_LEASE_LOST":
+		return fmt.Errorf("redis cp SaveNS: %w", compose_v2.ErrTaskLeaseLost)
+	case "GRAPH_ID_CONFLICT":
 		return fmt.Errorf("%w: sid=%q ns=%q new=%q",
 			compose_v2.ErrGraphIDConflict, sessionID, ns, cp.GraphID)
 	}

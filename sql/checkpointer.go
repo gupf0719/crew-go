@@ -141,6 +141,12 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 		}
 	}()
 
+	if token := compose_v2.CheckpointTaskLeaseToken(ctx, c.CheckpointTaskLeases(), sessionID); token != "" {
+		if err := c.checkTaskLease(ctx, tx, sessionID, token); err != nil {
+			return fmt.Errorf("sql cp SaveNS task lease: %w", err)
+		}
+	}
+
 	ph := c.dialect.Placeholder
 	claim := fmt.Sprintf(
 		`INSERT INTO %s (sid, ns, parent_ns, status, schema_ver, graph_id, created_at, payload)
@@ -249,11 +255,13 @@ func (c *Checkpointer) ExistsNS(ctx context.Context, sessionID, ns string) (bool
 //
 // 换成枚举之后，判据只剩权威函数那一份：将来加第四种段分隔符，**backend 一行都不用改**。
 //
-// # 代价：两个新的非原子语义（本方法自己的契约，到此为止）
+// # 删除的原子性
+//
+// 有租约的调用在同一事务内核验租约、枚举和删除子树。删除失败时回滚并返回 0。
+// 直接调用且没有租约时，非空前缀有两处并发边界。
 //
 //  1. **SELECT 与 DELETE 之间有窗口**：期间新插入的、本该属于这棵子树的 ns 会逃过删除。
-//     旧的单条 LIKE 语句没有这个窗口。
-//  2. **多批之间也不是原子的**：子树超过 [deleteSubtreeBatchSize] 时拆成多条 DELETE，
+//  2. **分批提交**：子树超过 [deleteSubtreeBatchSize] 时拆成多条 DELETE，
 //     中途某批失败返回的是「**已删的条数** + 那个错」（实测：批 1 删 500 成功、批 2 失败
 //     ⟹ 返 `(500, err)`），子树被删掉一半。
 //
@@ -270,17 +278,42 @@ func (c *Checkpointer) ExistsNS(ctx context.Context, sessionID, ns string) (bool
 // 「残留会不会被扫掉」是**调用方那一侧的性质**，规则收敛在 [compose_v2.Checkpointer]
 // 的 `DeleteSubtree` 接口 godoc 里（一条不枚举调用点的判据）。
 //
-// 剩下真正能撞第 1 条窗口的是「同一个 sid 上并发跑多个 Run」——那本身就是业务错，
-// 框架另有 [compose_v2.WithStaleWriteGuard] 应对。
-//
 // PG / MySQL / SQLite 共用本段，方言只差 [Dialect.Placeholder] 渲染出的占位符。
 func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix string) (int32, error) {
+	token := compose_v2.CheckpointTaskLeaseToken(ctx, c.CheckpointTaskLeases(), sessionID)
+	if token == "" {
+		return c.deleteSubtree(ctx, c.db, sessionID, nsPrefix)
+	}
+	tx, err := c.db.BeginTx(ctx, &dbsql.TxOptions{Isolation: dbsql.LevelReadCommitted})
+	if err != nil {
+		return 0, fmt.Errorf("sql cp DeleteSubtree begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // 已提交时无操作，否则回滚。
+	if err := c.checkTaskLease(ctx, tx, sessionID, token); err != nil {
+		return 0, fmt.Errorf("sql cp DeleteSubtree task lease: %w", err)
+	}
+	deleted, err := c.deleteSubtree(ctx, tx, sessionID, nsPrefix)
+	if err != nil {
+		return 0, err // 事务回滚全部删除。
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("sql cp DeleteSubtree commit: %w", err)
+	}
+	return deleted, nil
+}
+
+type checkpointQueryer interface {
+	ExecContext(context.Context, string, ...any) (dbsql.Result, error)
+	QueryContext(context.Context, string, ...any) (*dbsql.Rows, error)
+}
+
+func (c *Checkpointer) deleteSubtree(ctx context.Context, db checkpointQueryer, sessionID, nsPrefix string) (int32, error) {
 	ph := c.dialect.Placeholder
 
 	// 空前缀 = 删整 session，不需要子树判据，一条语句搞定。
 	if nsPrefix == "" {
 		q := fmt.Sprintf(`DELETE FROM %s WHERE sid = %s`, c.table, ph(1))
-		result, err := c.db.ExecContext(ctx, q, sessionID)
+		result, err := db.ExecContext(ctx, q, sessionID)
 		if err != nil {
 			return 0, fmt.Errorf("sql cp DeleteSubtree: %w", err)
 		}
@@ -294,7 +327,7 @@ func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix st
 	// 1. 枚举本 session 的全部 ns。`sid` 是主键前缀（PRIMARY KEY (sid, ns)），
 	//    这一步走索引、只回一列短字符串。
 	listQ := fmt.Sprintf(`SELECT ns FROM %s WHERE sid = %s`, c.table, ph(1))
-	rows, err := c.db.QueryContext(ctx, listQ, sessionID)
+	rows, err := db.QueryContext(ctx, listQ, sessionID)
 	if err != nil {
 		return 0, fmt.Errorf("sql cp DeleteSubtree list: %w", err)
 	}
@@ -339,7 +372,7 @@ func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix st
 		}
 		q := fmt.Sprintf(`DELETE FROM %s WHERE sid = %s AND ns IN (%s)`,
 			c.table, ph(1), strings.Join(marks, ", "))
-		result, err := c.db.ExecContext(ctx, q, args...)
+		result, err := db.ExecContext(ctx, q, args...)
 		if err != nil {
 			return int32(total), fmt.Errorf("sql cp DeleteSubtree: %w", err)
 		}

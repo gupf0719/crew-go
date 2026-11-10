@@ -377,11 +377,13 @@ class CheckpointNotLatest(Exception):
 
 - **已有落点**：`Checkpoint.Status`（Pending/Unset）+ `SaveNS` 的 `ErrGraphIDConflict` 写时校验——等于已经有"写时拒绝"的先例和一个能放 version/owner 的位置。eino 连表达 Pending/Done 的字段都没有。
 - **多 ns 的额外风险**：我们生产路径只用 `SaveNS`，**共三个写点**——出口 defer（`graph_loop.go`）+ `Sync` 档每超步写 + `Async` worker（后两者在 `durability.go`）。**三者统一走 `guardedSaveNS`**（世代比对 + mint + 写 + 更新基线）。嵌套子图每层各自独立写，**无跨 ns 原子性**。`Durability=Sync/Async` 下 cp 每超步落盘，**并发覆盖窗口比 `Exit` 档宽得多**。（`SaveBatch` 按 caller 讲仅 conformance 在用，但 `redis/` `sql/` 两个独立 module 有第一方实现。）理论上并发交错可拼出「ns=A 来自 run1、ns=B 来自 run2」的混合树——两个 run 谁都没经历过的状态。eino 单 key 单 blob 在这条轴上反而更鲁棒。**未实证**（构造特定交错未成功），且它是并发 Resume 的次生症状，根因解决即消失。
-- **上层已有 in-process 保护**：`agui`（`handler.go` 的 busy 条目）和 `a2a/server`（`executor.go` 的 `taskState.busy`）都拒同 threadID/taskID 并发。缺口在**业务直接调 `agent_v2` / `compose_v2`** 以及**跨进程**两处。
+- **调研时的进程内保护**：`agui`（`handler.go` 的 busy 条目）和 `a2a/server`（`executor.go` 的 `taskState.busy`）都拒同 threadID/taskID 并发。当时的缺口在业务直接调 `agent_v2` / `compose_v2` 和跨进程两处。
 
 ### 决策记录（2026-07-21 拍板）
 
-**采纳：契约 + opt-in 的世代校验，默认零开销。** 排除完整分布式租约（五家都不在库层面做——那是 workflow engine 的职责边界；这句归类是我们的设计判断，非各家明文声明）。
+**2026-11-10 补充决策。** 两个进程共用 SQLite 时，放弃可以在另一进程载入存档后删档并补写历史，已载入的执行仍能执行工具。Redis 与内建 SQL Checkpointer 因此在框架入口增加按任务 ID 的独占租约，所有权覆盖读档、执行及存档和历史收尾。后端原子校验写档与删档的 token。自定义后端可通过 `TaskLeaseProvider` 接入；部署与失租边界见 [Checkpoint](../../v2/checkpoint.md#61-共享存档的任务租约)。
+
+**2026-07-21 原决定。** 当时仅采纳契约和 opt-in 的世代校验，默认关闭校验。
 
 **实施时修正了一处形态**（值得记，因为它是"照抄会失效"的典型）：LangGraph 那个被删的 `CheckpointNotLatest` 是**载入时**校验，成立前提是它有 **cp_id 链**、Resume 时明确指定"恢复哪个历史点"。
 

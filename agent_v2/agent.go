@@ -79,6 +79,7 @@ const (
 
 	// ResumeActionAbort 终止：清掉 cp 退出（用户主动取消任务）。所有 agent 支持。
 	// Resume 返回 (nil, nil) 让 caller 区分于"自然跑完"（caller 显式发 aborted 事件）。
+	// 内建 Agent 在登记执行或放弃许可时遇到同一任务的在途操作冲突会返回 compose_v2.ErrTaskBusy。
 	ResumeActionAbort
 )
 

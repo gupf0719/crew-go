@@ -1,9 +1,9 @@
 # crew-go Makefile
 #
 # 测试分两层：
-#   - test-unit         默认 go test ./...，不带任何 build tag，纯单测，无网络依赖。
-#   - test-integration  显式开启 integration tag，编译并运行 example/adv_*_test.go。
-#                       依赖 QWEN_API_KEY（默认 model/qwen，dashscope 兼容 OpenAI）；DEEPSEEK_API_KEY 仍可备选；缺失时各用例 t.Skip。
+#   - test-unit         运行各模块的默认测试，无需外部服务，部分用例监听本机端口。
+#   - test-integration  开启 integration tag，运行 example 下匹配 TestAdv 的用例（含 mock）。
+#                       真模型用例按各自要求读取 API key，缺失时跳过。
 #
 # 详细规约见 doc/description/testing-conventions.md。
 
@@ -12,19 +12,19 @@
 # 默认 test = 单测，与 CI 必过路径一致。
 test: test-unit
 
-# 单元测试：纯本地、毫秒级、不连外网。go.work 下根目录的 ./... 不含三个子模块，各自进目录跑（同 CI）。
+# 根目录的 ./... 不含三个子模块，各自进目录跑，与 CI 的默认测试范围一致。
 test-unit:
 	go test ./...
 	cd redis && go test ./...
 	cd sql && go test ./...
 	cd a2a/zk && go test ./...
 
-# 集成测试：走真实 LLM，单条用例 60~300s 不等。
+# 教学集成用例同时运行匹配 TestAdv 的 mock 测试。
 # 总超时 600s 容纳 PlanAgent / ReflectAgent 等多轮场景累积耗时。
 test-integration:
 	go test -tags=integration -v -run TestAdv -timeout 600s ./example/...
 
-# 全跑（单测 + 集成）。CI nightly 用。
+# 组合运行默认测试和教学集成测试。
 test-all: test-unit test-integration
 
 build:

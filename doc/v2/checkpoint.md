@@ -624,9 +624,21 @@ frontier 上节点当前执行的条目）——进程在节点执行中途崩�
 ⚠️ `GetNodeState` 的 `ok==true` **不保证值非 nil**（T 是 map/slice/指针时 round-trip 回来是
 typed nil），上面范式里的 `done == nil` 判断不是多余的守卫。
 
-## 6. 并发保护：陈旧写回检测
+## 6. 并发保护
 
-同一个 sid 被并发 Run/Resume 时，双方各自载入同一份 cp、各自执行、各自写回 → 后写者静默覆盖先
+### 6.1 共享存档的任务租约
+
+Redis 和 SQL 内建方言的 Checkpointer 以存储域和任务 ID 为键，在框架读取存档前取得独占租约。配置这类 Checkpointer 时，内建 Agent 的 `Run`、`Resume`、`Abort`、`WithAbandonedTasks` 和 AG-UI 删档使用同一套租约。直接调用 `compose_v2.Run` 时还需提供非空的 session ID。冲突返回 `compose_v2.ErrTaskBusy`。正常结束在存档和历史收尾后归还许可，嵌套调用沿用同一存储域的租约。
+
+租约有效期为 30 秒，每 10 秒续约。续约失败会取消执行，保存或删除存档时由后端原子校验令牌。过期持有者的存档变更返回 `compose_v2.ErrTaskLeaseLost`。已经开始的外部工具调用和独立历史存储写入仍依赖各自的取消和幂等机制。
+
+- SQL 升级时先运行 `Checkpointer.Setup` 创建租约表。手工维护 schema 时参照 [建表定义](../../sql/checkpointer_schema.go)。各进程使用同一数据库、schema 和存档表。进程内的嵌套调用复用同一 `*sql.DB`。
+- Redis 的应用副本使用同一主库、逻辑库及存档前缀，配置 Redis 保留租约键。嵌套调用复用同一 Redis client。
+- 自定义共享 Checkpointer 需要实现 `TaskLeaseProvider` 和 `TaskLeaseStore` 的原子校验，或由调用方协调。嵌套调用需要 provider 返回可比较且相等的租约存储值。同一存储域中的所有工作进程需使用同一协议。调用方直接修改存档、调用 `Cleanup` 或手动传入旧快照时，自行管理这些操作的归属。
+
+### 6.2 陈旧写回检测
+
+只使用进程内登记且共用自定义存储时，同一个 sid 仍可能被并发 Run/Resume。双方各自载入同一份 cp、各自执行、各自写回 → 后写者静默覆盖先
 写者，**且两边都 `err == nil`**。`WithStaleWriteGuard()` / `WithStaleWriteGuardCtx(ctx)` 开启后，
 写/删 cp 前比对 `Epoch`，被推进过则返 `ErrCheckpointStale`。
 
@@ -639,8 +651,7 @@ typed nil），上面范式里的 `done == nil` 判断不是多余的守卫。
 - **不管带「新开」信号的 Run**——新开的 Run 没有世代基线（agent_v2 顶层 Run 恒是），守卫要等本次首写之后才生效，而首写本身不校验；于是默认 exit 档下，新开的 Run 全程不受保护——成功清理时还会把槽里别人的挂起档一并删掉；sync / async 档从本次第二次写入起受保护（每次写成功都会把基线推到自己写的那一代）。两个新开 Run 并发撞同一 sid——那本身违反「一枚 RunID 只服务一个任务」的契约（见 `RunSession.RunID` godoc）
 
 **默认关闭。** `agent_v2` 的 9 编排下只能用 ctx 那个（编排内部自己拼 RunOption、不透传业务的），
-嵌套子图靠 ctx 继承。真正的解在调用方串行化：会话亲和路由 / 分布式锁 / 队列。这道守卫只把最坏的
-「静默」变成「可见」。
+嵌套子图靠 ctx 继承。执行入口的互斥由上节的任务租约或调用方的串行化提供。
 
 ## 7. Resume 协议
 

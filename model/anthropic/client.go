@@ -364,8 +364,8 @@ func (c *Client) Generate(ctx context.Context, messages []*schema.Message, opts 
 // 回放标注在流正常结束后一次交出（最后一个片段）。工具调用压到最后，是因为服务端回退在中途切换模型时，
 // 切换点之前的工具调用要作废（见 [FallbackAnnotation]），提前交出就收不回来了。
 //
-// 只有收到 message_stop 且结束原因不是拒答 / 超窗口才算完整；读错、ctx 取消、错误帧、没收到
-// message_stop 就断开，都作为流的错误交出，不当正常结束。
+// 收到 message_stop 后立即收尾。拒答 / 超窗口、读错、ctx 取消、错误帧、没收到 message_stop 就断开，
+// 都作为流的错误交出。
 func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
 	req, err := c.buildRequest(ctx, messages, model.Apply(opts...))
 	if err != nil {

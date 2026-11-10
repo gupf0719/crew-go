@@ -438,25 +438,25 @@ func dedupCallers(callers []*schema.Message) []*schema.Message {
 //   - win 里每条带 skill 正文标记的 tool_result 都在 win 里找得到声明者：第 0 层截断把这样的一对
 //     成对保下（不论多早），win 的开头若恰好切在这一对中间，在 win 上截会把那条正文当孤儿截掉。
 func priorWindowSatisfied(win []*schema.Message, need int) bool {
-	inWin := make(map[string]bool)
+	inWin := make(map[historyToolCallKey]bool)
 	for _, m := range win {
 		for _, tc := range schema.GetToolCalls(m) {
-			inWin[tc.ID] = true
+			inWin[historyToolKey(m, tc.ID)] = true
 		}
 	}
 	for _, m := range win {
-		if m.Role == schema.RoleTool && hasSkillMarker(m) && !inWin[schema.GetToolResultID(m)] {
+		if m.Role == schema.RoleTool && hasSkillMarker(m) && !inWin[historyToolKey(m, schema.GetToolResultID(m))] {
 			return false
 		}
 	}
 	// （下面「最早那条不受保护的」与第 0 层截断用同一个保护判据 isPriorProtected。）
 	kept := truncatePriorPreservingMarkers(win, need)
 	in := make(map[*schema.Message]bool, len(kept))
-	declared := make(map[string]bool)
+	declared := make(map[historyToolCallKey]bool)
 	for _, m := range kept {
 		in[m] = true
 		for _, tc := range schema.GetToolCalls(m) {
-			declared[tc.ID] = true
+			declared[historyToolKey(m, tc.ID)] = true
 		}
 	}
 	for _, m := range kept {
@@ -464,7 +464,7 @@ func priorWindowSatisfied(win []*schema.Message, need int) bool {
 			continue
 		}
 		for _, id := range toolResultIDs(m) { // 每个结果块都要有声明它的调用
-			if id != "" && !declared[id] {
+			if id != "" && !declared[historyToolKey(m, id)] {
 				return false
 			}
 		}

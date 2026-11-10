@@ -76,8 +76,8 @@ orch := obs.OrchHooks(sseOrchHooks)                // 编排级
   里面的钩子跑完再记；结束一侧里面的钩子先跑。业务在钩子里改写 [消费] 字段（PII 过滤输入、脱敏或改判工具结果）
   时，span 记的是改写之后、真正交下去 / 被框架用上的那份。里面的结束钩子报错、等人或被叫停时，模型 / 工具调用本身已经
   完成，照样按这次调用自己的结局收尾（模型调用的用量只在这一遍交来）。
-- **外来 ctx**：里面的钩子返回外来的 ctx（缓存下来的、`Background`）属于违约（框架会告警），observability 仍把
-  自己的句柄与当前 span 挂回去，span 照常收尾。
+- **钩子的 ctx**：钩子成功返回 `nil` 时沿用它收到的 ctx，其中包含当前 span。返回外来的 ctx（缓存下来的、`Background`）
+  时，框架会告警，observability 会把本次调用的句柄与 span 挂回去。
 
 同一个 Observability 装了两层（`Install` 两次、`Install` 之外又 `WithHooks(obs.AgentHooks())`、ctx 上已有它的编排
 钩子再 `Install`）时只记一份；两个不同的 Observability 叠在一起时各记各的（句柄按实例区分）。顶不掉的范围到

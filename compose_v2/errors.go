@@ -175,6 +175,12 @@ func (e *MaxRoundsError) NonRetryable() {}
 // 里面多一条判断就失效，枚举会。
 var ErrRunAborted = errors.New("compose_v2: run aborted (terminal failure, checkpoint purged)")
 
+// ErrTaskBusy 表示同一个任务有与当前操作冲突的执行或放弃。冲突操作返回后可重试。
+var ErrTaskBusy = errors.New("compose_v2: task is busy")
+
+// ErrTaskLeaseLost 表示本次执行已失去存档任务租约，不能再变更该任务的存档。
+var ErrTaskLeaseLost = errors.New("compose_v2: checkpoint task lease lost")
+
 // ErrCheckpointNotPersisted 报「这次退出本该留下一份存档，但没写成」——Run 出口写档（或写档前的
 // 快照）失败了。挂起类的退出（中断、软取消、调用方取消……）与业务报错退出都算：两者的档按设计都
 // 续得上（失败档续跑 = 重试失败的分支）。
@@ -188,9 +194,8 @@ var ErrRunAborted = errors.New("compose_v2: run aborted (terminal failure, check
 //
 // 它同时带 [ErrRunAborted]：不自动重试、各吞错点不吞（[MustPropagate]），出口尽力删掉这一层的
 // 存档子树（存储坏着时可能删不掉，删失败写进错误文本），嵌套时上层出口跟着清。**例外**：写档失败
-// 是因为这个槽已经属于别人——别的执行推进了它（[ErrCheckpointStale]），或者它是另一张图的档
-// （[ErrGraphIDConflict]）——时不带 ErrRunAborted、不删，那份档不是这次执行的。这时照样不自动重试
-// （错误类型实现 [NonRetryable]）。
+// 属于存档所有权冲突（[ErrCheckpointStale]、[ErrGraphIDConflict]、[ErrTaskLeaseLost]）时，
+// 保留存档并透出冲突原因。错误类型实现 [NonRetryable]。
 //
 // 出口写档与清档不跟着调用方取消：调用方取消或超时导致的退出也要存下可以续跑的档，而持久后端拿到已经
 // 结束的 ctx 一律写不进去。调用方结束之后每次存储调用最多再等 10 秒；调用方放弃之后，读、写、删每一类调用
@@ -430,7 +435,7 @@ func MustPropagate(ctx context.Context, err error) bool {
 	if errors.As(err, &ie) {
 		return true
 	}
-	if errors.Is(err, ErrCheckpointStale) || errors.Is(err, ErrSoftCanceled) ||
+	if errors.Is(err, ErrCheckpointStale) || errors.Is(err, ErrTaskLeaseLost) || errors.Is(err, ErrSoftCanceled) ||
 		errors.Is(err, ErrRunAborted) || errors.Is(err, ErrCheckpointNotResumable) ||
 		errors.Is(err, ErrGraphIDConflict) || errors.Is(err, ErrCheckpointNotPersisted) {
 		return true

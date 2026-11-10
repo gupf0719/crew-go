@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"iter"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -253,11 +254,19 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 	// handleWaiting：session 上的句柄是在远端等人（input-required）时留下的——这次的输入是答复，续之前要对账；不是（上一次
 	// 的流停在远端还在办的状态上就断了）时这次是新的请求（见下面对账那一段）。seenArtifacts：问人那一刻任务里各 artifact 的状态。
 	handleWaiting := false
+	var sessionQuestion gatePending
 	var seenArtifacts []seenArtifact
 	if !sessionHandles {
 		taskID = ""
 	} else if taskID != "" {
 		handleWaiting = a.loadHandleWaiting(session)
+		if handleWaiting {
+			v, _ := session.GetValue(a.pendingKey(session))
+			sessionQuestion, _ = v.(gatePending)
+			if sessionQuestion.TaskID != taskID {
+				sessionQuestion = gatePending{}
+			}
+		}
 		seenArtifacts = a.loadSeenArtifacts(session)
 		if a.loadAuthWait(session) {
 			// 上一次停在远端要授权上、句柄在 session 上（不在任何节点执行里）：这次的输入是人对那一问的答复。标记在
@@ -268,10 +277,10 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 				return nil, a.authRefusedErr()
 			}
 			reattach = true
-		} else if ids := a.loadPendingIDs(session); len(ids) > 1 {
+		} else if len(sessionQuestion.Items) > 1 {
 			// 续一个远端挂着多问的任务：调用方（host LLM / 业务）按约定给的是 interruptId → 答复的 JSON 对象时，
 			// 换成每问一个 DataPart。远端挂多问时只接受按 interruptId 的答复，一条文本会被请重答。
-			sendParts = answerPartsFromJSON(input, ids)
+			sendParts = answerPartsFromJSON(input, sessionQuestion.Items)
 		}
 	}
 	if byPosition {
@@ -355,15 +364,34 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 		answering := byPosition && pend.TaskID != "" && pend.TaskID == taskID
 		switch {
 		case answering || handleWaiting:
-			// 续一个在等人的远端任务：先查它此刻的状态再决定发不发（见 reconcileTask）。答复人那一问的消息 ID 按那一问派生，
+			// 续一个在等输入的远端任务：先查它此刻的状态再决定发不发（见 reconcileTask）。答复消息 ID 按原问题派生，
 			// 重发同一个答复是同一个 ID，对账时据它认出远端收没收到。
-			sentID, questionID := "", ""
+			question, questionPos := sessionQuestion, "session"
 			if answering {
-				sentID, questionID = gateMessageID(pos, pend.TaskID, pend.Round), pend.QuestionMsgID
+				question, questionPos = pend, pos
+			}
+			sentID := ""
+			if question.TaskID == taskID {
+				sentID = gateMessageID(questionPos, taskID, question.Round)
 				msg.ID = sentID
 			}
-			snap, how, rerr := a.reconcileTask(ctx, taskID, sentID, questionID)
+			snap, how, rerr := a.reconcileTask(ctx, taskID, sentID, question.QuestionMsgID)
 			switch how {
+			case reconcileSend:
+				switch items := question.Items; {
+				case len(items) == 1 && items[0].Approval:
+					parts, err := addressApprovalAnswer(msg.Parts, items[0].InterruptID)
+					if err != nil {
+						return nil, fmt.Errorf("a2a: remote agent %q: %w", a.card.Name, err)
+					}
+					msg.Parts = parts
+				case len(items) > 0:
+					ids := make([]any, 0, len(items))
+					for _, item := range items {
+						ids = append(ids, item.InterruptID)
+					}
+					msg.Metadata = map[string]any{ReplyToInterruptIDsKey: ids}
+				}
 			case reconcileSnapshot:
 				msg, method, recovered = nil, "get_task", true
 				source = func(yield func(a2atypes.Event, error) bool) { yield(snap, nil) }
@@ -523,22 +551,28 @@ stream:
 
 	switch lastState {
 	case a2atypes.TaskStateInputRequired, a2atypes.TaskStateAuthRequired:
-		if toHuman {
-			// 这一问属于哪个远端任务：本次响应里给的，没给就是刚才续的那个
-			askTask := firstNonEmpty(newTaskID, taskID)
-			if askTask == "" {
-				// 不合协议（input-required 是任务的状态，必带 taskID）。抛中断的话人答了也续不上：续跑时没有
-				// 待续的任务，原始请求再发一遍、远端再要人，同一个问题一遍遍重问。
-				return nil, fmt.Errorf("a2a: remote agent %q asked for input without a task id, the answer could not be routed back to it", a.card.Name)
+		askTask := firstNonEmpty(newTaskID, taskID)
+		if toHuman && askTask == "" {
+			// 缺少任务句柄会让下一次调用重发原始请求，反复问同一个问题。
+			return nil, fmt.Errorf("a2a: remote agent %q asked for input without a task id, the answer could not be routed back to it", a.card.Name)
+		}
+		if !toHuman || !inNode {
+			a.storeIDs(session, askTask, newContextID)
+			round := 1
+			if sessionQuestion.TaskID == askTask {
+				round = sessionQuestion.Round + 1
 			}
+			session.SetValue(a.pendingKey(session), gatePending{
+				TaskID: askTask, Round: round, QuestionMsgID: statusMsgID, Items: items,
+			})
+			a.storeAuthWait(session, auth)
+			a.storeHandleWaiting(session, true, a.artifactStates(ctx, askTask))
+		}
+		if toHuman {
 			if !inNode {
 				// 不在节点执行里：句柄记在 session 上，中断没有 ID（没有位置可派生）。挂多问时业务用同一个
 				// session 再 Run 一次、输入给 interruptId → 答复的 JSON 对象（见 answerPartsFromJSON）；要授权时输入
 				// 人的答复（deny 取消远端任务，别的重新挂上它，见 authRefused）。
-				a.storeIDs(session, askTask, newContextID)
-				a.storePendingIDs(session, items)
-				a.storeAuthWait(session, auth)
-				a.storeHandleWaiting(session, true, a.artifactStates(ctx, askTask))
 				if auth {
 					return nil, authInterrupt("", q)
 				}
@@ -577,10 +611,6 @@ stream:
 			}
 			return nil, gateInterrupt(id, q, items)
 		}
-		// 远程要更多输入——存 taskID 供续跑同一 task
-		a.storeIDs(session, newTaskID, newContextID)
-		a.storePendingIDs(session, items)
-		a.storeHandleWaiting(session, true, a.artifactStates(ctx, firstNonEmpty(newTaskID, taskID)))
 		// 默认：把追问当输出返回——host BasicAgent 的 LLM 看到后补信息再调一次（续同一 task）
 		if len(items) > 1 {
 			return schema.AssistantMessage(fmt.Sprintf(
@@ -633,14 +663,11 @@ const (
 //
 //   - 已结束：不发，按快照收尾——完成就取回结果，失败、取消、拒绝同直接收到那个结局。
 //   - 在办（submitted / working）：它在等人时不会自己动起来，只能是收下了答复：不重发，重新挂上读结果。
-//   - 在等人、sentID 非空（答复人那一问，ID 按那一问派生）、任务历史里有它：远端收下了答复，重发的话会被当成下一问的答复。
-//     远端回应过（历史里它后面还有东西——服务端更新状态时把旧的状态消息移进历史；或状态消息已不是我们答的那一问 questionID）
-//     ⟹ 在问新的，按快照收尾、问人新的那一问；没回应过（执行器发出第一个状态之前任务一直停在原来那一问上）：轮询等它回应，
-//     最多 authReattachGrace，回应了按上面几条处置，到时仍没回应报 reconcileInFlight——不重发：远端可能只是慢，在不去重的
-//     服务端上重发会让它办两遍。历史里没有它（没收到，或远端不留历史）照常发。
+//   - 在等人且状态消息 ID 已变：直接交出新的问题，即使快照不含历史。状态消息 ID 未变时，历史里有这次答复、且后面还有消息，
+//     也按快照重新提问。历史里有答复但还没回应时轮询，最多 authReattachGrace；超时报 reconcileInFlight。
+//   - 在等人且未发现已接收的答复或新的问题：可以发。已知 interruptId 时，发送的答复绑定到已展示的问题。
 //   - 远端说没有这个任务：reconcileGone。
-//   - 查不到状态：sentID 非空时报 reconcileUnknown（不盲发，理由同上）；远端不支持 GetTask，或这次续的是 session 上的句柄
-//     （sentID 为空、答复认不出是哪一条）时照常发，跟没有这一步时一样。
+//   - 查不到状态：sentID 非空时对瞬时查询失败报 reconcileUnknown。确定不支持查询时允许发送。
 func (a *RemoteAgent) reconcileTask(ctx context.Context, taskID, sentID, questionID string) (*a2atypes.Task, reconcileOutcome, error) {
 	id := a2atypes.TaskID(taskID)
 	task, err := a.client.GetTask(ctx, &a2atypes.GetTaskRequest{ID: id})
@@ -657,11 +684,11 @@ func (a *RemoteAgent) reconcileTask(ctx context.Context, taskID, sentID, questio
 		return nil, reconcileSend, nil
 	}
 	at := slices.IndexFunc(task.History, func(m *a2atypes.Message) bool { return m != nil && m.ID == sentID })
-	if !waitsForInput(task.Status.State) || sentID == "" || at < 0 {
+	if !waitsForInput(task.Status.State) || sentID == "" {
 		return task, settledOutcome(task), nil
 	}
 	responded := func(t *a2atypes.Task) bool {
-		if questionID != "" && statusMessageID(t) != questionID {
+		if current := statusMessageID(t); questionID != "" && current != "" && current != questionID {
 			return true
 		}
 		i := slices.IndexFunc(t.History, func(m *a2atypes.Message) bool { return m != nil && m.ID == sentID })
@@ -669,6 +696,9 @@ func (a *RemoteAgent) reconcileTask(ctx context.Context, taskID, sentID, questio
 	}
 	if responded(task) {
 		return task, reconcileSnapshot, nil
+	}
+	if at < 0 {
+		return task, reconcileSend, nil
 	}
 	task, err = a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
 		return !waitsForInput(t.Status.State) || responded(t)
@@ -997,12 +1027,49 @@ func gateItemAnswers(ctx context.Context, pos string, p gatePending) a2atypes.Co
 	return parts
 }
 
+// addressApprovalAnswer 将单项审批答复绑定到远端的 interruptId。
+func addressApprovalAnswer(parts a2atypes.ContentParts, interruptID string) (a2atypes.ContentParts, error) {
+	if interruptID == "" {
+		return nil, errors.New("pending approval is missing its interruptId")
+	}
+	addressed := false
+	for i, part := range parts {
+		if part == nil {
+			continue
+		}
+		data, ok := part.Data().(map[string]any)
+		if !ok {
+			continue
+		}
+		rawID, hasID := data[answerInterruptIDKey]
+		_, hasApproval := data[answerApprovedKey]
+		_, hasText := data[answerTextKey]
+		if !hasID && !hasApproval && !hasText {
+			continue
+		}
+		if !hasID {
+			bound := maps.Clone(data)
+			bound[answerInterruptIDKey] = interruptID
+			copyPart := *part
+			copyPart.Content = a2atypes.NewDataPart(bound).Content
+			parts[i] = &copyPart
+		} else if id, ok := rawID.(string); !ok || id != interruptID {
+			return nil, errors.New("approval answer must refer to the pending interruptId")
+		}
+		addressed = true
+	}
+	if addressed {
+		return parts, nil
+	}
+	return append(parts, AnswerPart(interruptID, nil, a2aPartsText(parts))), nil
+}
+
 // jsonAnswerHint 告诉调用方远端挂多问时怎么作答。
 const jsonAnswerHint = `answer by calling again with a JSON object that maps each interruptId to its answer, e.g. {"<interruptId>": "<answer>"}; tool approvals take true / false or one of "approve", "approve_always", "approve_always_tool", "deny"`
 
 // answerPartsFromJSON 把调用方给的 interruptId → 答复 JSON 对象转成按 interruptId 的 DataPart：键必须都是远端
 // 挂着的提问，值是字符串或布尔。不是这个形状时返回 nil（照常作为文本发出，远端会请重答）。
-func answerPartsFromJSON(input *schema.Message, pendingIDs []string) a2atypes.ContentParts {
+func answerPartsFromJSON(input *schema.Message, pending []PendingQuestion) a2atypes.ContentParts {
 	if input == nil {
 		return nil
 	}
@@ -1010,9 +1077,9 @@ func answerPartsFromJSON(input *schema.Message, pendingIDs []string) a2atypes.Co
 	if err := json.Unmarshal([]byte(strings.TrimSpace(input.Content)), &m); err != nil || len(m) == 0 {
 		return nil
 	}
-	known := make(map[string]bool, len(pendingIDs))
-	for _, id := range pendingIDs {
-		known[id] = true
+	known := make(map[string]bool, len(pending))
+	for _, q := range pending {
+		known[q.InterruptID] = true
 	}
 	ids := make([]string, 0, len(m))
 	for id := range m {
@@ -1198,26 +1265,9 @@ func blocksHash(bs []*schema.ContentBlock) string {
 	return textHash(string(raw))
 }
 
-// pendingKey 是远端挂多问时那几问的 interruptId 在 session 上的键（任务级，同 taskKey）。
+// pendingKey 记 session 上的远端挂起问题（任务级，同 taskKey），续发前用问题身份对账。
 func (a *RemoteAgent) pendingKey(s *agent_v2.RunSession) string {
 	return "a2a:" + a.name + ":pending:" + s.RunID
-}
-
-// storePendingIDs 记下远端挂着的几问的 interruptId（只有一问或没有清单时清空）：续这个任务时据此认出调用方给的
-// 按 interruptId 的 JSON 答复。
-func (a *RemoteAgent) storePendingIDs(s *agent_v2.RunSession, items []PendingQuestion) {
-	if s == nil {
-		return
-	}
-	if len(items) <= 1 {
-		s.SetValue(a.pendingKey(s), []string(nil))
-		return
-	}
-	ids := make([]string, 0, len(items))
-	for _, it := range items {
-		ids = append(ids, it.InterruptID)
-	}
-	s.SetValue(a.pendingKey(s), ids)
 }
 
 // authKey 是「这个任务停在远端要授权上」在 session 上的键（任务级，同 taskKey）。只在不在任何节点执行里、句柄记在
@@ -1242,20 +1292,11 @@ func (a *RemoteAgent) loadAuthWait(s *agent_v2.RunSession) bool {
 	return waiting
 }
 
-func (a *RemoteAgent) loadPendingIDs(s *agent_v2.RunSession) []string {
-	if s == nil {
-		return nil
-	}
-	v, _ := s.GetValue(a.pendingKey(s))
-	ids, _ := v.([]string)
-	return ids
-}
-
 func (a *RemoteAgent) clearIDs(s *agent_v2.RunSession) {
 	if s == nil {
 		return
 	}
-	s.SetValue(a.pendingKey(s), []string(nil))
+	s.SetValue(a.pendingKey(s), gatePending{})
 	s.SetValue(a.authKey(s), false)
 	s.SetValue(a.handleKey(s), false)
 	s.SetValue(a.seenKey(s), []string(nil))
@@ -1273,12 +1314,12 @@ func (a *RemoteAgent) clearIDs(s *agent_v2.RunSession) {
 	s.SetValue(a.taskKey(s), "")
 }
 
-// gatePending 是 human gate 在一个调用位置上等人答复的那一问：远端哪个任务、这个任务里的第几问、问的什么。
+// gatePending 记录一个远端任务正在等的那轮提问：远端哪个任务、这个任务里的第几问、问的什么。
 // 远端要人时记下、远端给了别的结局时清掉（TaskID 为空即没有）。
 //
-// 记在宿主节点这次执行的私有态里（compose_v2.SaveStepResult，键带上调用位置）：按节点体 / tool_call / 交接
+// 真人答复记在宿主节点这次执行的私有态里（compose_v2.SaveStepResult，键带上调用位置）：按节点体 / tool_call / 交接
 // 出去的那一段分开，节点里先后调两次、同一批几个 tool_call、几个并行分支各是各的；随宿主的存档走，续跑不带
-// 原来的 session 也读得回。
+// 原来的 session 也读得回。经 session 句柄续发时，问题身份和轮次记在 session 的任务级 KV。
 //
 // 会话线程（ContextID）也跟任务一起记：并发的几个调用各自新开任务时，远端可能给出不同的线程，续哪个任务
 // 就要带哪个任务的线程——session 上那一个槽是最后写的那个，续别的任务时会被远端拒掉（实测）。

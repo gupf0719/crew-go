@@ -417,7 +417,8 @@ func (f *FallbackChatModel) WithTools(tools []*schema.ToolInfo) (model.ChatModel
 
 限流（429）和部分 503 下，服务端会在 `Retry-After` 响应头里**明说**等多久。这个值是权威的，而我们算的指数退避是猜的——猜早了再吃一次限流（部分 provider 还会因此延长封禁），猜晚了白等。
 
-所以 per-member 重试在睡之前先问一次：拿到正值就**整个替换**掉算出来的退避（`fallback.go` 的重试循环）。同一取舍也在 `compose_v2.RunWithRetry` 里（编排层重试），两处各接各的。
+每候选重试和编排层的 `compose_v2.RunWithRetry` 都用正值的 `Retry-After` 替换计算出的退避。
+编排层在等待前检查调用方期限。若剩余时间不足以等完并发起重试，直接返回当前错误，保留原始状态码和响应体。
 
 **要等很久的候选先推迟，别的都没成时回来**（2026-10-19）：Retry-After 超过 60 秒（跟 OpenAI 的 Go SDK 只认一分钟
 以内、pi-ai 超过 60 秒直接报错一致）、且切换判据允许换候选时，给这个候选设一道共享的门（2026-10-20），先推迟它

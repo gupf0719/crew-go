@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"crew-go/compose_v2"
@@ -138,4 +139,33 @@ func TestFinalError_UnreachablePrimaryNotRetried(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > time.Second || !errors.As(err, &apiErr) || apiErr.Provider != "p1" {
 		t.Fatalf("应立即交出主候选的错，实际耗时 %v、err=%v", elapsed, err)
 	}
+}
+
+type stayOnCurrentModel struct{}
+
+func (stayOnCurrentModel) ShouldFailover(context.Context, error) bool { return false }
+
+func TestFinalError_NoSwitchPreserves429WhenRetryAfterExceedsDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var primaryCalls, backupCalls atomic.Int32
+		providerErr := &model.APIError{Provider: "p1", StatusCode: 429, Body: "rate limited", RetryAfter: time.Minute}
+		primary := countingModel{n: &primaryCalls, err: func(int32) error { return providerErr }}
+		backup := countingModel{n: &backupCalls, err: func(int32) error { return nil }}
+		fb := fallback.New([]model.ChatModel{primary, backup},
+			fallback.WithPerModelRetry(fallback.PerModelRetry{MaxRetries: 2}),
+			fallback.WithFailoverPolicy(stayOnCurrentModel{}))
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+
+		start := time.Now()
+		_, err := compose_v2.RunWithRetry(ctx, compose_v2.SimpleRetry(2), func(ctx context.Context) (*schema.Message, error) {
+			return fb.Generate(ctx, nil)
+		})
+		if err != providerErr || time.Since(start) != 0 {
+			t.Errorf("应立即返回原始 429，实际耗时 %v、err=%v", time.Since(start), err)
+		}
+		if primaryCalls.Load() != 1 || backupCalls.Load() != 0 {
+			t.Errorf("应只请求主候选一次，实际主候选 %d 次、备用 %d 次", primaryCalls.Load(), backupCalls.Load())
+		}
+	})
 }

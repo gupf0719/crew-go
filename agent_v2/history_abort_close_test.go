@@ -8,6 +8,7 @@ import (
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/model"
 	"crew-go/schema"
 )
 
@@ -83,6 +84,81 @@ func TestHistory_AbortCountsEveryResultBlock(t *testing.T) {
 	}
 	if len(after) != len(seed) {
 		t.Errorf("两个调用都有结果，放弃收尾不该再补，实际历史从 %d 条变成 %d 条", len(seed), len(after))
+	}
+}
+
+func TestHistory_ReusedToolCallIDAcrossRoundsAndTasks(t *testing.T) {
+	const abandoned = "任务已被放弃，此工具调用没有结果"
+	key := agent_v2.HistoryKey{Owner: "tenant", ConvID: "reuse-tool-id"}
+	hs := agent_v2.NewInMemoryHistoryStore()
+	cp := compose_v2.NewInMemoryCheckpointer()
+	ctx := compose_v2.WithCheckpointerCtx(compose_v2.WithThreadIDCtx(context.Background(), key.ConvID), cp)
+	first := &recordTool{name: "first"}
+	pending := &recordTool{name: "pending"}
+	other := &recordTool{name: "other"}
+	tk := agent_v2_newToolkit()
+	for _, rt := range []*recordTool{first, pending, other} {
+		tk.Register(rt)
+	}
+	build := func(llm model.ChatModel) *agent_v2.BasicAgent {
+		return agent_v2.NewBasicAgent(agent_v2.WithName("worker"), agent_v2.WithHistory(hs, key.Owner),
+			agent_v2.WithToolkit(tk), agent_v2.WithModel(llm),
+			agent_v2.WithApprovalHeuristic(func(_ context.Context, name string, _ map[string]any) agent_v2.ApprovalDecision {
+				if name == pending.name {
+					return agent_v2.ApprovalDecisionAsk
+				}
+				return agent_v2.ApprovalDecisionAllow
+			}))
+	}
+	// oneToolCall 每轮用同一个 ID。A 完成第一轮后挂起，B 完成自己的工具调用。
+	a := agent_v2.NewRunSession()
+	_, err := build(newStubModel([]*schema.Message{oneToolCall(first.name), oneToolCall(pending.name)})).Run(ctx, a, schema.UserMessage("任务 A"))
+	if _, ok := compose_v2.IsInterrupt(err); !ok {
+		t.Fatalf("任务 A 应挂起，实际 %v", err)
+	}
+	if entries, err := cp.ListPending(ctx, a.RunID); err != nil || len(entries) == 0 {
+		t.Fatalf("任务 A 应有可续存档，实际 %v err=%v", entries, err)
+	}
+	b := agent_v2.NewRunSession()
+	if _, err := build(newStubModel([]*schema.Message{oneToolCall(other.name), schema.AssistantMessage("B 完成")})).Run(ctx, b, schema.UserMessage("任务 B")); err != nil {
+		t.Fatalf("任务 B 应成功，实际 %v", err)
+	}
+	if first.calls.Load() != 1 || pending.calls.Load() != 0 || other.calls.Load() != 1 {
+		t.Fatalf("实际工具执行次数 first=%d pending=%d other=%d", first.calls.Load(), pending.calls.Load(), other.calls.Load())
+	}
+	llm := &capturingModel{}
+	if _, err := build(llm).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("查看结果"), agent_v2.WithAbandonedTasks(a.RunID)); err != nil {
+		t.Fatal(err)
+	}
+	if len(llm.captured) != 1 {
+		t.Fatalf("应调用一次模型，实际 %d", len(llm.captured))
+	}
+	want := map[string]string{first.name: "ran_first", pending.name: abandoned, other.name: "ran_other"}
+	msgs := llm.captured[0]
+	for i, m := range msgs {
+		for _, call := range schema.GetToolCalls(m) {
+			name := call.Function.Name
+			if i+1 == len(msgs) || schema.GetToolResultID(msgs[i+1]) != call.ID || msgs[i+1].Content != want[name] {
+				t.Errorf("送模的 %s 未配到 %q，后续消息 %+v", name, want[name], msgs[i+1:])
+			}
+			delete(want, name)
+		}
+	}
+	if len(want) != 0 {
+		t.Errorf("送模时缺少调用 %v", want)
+	}
+	stored, err := agent_v2.LoadAllHistory(ctx, hs, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var closed int
+	for _, m := range stored {
+		if m.Content == abandoned && m.Annotations[agent_v2.HistoryTaskAnnotation] == a.RunID {
+			closed++
+		}
+	}
+	if closed != 1 {
+		t.Errorf("任务 A 应补写一次放弃结果，实际 %d", closed)
 	}
 }
 

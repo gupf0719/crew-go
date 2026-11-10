@@ -484,22 +484,23 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		}
 	}()
 	// 这次执行还在跑的标记（见 runAliveKey）：不在任何节点执行范围里的 Run 铸一个、出口置否，嵌套的 Run 继承。
-	// 脱离时记进来源链，从存下来的 ctx 脱离的那一项在这次执行结束之后不再凭它算「仍在执行」。这样的 Run 配了 sid
-	// 时还登记「这个任务有执行在跑」（见 executingTasks，要等下面解析出 sid 才登记）。置否与注销放在这个早注册、
-	// 晚执行的 defer 里：出口的存档、OnGraphEnd 跑完之前，这次执行都还在跑。
+	// 脱离时记进来源链。解析出 sid 后登记任务执行，存档与 OnGraphEnd 收尾完成后再注销。
 	rootRun := !WithinNodeScope(ctx)
-	var exitExecuting func()
+	var alive *atomic.Bool
+	var activity *TaskActivity
 	if rootRun {
-		alive := new(atomic.Bool)
+		alive = new(atomic.Bool)
 		alive.Store(true)
 		ctx = context.WithValue(ctx, runAliveKey{}, alive)
-		defer func() {
-			alive.Store(false)
-			if exitExecuting != nil {
-				exitExecuting()
-			}
-		}()
 	}
+	defer func() {
+		if alive != nil {
+			alive.Store(false)
+		}
+		if activity != nil {
+			activity.Release()
+		}
+	}()
 	// stayPendingFact 是「本次 Run 里有没有任何一个分支的退出方式值得把存档留在可恢复
 	// 那一档」——**事实，不是报告**。出口的 Status 盖章读它，不读被仲裁挑出来的那一个
 	// error（理由与实测见 frontierResult.StayPending）。
@@ -669,35 +670,36 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		cfg.sessionID = GetSessionID(ctx)
 	}
 	detachedSID = cfg.sessionID
-	// 一个任务的一次执行从这里开始：登记它在跑（出口在上面那个 defer 里注销），并把继承来的来源链里它那几次已经结束
-	// 的执行去掉——在它自己的执行里，它不是「脱离出来之前所在的任务」（见 withoutDetachedFrom）。
-	if rootRun && cfg.sessionID != "" {
-		exitExecuting = enterExecutingTask(cfg.sessionID)
-		ctx = withoutDetachedFrom(ctx, cfg.sessionID)
-	}
 	if cfg.graphNS == "" {
 		cfg.graphNS = GetGraphNS(ctx)
+	}
+	if cfg.sessionID != "" {
+		var err error
+		ctx, activity, err = beginTaskActivity(ctx, cfg.checkpointer, cfg.sessionID, nil)
+		if err != nil {
+			return fmt.Errorf("graph %q (ns=%q): %w", g.ID(), cfg.graphNS, err)
+		}
 	}
 	// 一个存档槽 (sid, ns) 同一时刻只归一个执行：一张正在跑的图，或一次在这个槽上跑图的 agent 调用从入口到出口（它的 agent 级钩子期间槽里
 	// 放着它自己的挂起档，见 OccupySlot）。在占着它的执行里发起、落进同一个槽的嵌套 Run 会把那份档当成自己的读进来接着跑
 	// （两张图的 GraphID 相同时——两个 BasicAgent 的图都是——用自己的节点跑别人的 frontier，实测旁路工具多执行一次），成功收尾时
 	// 按自己成功清掉那个槽、把别人的档一起删了，err == nil；这里当场拒。占着槽的那次 agent 调用自己的这次 Run 带着它的凭证
 	// （WithSlotClaim），放行。没配 checkpointer 或 sid 为空时没有槽：既不占、也不拦。在清档的 defer 注册之前返回：这个槽是别人的，
-	// 出口不能按终局失败去清它。占着的槽记在 ctx 上（runningSlotKey，执行状态：钩子返回别的 ctx 时照样取框架的）。
+	// 出口不能按终局失败去清它。候选 namespace 的清理子树盖住外层槽时也拒绝。槽的归属链是 ctx 上的执行状态。
 	if cfg.checkpointer != nil && cfg.sessionID != "" {
-		slot := runningSlot{sessionID: cfg.sessionID, graphNS: cfg.graphNS}
-		if cur, ok := ctx.Value(runningSlotKey{}).(runningSlot); ok && cur.sessionID == slot.sessionID && cur.graphNS == slot.graphNS &&
-			(cur.claim == nil || cur.claim != cfg.slotClaim) {
+		active, _ := ctx.Value(runningSlotKey{}).(*runningSlot)
+		if owner := active.conflict(cfg.sessionID, cfg.graphNS); owner != nil &&
+			(owner != active || owner.graphNS != cfg.graphNS || owner.claim == nil || owner.claim != cfg.slotClaim) {
 			where := "a hook or edge condition"
 			if id := GetCurrentNodeID(outerCtx); id != "" { // ctx 上的节点身份进图时已清掉（clearInheritedNodePosition）
 				where = fmt.Sprintf("node %q", id)
 			}
-			return fmt.Errorf("%w: %s started a nested run of graph %q on the checkpoint slot of the execution it runs in (session=%q ns=%q); "+
+			return fmt.Errorf("%w: %s started a nested run of graph %q whose checkpoint subtree covers an active slot (session=%q ns=%q active_ns=%q); "+
 				"call the other agent through agent_v2.RunSubAgent, or give a nested graph its own namespace with "+
 				"compose_v2.WithRunNS(compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), \"<name>\"))",
-				ErrRunAborted, where, g.ID(), cfg.sessionID, cfg.graphNS)
+				ErrRunAborted, where, g.ID(), cfg.sessionID, cfg.graphNS, owner.graphNS)
 		}
-		ctx = context.WithValue(ctx, runningSlotKey{}, slot)
+		ctx = context.WithValue(ctx, runningSlotKey{}, &runningSlot{sessionID: cfg.sessionID, graphNS: cfg.graphNS, parent: active})
 	}
 	// 图级相位（OnGraphStart / OnGraphEnd / 入口条件边）的名字：这张图的 ns，嵌套时再加「外层这次
 	// 执行里第几次跑这个 ns 的图」。它们记在承载这张图的外层节点执行名下，同一次外层执行在循环里
@@ -906,6 +908,10 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		if cfg.checkpointer == nil || cfg.sessionID == "" {
 			return
 		}
+		if err := CheckCheckpointTaskLease(ctx); err != nil {
+			runErr = err
+			return
+		}
 		// 出口的每一次存储读写都经 exitStorageOp：不跟着调用方取消（调用方结束之后再给一段宽限），后端
 		// panic 转成错误（不然它冒到最外层的 recover、跟中断并列，中断还在错误链上）。**先定结论、再发
 		// 事件**：cp 事件与清档日志在 runErr 定下、该清的档清完之后才发，钩子与日志 handler 的 panic 当场兜住、
@@ -1062,6 +1068,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		purge := purgeExitSlot(ctx, cfg, cm, "success", "purge-success", "")
 		if purge.staleErr != nil {
 			runErr = purge.staleErr
+		} else if errors.Is(purge.delErr, ErrTaskLeaseLost) {
+			runErr = purge.delErr
 		}
 		purge.report(ctx, cfg)
 	}()
@@ -2682,14 +2690,23 @@ func validateInterrupt(ctx context.Context, id NodeID, err error, ie *InterruptE
 	return nil
 }
 
-// runningSlotKey 记着这段执行占着的存档槽（session ID + ns）：Run 入口推（正在跑的图）、OccupySlot 推（一次 agent 调用），
-// Run 入口比（见 Run 里那道守卫）。
+// runningSlotKey 记着当前执行及各祖先占着的存档槽（session ID + ns）。Run 和 OccupySlot 在入口检查并追加。
 type runningSlotKey struct{}
 
-// runningSlot 是被占着的槽；claim 非 nil 时它是一次 agent 调用占的，带着同一张凭证的 Run 是那次调用自己的。
+// runningSlot 是只读的槽归属链。链首的 claim 非 nil 时，带着同一张凭证的 Run 是该 agent 调用自己的。
 type runningSlot struct {
 	sessionID, graphNS string
 	claim              *SlotClaim
+	parent             *runningSlot
+}
+
+func (s *runningSlot) conflict(sessionID, ns string) *runningSlot {
+	for ; s != nil; s = s.parent {
+		if s.sessionID == sessionID && IsNSInSubtree(ns, s.graphNS) {
+			return s
+		}
+	}
+	return nil
 }
 
 // SlotClaim 是 OccupySlot 发的凭证：占着槽的那次 agent 调用自己跑图时经 WithSlotClaim 出示，证明这次 Run 是它的。
@@ -2699,8 +2716,8 @@ type SlotClaim struct{ _ byte }
 // 它的 agent 级钩子、钩子里调起的别的 agent、直接跑的嵌套图——发起、落进同一个槽的嵌套 Run 在入口被拒，那时槽里放着它
 // 自己的挂起档。它自己跑图时带上返回的凭证（WithSlotClaim）。
 //
-// ctx 上没有 checkpointer、或 sessionID 为空时没有槽，原样返回、凭证为 nil。这个槽已经被外面的执行占着（落进了别人的槽）时
-// 也原样返回、凭证为 nil：之后在这个槽上跑图入口会拒。
+// ctx 上没有 checkpointer、或 sessionID 为空时没有槽，原样返回、凭证为 nil。候选 namespace 的清理子树覆盖外层执行
+// 已占的槽时，也原样返回、凭证为 nil：之后在这个槽上跑图入口会拒。
 //
 // 给在自己的槽上跑图的 agent 实现用（agent_v2 的 9 个编排入口已调）。只在你自己要在这个槽上跑图时调：占了槽之后把调用
 // 透传给另一个同 ns 的 agent，那个 agent 的入口拿不到凭证、跑图时被拒（同一个槽只归一个执行）。凭证只证明「这次 Run 是我
@@ -2710,11 +2727,12 @@ func OccupySlot(ctx context.Context, sessionID string) (context.Context, *SlotCl
 		return ctx, nil
 	}
 	ns := GetGraphNS(ctx)
-	if cur, ok := ctx.Value(runningSlotKey{}).(runningSlot); ok && cur.sessionID == sessionID && cur.graphNS == ns {
+	active, _ := ctx.Value(runningSlotKey{}).(*runningSlot)
+	if active.conflict(sessionID, ns) != nil {
 		return ctx, nil
 	}
 	claim := &SlotClaim{}
-	return context.WithValue(ctx, runningSlotKey{}, runningSlot{sessionID: sessionID, graphNS: ns, claim: claim}), claim
+	return context.WithValue(ctx, runningSlotKey{}, &runningSlot{sessionID: sessionID, graphNS: ns, claim: claim, parent: active}), claim
 }
 
 // WithSlotClaim 出示 OccupySlot 发的凭证：这次 Run 是占着这个槽的那次调用自己的，入口不拒。nil 等于不出示。
@@ -3015,6 +3033,9 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 // **audit Round 10 Bug D-N3 修复**：panic value 实现 error 接口时用 %w 保
 // errors.Is/As chain。
 func safeNodeRun(ctx context.Context, id NodeID, fn NodeFunc, chs Channels) (writes []ChannelWrite, err error) {
+	if err := CheckCheckpointTaskLease(ctx); err != nil {
+		return nil, err
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			pe := panicerr.New(r)

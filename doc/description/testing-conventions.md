@@ -8,15 +8,15 @@
 
 | 维度 | 单元测试 | 集成测试 |
 |---|---|---|
-| 位置 | 各包内 `*_test.go`（不带 build tag） | `example/adv_*_test.go` |
-| 依赖 | 仅本地、纯内存 stub / 手写假实现 | 真实 qwen API (`QWEN_API_KEY`, dashscope 兼容 OpenAI); DeepSeek (`DEEPSEEK_API_KEY`) 仍可备选 |
-| 触发 | 默认 `make test` / `go test ./...` | `make test-integration`（带 `-tags=integration`） |
+| 位置 | 各包内默认编译的 `*_test.go` | `example/tutorial/` 的教学用例，以及各功能对应的集成用例 |
+| 依赖 | 手写 stub、内存实现和本地服务，部分用例监听本地端口 | 真模型或其他外部服务，按用例提供凭据和服务地址 |
+| 触发 | `make test` 覆盖根模块和三个子模块，根目录 `go test ./...` 仅覆盖根模块 | `make test-integration` 启用 `integration` 标签并筛选 `example/` 下匹配 `TestAdv` 的用例，其余集成用例按包运行 |
 | 时间预算 | 单包毫秒~秒级 | 单条 60~300s，整体 5min+ |
-| CI 角色 | 必过门 | 可选 / nightly |
+| CI 角色 | [GitLab CI](../../.gitlab-ci.yml) 的必过门 | 需要对应环境时显式运行 |
 
-集成测试统一打 `//go:build integration` 标签。**默认 build 不会编译这些文件**——CI 单测路径不会因为没 key 或网络抖动 red。需要跑时显式 `make test-integration`。
+集成测试统一加 `//go:build integration`，默认测试路径不编译这些文件。教学用例用 `make test-integration`，其中同名模式的 mock 测试也会运行。其余集成用例进入对应模块，用 `go test -tags=integration` 按包运行。
 
-新增依赖外部服务（任何 API 调用、子进程、文件系统外部目录等）的测试，必须落到 `example/` 或同样带 integration tag 的位置，**不可混进默认单测**。
+依赖真实外部服务、外部凭据或宿主预置资源的测试使用 `integration` 标签。测试自行创建的临时资源、本地 mock 服务或子进程可走默认测试路径。
 
 ### 模型名：**别写死，用 `qwen.TestModelCandidates`**
 
@@ -139,9 +139,9 @@ CLAUDE.md 已明：**不引入 mock 框架**（gomock / mockery 等都不用）�
 - `compose_v2/audit_fixes_test.go` — fan-out / Resume / GraphID / ThreadID 多 audit 回归
 
 **Binary smoke**（`example/`）：
-- `example/orchestration/nested_smoke/main.go` — 13 scenario 端到端 binary（5 基础 + 4 高级 + Parallel/Routing 嵌入 + GraphID/ThreadID）
+- `example/orchestration/nested_smoke/main.go` — 12 个端到端场景，覆盖嵌套、存档清理、namespace 隔离和 GraphID 冲突
 - `example/orchestration/channel_smoke/main.go` — 5 场景 compose_v2 底层（含 BasicAgent ReAct + Plan + 嵌套子图独立 cp + parallel per-branch delta）
-- `example/orchestration/plan_chat_web/` mock 模式 — interrupt + Resume continue + cleanupOnSuccess
+- `example/orchestration/plan_chat_web/` mock 模式 — 验证 SSE 挂起、续跑完成及 HTTP 终态
 
 ### 强制约定
 

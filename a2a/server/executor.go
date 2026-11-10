@@ -226,11 +226,15 @@ func NewExecutor(agent agent_v2.Agent, opts ...ExecutorOption) *Executor {
 func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2atypes.Event, error] {
 	return func(yield func(a2atypes.Event, error) bool) {
 		inputMsg := inputMessage(execCtx)
+		var metadata map[string]any
+		if execCtx.Message != nil {
+			metadata = execCtx.Message.Metadata
+		}
 
 		// a2a 跨进程 trace：从入站 Message.metadata 取出远端的 trace context（W3C traceparent 等）作父，
 		// server 的整棵 span 树串到 client 的 trace 上。缺失或格式不对时原样返回 ctx，server 自起新 trace。
-		if e.obs != nil && execCtx.Message != nil {
-			ctx = e.obs.ExtractFromMetadata(ctx, execCtx.Message.Metadata)
+		if e.obs != nil && metadata != nil {
+			ctx = e.obs.ExtractFromMetadata(ctx, metadata)
 		}
 
 		// 会话线程身份：A2A ContextID 是跨 task 的会话线程标识——push 成 ThreadID。两个消费者
@@ -265,7 +269,7 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			}
 			// 按挂起提问校验答复（见 answers.go）：认不出的审批答复、挂多问时没按 interruptId 作答，都不调 Resume，
 			// 任务继续停在 input-required、请对端重答。
-			inputs, reask := resumeInputs(st.pending, st.answers, inputMsg)
+			inputs, reask := resumeInputs(st.pending, st.answers, inputMsg, metadata)
 			if reask != "" {
 				if e.releaseAfterReask(ctx, tkey, st) {
 					yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateInputRequired, pendingMessage(st.pending, reask)), nil)
@@ -355,8 +359,8 @@ func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) 
 // discardCanceled 清掉一个已取消、没有在途 run 的任务留下的存档与观测会话：abort 清 cp（detached ctx：取消请求
 // 本身的 ctx 可能已随客户端断开取消；push sid 让 abort Resume 的 OnAgentStart 复用本 task 的 session，不漏建
 // sid-less "" session），再清 session——不经 conclude 的路径（空闲时 Cancel、请重答期间来了 Cancel）由它释放，
-// 不清的话 input-required 留下的 session 永久泄漏。框架编排 abort 恒返 nil（DeleteSubtree 失败 helper 内已
-// slog.Warn）；自定义 Agent 的 abort 失败在此 warn——取消本身照常完成，但泄漏信号不能静默蒸发。
+// 不清的话 input-required 留下的 session 永久泄漏。框架编排会报告在途任务冲突，后端删档失败在 helper 内告警。
+// 取消本身照常完成，清理报错时在这里记日志。
 func (e *Executor) discardCanceled(ctx context.Context, taskID, sid string) {
 	rctx := compose_v2.WithSessionIDCtx(compose_v2.WithCheckpointerCtx(context.WithoutCancel(ctx), e.cp), sid)
 	if _, err := e.agent.Resume(rctx, sid, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
@@ -584,7 +588,7 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		// 本 task 的 session 由下面 cleanupSession defer 清（canceled → keepPending=false → cleanupSession=true）。
 		rctx := compose_v2.WithSessionIDCtx(compose_v2.WithCheckpointerCtx(context.WithoutCancel(ctx), e.cp), st.sess.RunID)
 		if _, err := e.agent.Resume(rctx, st.sess.RunID, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
-			// 同 Cancel 路径：框架编排恒 nil；自定义 Agent abort 失败 warn 不静默
+			// 同 Cancel 路径：清理报错时记日志。
 			slog.WarnContext(ctx, "a2a server: post-cancel abort cleanup failed (cp/session 可能残留)", "task", string(execCtx.TaskID), "err", err)
 		}
 		return

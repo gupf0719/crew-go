@@ -14,7 +14,7 @@ import (
 	"crew-go/schema"
 )
 
-// consumeStream 读 SSE 事件：文本与 thinking 文本逐片交给 send，事件同时累积成完整响应；流正常结束
+// consumeStream 读 SSE 事件：文本与 thinking 文本逐片交给 send，事件同时累积成完整响应。收到 message_stop
 // 后按完整响应交出最后一片（工具调用、标注、元数据），否则 SendError。最后总会 CloseSend。
 //
 // 下面这些都报错，不当正常结束：读响应体出错、调用方 ctx 取消、错误帧、事件累积失败、没收到
@@ -55,6 +55,7 @@ func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, s
 		// 要先补分隔（新的 thinking 块开始了）。跟 joinContent 的拼法一致。
 		reasoningStarted, reasoningSep bool
 	)
+readEvents:
 	for stream.Next() {
 		ev := stream.Current()
 		if err := acc.Accumulate(ev); err != nil {
@@ -96,6 +97,7 @@ func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, s
 			}
 		case "message_stop":
 			stopped = true
+			break readEvents // 协议已结束，连接可能仍由网关保持打开。
 		}
 	}
 
@@ -109,9 +111,7 @@ func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, s
 		schema.SendError(sr, err)
 		return
 	}
-	// 收到 message_stop 之后才空闲超时的（经代理 / 网关时发完了却不关连接）：答复已经完整，照常收尾、不当失败——当失败的话
-	// 是可重试的错，配了重试会把一次完整的调用整个重来。别的读错照旧报错。
-	if err := stream.Err(); err != nil && !(stopped && errors.Is(err, ErrStreamIdleTimeout)) {
+	if err := stream.Err(); err != nil {
 		schema.SendError(sr, c.streamFailure(err))
 		return
 	}

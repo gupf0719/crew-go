@@ -47,6 +47,20 @@ func TestSQLiteCheckpointer_Conformance(t *testing.T) {
 	})
 }
 
+func TestSQLiteCheckpointer_TaskLeases(t *testing.T) {
+	db := newSQLiteDB(t)
+	cp := agentSQL.NewCheckpointer(db, agentSQL.SQLite{})
+	if err := cp.Setup(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	peer := agentSQL.NewCheckpointer(db, agentSQL.SQLite{})
+	checkpointer_conformance.RunTaskLeaseTests(t, cp, peer, func(sid string) {
+		if _, err := db.ExecContext(t.Context(), "UPDATE crew_checkpoint_task_lease SET expires_at = 0 WHERE sid = ?", sid); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestSQLiteStore_Conformance(t *testing.T) {
 	conformance.RunStoreTests(t, func() store.Store {
 		db := newSQLiteDB(t)

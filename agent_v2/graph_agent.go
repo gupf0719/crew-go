@@ -238,9 +238,11 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	if err := checkAbandonedTasks(ctx, cfg.abandoned, session, g.Name()); err != nil {
+	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, g.Name())
+	if err != nil {
 		return nil, err
 	}
+	defer activity.Release()
 	if err := g.checkBreakpointsResumable(ctx); err != nil {
 		return nil, err
 	}
@@ -300,6 +302,7 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	ctx = enterGraphRunTask(ctx, session)
 	// 调用方声明放弃了的任务（WithAbandonedTasks）：在记这次的输入、触发钩子之前收尾
 	abandonTasksAtEntry(ctx, cfg.abandoned, g.Name())
+	activity.FinishAbandon()
 	var hookErr error
 	ctx, hookErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		return hooks.OnAgentStart(c, info, agentIn)
@@ -438,6 +441,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	if prep.AbortDone {
 		return nil, nil
 	}
+	defer prep.activity.Release()
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	// MED-1 fail-fast：composite Resume 同样不透传 per-call 覆盖给 inner step。
 	if err := rejectCompositeOverride(rcfg.overrides()); err != nil {

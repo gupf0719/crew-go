@@ -1,6 +1,6 @@
 # 测试规约
 
-> 单测必过、集成可选；新增 API 配套测试；黑盒/白盒按测试对象决定，不教条。
+> 默认测试必过，集成测试按环境运行。新增 API 配套测试，黑盒或白盒按测试对象决定。
 >
 > 来源：ISSUE-52 测试与 CI 流程缺口梳理。
 
@@ -12,11 +12,24 @@
 | 依赖 | 手写 stub、内存实现和本地服务，部分用例监听本地端口 | 真模型或其他外部服务，按用例提供凭据和服务地址 |
 | 触发 | `make test` 覆盖根模块和三个子模块，根目录 `go test ./...` 仅覆盖根模块 | `make test-integration` 启用 `integration` 标签并筛选 `example/` 下匹配 `TestAdv` 的用例，其余集成用例按包运行 |
 | 时间预算 | 单包毫秒~秒级 | 单条 60~300s，整体 5min+ |
-| CI 角色 | [GitLab CI](../../.gitlab-ci.yml) 的必过门 | 需要对应环境时显式运行 |
+| CI 角色 | [GitLab CI](../../.gitlab-ci.yml) 的必过门 | PostgreSQL 和 MySQL 由独立 job 提供测试库，其他集成用例按环境运行 |
 
 集成测试统一加 `//go:build integration`，默认测试路径不编译这些文件。教学用例用 `make test-integration`，其中同名模式的 mock 测试也会运行。其余集成用例进入对应模块，用 `go test -tags=integration` 按包运行。
 
 依赖真实外部服务、外部凭据或宿主预置资源的测试使用 `integration` 标签。测试自行创建的临时资源、本地 mock 服务或子进程可走默认测试路径。
+
+### PostgreSQL 与 MySQL
+
+GitLab 的 `test-postgres` 和 `test-mysql` 分别运行 PostgreSQL 16.9 和 MySQL 8.0.35。Checkpointer、Store、HistoryStore 一致性与租约测试在 PostgreSQL 上覆盖 pgx 的 `cache_statement`、`exec`、`simple_protocol`，在 MySQL 上覆盖 `interpolateParams` 开关两档。每个 job 另按其 DSN 跑一套放弃任务与续跑的双进程回归。
+
+本地给对应测试设置 DSN。账号须有创建和删除表的权限，测试使用带随机前缀的表并在结束时清理。
+
+```bash
+CREW_SQL_POSTGRES_DSN='host=127.0.0.1 port=5432 user=crew_test password=crew_test dbname=crew_test sslmode=disable' \
+  go -C sql test -race -tags=integration -count=1 -timeout=5m -run '^TestPostgresIntegration$' .
+CREW_SQL_MYSQL_DSN='crew_test:crew_test@tcp(127.0.0.1:3306)/crew_test?parseTime=true' \
+  go -C sql test -race -tags=integration -count=1 -timeout=5m -run '^TestMySQLIntegration$' .
+```
 
 ### 模型名：**别写死，用 `qwen.TestModelCandidates`**
 

@@ -70,16 +70,23 @@ func (pauseSharedResume) OnNodeStart(ctx context.Context, node string) (context.
 	return ctx, err
 }
 
-const sharedCPFileEnv = "CREW_TEST_SHARED_CP_FILE"
+const (
+	sharedCPDSNEnv   = "CREW_TEST_SHARED_CP_DSN"
+	sharedResumeBusy = "resume-busy"
+)
 
 func TestSharedCheckpointResumeWorker(t *testing.T) {
-	path := os.Getenv(sharedCPFileEnv)
-	if path == "" {
+	backend := sharedApprovalBackend{
+		driver: os.Getenv("CREW_TEST_SHARED_CP_DRIVER"),
+		dsn:    os.Getenv(sharedCPDSNEnv),
+		prefix: os.Getenv("CREW_TEST_SHARED_CP_PREFIX"),
+	}
+	if backend.dsn == "" {
 		t.Skip("由共享存档测试启动的子进程")
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
-	cp, history := openSharedApproval(t, path)
+	_, cp, history := backend.open(t)
 	ctx = compose_v2.WithCheckpointerCtx(compose_v2.WithThreadIDCtx(ctx, "shared-approval"), cp)
 	agent := sharedApprovalAgent(history, func() {
 		_, _ = fmt.Fprintln(os.Stdout, "transfer-executed") // 由父进程检查输出。
@@ -95,38 +102,74 @@ func TestSharedCheckpointResumeWorker(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	} else if !errors.Is(err, compose_v2.ErrTaskBusy) {
+		return
+	}
+	if !errors.Is(err, compose_v2.ErrTaskBusy) {
 		t.Fatalf("放弃期间续跑应返回 ErrTaskBusy，实际 %v", err)
+	}
+	if _, err := fmt.Fprintln(os.Stdout, sharedResumeBusy); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func openSharedApproval(t *testing.T, path string) (*crewsql.Checkpointer, *crewsql.HistoryStore) {
+type sharedApprovalBackend struct {
+	driver string
+	dsn    string
+	prefix string
+}
+
+func (b sharedApprovalBackend) open(t *testing.T) (*sql.DB, *crewsql.Checkpointer, *crewsql.HistoryStore) {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(2000)")
+	var dialect crewsql.Dialect
+	switch b.driver {
+	case "sqlite":
+		dialect = crewsql.SQLite{}
+	case "pgx":
+		dialect = crewsql.Postgres{}
+	case "mysql":
+		dialect = crewsql.MySQL{}
+	default:
+		t.Fatalf("不支持的存档测试驱动 %q", b.driver)
+	}
+	db, err := sql.Open(b.driver, b.dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return crewsql.NewCheckpointer(db, crewsql.SQLite{}), crewsql.NewHistoryStore(db, crewsql.SQLite{})
+	cpTable, historyTable := crewsql.DefaultCheckpointTable, crewsql.DefaultHistoryTable
+	if b.prefix != "" {
+		cpTable, historyTable = b.prefix+"_cp", b.prefix+"_history"
+	}
+	return db, crewsql.NewCheckpointer(db, dialect, crewsql.WithCheckpointerTable(cpTable)),
+		crewsql.NewHistoryStore(db, dialect, crewsql.WithHistoryTable(historyTable))
 }
 
 type sharedApproval struct {
-	ctx              context.Context
-	path, sid, askID string
-	cp               *crewsql.Checkpointer
-	history          *crewsql.HistoryStore
-	key              agent_v2.HistoryKey
-	agent            *agent_v2.BasicAgent
+	ctx        context.Context
+	backend    sharedApprovalBackend
+	sid, askID string
+	cp         *crewsql.Checkpointer
+	history    *crewsql.HistoryStore
+	key        agent_v2.HistoryKey
+	agent      *agent_v2.BasicAgent
 }
 
-func newSharedApproval(t *testing.T) sharedApproval {
+func newSQLiteSharedApproval(t *testing.T) sharedApproval {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "shared.db")
+	return newSharedApproval(t, sharedApprovalBackend{driver: "sqlite", dsn: "file:" + path + "?_pragma=busy_timeout(2000)"})
+}
+
+func newSharedApproval(t *testing.T, backend sharedApprovalBackend) sharedApproval {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	t.Cleanup(cancel)
 	key := agent_v2.HistoryKey{Owner: "tenant", ConvID: "shared-approval"}
 	ctx = compose_v2.WithThreadIDCtx(ctx, key.ConvID)
-	path := filepath.Join(t.TempDir(), "shared.db")
-	cp, history := openSharedApproval(t, path)
+	db, cp, history := backend.open(t)
+	if backend.prefix != "" {
+		dropSQLTestTablesOnCleanup(t, db, backend.prefix+"_cp_task_lease", backend.prefix+"_cp", backend.prefix+"_history")
+	}
 	if err := cp.Setup(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -141,13 +184,25 @@ func newSharedApproval(t *testing.T) sharedApproval {
 	if !ok || len(interrupt.AllQueries()) != 1 {
 		t.Fatalf("应停在转账审批，实际 %v", err)
 	}
-	return sharedApproval{ctx: ctx, path: path, sid: session.RunID, askID: interrupt.AllQueries()[0].InterruptID,
+	return sharedApproval{ctx: ctx, backend: backend, sid: session.RunID, askID: interrupt.AllQueries()[0].InterruptID,
 		cp: cp, history: history, key: key, agent: agent}
+}
+
+func dropSQLTestTablesOnCleanup(t *testing.T, db *sql.DB, tables ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS "+strings.Join(tables, ", ")); err != nil {
+			t.Errorf("删除测试表失败：%v", err)
+		}
+	})
 }
 
 func (f sharedApproval) worker(mode string) *exec.Cmd {
 	cmd := exec.CommandContext(f.ctx, os.Args[0], "-test.run=^TestSharedCheckpointResumeWorker$")
-	cmd.Env = append(os.Environ(), sharedCPFileEnv+"="+f.path, "CREW_TEST_SHARED_CP_SID="+f.sid,
+	cmd.Env = append(os.Environ(), sharedCPDSNEnv+"="+f.backend.dsn, "CREW_TEST_SHARED_CP_DRIVER="+f.backend.driver,
+		"CREW_TEST_SHARED_CP_PREFIX="+f.backend.prefix, "CREW_TEST_SHARED_CP_SID="+f.sid,
 		"CREW_TEST_SHARED_CP_QUESTION="+f.askID, "CREW_TEST_SHARED_CP_MODE="+mode)
 	return cmd
 }
@@ -167,9 +222,13 @@ func (f sharedApproval) results(t *testing.T) []string {
 	return results
 }
 
-// TestSharedCheckpointer_AbandonDuringResume 用同一文件库和两个进程穿过真实 Agent 的读档、工具执行和历史收尾。
+// TestSharedCheckpointer_AbandonDuringResume 用两个进程穿过真实 Agent 的读档、工具执行和历史收尾。
 func TestSharedCheckpointer_AbandonDuringResume(t *testing.T) {
-	f := newSharedApproval(t)
+	runAbandonDuringResume(t, newSQLiteSharedApproval(t))
+}
+
+func runAbandonDuringResume(t *testing.T, f sharedApproval) {
+	t.Helper()
 	cmd := f.worker("pause")
 	cmd.Stderr = os.Stderr
 	out, err := cmd.StdoutPipe()
@@ -226,7 +285,11 @@ func (p pauseSharedDeletion) DeleteSubtree(ctx context.Context, sid, ns string) 
 }
 
 func TestSharedCheckpointer_ResumeDuringAbandon(t *testing.T) {
-	f := newSharedApproval(t)
+	runResumeDuringAbandon(t, newSQLiteSharedApproval(t))
+}
+
+func runResumeDuringAbandon(t *testing.T, f sharedApproval) {
+	t.Helper()
 	paused := pauseSharedDeletion{Checkpointer: f.cp, entered: make(chan struct{}), release: make(chan struct{})}
 	ctx := compose_v2.WithCheckpointerCtx(f.ctx, paused)
 	done := make(chan struct{})
@@ -250,7 +313,8 @@ func TestSharedCheckpointer_ResumeDuringAbandon(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	output, err := f.worker("busy").CombinedOutput()
-	if err != nil || strings.Contains(string(output), "transfer-executed") {
+	if err != nil || strings.Count(string(output), sharedResumeBusy+"\n") != 1 ||
+		strings.Contains(string(output), "transfer-executed") {
 		t.Fatalf("删档中续跑应被拒且工具不执行，实际 err=%v output=%s", err, output)
 	}
 	close(paused.release)

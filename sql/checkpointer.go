@@ -34,16 +34,9 @@ const DefaultCheckpointTable = "crew_checkpoint"
 //	cp := agentSQL.NewCheckpointer(db, agentSQL.Postgres{})
 //	cp.Setup(ctx) // 创建表 + 索引
 //
-// **conformance 验证**: 本模块自身**没有跑** conformance —— 此前唯一的测试手段是 sqlmock（`b1a9434` 起已接真 SQLite 引擎跑 conformance，见 `conformance_sqlite_test.go`；PG / MySQL 那档仍需业务侧连真库），
-// 它对 payload 传 `sqlmock.AnyArg()`、内容从不检查，所以对"某个 cp 字段没进 wire"
-// 这类退化结构性失明（实测：给 `Checkpoint.Epoch` 打 `json:"-"`，本模块测试全绿）。
-//
-// 现有的两层保障：
-//   - `payload_roundtrip_test.go` 验 `MarshalCheckpoint` ↔ `UnmarshalCheckpoint` 全字段
-//     —— 那正是本模块存取 payload 的唯一路径（1 个 marshal 点 / 3 个 unmarshal 点，
-//     没有任何按列重建 Checkpoint 的路径），能挡住字段掉出 wire
-//   - 业务接真库时跑 `compose_v2/checkpointer_conformance.RunCheckpointerTests(t, factory)`
-//     验 SQL 层语义
+// 默认测试在 SQLite 上运行 Checkpointer 一致性套件。PostgreSQL 与 MySQL 的真库测试使用
+// integration 标签，并覆盖任务租约与双进程续跑。业务可通过
+// [crew-go/compose_v2/checkpointer_conformance.RunCheckpointerTests] 验证自己的存储实现。
 //
 // 所有 cp 业务字段都在 `payload` 列（JSON 类型；PG 也不用 JSONB——它拒收 `\u0000`，见 Setup 的 DDL 说明），独立列只有元数据（sid/ns/status/
 // graph_id/created_at）—— 这是设计如此，单一 marshal 点保证新字段自动带上。

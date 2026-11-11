@@ -8,9 +8,7 @@ package sql_test
 // 10.0）——都对 sqlmock 全程隐形，接上真引擎才变红。唯一的变量就是「backend 能不能真跑
 // 起来」。
 //
-// ⚠️ **它不等于 PG/MySQL 覆盖**——覆盖边界见 sql.OpenSQLiteForTest 的 godoc；那两家
-// 2026-09-03 用 embedded-postgres 与官方 MySQL tarball 各跑过一遍同一套 conformance
-// （PG 16.9 / MySQL 8.0.35 全绿），改 filter 语义或 DDL 时照 store 对照文档里的配方再跑。
+// PostgreSQL 和 MySQL 的方言与驱动行为由带 integration 标签的真库测试覆盖。
 
 import (
 	databasesql "database/sql"

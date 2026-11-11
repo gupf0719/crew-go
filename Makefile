@@ -9,7 +9,7 @@
 
 .PHONY: test test-unit test-integration test-all build vet lint cover tag
 
-# 默认 test = 单测，与 CI 必过路径一致。
+# 默认 test 对应 GitLab CI 的 test job。
 test: test-unit
 
 # 根目录的 ./... 不含三个子模块，各自进目录跑，与 CI 的默认测试范围一致。

@@ -163,10 +163,8 @@ query 值与长路径段），响应体再截到 512 字节（不切断多字节
 
 见 [`doc/code/todo.md`](../code/todo.md)：
 
-- `StreamableHTTPClient` 只实现了 streamable HTTP 的子集：只解 JSON 响应、`Accept` 只写 `application/json`、不处理
-  `Mcp-Session-Id`、不发 `notifications/initialized`。实测（2026-10-22）官方 MCP Go SDK v1.8.0 的 server 四种配置全在
-  `initialize` 处 400；加 `WithHTTPHeader("Accept", "application/json, text/event-stream")` 之后只有
-  `StreamableHTTPOptions{Stateless: true, JSONResponse: true}` 能用（另三种败在 SSE 响应或缺 initialized 通知）。
+- `StreamableHTTPClient` 支持 POST 的 JSON 或 SSE 响应，按 JSON-RPC ID 取结果。初始化完成后发送 `notifications/initialized`，后续请求携带协商版本与服务端分配的会话 ID。会话过期时下一次调用重建会话，关闭时尽力发送 DELETE。跨 origin 或改写请求方法的重定向会作为 HTTP 错误处理。[MCP Streamable HTTP 规范](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
+- 客户端消费本次 POST 的响应流，后台 GET 推送和 SSE 断线续订尚未实现。
 - 图片、音频不交给模型（只有一行说明）：要原样交，得让 tool_result 带图片块（Anthropic 支持），牵涉 schema 与各家适配器，没做。
 
 stdio 子进程默认继承父进程环境。`WithStdioEnvAllowlist` 选择允许继承的变量名，传空名单可清空继承项。`WithStdioEnv` 设置的值照常传入，同名值覆盖继承值。Windows 上 `os/exec` 会补入 `SYSTEMROOT`。

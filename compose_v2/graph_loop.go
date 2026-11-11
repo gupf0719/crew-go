@@ -486,6 +486,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 这次执行还在跑的标记（见 runAliveKey）：不在任何节点执行范围里的 Run 铸一个、出口置否，嵌套的 Run 继承。
 	// 脱离时记进来源链。解析出 sid 后登记任务执行，存档与 OnGraphEnd 收尾完成后再注销。
 	rootRun := !WithinNodeScope(ctx)
+	commitRoot := rootRun && taskCommitBase(ctx) == nil
 	var alive *atomic.Bool
 	var activity *TaskActivity
 	if rootRun {
@@ -564,6 +565,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			// 上行信号同理：本图已提交的（含续跑时从存档恢复的）交给调用这张图的那段执行，
 			// 失败 / 停下时不交（见 signal.go）。
 			bubbleSignalsTo(callerSignals, cm)
+			if commitRoot {
+				finishTaskCommit(ctx, cm)
+			}
 		}
 		// 图级钩子的信号属于调用方那段执行，图成没成都交（那段执行自己的提交决定它算不算）
 		callerSignals.add(endHookSignals.drain()...)
@@ -788,6 +792,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	}
 	if cfg.graphNS != "" {
 		ctx = WithGraphNS(ctx, cfg.graphNS) // 复用 ns_ctx.go 已有的 WithGraphNS helper
+	}
+	if commitRoot {
+		ctx = context.WithValue(ctx, taskCommitContextKey{}, &taskCommitScope{base: ctx, graphID: g.ID()})
 	}
 	// durability 解析（RunOption 显式 > 父 ctx 继承 > 默认 Exit）+ push 给下游，让嵌套
 	// 子图自动继承父档（各写自己 ns）。Exit 时下游也读到 Exit，行为与历史一致。
@@ -1238,6 +1245,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 处境说话。空 = 没走到 auto-load（本次声明了新开）。
 	noResumeReason := "本次声明了新开（WithFreshRun / 父层已声明），auto-load 整块跳过——" +
 		"注意档很可能还在，只是本次不捡它"
+	explicitResume := cfg.resumeFrom != nil
 	if cfg.resumeFrom == nil && !cfg.freshRun && !IsFreshRunCtx(ctx) &&
 		cfg.checkpointer != nil && cfg.sessionID != "" {
 		// opt-in 的 cp.load 事件（经 deliverCpEvent，钩子 panic 就地兜住、只记日志）
@@ -1420,7 +1428,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		judgeStart = !cfg.resumeFrom.FrontierStarted && !hasBreakpointStop(cfg.resumeFrom.PendingInterrupts)
 		// audit follow-up: 显式 WithResumeFrom 路径 fire cp.load event (Source=explicit)
 		// 之前只 auto-load 路径 fire, 业务统计 "Resume 次数" 时漏算显式路径.
-		if cfg.emitCpEvent && cfg.hooks != nil {
+		if explicitResume && cfg.emitCpEvent && cfg.hooks != nil {
 			// **判据必须跟真闸门同一个**：业务按这个字段统计「这次会不会真的续上」，
 			// 而引擎捡不捡档读的是 `HasResumableWork()`（按内容判）。这里曾按
 			// `Status == Pending` 算——那是档位 gate 撤销**之前**的判据，于是失败档
@@ -1506,6 +1514,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			bodyReached = true // 成功出口之二（共三处，见 Goexit 判据 defer）
 			return nil
 		}
+		notifyCheckpointRestored(ctx)
 		frontier = make([]FrontierMember, len(cfg.resumeFrom.CurrentFrontier))
 		copy(frontier, cfg.resumeFrom.CurrentFrontier)
 		// Resume 路径**无条件**清空旧 pending 列表 (跟 channel_manager.go::clearInterrupts

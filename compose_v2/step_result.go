@@ -19,7 +19,8 @@ const (
 	// handedRedoKeySep 标记交出去的一段执行（[HandOver] 封的那一格与它下面的分域）里的可重做记录：
 	// 那里的代际从交接那一层数起、不算执行级（见 nodeStateAccessor.handedOver），存档投影不能拿执行级
 	// 代际判它过没过期——单独一个标记让投影认得出来。
-	handedRedoKeySep = ":hredo"
+	handedRedoKeySep   = ":hredo"
+	handedRedoScopeSep = ":handover:"
 )
 
 // stepStateKey 是 key 这一步在 base 名下的派生键。
@@ -46,9 +47,28 @@ func handedRedoStepStateKey(base string, gen int, key string) string {
 func (a *nodeStateAccessor) redoKey(key string) string {
 	gen := a.cm.effectiveRerunGen(a)
 	if a.handedOver {
-		return handedRedoStepStateKey(a.base(), gen, key)
+		base := a.base() + handedRedoScopeSep + shortHash(a.chain[a.genFrom])
+		return handedRedoStepStateKey(base, gen, key)
 	}
 	return redoStepStateKey(a.base(), gen, key)
+}
+
+// FinishHandOver 回收已完成调用在交接分域中的可重做步骤。调用方应先记下可重放的完成结果。
+// ctx 必须是 [HandOver] 返回的交接相位。普通步骤记录仍可用于重放结果所引用的状态。
+func FinishHandOver(ctx context.Context) {
+	a := nodeStateAccessorFrom(ctx)
+	if a == nil || a.handover == nil {
+		return
+	}
+	group := handedRedoScopeSep + shortHash(a.scope) + handedRedoKeySep
+	legacy := a.base() + handedRedoKeySep
+	a.cm.mu.Lock()
+	defer a.cm.mu.Unlock()
+	for key := range a.cm.nodeStates {
+		if nodeStateOwner(key) == a.key && (strings.Contains(key, group) || strings.HasPrefix(key, legacy)) {
+			delete(a.cm.nodeStates, key)
+		}
+	}
 }
 
 // redoGenOf 从派生键里取出可重做记录的代际；不是可重做记录时 ok=false。
@@ -432,6 +452,11 @@ func GetStepResult[T any](ctx context.Context, key string) (T, bool) {
 	tv, ok := a.cm.getNodeState(k)
 	if !ok {
 		k = a.redoKey(key)
+		tv, ok = a.cm.getNodeState(k)
+	}
+	if !ok && a.handedOver {
+		// 旧存档的交接记录只包含实际分域，不包含交接组。
+		k = handedRedoStepStateKey(a.base(), a.cm.effectiveRerunGen(a), key)
 		tv, ok = a.cm.getNodeState(k)
 	}
 	if !ok {

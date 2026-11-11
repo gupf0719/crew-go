@@ -32,12 +32,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 
@@ -648,7 +646,7 @@ func (c *Client) post(ctx context.Context, body []byte, questions map[string]Que
 			Provider:   c.provider,
 			StatusCode: resp.StatusCode,
 			Body:       truncateRunes(string(raw), maxErrorBody),
-			RetryAfter: parseRetryAfter(resp.Header, time.Now()),
+			RetryAfter: model.ParseRetryAfter(resp.Header, time.Now()),
 		})
 	}
 	if len(raw) > maxResponseBody {
@@ -839,42 +837,6 @@ func (e *responseError) Unwrap() error { return e.err }
 
 // NonRetryable 实现 compose_v2.NonRetryable。
 func (e *responseError) NonRetryable() {}
-
-// parseRetryAfter 按官方 SDK 的顺序解析等待时长：先 retry-after-ms（毫秒），再
-// retry-after（秒数或 HTTP-date）。都没有、不可解析或已过期时返回 0；超出
-// time.Duration 能表示的范围时取最大值。
-func parseRetryAfter(h http.Header, now time.Time) time.Duration {
-	if v := strings.TrimSpace(h.Get("retry-after-ms")); v != "" {
-		if d, ok := durationOf(v, time.Millisecond); ok {
-			return d
-		}
-	}
-	v := strings.TrimSpace(h.Get("retry-after"))
-	if v == "" {
-		return 0
-	}
-	if _, err := strconv.ParseFloat(v, 64); err == nil {
-		d, _ := durationOf(v, time.Second)
-		return d
-	}
-	if t, err := http.ParseTime(v); err == nil && t.After(now) {
-		return t.Sub(now)
-	}
-	return 0
-}
-
-// durationOf 把非负的有限数字串按 unit 换成时长，超出范围时取 time.Duration 的最大值。
-func durationOf(v string, unit time.Duration) (time.Duration, bool) {
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
-		return 0, false
-	}
-	ns := f * float64(unit)
-	if ns >= math.MaxInt64 {
-		return time.Duration(math.MaxInt64), true
-	}
-	return time.Duration(ns), true
-}
 
 // truncateRunes 按字符截断，避免切坏多字节字符。
 func truncateRunes(s string, n int) string {

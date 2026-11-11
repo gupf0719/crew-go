@@ -295,6 +295,13 @@ func TestHandler_HITL_InterruptResume(t *testing.T) {
 	if interruptID == "" {
 		t.Fatal("no interruptId in RunFinished(interrupt)")
 	}
+	items := interruptsIn(events1)
+	if len(items) != 1 || items[0]["reason"] != "input_required" {
+		t.Fatalf("问答中断应使用 input_required，实际 %v", items)
+	}
+	if response, ok := items[0]["responseSchema"].(map[string]any); !ok || response["type"] != "string" {
+		t.Fatalf("问答中断应声明文本响应，实际 %v", items[0]["responseSchema"])
+	}
 
 	// 2. Resume（带答案）→ 应完成（success）+ 出最终答案
 	resumeBody := `{"threadId":"t1","resume":[{"interruptId":"` + interruptID + `","status":"resolved","payload":"张三"}]}`

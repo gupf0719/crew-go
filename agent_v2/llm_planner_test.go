@@ -19,12 +19,14 @@ type plannerStubModel struct {
 	calls     int
 	lastTools []*schema.ToolInfo
 	lastMsgs  []*schema.Message
+	lastOpts  *model.Options
 	respFunc  func(call int, tools []*schema.ToolInfo) *schema.Message
 }
 
-func (m *plannerStubModel) Generate(_ context.Context, msgs []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+func (m *plannerStubModel) Generate(_ context.Context, msgs []*schema.Message, opts ...model.Option) (*schema.Message, error) {
 	m.calls++
 	m.lastMsgs = msgs
+	m.lastOpts = model.Apply(opts...)
 	return m.respFunc(m.calls, m.lastTools), nil
 }
 func (m *plannerStubModel) Stream(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.StreamReader[*schema.Message], error) {
@@ -36,6 +38,40 @@ func (m *plannerStubModel) WithTools(tools []*schema.ToolInfo) (model.ChatModel,
 }
 
 var _ model.ChatModel = (*plannerStubModel)(nil)
+
+type plannerAutoToolModel struct{ *plannerStubModel }
+
+func (*plannerAutoToolModel) StructuredCapability(string) model.StructuredCapability {
+	return model.StructuredCapability{}
+}
+
+func TestLLMPlanner_AutoToolChoiceUsesBoundTools(t *testing.T) {
+	stub := &plannerStubModel{respFunc: func(call int, tools []*schema.ToolInfo) *schema.Message {
+		if call == 1 && len(tools) == 1 && tools[0].Name == "plan" {
+			return makeToolCallMsg("plan", `{"steps":[{"description":"查证"}]}`)
+		}
+		if call == 2 && len(tools) == 2 && tools[1].Name == "respond" {
+			return makeToolCallMsg("respond", `{"answer":"已查证"}`)
+		}
+		return nil
+	}}
+	planner := agent_v2.NewLLMPlanner(&plannerAutoToolModel{stub}, agent_v2.WithLLMPlannerSystemPrompt("请按业务规则处理。"))
+	sess := agent_v2.NewRunSession()
+	steps, _, err := planner(t.Context(), sess, "查证", nil)
+	if err != nil || len(steps) != 1 || steps[0].Description != "查证" || stub.lastOpts.ToolChoice != nil ||
+		!strings.Contains(stub.lastMsgs[0].Content, "plan 工具") {
+		t.Fatalf("首轮应在自动选工具模式下得到计划，steps=%v, opts=%+v, err=%v", steps, stub.lastOpts, err)
+	}
+	_, answer, err := planner(t.Context(), sess, "查证", []agent_v2.ExecutedStep{{}})
+	if err != nil || answer != "已查证" || stub.lastOpts.ToolChoice != nil ||
+		!strings.Contains(stub.lastMsgs[0].Content, "respond") {
+		t.Fatalf("续轮应在自动选工具模式下得到答复，answer=%q, opts=%+v, err=%v", answer, stub.lastOpts, err)
+	}
+	_, _, err = planner(t.Context(), sess, "查证", nil)
+	if !errors.Is(err, agent_v2.ErrPlannerNoToolCall) {
+		t.Fatalf("模型返回空结果时应给出可判断的错误，实际 %v", err)
+	}
+}
 
 // makeToolCallMsg 构造带 tool_call 的 assistant 消息——LLMPlanner 按 tool_call.Name
 // 路由 plan/respond 解析。
@@ -67,6 +103,9 @@ func TestLLMPlanner_FirstCallReturnsPlan(t *testing.T) {
 	}
 	if finalAns != "" {
 		t.Fatalf("first call should not return finalAnswer, got %q", finalAns)
+	}
+	if stub.lastOpts.ToolChoice == nil || *stub.lastOpts.ToolChoice != schema.ToolChoiceRequired {
+		t.Fatalf("未声明能力的现有模型应沿用 required，实际 %+v", stub.lastOpts)
 	}
 	if len(steps) != 2 {
 		t.Fatalf("expected 2 steps, got %d", len(steps))

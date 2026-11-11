@@ -22,6 +22,7 @@ var executionCtxKeys = []any{
 	sessionIDKey{}, runTaskIDKey{}, currentTaskIDKey{}, freshRunCtxKey{}, resumeCtxKey{}, answerLedgerKey{},
 	graphNSKey{}, nodeIDKey{}, nodeVisitKey{}, nodeInstanceIDKey{}, nodeInterruptCounterKey{},
 	checkpointingDisabledKey{},
+	taskCommitBarrierKey{}, taskCommitContextKey{},
 	toolCallIdxKey{}, currentToolCallIDKey{}, inToolCallKey{}, withinNodeScopeKey{},
 	nodeStateAccessorKey{}, subCallCounterKey{}, subCallScopeKey{}, abnormalNodeExitKey{},
 	componentKindKey{}, eventSinkKey{}, sendSinkKey{}, toolCategoryLookupKey{}, outerRerunGensKey{}, outerRegensKey{},
@@ -36,6 +37,7 @@ var configurableExecutionCtxKeys = []any{softCancelCtxKey{}}
 var environmentCtxKeys = []any{
 	checkpointerKey{}, orchHooksKey{}, ownerKey{},
 	durabilityCtxKey{}, staleGuardCtxKey{}, emitCpEventCtxKey{},
+	checkpointRestoreObserverKey{},
 }
 
 // usedCtxKeyTypes 扫 dir 下非测试 .go 文件，收集当 ctx key 用的类型名：`context.WithValue(_, T{}, _)`

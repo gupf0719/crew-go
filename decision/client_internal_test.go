@@ -3,51 +3,13 @@ package decision
 import (
 	"encoding/json"
 	"errors"
-	"math"
 	"net"
-	"net/http"
 	"reflect"
 	"testing"
 	"time"
 
 	"crew-go/model"
 )
-
-// TestParseRetryAfter：先认 retry-after-ms，再认 retry-after 的秒数或 HTTP-date；
-// 负数、非法值、过去的时间都当没给。
-func TestParseRetryAfter(t *testing.T) {
-	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
-	cases := []struct {
-		name string
-		hdr  map[string]string
-		want time.Duration
-	}{
-		{"none", nil, 0},
-		{"ms", map[string]string{"retry-after-ms": "250"}, 250 * time.Millisecond},
-		{"ms wins over seconds", map[string]string{"retry-after-ms": "100", "retry-after": "5"}, 100 * time.Millisecond},
-		{"invalid ms falls back to seconds", map[string]string{"retry-after-ms": "abc", "retry-after": "2"}, 2 * time.Second},
-		{"seconds", map[string]string{"retry-after": "1.5"}, 1500 * time.Millisecond},
-		{"negative seconds", map[string]string{"retry-after": "-3"}, 0},
-		{"http date", map[string]string{"retry-after": now.Add(3 * time.Second).Format(http.TimeFormat)}, 3 * time.Second},
-		{"past http date", map[string]string{"retry-after": now.Add(-time.Minute).Format(http.TimeFormat)}, 0},
-		{"garbage", map[string]string{"retry-after": "soon"}, 0},
-		// 越界的浮点转整数由平台决定：arm64 自己会饱和，amd64 会变成负数，所以这两条
-		// 只在 amd64 这类平台上抓得到回归。
-		{"huge seconds saturate", map[string]string{"retry-after": "1e300"}, time.Duration(math.MaxInt64)},
-		{"huge ms saturate", map[string]string{"retry-after-ms": "1e300"}, time.Duration(math.MaxInt64)},
-		{"infinite ms falls back to seconds", map[string]string{"retry-after-ms": "Inf", "retry-after": "2"}, 2 * time.Second},
-		{"negative ms falls back to seconds", map[string]string{"retry-after-ms": "-5", "retry-after": "1"}, time.Second},
-	}
-	for _, tc := range cases {
-		h := http.Header{}
-		for k, v := range tc.hdr {
-			h.Set(k, v)
-		}
-		if got := parseRetryAfter(h, now); got != tc.want {
-			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
-		}
-	}
-}
 
 // TestBackoff：第 k 次重试等首次等待的 2^k 倍、不超过上限，再随机减去至多四分之一；
 // 重试次数再大也不溢出。

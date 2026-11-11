@@ -22,6 +22,8 @@ func callWith(t *testing.T, result map[string]any) any {
 			return
 		}
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{"protocolVersion": "2025-06-18"})
 		case "tools/list":

@@ -16,7 +16,7 @@ import (
 // LLMPlanner 错误哨兵——caller 按错因分流（如"空 steps 时降级单步"）用 errors.Is
 // 判定，避免 strings.Contains(err.Error(), ...) 这种脆弱 match。
 var (
-	// ErrPlannerNoToolCall LLM 没产 tool_call（违反 tool_choice=required）
+	// ErrPlannerNoToolCall 表示模型未返回规划或答复所需的工具调用。
 	ErrPlannerNoToolCall = errors.New("planner returned no tool_call")
 	// ErrPlannerEmptySteps Planner plan tool steps 数组为空
 	ErrPlannerEmptySteps = errors.New("planner returned empty steps")
@@ -86,7 +86,8 @@ func WithLLMPlannerSubAgents(agents map[string]Agent) LLMPlannerOption {
 // plan / respond 是"信号 tool"——不真正执行，只借 tool_call schema 让 provider
 // 替我们强校验结构化输出，比解析自由形式 JSON 鲁棒。
 //
-// tool_choice 强制为 required：禁止 LLM 返裸文本绕过 tool 约束。
+// 支持 tool_choice=required 的模型走强制选工具。不支持的模型由提示词要求调用本轮绑定的工具；
+// 缺少工具调用时返回 [ErrPlannerNoToolCall]。
 //
 // **provider 兼容注记**：dashscope qwen3 的 thinking 模式不支持 tool_choice=required
 // （HTTP 400）——用 qwen.NewTestClient（默认已关 thinking）或业务 client 上
@@ -108,6 +109,7 @@ func NewLLMPlanner(m model.ChatModel, opts ...LLMPlannerOption) Planner {
 	}
 
 	respondTool := buildRespondToolInfo()
+	forceTool := supportsForcedToolChoice(m)
 
 	return func(ctx context.Context, sess *RunSession, original string, executed []ExecutedStep) ([]PlanStep, string, error) {
 		// plan tool schema 每次动态生成：depends_on 的 maximum = len(executed) - 1
@@ -121,6 +123,9 @@ func NewLLMPlanner(m model.ChatModel, opts ...LLMPlannerOption) Planner {
 		if err != nil {
 			return nil, "", fmt.Errorf("llm planner: bind tools: %w", err)
 		}
+		if isFrameworkNil(boundModel) {
+			return nil, "", fmt.Errorf("llm planner: bind tools returned a nil model")
+		}
 
 		// HITL：Resume 时框架通过 ResumeContext 透传 user 新指令——Planner 把它
 		// 塞进 prompt 让 LLM 看到并据此调整剩余步骤。
@@ -129,18 +134,27 @@ func NewLLMPlanner(m model.ChatModel, opts ...LLMPlannerOption) Planner {
 		// 「用户这轮说了什么」而不是「某个提问的答案」。曾经用「取 map 里任意一条」实现，
 		// 那会吃到别人的答案（实测：用户答任务 A 的 ID，节点执行了任务 B 那件事）。
 		resumeUserMsg, _ := compose_v2.GetResumeUserText(ctx)
+		prompt := cfg.systemPrompt
+		var modelOpts []model.Option
+		if forceTool {
+			modelOpts = append(modelOpts, model.WithToolChoice(schema.ToolChoiceRequired))
+		} else if len(executed) == 0 {
+			prompt += "\n\n本轮请调用 plan 工具提交步骤。必须通过工具调用返回结果。"
+		} else {
+			prompt += "\n\n本轮请调用 plan 提交剩余步骤，或调用 respond 提交最终答复。必须通过工具调用返回结果。"
+		}
 		msgs := []*schema.Message{
-			schema.SystemMessage(cfg.systemPrompt),
+			schema.SystemMessage(prompt),
 			schema.UserMessage(buildLLMPlannerUserInput(original, executed, cfg.subAgents, resumeUserMsg)),
 		}
 		_ = sess // 保留参数签名兼容（未来想读 sess 历史扩展时用）
-		out, err := boundModel.Generate(ctx, msgs, model.WithToolChoice(schema.ToolChoiceRequired))
+		out, err := boundModel.Generate(ctx, withModelUserData(ctx, msgs), modelOpts...)
 		if err != nil {
 			return nil, "", fmt.Errorf("llm planner: generate: %w", err)
 		}
 		calls := schema.GetToolCalls(out)
 		if len(calls) == 0 {
-			return nil, "", fmt.Errorf("llm planner: %w (content=%q)", ErrPlannerNoToolCall, out.Content)
+			return nil, "", fmt.Errorf("llm planner: %w (content=%q)", ErrPlannerNoToolCall, out.GetContent())
 		}
 		call := calls[0]
 		switch call.Function.Name {

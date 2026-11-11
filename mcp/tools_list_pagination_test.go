@@ -24,6 +24,8 @@ func pagedServer(t *testing.T, pages [][]string, cursorOf func(i int) string) *h
 			return
 		}
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{"protocolVersion": "2025-03-26"})
 		case "tools/list":

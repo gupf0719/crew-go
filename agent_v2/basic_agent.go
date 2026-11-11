@@ -3088,7 +3088,7 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			if agentsMD != "" {
 				in = append([]*schema.Message{schema.SystemMessage(agentsMD)}, in...)
 			}
-			return streamOrGenerate(c, llm, in, cfg.Name, runID, cfg.Hooks, streamHookInfo, modelRunOpts...)
+			return streamOrGenerate(c, llm, withModelUserData(c, in), cfg.Name, runID, cfg.Hooks, streamHookInfo, modelRunOpts...)
 		}
 		// callLLM 按 WithModelRetry 整次重来：一次调用就是一条消息、工具在 tools 节点才执行，重来没有本地副作用；
 		// 建流之前与流开始之后的错一样处理。下层（fallback 的每候选重试）已重试到上限的错误带标记，RunWithRetry 不再

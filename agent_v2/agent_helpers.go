@@ -154,7 +154,7 @@ func stampTask(ctx context.Context, sid string, fresh bool) context.Context {
 // （当时 BasicAgent 的图只按结构指纹算身份，任意两个 BasicAgent 的图身份相同）子层直接接着跑父图的存档、成功时把父图的档删掉。
 // 出路是走 `RunSubAgent`。
 func enterRunTask(ctx context.Context, session *RunSession) context.Context {
-	ctx = shadowNodeGrants(ctx)
+	ctx = withoutResumePhase(shadowNodeGrants(ctx))
 	if _, ok := enclosingTask(ctx); ok {
 		return stampTask(ctx, session.RunID, false)
 	}

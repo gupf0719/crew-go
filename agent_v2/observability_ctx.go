@@ -60,6 +60,13 @@ func WithResumePhase(ctx context.Context, action ResumeAction) context.Context {
 	return context.WithValue(ctx, resumePhaseCtxKey{}, action)
 }
 
+func withoutResumePhase(ctx context.Context) context.Context {
+	if _, ok := GetResumePhase(ctx); !ok {
+		return ctx
+	}
+	return context.WithValue(ctx, resumePhaseCtxKey{}, nil)
+}
+
 // GetResumePhase 从 ctx 读 Resume action.
 //
 //	返 (action, true): 当前是 Resume 路径 (observability 据此 记 crew.resumes{crew.resume.action})

@@ -29,7 +29,7 @@ func TestDecisionRouter_DeciderRunsWithoutHistory(t *testing.T) {
 		suppressed = historySuppressed(ctx)
 		return RouteDecision{Target: "a", Confidence: 1}, nil
 	}
-	r := NewRoutingAgent(WithRoutingName("support"), WithRouteDecider(decider, 0))
+	r := NewRoutingAgent(WithRoutingName("support"), WithRouteDecider("decider", decider, 0))
 	r.AddBranch("a", routeDeciderTestAgent{})
 
 	route := r.decisionRouter(NewRunSession())

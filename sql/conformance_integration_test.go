@@ -133,6 +133,17 @@ func runSQLBackendConformance(t *testing.T, dialect crewsql.Dialect, open func()
 			return st
 		})
 	})
+	if _, isPostgres := dialect.(crewsql.Postgres); isPostgres {
+		t.Run("DecimalFilterPrecision", func(t *testing.T) {
+			table := newSQLTestTable()
+			dropSQLTestTablesOnCleanup(t, db, table)
+			st := crewsql.NewStore(db, dialect, crewsql.WithStoreTable(table))
+			if err := st.Setup(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			assertDecimalFilterPrecision(t, st, true)
+		})
+	}
 	t.Run("HistoryStore", func(t *testing.T) {
 		history_conformance.RunHistoryStoreTests(t, func() agent_v2.HistoryStore {
 			table := newSQLTestTable()

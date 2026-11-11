@@ -80,28 +80,40 @@ func (o *Observability) startAgent(ctx context.Context, info *hook.AgentInfo) (c
 	ah.scope = &agentScope{}
 	o.inst.agentActive.Add(ctx, 1, metric.WithAttributes(AttrAgentName.String(info.Name)))
 
+	ctx = o.withHandle(ctx, ah)
 	if action, isResume := agent_v2.GetResumePhase(ctx); isResume {
-		labels := metric.WithAttributes(AttrAgentName.String(info.Name), AttrAgentKind.String(info.Type),
-			AttrResumeAction.String(action.String()))
-		o.inst.resumes.Add(ctx, 1, labels)
-		evAttrs := []attribute.KeyValue{AttrResumeAction.String(action.String())}
-		sid := compose_v2.GetSessionID(ctx)
-		if action == agent_v2.ResumeActionAbort {
-			// 放弃只在最外层触发开始 / 结束钩子，里面各层挂着的记录没人来取：连这棵子树一起丢掉。
-			o.dropInterruptsUnder(sid, graphNS, info.Name)
-		}
-		key := interruptKey(sid, graphNS, info.Name)
-		if v, ok := o.interruptedAt.LoadAndDelete(key); ok {
-			wait := time.Since(v.(time.Time)).Seconds()
-			o.inst.interruptWait.Record(ctx, wait, metric.WithAttributes(AttrAgentName.String(info.Name), AttrAgentKind.String(info.Type)))
-			evAttrs = append(evAttrs, attribute.Float64("crew.interrupt.wait_seconds", wait))
-		}
-		if rc, ok := compose_v2.GetResumeContext(ctx); ok && rc != nil {
-			evAttrs = append(evAttrs, attribute.Int("crew.resume.inputs", resumeInputCount(rc)))
-		}
-		span.AddEvent("crew.resume", trace.WithAttributes(evAttrs...))
+		o.recordAgentResume(ctx, ah, action)
+		return ctx, ah
 	}
-	return o.withHandle(ctx, ah), ah
+	sid := compose_v2.GetSessionID(ctx)
+	ctx = compose_v2.WithCheckpointRestoreObserver(ctx, func(restored context.Context) {
+		if compose_v2.GetGraphNS(restored) == ah.graphNS && compose_v2.GetSessionID(restored) == sid &&
+			o.agentHandleFrom(restored) == ah && !ah.ended.Load() {
+			o.recordAgentResume(restored, ah, agent_v2.ResumeActionContinue)
+		}
+	})
+	return ctx, ah
+}
+
+func (o *Observability) recordAgentResume(ctx context.Context, ah *handle, action agent_v2.ResumeAction) {
+	labels := metric.WithAttributes(AttrAgentName.String(ah.name), AttrAgentKind.String(ah.agentKind),
+		AttrResumeAction.String(action.String()))
+	o.inst.resumes.Add(ctx, 1, labels)
+	evAttrs := []attribute.KeyValue{AttrResumeAction.String(action.String())}
+	sid := compose_v2.GetSessionID(ctx)
+	if action == agent_v2.ResumeActionAbort {
+		o.dropInterruptsUnder(sid, ah.graphNS, ah.name)
+	}
+	key := interruptKey(sid, ah.graphNS, ah.name)
+	if v, ok := o.interruptedAt.LoadAndDelete(key); ok {
+		wait := time.Since(v.(time.Time)).Seconds()
+		o.inst.interruptWait.Record(ctx, wait, metric.WithAttributes(AttrAgentName.String(ah.name), AttrAgentKind.String(ah.agentKind)))
+		evAttrs = append(evAttrs, attribute.Float64("crew.interrupt.wait_seconds", wait))
+	}
+	if rc, ok := compose_v2.GetResumeContext(ctx); ok && rc != nil {
+		evAttrs = append(evAttrs, attribute.Int("crew.resume.inputs", resumeInputCount(rc)))
+	}
+	ah.span.AddEvent("crew.resume", trace.WithAttributes(evAttrs...))
 }
 
 // agentStartContent 记 agent 这次收到的输入（打开内容采集时）：首跑取最后一条用户消息，续跑取调用方这次给的输入。
@@ -530,6 +542,13 @@ func (h *agentHooks) OnToolEnd(ctx context.Context, info *hook.AgentInfo, out *s
 		denied = true
 		r = result{outcome: OutcomeBlocked}
 		extra = append(extra, AttrToolOutcome.String(agent_v2.ToolOutcomeDenied))
+	}
+	if out.Result != nil && !denied {
+		bytes := len(out.Result.Output)
+		if original, ok := out.Extra[agent_v2.ToolOriginalOutputBytesExtraKey].(int); ok && original > 0 {
+			bytes = original
+		}
+		extra = append(extra, AttrToolOutputBytes.Int(bytes))
 	}
 	// 续跑时从工具账重放的调用（上一次那批里已经跑完的）这一次没有执行：它在上一次那批的 OnToolEnd 里已经按自己的结局
 	// 记过，这次 span 标上重放、不记时长样本、不算进 agent 的调用次数。

@@ -19,15 +19,12 @@ import (
 // 成正的约 49 年）。合法的长等待照收：日配额重置常发 86400，返回 24h，这里不设「等太久」的上限。
 //
 // now 由调用方传入：HTTP-date 形式要算相对时长，注入时钟才能稳定测试。
-//
-// ⚠️ model/openai 与 decision 包各有一份早于本函数的私有实现，溢出时的取值不同（openai 返回 0、
-// decision 封顶成最大值）；新代码用本函数，两份旧实现的统一另行处理。
 func ParseRetryAfter(h http.Header, now time.Time) time.Duration {
 	if h == nil {
 		return 0
 	}
 	if v := strings.TrimSpace(h.Get("retry-after-ms")); v != "" {
-		if d, ok := retryDelay(v, time.Millisecond); ok {
+		if d := retryDelay(v, time.Millisecond); d > 0 {
 			return d
 		}
 	}
@@ -35,7 +32,7 @@ func ParseRetryAfter(h http.Header, now time.Time) time.Duration {
 	if v == "" {
 		return 0
 	}
-	if d, ok := retryDelay(v, time.Second); ok {
+	if d := retryDelay(v, time.Second); d > 0 {
 		return d
 	}
 	if t, err := http.ParseTime(v); err == nil {
@@ -46,19 +43,21 @@ func ParseRetryAfter(h http.Header, now time.Time) time.Duration {
 	return 0
 }
 
-// retryDelay 把数字串按 unit 换成时长。ok 为 false 表示 v 不是数字（调用方接着按 HTTP-date 解析）；
-// 是数字但不可用（不是正数、NaN、换算溢出）时返回 (0, true)。
-func retryDelay(v string, unit time.Duration) (time.Duration, bool) {
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil {
-		return 0, false
+// retryDelay 把正数按 unit 换成时长。整数用精确乘法，小数允许截到纳秒。
+func retryDelay(v string, unit time.Duration) time.Duration {
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n <= 0 || n > math.MaxInt64/int64(unit) {
+			return 0
+		}
+		return time.Duration(n) * unit
 	}
-	if math.IsNaN(f) || f <= 0 {
-		return 0, true
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || math.IsNaN(f) || f <= 0 {
+		return 0
 	}
 	ns := f * float64(unit)
 	if ns >= float64(math.MaxInt64) { // 含 +Inf
-		return 0, true
+		return 0
 	}
-	return time.Duration(ns), true
+	return time.Duration(ns)
 }

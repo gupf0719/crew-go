@@ -105,7 +105,7 @@ func TestRouteDecider_ConfidentDecisionSkipsClassifier(t *testing.T) {
 	cls := &recordingClassifier{target: "tech"}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0.85),
+		agent_v2.WithRouteDecider("decider", decider, 0.85),
 		agent_v2.WithRoutingClassifier(cls),
 		agent_v2.WithRoutingDescriptions(supportDescriptions),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
@@ -157,7 +157,7 @@ func TestRouteDecider_LowConfidenceEscalatesToClassifier(t *testing.T) {
 	cls := &recordingClassifier{target: "tech"}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0.85),
+		agent_v2.WithRouteDecider("decider", decider, 0.85),
 		agent_v2.WithRoutingClassifier(cls),
 		agent_v2.WithRoutingDescriptions(supportDescriptions),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
@@ -213,7 +213,7 @@ func TestRouteDecider_UndecidedOutcomesEscalateToFallback(t *testing.T) {
 			}
 			r := agent_v2.NewRoutingAgent(
 				agent_v2.WithRoutingName("support"),
-				agent_v2.WithRouteDecider(decider, 0.5),
+				agent_v2.WithRouteDecider("decider", decider, 0.5),
 				agent_v2.WithRoutingFallback(branchAgent("human")),
 			).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -250,7 +250,7 @@ func TestRouteDecider_ServiceTimeoutEscalates(t *testing.T) {
 	cls := &recordingClassifier{target: "tech"}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0.85),
+		agent_v2.WithRouteDecider("decider", decider, 0.85),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -278,7 +278,7 @@ func TestRouteDecider_CallerCancelPropagates(t *testing.T) {
 	cls := &recordingClassifier{target: "tech"}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0.85),
+		agent_v2.WithRouteDecider("decider", decider, 0.85),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -305,8 +305,8 @@ func TestRouteDecider_CascadeOrderAndIsolation(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(first, 0.9),
-		agent_v2.WithRouteDecider(second, 0),
+		agent_v2.WithRouteDecider("first", first, 0.9),
+		agent_v2.WithRouteDecider("second", second, 0),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
 	rec := &routeEventRecorder{}
@@ -358,8 +358,8 @@ func TestRouteDecider_AskUserWhenUnsure(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(fast, 0.85),
-		agent_v2.WithRouteDecider(askUser, 0),
+		agent_v2.WithRouteDecider("fast", fast, 0.85),
+		agent_v2.WithRouteDecider("askUser", askUser, 0),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech")).AddBranch("sales", branchAgent("sales"))
 
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -425,7 +425,7 @@ func TestRouteDecider_NoEscalationTargetReturnsError(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0),
+		agent_v2.WithRouteDecider("decider", decider, 0),
 	).AddBranch("billing", branchAgent("billing"))
 
 	_, err := r.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("hi"))
@@ -464,7 +464,7 @@ func TestRouteDecider_UndecidedWithoutErrorsRetriesFromScratch(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(flaky, 0),
+		agent_v2.WithRouteDecider("flaky", flaky, 0),
 	).AddBranch("billing", branchAgent("billing"))
 
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -492,7 +492,7 @@ func TestRouteDecider_UndecidedRouterAsToolLeavesParentRunning(t *testing.T) {
 	router := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("router"),
 		agent_v2.WithRoutingDescription("把问题转给合适的专员"),
-		agent_v2.WithRouteDecider(abstain, 0),
+		agent_v2.WithRouteDecider("abstain", abstain, 0),
 	).AddBranch("billing", branchAgent("billing"))
 
 	tk := tool.NewToolkit()
@@ -554,7 +554,7 @@ func TestRouteDecider_SequentialRetriesOnlyTheRoutingStep(t *testing.T) {
 	}
 	router := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("router"),
-		agent_v2.WithRouteDecider(flaky, 0),
+		agent_v2.WithRouteDecider("flaky", flaky, 0),
 	).AddBranch("billing", branchAgent("billing"))
 	seq := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("flow")).
 		AddStep("confirm", confirm).AddStep("route", router)
@@ -598,7 +598,7 @@ func TestRouteDecider_ClassifierQuestionSurvivesEarlierTransientError(t *testing
 	cls := &askingClassifier{}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0.5),
+		agent_v2.WithRouteDecider("decider", decider, 0.5),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -642,7 +642,7 @@ func TestRouteDecider_ClassifierContradictionFirstTargetWins(t *testing.T) {
 	)
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(unsure, 0.5),
+		agent_v2.WithRouteDecider("unsure", unsure, 0.5),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -680,8 +680,8 @@ func TestRouteDecider_RetryAfterFailureKeepsAnsweredStages(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(ask, 0.5),
-		agent_v2.WithRouteDecider(flaky, 0),
+		agent_v2.WithRouteDecider("ask", ask, 0.5),
+		agent_v2.WithRouteDecider("flaky", flaky, 0),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -732,7 +732,7 @@ func TestRouteDecider_ClassifierFailureRetriesFailedDeciders(t *testing.T) {
 	)
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0.5),
+		agent_v2.WithRouteDecider("decider", decider, 0.5),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -760,7 +760,7 @@ func TestRouteDecider_UndecidedErrorHidesDeciderTimeout(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0),
+		agent_v2.WithRouteDecider("decider", decider, 0),
 	).AddBranch("billing", branchAgent("billing"))
 
 	_, err := r.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("hi"))
@@ -785,7 +785,7 @@ func TestRouteDecider_CheckpointNotResumablePropagates(t *testing.T) {
 	cls := &recordingClassifier{target: "billing"}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0.5),
+		agent_v2.WithRouteDecider("decider", decider, 0.5),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing"))
 
@@ -843,9 +843,9 @@ func TestRouteDecider_RequestCopiesAreIsolated(t *testing.T) {
 	}}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(first, 0.85),
-		agent_v2.WithRouteDecider(second, 0.85),
-		agent_v2.WithRouteDecider(third, 0),
+		agent_v2.WithRouteDecider("first", first, 0.85),
+		agent_v2.WithRouteDecider("second", second, 0.85),
+		agent_v2.WithRouteDecider("third", third, 0),
 	).AddBranch("billing", billing).AddBranch("tech", branchAgent("tech"))
 
 	rec := &routeEventRecorder{}
@@ -901,8 +901,8 @@ func TestRouteDecider_SubAgentNamespacesAreDistinct(t *testing.T) {
 	}}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(viaHelper, 0.5),
-		agent_v2.WithRouteDecider(viaHelper, 0.5),
+		agent_v2.WithRouteDecider("first", viaHelper, 0.5),
+		agent_v2.WithRouteDecider("second", viaHelper, 0.5),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing"))
 
@@ -1033,24 +1033,24 @@ func TestRouteDecider_ConstructionGuards(t *testing.T) {
 		fn()
 	}
 	t.Run("nil decider", func(t *testing.T) {
-		mustPanic(t, "nil decider", func() { agent_v2.WithRouteDecider(nil, 0.5) })
+		mustPanic(t, "nil decider", func() { agent_v2.WithRouteDecider("primary", nil, 0.5) })
 	})
 	for _, bad := range []float64{-0.1, 1.1, math.NaN()} {
 		t.Run(fmt.Sprintf("threshold %v", bad), func(t *testing.T) {
-			mustPanic(t, "within [0, 1]", func() { agent_v2.WithRouteDecider(ok, bad) })
+			mustPanic(t, "within [0, 1]", func() { agent_v2.WithRouteDecider("primary", ok, bad) })
 		})
 	}
 	t.Run("positive threshold with nowhere to escalate", func(t *testing.T) {
 		mustPanic(t, "没有地方可升级", func() {
-			agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("support"), agent_v2.WithRouteDecider(ok, 0.85))
+			agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("support"), agent_v2.WithRouteDecider("primary", ok, 0.85))
 		})
 	})
 	t.Run("zero threshold needs no escalation target", func(t *testing.T) {
-		agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("support"), agent_v2.WithRouteDecider(ok, 0))
+		agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("support"), agent_v2.WithRouteDecider("primary", ok, 0))
 	})
 	t.Run("positive threshold then zero threshold", func(t *testing.T) {
 		agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("support"),
-			agent_v2.WithRouteDecider(ok, 0.85), agent_v2.WithRouteDecider(ok, 0))
+			agent_v2.WithRouteDecider("primary", ok, 0.85), agent_v2.WithRouteDecider("secondary", ok, 0))
 	})
 }
 
@@ -1114,7 +1114,7 @@ func TestRouteDecider_BranchThresholdOverridesDefault(t *testing.T) {
 			}
 			r := agent_v2.NewRoutingAgent(
 				agent_v2.WithRoutingName("support"),
-				agent_v2.WithRouteDecider(decider, 0.5, agent_v2.WithBranchMinConfidence("refund", 0.95)),
+				agent_v2.WithRouteDecider("decider", decider, 0.5, agent_v2.WithBranchMinConfidence("refund", 0.95)),
 				agent_v2.WithRoutingFallback(branchAgent("human")),
 			).AddBranch("refund", branchAgent("refund")).AddBranch("tech", branchAgent("tech"))
 
@@ -1162,20 +1162,20 @@ func TestRouteDecider_BranchThresholdMisconfiguration(t *testing.T) {
 	})
 	t.Run("same branch twice", func(t *testing.T) {
 		panics(t, "set twice", func() {
-			agent_v2.WithRouteDecider(ok, 0,
+			agent_v2.WithRouteDecider("primary", ok, 0,
 				agent_v2.WithBranchMinConfidence("refund", 0.9), agent_v2.WithBranchMinConfidence("refund", 0.95))
 		})
 	})
 	t.Run("branch threshold with nowhere to escalate", func(t *testing.T) {
 		panics(t, "没有地方可升级", func() {
 			agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("support"),
-				agent_v2.WithRouteDecider(ok, 0, agent_v2.WithBranchMinConfidence("refund", 0.9)))
+				agent_v2.WithRouteDecider("primary", ok, 0, agent_v2.WithBranchMinConfidence("refund", 0.9)))
 		})
 	})
 	t.Run("unknown branch fails at Run", func(t *testing.T) {
 		r := agent_v2.NewRoutingAgent(
 			agent_v2.WithRoutingName("support"),
-			agent_v2.WithRouteDecider(ok, 0.5, agent_v2.WithBranchMinConfidence("refnud", 0.9)),
+			agent_v2.WithRouteDecider("primary", ok, 0.5, agent_v2.WithBranchMinConfidence("refnud", 0.9)),
 			agent_v2.WithRoutingFallback(branchAgent("human")),
 		).AddBranch("refund", branchAgent("refund")).AddBranch("tech", branchAgent("tech"))
 		_, err := r.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("hi"))
@@ -1210,8 +1210,8 @@ func TestRouteDecider_ResumeHonorsTheUsersAnswer(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(flakyDecider(&calls), 0.85),
-		agent_v2.WithRouteDecider(askUser, 0),
+		agent_v2.WithRouteDecider("flakyDecider", flakyDecider(&calls), 0.85),
+		agent_v2.WithRouteDecider("askUser", askUser, 0),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -1261,7 +1261,7 @@ func TestRouteDecider_ResumeKeepsTheClassifiersQuestion(t *testing.T) {
 	cls := &askingClassifier{}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(flakyDecider(&calls), 0.85),
+		agent_v2.WithRouteDecider("flakyDecider", flakyDecider(&calls), 0.85),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -1298,7 +1298,7 @@ func TestRouteDecider_RetryAfterFailureCallsDecidersAgain(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0),
+		agent_v2.WithRouteDecider("decider", decider, 0),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -1351,8 +1351,8 @@ func TestRouteDecider_AnswerDoesNotLeakAcrossDeciders(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(transfer, 0.5),
-		agent_v2.WithRouteDecider(deleteAccount, 0),
+		agent_v2.WithRouteDecider("transfer", transfer, 0.5),
+		agent_v2.WithRouteDecider("deleteAccount", deleteAccount, 0),
 	).AddBranch("transfer", branchAgent("transfer")).AddBranch("delete_account", branchAgent("delete_account")).AddBranch("chat", branchAgent("chat"))
 
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -1400,8 +1400,8 @@ func TestRouteDecider_RetryDoesNotBindOldAnswersToNewQuestions(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(suggest, 0.9),
-		agent_v2.WithRouteDecider(confirm, 0),
+		agent_v2.WithRouteDecider("suggest", suggest, 0.9),
+		agent_v2.WithRouteDecider("confirm", confirm, 0),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("delete_account", branchAgent("delete_account"))
 
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -1479,7 +1479,7 @@ func TestRouteDecider_RetriedDeciderSubAgentStartsFresh(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0),
+		agent_v2.WithRouteDecider("decider", decider, 0),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -1538,8 +1538,8 @@ func TestRouteDecider_ClassifierFailureRetryAsksAgain(t *testing.T) {
 	)
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(broken, 0.5),
-		agent_v2.WithRouteDecider(ask, 0.5),
+		agent_v2.WithRouteDecider("broken", broken, 0.5),
+		agent_v2.WithRouteDecider("ask", ask, 0.5),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -1585,8 +1585,8 @@ func TestRouteDecider_RetryGenerationSurvivesResume(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(flaky, 0.5),
-		agent_v2.WithRouteDecider(ask, 0),
+		agent_v2.WithRouteDecider("flaky", flaky, 0.5),
+		agent_v2.WithRouteDecider("ask", ask, 0),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -1699,7 +1699,7 @@ func TestRouteDecider_ClassifierFailureWithoutFallbackReplaysDeciders(t *testing
 	)
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(unsure, 0.5),
+		agent_v2.WithRouteDecider("unsure", unsure, 0.5),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -1836,7 +1836,7 @@ func TestRouteDecider_ClassifierFailureRetriesTheErroredDeciderFirst(t *testing.
 	cls := agent_v2.NewBasicAgent(agent_v2.WithName("classifier"), agent_v2.WithModel(m), agent_v2.WithRouteTool(), agent_v2.WithMaxRounds(3))
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0.5),
+		agent_v2.WithRouteDecider("decider", decider, 0.5),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -1857,7 +1857,7 @@ func TestRouteDecider_ClassifierFailureRetriesTheErroredDeciderFirst(t *testing.
 	if out := finalContent(t, events); out != "from billing" || m.callCount() != 1 {
 		t.Fatalf("the errored decider should be called again and decide: routed %q, classifier model called %d times", out, m.callCount())
 	}
-	if strings.Join(ids, ",") != "route_decider_0,route_decider_0_retry1" {
+	if strings.Join(ids, ",") != "route_decider_decider#0,route_decider_decider#1" {
 		t.Fatalf("the re-called decider should carry a new identity, got %v", ids)
 	}
 }
@@ -1872,7 +1872,7 @@ func TestRouteDecider_ClassifierErrorIsTheLastErr(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0.5),
+		agent_v2.WithRouteDecider("decider", decider, 0.5),
 		agent_v2.WithRoutingClassifier(&fixedAgent{name: "classifier", err: fmt.Errorf("llm 429: %w", classifierErr)}),
 	).AddBranch("billing", branchAgent("billing"))
 
@@ -2029,7 +2029,7 @@ func TestRouteDecider_ClassifierErrorDoesNotReaskAnsweredDecider(t *testing.T) {
 	cls := agent_v2.NewBasicAgent(agent_v2.WithName("classifier"), agent_v2.WithModel(m), agent_v2.WithRouteTool(), agent_v2.WithMaxRounds(3))
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decider, 0.5),
+		agent_v2.WithRouteDecider("decider", decider, 0.5),
 		agent_v2.WithRoutingClassifier(cls),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 
@@ -2078,8 +2078,8 @@ func TestRouteDecider_DeciderGenerationKeepsIncreasing(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(suggest, 0.9),
-		agent_v2.WithRouteDecider(confirm, 0),
+		agent_v2.WithRouteDecider("suggest", suggest, 0.9),
+		agent_v2.WithRouteDecider("confirm", confirm, 0),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("delete_account", branchAgent("delete_account"))
 
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -2132,8 +2132,8 @@ func TestRouteDecider_RetryStartsFromTheFirstErroredDecider(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(d0, 0.5),
-		agent_v2.WithRouteDecider(d1, 0),
+		agent_v2.WithRouteDecider("d0", d0, 0.5),
+		agent_v2.WithRouteDecider("d1", d1, 0),
 	).AddBranch("billing", branchAgent("billing")).AddBranch("tech", branchAgent("tech"))
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
 	sess := agent_v2.NewRunSession()
@@ -2166,8 +2166,8 @@ func TestRouteDecider_ReplayedDeciderErrorStaysInLastErr(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(d0, 0.5),
-		agent_v2.WithRouteDecider(d1, 0),
+		agent_v2.WithRouteDecider("d0", d0, 0.5),
+		agent_v2.WithRouteDecider("d1", d1, 0),
 	).AddBranch("billing", branchAgent("billing"))
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
 	sess := agent_v2.NewRunSession()
@@ -2204,8 +2204,8 @@ func TestRouteDecider_LastErrIsTheLatestErroredStage(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(d0, 0.5),
-		agent_v2.WithRouteDecider(d1, 0),
+		agent_v2.WithRouteDecider("d0", d0, 0.5),
+		agent_v2.WithRouteDecider("d1", d1, 0),
 	).AddBranch("billing", branchAgent("billing"))
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
 	sess := agent_v2.NewRunSession()

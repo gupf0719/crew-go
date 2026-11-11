@@ -465,7 +465,8 @@ func cloneToolResultWithOffloadRef(m *schema.Message, key string, previewBytes i
 			}
 		}
 	}
-	cloned.Content = offloadPlaceholder(key, clampPrefixToUTF8(previewSrc, previewBytes), readToolName)
+	_, truncated := annotationInt(m, TruncatedOriginalBytesAnnotation)
+	cloned.Content = offloadPlaceholder(key, clampPrefixToUTF8(previewSrc, previewBytes), readToolName, truncated)
 	cloned.Annotations = make(map[string]any, len(m.Annotations)+2)
 	for k, v := range m.Annotations {
 		cloned.Annotations[k] = v
@@ -481,7 +482,7 @@ func cloneToolResultWithOffloadRef(m *schema.Message, key string, previewBytes i
 			if cb.Toolresult != nil {
 				cbCopy := *cb
 				trCopy := *cb.Toolresult
-				trCopy.Content = offloadPlaceholder(key, clampPrefixToUTF8(cb.Toolresult.Content, previewBytes), readToolName)
+				trCopy.Content = offloadPlaceholder(key, clampPrefixToUTF8(cb.Toolresult.Content, previewBytes), readToolName, truncated)
 				cbCopy.Toolresult = &trCopy
 				cloned.ContentBlocks[i] = &cbCopy
 				continue
@@ -570,10 +571,16 @@ func offloadDedupFrom(ctx context.Context) *offloadDedup {
 //
 // readToolName 为空时不拼读回提示——那个工具是业务自己注册的，没配却写一句
 // 「用 X 读回全文」等于给模型一条它执行不了的指令。
-func offloadPlaceholder(key, preview, readToolName string) string {
+func offloadPlaceholder(key, preview, readToolName string, truncated bool) string {
 	s := fmt.Sprintf("[offloaded:%s] preview: %s", key, preview)
 	if readToolName != "" {
-		s += fmt.Sprintf("（用 %s 工具按上面这个 key 读回全文）", readToolName)
+		content := "全文"
+		if truncated {
+			content = "已保存的截断内容"
+		}
+		s += fmt.Sprintf("（用 %s 工具按上面这个 key 读回%s）", readToolName, content)
+	} else if truncated {
+		s += "（已保存的内容经过截断）"
 	}
 	return s
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
@@ -425,6 +426,55 @@ func TestSameCall_HandedOverRerunnableRecord_KeptAcrossCallerRedo(t *testing.T) 
 	hrCheckApprovals(t, approved, asked)
 }
 
+func TestCompletedHandover_DropsRedoRecordsAndStillReplays(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cp := compose_v2.NewInMemoryCheckpointer()
+	var calls int
+	planner := &hoFuncAgent{name: "planner", run: func(ctx context.Context, _ *schema.Message) ([]*agent_v2.AgentEvent, error) {
+		calls++
+		if err := compose_v2.SaveStepResult(ctx, "draft", "draft done", compose_v2.Rerunnable()); err != nil {
+			return nil, err
+		}
+		if err := compose_v2.SaveStepResult(compose_v2.EnterPhase(ctx, "refine"), "draft", "refined", compose_v2.Rerunnable()); err != nil {
+			return nil, err
+		}
+		return []*agent_v2.AgentEvent{agent_v2.NewExitEvent("planner", schema.AssistantMessage("draft done"))}, nil
+	}}
+	g := hoHostGraph(t, "completed_handover", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		ev, err := agent_v2.RunSubAgent(ctx, "planner", planner, schema.UserMessage("draft"))
+		if err != nil {
+			return nil, err
+		}
+		if got := agent_v2.FinalMessage(ev).GetContent(); got != "draft done" {
+			t.Errorf("完成结果应可重放，实际 %q", got)
+		}
+		_, err = compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "accept?"})
+		return nil, err
+	})
+	base := []compose_v2.RunOption{compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID("handover")}
+	err := compose_v2.Run(ctx, g, compose_v2.NewChannelManager(), base...)
+	ie, ok := compose_v2.IsInterrupt(err)
+	if !ok {
+		t.Fatalf("外层应在完成记录写入后挂起，实际 %v", err)
+	}
+	saved, err := cp.LoadNS(ctx, "handover", "")
+	if err != nil || saved == nil || len(saved.NodeStates) == 0 {
+		t.Fatalf("应保存外层完成记录，实际 %+v，错误 %v", saved, err)
+	}
+	for key := range saved.NodeStates {
+		if strings.Contains(key, ":hredo") {
+			t.Errorf("完成调用的可重做记录仍在存档里 %q", key)
+		}
+	}
+	err = compose_v2.Run(ctx, g, compose_v2.NewChannelManager(), append(base, compose_v2.WithResumeAnswers(map[string]*schema.Message{
+		ie.Query.InterruptID: schema.UserMessage("accept"),
+	}))...)
+	if err != nil || calls != 1 {
+		t.Fatalf("恢复应复用完成结果，调用次数 %d，错误 %v", calls, err)
+	}
+}
+
 // hrResumeAll 首跑之后不管什么错都续跑（问到的都答「答:<问题>」、累积传），最多 6 轮；按问题计数。
 func hrResumeAll(ctx context.Context, ag agent_v2.Agent, sess *agent_v2.RunSession, err error) (error, map[string]int) {
 	answers := map[string]*schema.Message{}
@@ -510,7 +560,7 @@ func TestDecisionAgent_OutOfGraphNodeState_KeptApartFromClassifyProgress(t *test
 		return []*agent_v2.AgentEvent{agent_v2.NewExitEvent("cls", schema.AssistantMessage("a"))}, nil
 	}}
 	r := agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("hr_route"),
-		agent_v2.WithRouteDecider(decider, 0.9), agent_v2.WithRoutingClassifier(classifier)).
+		agent_v2.WithRouteDecider("decider", decider, 0.9), agent_v2.WithRoutingClassifier(classifier)).
 		AddBranch("a", dtBasic("a", "branch a done")).
 		AddBranch("b", dtBasic("b", "branch b done"))
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())

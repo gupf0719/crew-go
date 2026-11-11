@@ -117,12 +117,18 @@ func TestConvertTextOnly(t *testing.T) {
 // （A2A SDK UnmarshalJSON 把它判"无 content" → 拒绝整条 message，跨语言 hazard）——跳过该 block
 // 不发毒 wire；falsy 非 nil 值（false/0/""）合法、正常发。
 func TestConvertNilDataSkipped(t *testing.T) {
+	var typedPointer *string
+	var typedSlice []any
+	var typedMap map[string]any
 	// nil 内部值 → 跳过（只剩 text part，无 data part）
 	parts := MessageToA2AParts(&schema.Message{
 		Content: "answer",
 		ContentBlocks: []*schema.ContentBlock{
 			{Type: string(schema.ContentBlockTypeData), MediaType: "application/json",
 				Data: &schema.DataContentBlock{Type: schema.ContentBlockTypeData, Data: nil}},
+			{Data: &schema.DataContentBlock{Data: typedPointer}},
+			{Data: &schema.DataContentBlock{Data: typedSlice}},
+			{Data: &schema.DataContentBlock{Data: typedMap}},
 		},
 	})
 	if len(parts) != 1 || parts[0].Text() != "answer" {
@@ -139,7 +145,7 @@ func TestConvertNilDataSkipped(t *testing.T) {
 	}
 
 	// falsy 非 nil 值正常发（不跳过）——false/0/"" 是合法 data，A2A 应传
-	for _, falsy := range []any{false, 0, ""} {
+	for _, falsy := range []any{false, 0, "", []any{}, map[string]any{}} {
 		p := MessageToA2AParts(&schema.Message{ContentBlocks: []*schema.ContentBlock{
 			{Type: string(schema.ContentBlockTypeData), Data: &schema.DataContentBlock{Data: falsy}},
 		}})

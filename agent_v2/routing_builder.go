@@ -61,10 +61,11 @@ type routingBranchDef struct {
 // **vs Sequential / Parallel**：Sequential 串行链，Parallel 全跑合并，
 // Routing 选一条路径——典型分流场景（按 query 类型派发到不同专家 agent）。
 type RoutingAgentBuilder struct {
-	name     string
-	branches []routingBranchDef
-	router   RoutingAgentRouter
-	hooks    hook.Hooks
+	graphIdentitySuffix string
+	name                string
+	branches            []routingBranchDef
+	router              RoutingAgentRouter
+	hooks               hook.Hooks
 }
 
 // 内部 channels (RoutingAgent 编排专用)
@@ -149,7 +150,7 @@ func (b *RoutingAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		name = "routing_agent"
 	}
 
-	bld := compose_v2.NewBuilder().WithName(name)
+	bld := compose_v2.NewBuilder().WithName(name + b.graphIdentitySuffix)
 	compose_v2.WithChannel(bld, routingAgentInputCh)
 	compose_v2.WithChannel(bld, routingAgentResultCh)
 	compose_v2.WithChannel(bld, routingAgentTargetCh)

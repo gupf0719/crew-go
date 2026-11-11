@@ -12,6 +12,7 @@ package sql_test
 
 import (
 	databasesql "database/sql"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -71,4 +72,38 @@ func TestSQLiteStore_Conformance(t *testing.T) {
 		}
 		return st
 	})
+}
+
+func TestSQLiteStore_DecimalFilterPrecision(t *testing.T) {
+	st := agentSQL.NewStore(newSQLiteDB(t), agentSQL.SQLite{})
+	if err := st.Setup(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	assertDecimalFilterPrecision(t, st, false)
+}
+
+func assertDecimalFilterPrecision(t *testing.T, st store.Store, exact bool) {
+	t.Helper()
+	ctx := t.Context()
+	ns := store.NS("decimals")
+	baseline, nearby := json.Number("0.1"), json.Number("0.100000000000000001")
+	for key, value := range map[string]json.Number{"baseline": baseline, "nearby": nearby} {
+		if err := st.Put(ctx, ns, key, map[string]any{"price": value}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantEqual, wantGreater := 2, 0
+	if exact {
+		wantEqual, wantGreater = 1, 1
+	}
+	for op, want := range map[string]int{"$eq": wantEqual, "$gt": wantGreater} {
+		items, err := st.Search(ctx, ns, store.WithFilter(map[string]any{"price": map[string]any{op: baseline}}))
+		if err != nil || len(items) != want {
+			t.Errorf("小数比较 %s 得到 %d 条，预期 %d，错误 %v", op, len(items), want, err)
+			continue
+		}
+		if exact && ((op == "$eq" && items[0].Key != "baseline") || (op == "$gt" && items[0].Key != "nearby")) {
+			t.Errorf("精确小数比较 %s 命中了错误的值 %q", op, items[0].Key)
+		}
+	}
 }

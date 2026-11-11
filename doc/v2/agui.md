@@ -64,7 +64,7 @@ adapter（`agui/adapter.go`）一个 struct 同时实现 `hook.Hooks` + `agent_v
 | `OnToolStart`（`CallId`/`Name`/`ArgumentsJSON`） | `ToolCallStart` + `ToolCallArgs` + `ToolCallEnd`（参数非流式，一次性发） |
 | `OnToolEnd`（`Result`） | `ToolCallResult`（`CallId` 作 `toolCallId` 配对锚点） |
 | Run 开始 / 结束 / 出错 | `RunStarted` / `RunFinished` / `RunError` |
-| `InterruptError` | `RunFinished(outcome=interrupt, interrupts=[{id, reason, message, …}])`：工具审批 reason=`tool_call`（带 `toolCallId`、`responseSchema` 与 `metadata.options`），没有工具调用 ID 时 `confirmation`；其余提问的 reason 取提问自己的（如 `ask_user`） |
+| `InterruptError` | `RunFinished(outcome=interrupt, interrupts=[{id, reason, message, …}])`：工具审批 reason=`tool_call`（带 `toolCallId`、`responseSchema` 与 `metadata.options`），没有工具调用 ID 时 `confirmation`；普通提问使用 `input_required` 和字符串响应 schema，框架断点使用 `crew-go:breakpoint` |
 | `EventSink.Send("state_snapshot")` | `StateSnapshot`（业务 opt-in，见 §6） |
 | `EventSink.Send("reset_stream")` | 收尾那条消息；作废时连同这次模型调用的工具调用与结果一起作废（按框架标在工具钩子 `Extra` 上的 `agent_v2.ToolModelRunIDExtraKey` 认），带 `replacement`（`OnModelEnd` 钩子改写了答复）时换成新正文；再发 AG-UI 标准的 `MessagesSnapshot`（请求带来的消息原样 + 这个 run 发出、没作废的消息）纠正前端——连着来的几个撤回与改写攒成一份，在适配层下一次往外写别的事件、或 run 收尾时发，有在途的流式消息时等它们都收尾（落在一条流中间时官方客户端的事件压缩回放把快照排到那条流之后，那条消息回放出来只剩半截），另立即发 `Custom(crew.reset_stream)` 给按 run_id 自管缓冲的前端。**请求没带 messages 时不发快照**（快照之外的消息会被前端丢掉，而适配层不知道它手上有什么），标准前端那时留着旧内容 |
 | `OnError` | `Custom`（前端可处理，标准组件忽略） |
@@ -73,6 +73,8 @@ adapter（`agui/adapter.go`）一个 struct 同时实现 `hook.Hooks` + `agent_v
 > 所有权，不重复。
 
 ---
+
+`context` 的描述和值以及非空 `state` 会以 JSON 补到本次送模的用户消息。BasicAgent 和 LLMPlanner 使用这份临时数据，历史和存档保留原对话。Resume 请求可提供新的本轮数据。客户端的 system / developer 消息仍按前文规则过滤。[AG-UI 输入类型](https://docs.ag-ui.com/sdk/js/core/types) · [中断原因](https://docs.ag-ui.com/concepts/interrupts#reason-taxonomy)
 
 ## 5. HITL 闭环（Resume）
 

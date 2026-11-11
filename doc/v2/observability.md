@@ -225,7 +225,7 @@ A2A client span 按发请求用的 ctx 判（`A2AClientSpan.End(ctx, err)`），
   沿用的那一遍不再开 `chat` span、不记耗时与用量。
 - 一批工具调用没整体成功时（同批有调用中断或硬失败），已经有结局的调用照样各自触发 `OnToolEnd`
   （`Extra` 带 `agent_v2.ToolBatchFailedExtraKey`），按自己的结局收尾。续跑时它们从工具账重放、`OnToolEnd` 再触发一次
-  （`Extra` 带 `agent_v2.ToolReplayedExtraKey`）：span 标 `crew.tool.replayed`，不记时长样本、不计入 agent 的调用次数。
+  （`Extra` 带 `agent_v2.ToolReplayedExtraKey`）：span 标 `crew.tool.replayed`，不记时长样本、不计入 agent 的调用次数。工具 span 的 `crew.tool.output.size_bytes` 取框架截断前的输出字节数。
 - 被审批拒绝的调用没有执行：`OnToolEnd` 的 `Extra` 带 `agent_v2.ToolOutcomeDenied`，span 记 `blocked`、不标 Error、
   带 `crew.tool.outcome=denied`，时长样本带同一个属性——跟执行成功的分得开。
 - 模型调用整次重来（`agent_v2.WithModelRetry`）仍是一次调用：一个 `chat` span，时长含全部尝试与退避，用量只记交付那次；
@@ -301,7 +301,7 @@ trace。
 | `crew.agent.active` | UpDownCounter | `gen_ai.agent.name` | 在途调用数 |
 | `crew.interrupts` | 计数 | `gen_ai.agent.name`、`crew.agent.kind` | 以中断结束 |
 | `crew.interrupt.wait.duration` | 直方图 / s | `gen_ai.agent.name`、`crew.agent.kind` | 续跑时，从挂起到续跑 |
-| `crew.resumes` | 计数 | `gen_ai.agent.name`、`crew.agent.kind`、`crew.resume.action` | 每次 Resume |
+| `crew.resumes` | 计数 | `gen_ai.agent.name`、`crew.agent.kind`、`crew.resume.action` | 显式 Resume 及实际载入可执行存档的嵌套 agent |
 | `crew.skill.activations` | 计数 | `gen_ai.agent.name`、`gen_ai.skill.name` | `activate_skill` 调用成功结束 |
 | `crew.checkpoint.stale_writes` | 计数 | `crew.checkpoint.stale_op`（拿不到操作名时 `unknown`） | agent 以陈旧写回结束（开了陈旧写回检测，且结束时 ctx 没被取消） |
 | `crew.node.executions` | 计数 | `crew.node.id` | 每次节点执行（编排钩子） |
@@ -313,6 +313,8 @@ trace。
 | `crew.fanout.branches` | 直方图 | `crew.fanout.kind` | 一次扇出的分支数 |
 | `crew.plan.replans` | 计数 | `crew.plan.phase` | PlanAgent 每次规划 |
 | `crew.route.decisions` | 计数 | `gen_ai.agent.name`、`crew.route.target`（没有目标时 `__none__`） | RoutingAgent 每次路由 |
+| `crew.route.escalations` | 计数 | `gen_ai.agent.name`、`crew.route.stage` | 至少升级一次的路由决策 |
+| `crew.route.confidence` | 直方图 | `gen_ai.agent.name`、`crew.route.decider` | 被采纳与低置信度升级档的置信度，影子档只进入事件 |
 | `crew.fallback.failovers` | 计数 | `crew.failover.reason`、`crew.failover.from`（候选下标） | `fallback` 候选切换 |
 | `crew.fallback.member_trips` | 计数 | `crew.fallback.member`（候选下标）、`crew.fallback.reason` | `fallback` 候选断路器熔断 |
 

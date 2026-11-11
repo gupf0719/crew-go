@@ -339,6 +339,9 @@ const ToolTimeoutErrCode = "tool_timeout"
 // 这个键时按 `Result.Success` 判成败。
 const ToolOutcomeExtraKey = "outcome"
 
+// ToolOriginalOutputBytesExtraKey 是工具结果在框架截断前的字节数，值为 int。
+const ToolOriginalOutputBytesExtraKey = "original_output_bytes"
+
 // ToolOutcomeDenied 标「这次调用被审批拒绝、没有执行」：`Result.Success` 为 true（拒绝不是失败——是用户或审批策略的
 // 决定，计进错误率会污染告警），可它也不是一次成功的执行。observability 把它记成 blocked。
 const ToolOutcomeDenied = "denied"
@@ -422,6 +425,12 @@ func toolOutputFor(r *schema.Message, callID string, replayed bool) *schema.Tool
 	if _, denied := r.Annotations[toolDeniedAnnotation]; denied {
 		// 被审批拒绝、没有执行：Success 照旧为 true（不是失败），观测层据 Extra 把它记成 blocked
 		to.Extra = map[string]any{ToolOutcomeExtraKey: ToolOutcomeDenied}
+	}
+	if original, ok := annotationInt(r, TruncatedOriginalBytesAnnotation); ok && original > 0 {
+		if to.Extra == nil {
+			to.Extra = make(map[string]any)
+		}
+		to.Extra[ToolOriginalOutputBytesExtraKey] = original
 	}
 	if replayed {
 		if to.Extra == nil {

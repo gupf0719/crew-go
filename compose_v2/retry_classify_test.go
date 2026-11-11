@@ -32,8 +32,10 @@ func TestIsRetryable_DeterministicHTTPFailures(t *testing.T) {
 		// 确定性失败——请求本身有问题，重发必然同样失败
 		{"400 参数错", 400, false},
 		{"401 鉴权失败", 401, false},
+		{"402 计费失败", 402, false},
 		{"403 无权限", 403, false},
 		{"404 模型不存在", 404, false},
+		{"413 请求体超限", 413, false},
 		{"422 请求体不合法", 422, false},
 		// 值得重试
 		{"0 非 HTTP 错误（网络/超时/解析）", 0, true},

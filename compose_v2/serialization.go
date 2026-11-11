@@ -560,9 +560,7 @@ func (cm *ChannelManager) Snapshot() (*Checkpoint, error) {
 			// 读得到的记录代际可以比执行级小。拿执行级比的话，调用方被否决重做之后，被调方在图外按
 			// Rerunnable 记下的方案掉出存档，续跑时重新产出一份，而提问的 ID 没变——对旧方案的批准兑付给了
 			// 新方案（实测）。
-			// 代价：调用方重做之后交来的输入变了、调用换了身份时，旧身份那一格最后那条读不到却照样导出——每否决
-			// 一次多带一条（审计实测 3 次否决 3 条），这次节点执行成功之后整串一起不可达。精确回收要知道「这一格
-			// 的调用已经完成」，见 doc/code/todo.md。
+			// 嵌套调用记下完成结果后由 FinishHandOver 回收交接分域的可重做记录。仍在执行的交接保留可读的代际。
 			if slot, gen, handed, ok := redoSlotOf(k); ok && (gen < newest[slot] || (!handed && gen < cm.rerunGenHeld(owner, ""))) {
 				continue
 			}

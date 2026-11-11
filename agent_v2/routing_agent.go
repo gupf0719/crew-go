@@ -542,6 +542,8 @@ func (r *RoutingAgent) buildComposeGraph(
 		if err := r.validateBranchThresholds(); err != nil {
 			return nil, err
 		}
+		// 升级链的持久化调用身份按档名。旧下标存档在引擎入口得到明确的身份冲突。
+		bld.graphIdentitySuffix = ":named-stages"
 		bld = bld.WithRouter(r.decisionRouter(parentSession))
 	default:
 		// Run 入口已校验；Resume 走到这里说明 agent 配置不全

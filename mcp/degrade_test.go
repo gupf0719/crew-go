@@ -593,6 +593,8 @@ func TestHub_RPCError_KeepsServerOnline(t *testing.T) {
 		var req rpcReq
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{})
 		case "tools/list":
@@ -1115,6 +1117,8 @@ func TestStreamableHTTP_BlackholeDial_NotSentAndOffline(t *testing.T) {
 		var req rpcReq
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{})
 		case "tools/list":
@@ -1196,13 +1200,15 @@ func TestStreamableHTTP_ErrorResponsesClassified(t *testing.T) {
 				var req rpcReq
 				_ = json.NewDecoder(r.Body).Decode(&req)
 				switch req.Method {
+				case "notifications/initialized":
+					w.WriteHeader(http.StatusAccepted)
 				case "initialize":
 					writeResult(w, req.ID, map[string]any{})
 				case "tools/list":
 					writeResult(w, req.ID, map[string]any{"tools": []map[string]any{{"name": "t"}}})
 				default:
 					w.WriteHeader(c.status)
-					_, _ = w.Write([]byte(c.body))
+					_, _ = w.Write([]byte(strings.Replace(c.body, `"id":1`, fmt.Sprintf(`"id":%d`, req.ID), 1)))
 				}
 			}))
 			defer server.Close()
@@ -1284,6 +1290,8 @@ func TestStreamableHTTP_ToolAnnotations(t *testing.T) {
 		var req rpcReq
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{})
 		case "tools/list":
@@ -1479,6 +1487,8 @@ func TestStreamableHTTP_H2_SlowBodyWrite_NeverClaimsNotSent(t *testing.T) {
 			return // 请求体没读全：没执行
 		}
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{})
 		case "tools/list":
@@ -1568,6 +1578,8 @@ func TestStreamableHTTP_RedactEdges(t *testing.T) {
 		var req rpcReq
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{})
 		case "tools/list":

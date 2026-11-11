@@ -71,7 +71,7 @@ func blockToA2APart(cb *schema.ContentBlock) *a2atypes.Part {
 	switch {
 	case cb.Text != nil:
 		return a2atypes.NewTextPart(cb.Text.Text)
-	case cb.Data != nil && cb.Data.Data != nil:
+	case cb.Data != nil && !isNilIface(cb.Data.Data):
 		// 守内部值非 nil（audit HIGH）：nil 值序列化成 {"data":null}，A2A SDK（含 Go 自己）
 		// UnmarshalJSON 把它判为"无 content"→ 拒绝**整条** message（跨语言 hazard）。内部 nil
 		// 直接跳过该 block，不发毒 wire（falsy 值 false/0/""/{}/[]​ 是合法非 nil，正常发）。

@@ -38,8 +38,17 @@ type RunAgentInput struct {
 	// 请求开流之前回 400；同一大版本里更新的小版本、看不懂的值照常服务、告警一次（见 checkProtocolVersion）。
 	ProtocolVersion string        `json:"protocolVersion,omitempty"`
 	Messages        []AGUIMessage `json:"messages"`
+	// Context 和 State 是客户端提供的本轮用户数据。
+	Context []ContextItem   `json:"context,omitempty"`
+	State   json.RawMessage `json:"state,omitempty"`
 	// Resume 非空 = 回答上一次 HITL 中断、续跑（走 Resume 而非新 Run）。
 	Resume []ResumeEntry `json:"resume,omitempty"`
+}
+
+// ContextItem 是 AG-UI 请求中一项带描述的客户端上下文。
+type ContextItem struct {
+	Description string `json:"description"`
+	Value       string `json:"value"`
 }
 
 // ResumeEntry 是一个 HITL 中断的答复——**对齐官方 AG-UI ResumeEntry 协议**
@@ -400,6 +409,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.cp != nil {
 		ctx = compose_v2.WithCheckpointerCtx(ctx, h.cp)
 	}
+	ctx = withClientModelData(ctx, &in)
 
 	if len(in.Resume) > 0 {
 		h.serveResume(ctx, sse, &in, key)
@@ -802,7 +812,7 @@ func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key session
 				continue
 			}
 			open[q.InterruptID] = false
-			interrupts = append(interrupts, RunInterrupt{ID: q.InterruptID, Reason: reason, Message: q.Question})
+			interrupts = append(interrupts, questionInterrupt(q, reason))
 		}
 		h.storeInterrupt(key, sess, open, prior)
 		_ = sse.WriteEvent(NewRunInterrupted(key.threadID, runID, interrupts))

@@ -46,13 +46,12 @@ import (
 // 分域），碰不到升级链的进度记录；以失败收尾后重新调用时身份变了，是新的一格。
 //
 // 这个身份借的是 tool_call 的那几个维度：决策方里 compose_v2.GetCurrentToolCallID 返回
-// "route_decider_<档位下标>"（下标不算影子档；影子档是 "route_shadow_<序号>"），以失败收尾后重新调用时
-// 带上 "_retry<代数>"。它跨任务、跨
+// "route_decider_<档名>#<代数>"（影子档使用 "route_shadow_<档名>#<代数>"）。它跨任务、跨
 // 会话都可能相同，不是某次 LLM 调用的 tool_call ID，别拿它当幂等键或缓存键。
 //
 // ⚠️ **同一个输入要问同一个问题**：中断续跑时这一档会被重新执行，身份不变，用户的回答
 // 按身份兑现。这次改口问别的，拿到的就是上一个问题的答案。问题内容取决于前面各档的结果
-// 时没关系——前面的档在这条路上是原样重放的。
+// 时，框架把发问时的 Escalations 原样交给待答档。
 //
 // 框架调决策方时已经套了 [WithoutHistoryCtx]：它是内部决策，产出不进会话历史；它也拿不到用户的运行中插话
 // （[Inbox]，路由节点调整条决策链时就摘掉了）——插话留给被路由到的分支。
@@ -186,6 +185,8 @@ type RouteEscalation struct {
 	// DeciderIndex 是这个决策方在 [WithRouteDecider] 挂载顺序里的下标，从 0 起，不算影子档；Shadow 为
 	// true 时是它在影子档里的序号（同样按挂载顺序、从 0 起）。
 	DeciderIndex int `json:"decider_index"`
+	// DeciderName 是注册时声明的稳定档名。
+	DeciderName string `json:"decider_name,omitempty"`
 	// Reason 是没被采纳的原因，取值见 RouteReason 开头的常量。
 	Reason string `json:"reason"`
 	// Target、Confidence、Scores、Source 是这一档给出的判断；Reason 为
@@ -228,6 +229,7 @@ const (
 
 // routeDeciderStage 是升级链里的一档决策方。
 type routeDeciderStage struct {
+	name          string
 	decide        RouteDecider
 	minConfidence float64
 	// branchMin 是按分支单独设的门槛，覆盖 minConfidence。
@@ -309,6 +311,8 @@ func WithShadow() RouteDeciderOption {
 
 // WithRouteDecider 给 RoutingAgent 加一档带置信度的决策方。
 //
+// stageName 在当前 RoutingAgent 内唯一，用于恢复在途的决策方和已完成记录。部署时保持档名稳定。
+//
 // minConfidence 取 [0, 1]：置信度不低于它才采纳，否则交给下一档。设 0 表示不因置信度
 // 升级，这时置信度只用于观测；弃权、非法结果与报错照样升级。个别分支要不同的门槛时用
 // [WithBranchMinConfidence]。可以多次调用，按调用顺序排成升级链，排在 classifier 和兜底
@@ -325,18 +329,21 @@ func WithShadow() RouteDeciderOption {
 //
 //	router := agent_v2.NewRoutingAgent(
 //	    agent_v2.WithRoutingName("support"),
-//	    agent_v2.WithRouteDecider(decision.NewRouteDecider(client), 0.85),
+//	    agent_v2.WithRouteDecider("provider", decision.NewRouteDecider(client), 0.85),
 //	    agent_v2.WithRoutingClassifier(llmClassifier),
 //	    agent_v2.WithRoutingDescriptions(descriptions),
 //	)
-func WithRouteDecider(d RouteDecider, minConfidence float64, opts ...RouteDeciderOption) RoutingOption {
+func WithRouteDecider(stageName string, d RouteDecider, minConfidence float64, opts ...RouteDeciderOption) RoutingOption {
+	if err := compose_v2.ValidateNodeIDForNS(stageName); err != nil {
+		panic(fmt.Sprintf("WithRouteDecider: invalid stage name %q: %v", stageName, err))
+	}
 	if d == nil {
 		panic("WithRouteDecider: nil decider")
 	}
 	if math.IsNaN(minConfidence) || minConfidence < 0 || minConfidence > 1 {
 		panic(fmt.Sprintf("WithRouteDecider: minConfidence must be within [0, 1], got %v", minConfidence))
 	}
-	st := routeDeciderStage{decide: d, minConfidence: minConfidence}
+	st := routeDeciderStage{name: stageName, decide: d, minConfidence: minConfidence}
 	for _, opt := range opts {
 		if opt == nil {
 			panic("WithRouteDecider: nil RouteDeciderOption")
@@ -344,6 +351,11 @@ func WithRouteDecider(d RouteDecider, minConfidence float64, opts ...RouteDecide
 		opt(&st)
 	}
 	return func(r *RoutingAgent) {
+		for _, existing := range r.deciders {
+			if existing.name == stageName {
+				panic(fmt.Sprintf("WithRouteDecider: duplicate stage name %q", stageName))
+			}
+		}
 		r.deciders = append(r.deciders, st)
 	}
 }
@@ -424,14 +436,36 @@ func (r *RoutingAgent) routingChoices() []RoutingChoice {
 // 重新调用，见 [RouteUndecidedError] 与 progressBeforeFirstError。
 type routeStageMemo struct {
 	Escalations []RouteEscalation `json:"escalations,omitempty"`
-	// Shadow 是已经跑完的影子档，按影子档序号对齐，与 Escalations 分开存：影子档不占真实档的下标，挂上或
-	// 摘掉影子档都不让真实档的重放错位（见 WithShadow）。以失败收尾时不保留，重试时影子档重新调用——
+	// Shadow 是已经跑完的影子档，按档名恢复，与 Escalations 分开存。以失败收尾时不保留，重试时影子档重新调用——
 	// 它不影响路由，重新调用只多花一次调用。
 	Shadow []RouteEscalation `json:"shadow,omitempty"`
 	// Retry 是以失败收尾的次数，每个失败出口加一。重新调用的档把它带进调用身份：上一次
 	// 失败之前问过的问题，答案从没兑付过，如果身份不变，调用方带着的旧答案会被套到这次
 	// 内容可能已经变了的问题上。中断续跑不加，提问 ID 保持稳定。
 	Retry int `json:"retry,omitempty"`
+	// Pending 标识已向用户提问的档。恢复时保留这次提问的归属。
+	Pending string `json:"pending,omitempty"`
+	// PendingEscalations 是待答档发问时收到的输入，即使原前序档被移除也原样复用。
+	PendingEscalations []RouteEscalation `json:"pending_escalations,omitempty"`
+}
+
+const pendingRouteClassifier = "classifier"
+
+func pendingRouteStage(st routeDeciderStage) string {
+	if st.shadow {
+		return "shadow:" + st.name
+	}
+	return "decider:" + st.name
+}
+
+func routeEscalationsByName(records []RouteEscalation) map[string]RouteEscalation {
+	indexed := make(map[string]RouteEscalation, len(records))
+	for _, record := range records {
+		if record.DeciderName != "" {
+			indexed[record.DeciderName] = record
+		}
+	}
+	return indexed
 }
 
 func init() {
@@ -509,21 +543,34 @@ func (r *RoutingAgent) decisionRouter(parentSession *RunSession) RoutingAgentRou
 	hasFallback := r.fallback != nil
 
 	return func(ctx context.Context, input *schema.Message) (compose_v2.NodeID, error) {
-		// 三份记录：chain 是真实档的（按真实档下标对齐，交给后面的档、决定重判起点），shadows 是影子档的
-		// （按影子档序号对齐），escalations 是两者按执行顺序合起来的（给事件与 RouteUndecidedError）。影子档
-		// 不占真实档的下标：挂上或摘掉影子档，真实档的重放对齐与调用身份都不变（见 WithShadow）。
+		// 已完成记录按档名重放，序号随本次配置用于事件。影子档的判断只用于观测。
 		chain := make([]RouteEscalation, 0, len(deciders))
 		var shadows []RouteEscalation
 		escalations := make([]RouteEscalation, 0, len(deciders))
 		var lastErr error
 		// 重跑时读回上一次已经跑完的档，见 routeStageMemo。
-		var replay, shadowReplay []RouteEscalation
+		var replay, shadowReplay map[string]RouteEscalation
+		var pending string
+		var pendingEscalations []RouteEscalation
 		retry := 0
 		if memo, ok := compose_v2.GetNodeState[*routeStageMemo](ctx); ok && memo != nil {
-			replay, shadowReplay, retry = memo.Escalations, memo.Shadow, memo.Retry
+			replay, shadowReplay = routeEscalationsByName(memo.Escalations), routeEscalationsByName(memo.Shadow)
+			pending, retry = memo.Pending, memo.Retry
+			pendingEscalations = memo.PendingEscalations
+			if pending != "" {
+				found := pending == pendingRouteClassifier && classify != nil
+				for _, st := range deciders {
+					found = found || pendingRouteStage(st) == pending
+				}
+				if !found {
+					return "", fmt.Errorf("routing agent %q: pending stage %q is missing: %w", agentName, pending, compose_v2.ErrCheckpointNotResumable)
+				}
+			}
 		}
-		save := func() {
-			if err := compose_v2.SaveNodeState(ctx, &routeStageMemo{Escalations: cloneEscalations(chain), Shadow: cloneEscalations(shadows), Retry: retry}); err != nil {
+		save := func(pending string, input []RouteEscalation) {
+			memo := &routeStageMemo{Escalations: cloneEscalations(chain), Shadow: cloneEscalations(shadows),
+				Retry: retry, Pending: pending, PendingEscalations: cloneEscalations(input)}
+			if err := compose_v2.SaveNodeState(ctx, memo); err != nil {
 				// 记不下来只影响 Resume 时这一档会被重新调用，不影响本次路由，所以不让它失败。
 				slog.WarnContext(ctx, "routing: failed to save decider progress", "agent", agentName, "err", err)
 			}
@@ -531,68 +578,91 @@ func (r *RoutingAgent) decisionRouter(parentSession *RunSession) RoutingAgentRou
 		record := func(e RouteEscalation) {
 			chain = append(chain, e)
 			escalations = append(escalations, e)
-			save()
+			save("", nil)
 		}
 		ci, si := 0, 0 // 真实档下标、影子档序号
 		for _, st := range deciders {
+			stage := pendingRouteStage(st)
+			stageInput := chain
+			if pending == stage {
+				stageInput = pendingEscalations
+			}
 			if st.shadow {
 				j := si
 				si++
-				if j < len(shadowReplay) && shadowReplay[j].DeciderIndex == j {
-					shadows = append(shadows, shadowReplay[j])
-					escalations = append(escalations, shadowReplay[j])
+				if e, ok := shadowReplay[st.name]; ok && pending != stage {
+					e.DeciderIndex = j
+					shadows = append(shadows, e)
+					escalations = append(escalations, e)
 					continue
 				}
-				e, err := runShadowStage(ctx, st, j, retry, input, candidates, chain, branchSet, agentName)
+				if pending != "" && pending != stage {
+					continue
+				}
+				pending = ""
+				e, err := runShadowStage(ctx, st, j, retry, input, candidates, stageInput, branchSet, agentName)
 				if err != nil {
+					if _, interrupted := compose_v2.IsInterrupt(err); interrupted {
+						save(stage, stageInput)
+					}
 					return "", err
 				}
 				shadows = append(shadows, e)
 				escalations = append(escalations, e)
-				save()
+				save("", nil)
 				continue
 			}
 			i := ci
 			ci++
-			if i < len(replay) && replay[i].DeciderIndex == i {
-				chain = append(chain, replay[i])
-				escalations = append(escalations, replay[i])
-				if replay[i].Reason == RouteReasonError {
-					lastErr = errors.New(replay[i].Err)
+			if e, ok := replay[st.name]; ok && pending != stage {
+				e.DeciderIndex = i
+				chain = append(chain, e)
+				escalations = append(escalations, e)
+				if e.Reason == RouteReasonError {
+					lastErr = errors.New(e.Err)
 				}
 				continue
 			}
+			if pending != "" && pending != stage {
+				continue
+			}
+			pending = ""
 			// 输入、候选与前面各档的结果每次给一份拷贝：决策方是业务代码，改了它们不该
 			// 影响分支收到的输入，也不该影响下一档。前面各档的结果只含真实档：影子档对路由不可见。
 			req := RouteRequest{
 				Input:       copyInput(input),
 				Candidates:  append([]RoutingChoice(nil), candidates...),
-				Escalations: cloneEscalations(chain),
+				Escalations: cloneEscalations(stageInput),
 			}
 			// 每一档一个独立的调用身份：提问 ID 与 RunSubAgent 的子命名空间都按它派生，
 			// 不同档的提问不共用答案位，子 agent 也不会与 classifier 那一档撞命名空间。
 			// 以失败收尾后重新调用时身份带上重试代数，见 routeStageMemo.Retry。身份里不必带
 			// 节点的访问序号：子命名空间、提问 ID、私有态键各自已经含它。
-			dctx := compose_v2.WithCurrentToolCallContext(WithoutHistoryCtx(ctx), deciderCallID(i, retry), i)
+			dctx := compose_v2.WithCurrentToolCallContext(WithoutHistoryCtx(ctx), deciderCallID(st.name, retry), 0)
 			dec, err := st.decide(dctx, req)
 			if err != nil {
 				if compose_v2.MustPropagate(ctx, err) {
+					if _, interrupted := compose_v2.IsInterrupt(err); interrupted {
+						save(stage, stageInput)
+					}
 					return "", err
 				}
 				slog.WarnContext(ctx, "routing decider failed, escalating",
 					"agent", agentName, "decider", i, "err", err)
 				lastErr = err
-				record(RouteEscalation{DeciderIndex: i, Reason: RouteReasonError, Err: err.Error()})
+				record(RouteEscalation{DeciderIndex: i, DeciderName: st.name, Reason: RouteReasonError, Err: err.Error()})
 				continue
 			}
 			if reason := judgeRouteDecision(dec, branchSet, st); reason != "" {
-				record(escalationFor(i, reason, dec))
+				e := escalationFor(i, reason, dec)
+				e.DeciderName = st.name
+				record(e)
 				continue
 			}
 			conf := dec.Confidence
 			EmitRouteDecisionEvent(ctx, &RouteDecisionAction{
 				AgentName: agentName, Target: dec.Target,
-				Stage: RouteStageDecider, DeciderIndex: i, Confidence: &conf, Scores: finiteScores(dec.Scores), Source: dec.Source,
+				Stage: RouteStageDecider, DeciderIndex: i, DeciderName: st.name, Confidence: &conf, Scores: finiteScores(dec.Scores), Source: dec.Source,
 				Escalations: escalations,
 			})
 			return compose_v2.NodeID(dec.Target), nil
@@ -608,7 +678,9 @@ func (r *RoutingAgent) decisionRouter(parentSession *RunSession) RoutingAgentRou
 				// 排在前面的生效。不在其中的只剩框架自己的不变量被破坏（classify 不在节点
 				// 执行里、铸不出收件人）：按失败出在 classifier 处理，决策方的结果留着重放；
 				// 有档报错时从那一档重新调用。
-				if !compose_v2.MustPropagate(ctx, err) {
+				if _, interrupted := compose_v2.IsInterrupt(err); interrupted {
+					save(pendingRouteClassifier, nil)
+				} else if !compose_v2.MustPropagate(ctx, err) {
 					saveRetryProgress(ctx, agentName, progressBeforeFirstError(chain, chain), retry)
 				}
 				return "", err
@@ -666,13 +738,9 @@ func saveRetryProgress(ctx context.Context, agentName string, keep []RouteEscala
 	}
 }
 
-// deciderCallID 是第 i 档决策方的调用身份。重试代数为 0 时是 "route_decider_<i>"，之后
-// 带上 "_retry<代数>"。
-func deciderCallID(i, retry int) string {
-	if retry == 0 {
-		return fmt.Sprintf("route_decider_%d", i)
-	}
-	return fmt.Sprintf("route_decider_%d_retry%d", i, retry)
+// deciderCallID 以档名和失败重试代数标识调用。
+func deciderCallID(name string, retry int) string {
+	return fmt.Sprintf("route_decider_%s#%d", name, retry)
 }
 
 // firstErroredStage 返回第一个报错的档在 escalations 里的下标，没有时返回 -1。传进来的是真实档的记录：
@@ -695,20 +763,21 @@ func runShadowStage(ctx context.Context, st routeDeciderStage, j, retry int, inp
 		Candidates:  append([]RoutingChoice(nil), candidates...),
 		Escalations: cloneEscalations(chain),
 	}
-	sctx := compose_v2.WithCurrentToolCallContext(WithoutHistoryCtx(ctx), shadowCallID(j, retry), j)
+	sctx := compose_v2.WithCurrentToolCallContext(WithoutHistoryCtx(ctx), fmt.Sprintf("route_shadow_%s#%d", st.name, retry), 0)
 	dec, err := callShadowDecider(sctx, st.decide, req)
 	if err != nil {
 		if compose_v2.MustPropagate(ctx, err) {
 			return RouteEscalation{}, err
 		}
 		slog.WarnContext(ctx, "routing shadow decider failed", "agent", agentName, "shadow", j, "err", err)
-		return RouteEscalation{DeciderIndex: j, Reason: RouteReasonError, Err: err.Error(), Shadow: true}, nil
+		return RouteEscalation{DeciderIndex: j, DeciderName: st.name, Reason: RouteReasonError, Err: err.Error(), Shadow: true}, nil
 	}
 	reason := judgeRouteDecision(dec, branchSet, st)
 	if reason == "" {
 		reason = RouteReasonShadow
 	}
 	e := escalationFor(j, reason, dec)
+	e.DeciderName = st.name
 	e.Shadow = true
 	return e, nil
 }
@@ -724,14 +793,6 @@ func callShadowDecider(ctx context.Context, d RouteDecider, req RouteRequest) (d
 		}
 	}()
 	return d(ctx, req)
-}
-
-// shadowCallID 是第 j 个影子档的调用身份，与真实档的（deciderCallID）分开编号。
-func shadowCallID(j, retry int) string {
-	if retry == 0 {
-		return fmt.Sprintf("route_shadow_%d", j)
-	}
-	return fmt.Sprintf("route_shadow_%d_retry%d", j, retry)
 }
 
 // copyInput 给决策方一份输入的拷贝：结构体、Annotations、Metadata、ContentBlocks 及其

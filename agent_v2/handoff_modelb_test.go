@@ -2,14 +2,17 @@ package agent_v2_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
 	"crew-go/model"
 	"crew-go/schema"
+	"crew-go/store"
 )
 
 // transferToolCall 构造一个调 transfer_to_agent 工具的 assistant message。
@@ -21,6 +24,93 @@ func transferToolCall(callID, target string) *schema.Message {
 			Arguments: `{"agent_name":"` + target + `"}`,
 		},
 	}})
+}
+
+func TestHandoffAgent_ActiveRequiresOuterCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		resume bool
+	}{{"failed_parent", false}, {"resumed_parent", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			cp := compose_v2.NewInMemoryCheckpointer()
+			st := store.NewInMemoryStore()
+			ctx = compose_v2.WithThreadIDCtx(store.WithContext(ctx, st), "thread")
+			ctx = compose_v2.WithCheckpointerCtx(ctx, cp)
+			front := agent_v2.NewBasicAgent(agent_v2.WithName("front"), agent_v2.WithHandoffTransfer(),
+				agent_v2.WithModel(newStubModel([]*schema.Message{transferToolCall("tc", "billing")})))
+			billing := agent_v2.NewBasicAgent(agent_v2.WithName("billing"),
+				agent_v2.WithModel(newStubModel([]*schema.Message{schema.AssistantMessage("账单已处理")})))
+			handoff := agent_v2.NewHandoffAgent(agent_v2.WithHandoffName("support"), agent_v2.WithHandoffInitial("front")).
+				AddAgent("front", front).AddAgent("billing", billing)
+			stop := errors.New("host rejected the execution")
+			b := compose_v2.NewBuilder().WithName("commit-host")
+			b.AddNode("delegate", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+				events, err := agent_v2.RunSubAgent(ctx, "support", handoff, schema.UserMessage("查账单"))
+				if err != nil {
+					return nil, err
+				}
+				if got := agent_v2.FinalMessage(events).GetContent(); got != "账单已处理" {
+					t.Errorf("转交应实际运行 billing，实际 %q", got)
+				}
+				if !tc.resume {
+					return nil, stop
+				}
+				return nil, nil
+			})
+			b.AddNode("approve", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+				_, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "接受处理结果吗？"})
+				return nil, err
+			})
+			b.AddEdge(compose_v2.StartNode, "delegate")
+			b.AddEdge("delegate", "approve")
+			b.AddEdge("approve", compose_v2.EndNode)
+			g, err := b.Compile()
+			if err != nil {
+				t.Fatal(err)
+			}
+			const sid = "task"
+			run := func(opts ...compose_v2.RunOption) error {
+				base := []compose_v2.RunOption{compose_v2.WithSessionID(sid), compose_v2.WithCheckpointer(cp)}
+				return compose_v2.Run(ctx, g, compose_v2.NewChannelManager(), append(base, opts...)...)
+			}
+			err = run()
+			if !tc.resume && !errors.Is(err, stop) {
+				t.Fatalf("测试应在外层否决这次转交，实际 %v", err)
+			}
+			ns := store.NS("__handoff_active__", "support", "thread")
+			if item, err := st.Get(ctx, ns, "active"); err != nil || item != nil {
+				t.Fatalf("外层提交前不得写入 active，实际 %+v，错误 %v", item, err)
+			}
+			if !tc.resume {
+				return
+			}
+			interrupt, ok := compose_v2.IsInterrupt(err)
+			if !ok {
+				t.Fatalf("外层应挂起，实际 %v", err)
+			}
+			answers := map[string]*schema.Message{interrupt.Query.InterruptID: schema.UserMessage("接受")}
+			saved, err := cp.LoadNS(ctx, sid, "")
+			if err != nil || saved == nil || len(saved.Signals) == 0 {
+				t.Fatalf("挂起存档应带有待提交的转交，实际 %+v，错误 %v", saved, err)
+			}
+			fork := compose_v2.WithThreadIDCtx(ctx, "fork-thread")
+			if err := compose_v2.Run(fork, g, compose_v2.NewChannelManager(), compose_v2.WithSessionID("fork-task"),
+				compose_v2.WithResumeFrom(saved), compose_v2.WithResumeAnswers(answers)); err != nil {
+				t.Fatalf("分叉任务应正常运行，实际 %v", err)
+			}
+			if item, err := st.Get(ctx, ns, "active"); err != nil || item != nil {
+				t.Fatalf("分叉任务不得发布来源任务的转交，实际 %+v，错误 %v", item, err)
+			}
+			if err := run(compose_v2.WithResumeAnswers(answers)); err != nil {
+				t.Fatal(err)
+			}
+			if item, err := st.Get(ctx, ns, "active"); err != nil || item == nil || item.Value != "billing" {
+				t.Fatalf("提交后应写入恢复的转交目标，实际 %+v，错误 %v", item, err)
+			}
+		})
+	}
 }
 
 // TestHandoffAgent_ModelB_LLMTransfer 验证模型 B 核心：LLM 在 sub-agent 内调

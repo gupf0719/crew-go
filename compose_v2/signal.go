@@ -117,31 +117,44 @@ import (
 // [EmitSignal] 与 [Signals.Take] 都要它：放在不导出的变量里，别的包就没法经这两个入口发、取这类
 // 信号。它不是防伪造的那道防线——[Signals] 的 JSON 形态里种类只是一个名字；防伪造靠收件人
 // （见 [SignalRecipient]）。
-type SignalKind struct{ name string }
+type SignalKind struct {
+	name   string
+	commit func(context.Context, Signal) error
+}
+
+type signalKindRegistration struct {
+	kind  *SignalKind
+	where string
+}
 
 var (
 	signalKindsMu sync.Mutex
 	// signalKinds 记每个名字由谁铸的（调用位置），重复铸造时报给调用方。
-	signalKinds = map[string]string{}
+	signalKinds = map[string]signalKindRegistration{}
 )
 
 // NewSignalKind 铸造一类上行信号。名字用于持久化（存档与记录里按名字存），在进程内必须唯一：
 // 重复铸造会 panic——两个包用同一个名字，彼此的信号就会被对方当成自己的。在包级变量里铸。
 func NewSignalKind(name string) *SignalKind {
+	return registerSignalKind(name, nil)
+}
+
+func registerSignalKind(name string, commit func(context.Context, Signal) error) *SignalKind {
 	if name == "" {
 		panic("compose_v2: NewSignalKind 的名字不能为空")
 	}
 	where := "未知位置"
-	if _, file, line, ok := runtime.Caller(1); ok {
+	if _, file, line, ok := runtime.Caller(2); ok {
 		where = fmt.Sprintf("%s:%d", file, line)
 	}
 	signalKindsMu.Lock()
 	defer signalKindsMu.Unlock()
 	if first, dup := signalKinds[name]; dup {
-		panic(fmt.Sprintf("compose_v2: 信号种类 %q 已经在 %s 铸过（这次在 %s）——同名只能铸一次", name, first, where))
+		panic(fmt.Sprintf("compose_v2: 信号种类 %q 已经在 %s 铸过（这次在 %s）——同名只能铸一次", name, first.where, where))
 	}
-	signalKinds[name] = where
-	return &SignalKind{name: name}
+	kind := &SignalKind{name: name, commit: commit}
+	signalKinds[name] = signalKindRegistration{kind: kind, where: where}
+	return kind
 }
 
 // Name 返回铸造时的名字。
@@ -169,6 +182,7 @@ type SignalRecord struct {
 	Dest   string `json:"dest,omitempty"`
 	Value  string `json:"value,omitempty"`
 	Origin string `json:"origin,omitempty"`
+	Seal   string `json:"seal,omitempty"` // 任务提交信号的认证码。
 }
 
 func (r SignalRecord) sameSlot(o SignalRecord) bool { return r.Kind == o.Kind && r.Dest == o.Dest }
@@ -480,7 +494,16 @@ func EmitSignal(ctx context.Context, k *SignalKind, s Signal) bool {
 	if sc == nil {
 		return false
 	}
-	sc.add(SignalRecord{Kind: k.name, Dest: s.Dest, Value: s.Value, Origin: s.Origin})
+	record := SignalRecord{Kind: k.name, Dest: s.Dest, Value: s.Value, Origin: s.Origin}
+	if k.commit != nil {
+		key := taskRecipientKeyFrom(ctx)
+		scope := taskCommitBase(ctx)
+		if len(key) == 0 || scope == nil {
+			return false
+		}
+		record.Seal = sealCommitSignal(key, scope, record)
+	}
+	sc.add(record)
 	return true
 }
 

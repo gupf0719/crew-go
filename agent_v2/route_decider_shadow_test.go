@@ -50,7 +50,7 @@ func TestRouteDecider_ShadowRecordsButNeverDecides(t *testing.T) {
 			}
 			cls := &recordingClassifier{target: "tech"}
 			r := newShadowSupportAgent(
-				agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()),
+				agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()),
 				agent_v2.WithRoutingClassifier(cls),
 			)
 			rec := &routeEventRecorder{}
@@ -100,8 +100,8 @@ func TestRouteDecider_ShadowHiddenFromLaterDeciders(t *testing.T) {
 		return agent_v2.RouteDecision{Target: "tech", Confidence: 0.9}, nil
 	}
 	r := newShadowSupportAgent(
-		agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()),
-		agent_v2.WithRouteDecider(real, 0.85),
+		agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()),
+		agent_v2.WithRouteDecider("real", real, 0.85),
 		agent_v2.WithRoutingFallback(branchAgent("fallback")),
 	)
 	rec := &routeEventRecorder{}
@@ -139,9 +139,9 @@ func TestRouteDecider_ShadowErrorDoesNotMoveRetryPoint(t *testing.T) {
 		return agent_v2.RouteDecision{}, nil
 	}
 	r := newShadowSupportAgent(
-		agent_v2.WithRouteDecider(first, 0),
-		agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()),
-		agent_v2.WithRouteDecider(last, 0),
+		agent_v2.WithRouteDecider("first", first, 0),
+		agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()),
+		agent_v2.WithRouteDecider("last", last, 0),
 	)
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
 	sess := agent_v2.NewRunSession()
@@ -187,8 +187,8 @@ func TestRouteDecider_ShadowReplayedOnResume(t *testing.T) {
 		return agent_v2.RouteDecision{Target: strings.TrimSpace(ans.Content), Confidence: 1, Source: "user"}, nil
 	}
 	r := newShadowSupportAgent(
-		agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()),
-		agent_v2.WithRouteDecider(askUser, 0),
+		agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()),
+		agent_v2.WithRouteDecider("askUser", askUser, 0),
 	)
 	rec := &routeEventRecorder{}
 	ctx := agent_v2.WithCtxOrchHooks(compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer()), rec)
@@ -227,7 +227,7 @@ func TestRouteDecider_ShadowQuestionStillInterrupts(t *testing.T) {
 		return agent_v2.RouteDecision{}, nil
 	}
 	r := newShadowSupportAgent(
-		agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()),
+		agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()),
 		agent_v2.WithRoutingClassifier(&recordingClassifier{target: "tech"}),
 	)
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
@@ -254,19 +254,19 @@ func TestRouteDecider_ShadowConstructionGuards(t *testing.T) {
 	}
 	t.Run("shadow after a zero-threshold tier needs no escalation target", func(t *testing.T) {
 		agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("support"),
-			agent_v2.WithRouteDecider(noDecision, 0),
-			agent_v2.WithRouteDecider(noDecision, 0.85, agent_v2.WithShadow()))
+			agent_v2.WithRouteDecider("noDecision", noDecision, 0),
+			agent_v2.WithRouteDecider("shadow", noDecision, 0.85, agent_v2.WithShadow()))
 	})
 	t.Run("last real tier can still escalate with nowhere to go", func(t *testing.T) {
 		expectPanic(t, "没有地方可升级", func() {
 			agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("support"),
-				agent_v2.WithRouteDecider(noDecision, 0.85),
-				agent_v2.WithRouteDecider(noDecision, 0, agent_v2.WithShadow()))
+				agent_v2.WithRouteDecider("noDecision", noDecision, 0.85),
+				agent_v2.WithRouteDecider("shadow", noDecision, 0, agent_v2.WithShadow()))
 		})
 	})
 	t.Run("shadow tiers alone are no decision source", func(t *testing.T) {
 		r := agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("support"),
-			agent_v2.WithRouteDecider(noDecision, 0.85, agent_v2.WithShadow()),
+			agent_v2.WithRouteDecider("shadow", noDecision, 0.85, agent_v2.WithShadow()),
 			agent_v2.WithRoutingFallback(branchAgent("fallback")),
 		).AddBranch("billing", branchAgent("billing"))
 		_, err := r.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("hi"))
@@ -278,7 +278,7 @@ func TestRouteDecider_ShadowConstructionGuards(t *testing.T) {
 		expectPanic(t, "WithRouter", func() {
 			agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("support"),
 				agent_v2.WithRouter(func(context.Context, *schema.Message) (compose_v2.NodeID, error) { return "billing", nil }),
-				agent_v2.WithRouteDecider(noDecision, 0.85, agent_v2.WithShadow()))
+				agent_v2.WithRouteDecider("shadow", noDecision, 0.85, agent_v2.WithShadow()))
 		})
 	})
 }
@@ -317,15 +317,15 @@ func TestRouteDecider_ShadowAddedWhileTaskPaused(t *testing.T) {
 	}
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
 	sess := agent_v2.NewRunSession()
-	before := newShadowSupportAgent(agent_v2.WithRouteDecider(flaky, 0.85), agent_v2.WithRouteDecider(askBranch, 0))
+	before := newShadowSupportAgent(agent_v2.WithRouteDecider("flaky", flaky, 0.85), agent_v2.WithRouteDecider("askBranch", askBranch, 0))
 	_, err := before.Run(ctx, sess, schema.UserMessage("钱的事"))
 	ie, ok := compose_v2.IsInterrupt(err)
 	if !ok {
 		t.Fatalf("the chain should stop to ask the user, got %v", err)
 	}
 	after := newShadowSupportAgent(
-		agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()),
-		agent_v2.WithRouteDecider(flaky, 0.85), agent_v2.WithRouteDecider(askBranch, 0))
+		agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()),
+		agent_v2.WithRouteDecider("flaky", flaky, 0.85), agent_v2.WithRouteDecider("askBranch", askBranch, 0))
 	events, err := after.Resume(ctx, sess.RunID, agent_v2.WithResumeUserInputs(map[string]*schema.Message{
 		ie.AllQueries()[0].InterruptID: schema.UserMessage("billing"),
 	}))
@@ -344,13 +344,13 @@ func TestRouteDecider_ShadowRemovedWhileTaskPaused(t *testing.T) {
 	}
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
 	sess := agent_v2.NewRunSession()
-	before := newShadowSupportAgent(agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()), agent_v2.WithRouteDecider(askBranch, 0))
+	before := newShadowSupportAgent(agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()), agent_v2.WithRouteDecider("askBranch", askBranch, 0))
 	_, err := before.Run(ctx, sess, schema.UserMessage("钱的事"))
 	ie, ok := compose_v2.IsInterrupt(err)
 	if !ok {
 		t.Fatalf("the real tier should ask the user, got %v", err)
 	}
-	after := newShadowSupportAgent(agent_v2.WithRouteDecider(askBranch, 0))
+	after := newShadowSupportAgent(agent_v2.WithRouteDecider("askBranch", askBranch, 0))
 	events, err := after.Resume(ctx, sess.RunID, agent_v2.WithResumeUserInputs(map[string]*schema.Message{
 		ie.AllQueries()[0].InterruptID: schema.UserMessage("tech"),
 	}))
@@ -359,6 +359,75 @@ func TestRouteDecider_ShadowRemovedWhileTaskPaused(t *testing.T) {
 	}
 	if out := finalContent(t, events); out != "from tech" {
 		t.Fatalf("should route to the branch the user picked, got %q", out)
+	}
+}
+
+func TestRouteDecider_StageNameSurvivesInsertionAndRemoval(t *testing.T) {
+	ctx := compose_v2.WithCheckpointerCtx(t.Context(), compose_v2.NewInMemoryCheckpointer())
+	sess := agent_v2.NewRunSession()
+	oldStage := func(context.Context, agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
+		return agent_v2.RouteDecision{}, nil
+	}
+	var insertedCalls int
+	inserted := func(context.Context, agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
+		insertedCalls++
+		return agent_v2.RouteDecision{Target: "tech", Confidence: 1}, nil
+	}
+	question := func(ctx context.Context, req agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
+		if len(req.Escalations) != 1 || req.Escalations[0].DeciderName != "removed" || req.Escalations[0].DeciderIndex != 0 {
+			return agent_v2.RouteDecision{Target: "tech", Confidence: 1}, nil
+		}
+		return askBranch(ctx, req)
+	}
+	before := newShadowSupportAgent(agent_v2.WithRouteDecider("removed", oldStage, 0),
+		agent_v2.WithRouteDecider("question", question, 0))
+	_, err := before.Run(ctx, sess, schema.UserMessage("钱的事"))
+	interrupt, ok := compose_v2.IsInterrupt(err)
+	if !ok {
+		t.Fatalf("原配置应挂起，实际 %v", err)
+	}
+	withoutQuestion := newShadowSupportAgent(agent_v2.WithRouteDecider("inserted", inserted, 0))
+	if _, err := withoutQuestion.Resume(ctx, sess.RunID); !errors.Is(err, compose_v2.ErrCheckpointNotResumable) {
+		t.Fatalf("待答档被删除时应明确拒绝恢复，实际 %v", err)
+	}
+	after := newShadowSupportAgent(agent_v2.WithRouteDecider("inserted", inserted, 0),
+		agent_v2.WithRouteDecider("another", inserted, 0), agent_v2.WithRouteDecider("question", question, 0))
+	ev, err := after.Resume(ctx, sess.RunID, agent_v2.WithResumeUserInputs(map[string]*schema.Message{
+		interrupt.Query.InterruptID: schema.UserMessage("billing"),
+	}))
+	if err != nil || finalContent(t, ev) != "from billing" || insertedCalls != 0 {
+		t.Fatalf("应以原 ID 续待答档，新增前置档调用 %d 次，错误 %v", insertedCalls, err)
+	}
+	ev, err = after.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("新任务"))
+	if err != nil || finalContent(t, ev) != "from tech" || insertedCalls != 1 {
+		t.Fatalf("新任务应使用新升级链，新增档调用 %d 次，错误 %v", insertedCalls, err)
+	}
+}
+
+func TestRouteDecider_PendingShadowAnswerCannotChooseProductionRoute(t *testing.T) {
+	ctx := compose_v2.WithCheckpointerCtx(t.Context(), compose_v2.NewInMemoryCheckpointer())
+	sess := agent_v2.NewRunSession()
+	var productionCalls int
+	production := func(context.Context, agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
+		productionCalls++
+		return agent_v2.RouteDecision{Target: "tech", Confidence: 1}, nil
+	}
+	before := newShadowSupportAgent(agent_v2.WithRouteDecider("experiment", askBranch, 0, agent_v2.WithShadow()),
+		agent_v2.WithRouteDecider("production", production, 0))
+	_, err := before.Run(ctx, sess, schema.UserMessage("请求"))
+	ie, ok := compose_v2.IsInterrupt(err)
+	if !ok {
+		t.Fatalf("影子档应先提问，实际 %v", err)
+	}
+	answers := agent_v2.WithResumeUserInputs(map[string]*schema.Message{ie.Query.InterruptID: schema.UserMessage("billing")})
+	after := newShadowSupportAgent(agent_v2.WithRouteDecider("experiment", askBranch, 0),
+		agent_v2.WithRouteDecider("production", production, 0))
+	if _, err := after.Resume(ctx, sess.RunID, answers); !errors.Is(err, compose_v2.ErrCheckpointNotResumable) || productionCalls != 0 {
+		t.Fatalf("切换待答档角色应拒绝恢复，实际 %v，生产档调用 %d 次", err, productionCalls)
+	}
+	ev, err := before.Resume(ctx, sess.RunID, answers)
+	if err != nil || finalContent(t, ev) != "from tech" || productionCalls != 1 {
+		t.Fatalf("原角色应继续由生产档作出实际决策，实际 %v，生产档调用 %d 次", err, productionCalls)
 	}
 }
 
@@ -372,7 +441,7 @@ func TestRouteDecider_ShadowPanicDoesNotBreakRouting(t *testing.T) {
 	real := func(_ context.Context, _ agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
 		return agent_v2.RouteDecision{Target: "billing", Confidence: 0.9}, nil
 	}
-	r := newShadowSupportAgent(agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()), agent_v2.WithRouteDecider(real, 0))
+	r := newShadowSupportAgent(agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()), agent_v2.WithRouteDecider("real", real, 0))
 	rec := &routeEventRecorder{}
 	events, err := r.Run(agent_v2.WithCtxOrchHooks(context.Background(), rec), agent_v2.NewRunSession(), schema.UserMessage("hi"))
 	if err != nil {
@@ -401,7 +470,7 @@ func TestRouteDecider_ShadowErrorReplayedKeepsLastErr(t *testing.T) {
 		}
 		return agent_v2.RouteDecision{}, nil // 用户答了也定不下来
 	}
-	r := newShadowSupportAgent(agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()), agent_v2.WithRouteDecider(askThenAbstain, 0))
+	r := newShadowSupportAgent(agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()), agent_v2.WithRouteDecider("askThenAbstain", askThenAbstain, 0))
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
 	sess := agent_v2.NewRunSession()
 	_, err := r.Run(ctx, sess, schema.UserMessage("hi"))
@@ -441,7 +510,7 @@ func TestRouteDecider_ShadowKeepsRealDeciderIndices(t *testing.T) {
 		return agent_v2.RouteDecision{Target: "tech", Confidence: 0.99}, nil
 	}
 	run := func(opts ...agent_v2.RoutingOption) string {
-		opts = append(opts, agent_v2.WithRouteDecider(j, 0.85), agent_v2.WithRouteDecider(k, 0),
+		opts = append(opts, agent_v2.WithRouteDecider("j", j, 0.85), agent_v2.WithRouteDecider("k", k, 0),
 			agent_v2.WithRoutingFallback(branchAgent("fallback")))
 		events, err := newShadowSupportAgent(opts...).Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("hi"))
 		if err != nil {
@@ -450,7 +519,7 @@ func TestRouteDecider_ShadowKeepsRealDeciderIndices(t *testing.T) {
 		return finalContent(t, events)
 	}
 	without := run()
-	with := run(agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()))
+	with := run(agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()))
 	if without != "from billing" || with != without {
 		t.Fatalf("a later tier looking up decider 0 must see the same record with or without a shadow tier: without=%q with=%q", without, with)
 	}

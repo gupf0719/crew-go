@@ -126,7 +126,7 @@ LangGraph swarm 的本质是**零私有引擎**——把三个 langgraph 通用�
            （owner 空时退化成 (标记, name, threadID) 三段，跟加这一维之前逐字一致），key = "active"
           ├─ 业务配 WithStore → 真持久（可 Redis/PG 跨进程）
           └─ 不配 → 默认 InMemoryStore（单进程多 Run 有效，类比 InMemoryCheckpointer）
-写入方   = HandoffAgent stepFn（统一持久，§8）——transfer 工具只把决定交给它所在的那段执行，不碰 store（§6.3）
+写入方   = 任务最外层成功提交（§8），stepFn 随执行登记待提交的目标
 ```
 
 store 本就是「跨 Run 持久」语义（`store.Store` godoc：跨 thread/跨用户长期 KV），namespace 按 conversation 维度组织，天然不受 cp cleanup 影响。
@@ -149,7 +149,7 @@ Run1("我要退款", threadID=T1):
   → transfer 工具: 从 ctx 取本跳的收件人 → 验证 refund 合法 → EmitSignal(收件人,"refund")
                   → 返回 ack + 标记 return-direct → frontdesk ReAct 当轮短路结束(不再回 LLM)
   → frontdesk.Run 返回 → stepFn: takeHandoffTarget(这次调用交上来的决定)=refund
-                        → store.Put(active=refund)(统一持久)
+                        → 登记 active=refund，随任务提交写入
                         → maxHops 检查 → 图回边进 refund(单 Run 内接管)
   → refund(BasicAgent) 看共享 session 完整历史 → 回复"请提供订单号"(不调 transfer)
   → refund.Run 返回 → stepFn: 这次调用交上来的决定里没有发给本跳的 → done → Run1 返回, active=refund 已持久 store
@@ -210,10 +210,9 @@ transfer 工具 fn 执行（LLM 调用时）：
 
 **职责边界（解决 audit H3）**：
 - **transfer 工具**：只表达「我要转给谁」→ 交给它所在的那段执行
-- **stepFn**：sub-agent.Run **成功**返回后 `takeHandoffTarget` 取走发给本跳的 → 统一 `store.Put`
-  **持久 active**（跨 Run）+ 图回边；剩下的（发给更上方的）交给 stepFn 这次节点执行，跟着它的提交继续往上走
+- **stepFn**：sub-agent.Run **成功**返回后 `takeHandoffTarget` 取走发给本跳的 → 登记跨 Run 的 active 更新并走图回边；剩下的（发给更上方的）交给 stepFn 这次节点执行，跟着它的提交继续往上走
 
-两者职责不重叠：工具交决定、stepFn 碰持久 store。stepFn 靠「这次调用交上来的决定里有没有发给本跳的」
+工具交出决定，stepFn 同时驱动本图路由和登记任务提交信号。stepFn 靠「这次调用交上来的决定里有没有发给本跳的」
 判断「本次调用是否发生转交」，**不靠读 store active**（store active 可能本来就是当前 agent，无法区分新转交）。
 
 #### 一个收件人上是一个单值格子
@@ -376,7 +375,7 @@ sub-agent 一轮**同时**调 transfer_to_agent + ask_user（InterruptError）�
 拿到答案，return-direct 短路转交走，**ask_user 的答案无 agent 消费（丢弃）**。
 
 - **影响**：LLM 同轮既转交又问用户是矛盾意图（罕见/不连贯）；**持久 store active 不污染**
-  （store.Put 只在 stepFn 成功路径，interrupt 路径不到达——abort 后新会话仍正确路由 initial）。
+  （挂起与放弃都不提交新的 active）。
 - **严重度 LOW-MED**：边缘 case 丢用户输入，无崩溃、无持久态损坏。
 - **业务规避**：sub-agent system prompt 引导"要么转交、要么问用户，不要同轮都做"。
 - ⚠️ ~~**transfer 必须留在 tool memo 之外**~~ **已不成立**：transfer **进** memo。它做出的决定随这次
@@ -436,12 +435,12 @@ startActive 为 `initial` 的情形（= swarm `default_active_agent` 语义）�
 **单 Run 内**（复用现有 `step→cond→step` 循环，`agent_v2/handoff_builder.go`）：
 ```
 首个 active 处理(input=用户新输入) → 调 transfer → return-direct 终止该 sub-agent
-→ stepFn 取发给本跳的转交 + store.Put 持久 active + 图回边 → 新 active 接管(input=共享历史)
+→ stepFn 取发给本跳的转交、登记 active 更新并走图回边 → 新 active 接管(input=共享历史)
 → ... → 某 active 不转交(回复用户) → Run 返回
 ```
-单 Run 内转交链**不上 cp**（内存循环即可——run 内转交不需要持久，OpenAI Swarm 同款）。
+图内 active 与待提交的更新随宿主存档保存。
 
-**跨 Run**：active 持久在 store；下个 Run 入口（§7）从 store 读 active 直接进。
+**跨 Run**：最外层图成功后将已提交的 active 更新写进 store。挂起、失败或被否决的外层执行不会发布更新。图在另一个任务、命名空间或会话中从快照分叉时，来源任务的更新无法提交。业务 `GraphAgent` 的输出读取成功后才发布。外置 store 由任务最外层图的入口 ctx 提供，Resume 应继续提供同一个后端；没有外置 store 时仍使用原 HandoffAgent 实例的内存 store。写入失败记日志，本轮图内路由照常完成。下个 Run 从 store 读取已提交的 active。
 
 > ⚠️ **前提：业务声明了 `compose_v2.WithThreadIDCtx`**（2026-08-12 补——原文漏了这句，
 > 而它承重）。持久 active 的键取自 `handoffThreadID`：优先 ThreadID，**无则退化

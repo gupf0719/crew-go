@@ -379,12 +379,10 @@ func TestSystemOne_AcceptsJSONShapedCriteria(t *testing.T) {
 }
 
 // TestSystemOne_RetryBudgetSkipsLongServerWait：服务端要求的等待超出默认 30 秒预算时
-// 不再重试，立刻返回那次 429，而不是真去等。超出 time.Duration 范围的值也一样。
+// 不再重试，立刻返回那次 429。
 func TestSystemOne_RetryBudgetSkipsLongServerWait(t *testing.T) {
 	headers := map[string][2]string{
 		"one hour":             {"retry-after", "3600"},
-		"saturating seconds":   {"retry-after", "1e300"},
-		"saturating ms":        {"retry-after-ms", "1e300"},
 		"far future http date": {"retry-after", "Fri, 31 Dec 9999 23:59:59 GMT"},
 	}
 	for name, h := range headers {
@@ -444,13 +442,12 @@ func TestSystemOne_DoesNotWaitPastCallerDeadline(t *testing.T) {
 	}
 }
 
-// TestSystemOne_SaturatedWaitWithoutBudgetReturnsAtOnce：不设预算、只靠 ctx 兜底时，服务端
-// 要求的超大等待也不能让客户端睡到 deadline。
-func TestSystemOne_SaturatedWaitWithoutBudgetReturnsAtOnce(t *testing.T) {
+// TestSystemOne_FarFutureWaitWithoutBudgetReturnsAtOnce 验证合法 HTTP 日期晚于 deadline 时立刻交回原错误。
+func TestSystemOne_FarFutureWaitWithoutBudgetReturnsAtOnce(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
-		w.Header().Set("retry-after", "1e300")
+		w.Header().Set("retry-after", "Fri, 31 Dec 9999 23:59:59 GMT")
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer srv.Close()

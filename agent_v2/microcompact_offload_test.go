@@ -124,6 +124,27 @@ func TestAudit5_HIGH2_MicroCompact_OffloadToStore_StoresOriginalMessage(t *testi
 	}
 }
 
+func TestMicroCompactOffload_DescribesStoredTruncatedResult(t *testing.T) {
+	st := store.NewInMemoryStore()
+	ctx := store.WithContext(t.Context(), st)
+	old := schema.ToolResultMessage("old", "截断后留下的正文")
+	old.Annotations = map[string]any{agent_v2.TruncatedOriginalBytesAnnotation: 40000}
+	recent := schema.ToolResultMessage("recent", "仍留在上下文")
+	call := func(id string) *schema.Message {
+		return schema.AssistantToolCallMessage([]schema.ToolCall{{ID: id, Function: schema.FunctionCall{Name: "Read", Arguments: `{}`}}})
+	}
+	cfg := &agent_v2.MicroCompactConfig{Enabled: true, KeepRecent: 1, OffloadEnabled: true, OffloadReadToolName: "read_saved"}
+	out := agent_v2.MicroCompactRun(ctx, []*schema.Message{call("old"), old, call("recent"), recent}, cfg)
+	placeholder := out[1]
+	if !strings.Contains(placeholder.Content, "read_saved") || !strings.Contains(placeholder.Content, "已保存的截断内容") ||
+		strings.Contains(placeholder.Content, "读回全文") || placeholder.ContentBlocks[0].Toolresult.Content != placeholder.Content {
+		t.Fatalf("占位符应描述可取回的截断内容，实际 %+v", placeholder)
+	}
+	if item, err := st.Get(ctx, cfg.OffloadNamespace(ctx), "old"); err != nil || item == nil {
+		t.Fatalf("占位符应对应实际存储的内容，实际 %+v，错误 %v", item, err)
+	}
+}
+
 func TestAudit5_HIGH2_MicroCompact_OffloadDisabled_FallsBackToPlaceholder(t *testing.T) {
 	// OffloadEnabled=false (默认) → 行为同现状: 替占位符, store 不被调
 	st := store.NewInMemoryStore()

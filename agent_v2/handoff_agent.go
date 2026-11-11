@@ -44,8 +44,9 @@ type HandoffAgent struct {
 	// 未在 ctx push store 时用）。storeOnce 保 lazy init race-free。
 	// 见 doc/v2/handoff.md §5.2：业务 push store（Redis/PG）→ 真持久；不 push → 默认
 	// InMemoryStore（单进程多 Run 有效）。
-	defaultStore store.Store
-	storeOnce    sync.Once
+	defaultStore  *store.InMemoryStore
+	activeStoreID string
+	storeOnce     sync.Once
 
 	// stateBySession 按 session.RunID 记录最近的 HandoffStateSnapshot，供
 	// 外部通过 State(session) 实时查询当前激活 agent / hops / done / exhausted。
@@ -667,8 +668,7 @@ func (h *HandoffAgent) buildComposeGraph(
 		// 产出的代码手上（实测：删了本函数的读取，探针里那个未授予的候选**仍然**转走了
 		// 对话）。清掉之后，这个字段的唯一写入者是紧接着的那几行：框架按自己裁决的结果写。
 		out = clearHandoffTargetAnnotation(out)
-		// 写回 out.Annotations[HandoffSignalKey] 让 compose_v2 stepNode 路由（shallow clone +
-		// copy map 防污染原 out）；并持久 active 到 store（转交时，§6.3 stepFn 统一持久）。
+		// 写回 out.Annotations[HandoffSignalKey] 让 stepNode 路由，同时登记任务提交后的 active 写入。
 		if nextTarget != "" {
 			cloned := *out
 			m := make(map[string]any, len(out.Annotations)+1)
@@ -679,16 +679,7 @@ func (h *HandoffAgent) buildComposeGraph(
 			cloned.Annotations = m
 			out = &cloned
 			if _, ok := agents[nextTarget]; ok {
-				if st := h.storeForActive(ctx); st != nil {
-					if tid := handoffThreadID(ctx, parentSession); tid != "" {
-						if perr := st.Put(ctx, handoffActiveNS(h.name, compose_v2.GetOwner(ctx), tid), handoffActiveKey, nextTarget); perr != nil {
-							// audit MED: 持久失败不阻断本 Run（路由走 channel 不依赖 store），但
-							// 跨 Run active 会丢——slog 让业务可观测（对齐 BasicAgent store.Put pattern）。
-							slog.WarnContext(ctx, "handoff persist active failed (跨 Run active 将丢失)",
-								"agent", h.Name(), "thread", tid, "target", nextTarget, "err", perr)
-						}
-					}
-				}
+				h.stageActive(ctx, parentSession, nextTarget)
 			}
 		}
 		// hops snapshot 用真值（currentHops + 1 表示本 hop 已成功完成）
@@ -771,13 +762,13 @@ func handoffActiveNS(name, owner, threadID string) store.Namespace {
 	return store.NS("__handoff_active__", name, owner, threadID)
 }
 
-// storeForActive 取持久 active 的 store：优先 ctx（业务 push 的 Redis/PG 等），无则
+// storeForActive 取持久 active 的 store：优先任务最外层的 ctx，无则
 // HandoffAgent 默认 InMemoryStore（单进程多 Run 有效，lazy init race-free）。见 §5.2。
 func (h *HandoffAgent) storeForActive(ctx context.Context) store.Store {
-	if st := store.FromContext(ctx); st != nil {
+	if st := store.FromContext(compose_v2.TaskCommitContext(ctx)); st != nil {
 		return st
 	}
-	h.storeOnce.Do(func() { h.defaultStore = store.NewInMemoryStore() })
+	h.storeOnce.Do(h.initActiveStore)
 	return h.defaultStore
 }
 
@@ -818,7 +809,8 @@ func (h *HandoffAgent) readPersistedActive(ctx context.Context, st store.Store, 
 	if st == nil || threadID == "" {
 		return h.initial
 	}
-	item, err := st.Get(ctx, handoffActiveNS(h.name, compose_v2.GetOwner(ctx), threadID), handoffActiveKey)
+	owner := compose_v2.GetOwner(compose_v2.TaskCommitContext(ctx))
+	item, err := st.Get(ctx, handoffActiveNS(h.name, owner, threadID), handoffActiveKey)
 	if err != nil || item == nil {
 		return h.initial
 	}
@@ -828,7 +820,7 @@ func (h *HandoffAgent) readPersistedActive(ctx context.Context, st store.Store, 
 	}
 	if _, ok := h.agents[active]; !ok {
 		// 陈旧/非法（agent 集合变更后残留）→ fallback initial + 清陈旧
-		if perr := st.Put(ctx, handoffActiveNS(h.name, compose_v2.GetOwner(ctx), threadID), handoffActiveKey, nil); perr != nil {
+		if perr := st.Put(ctx, handoffActiveNS(h.name, owner, threadID), handoffActiveKey, nil); perr != nil {
 			slog.WarnContext(ctx, "handoff clear stale active failed",
 				"agent", h.Name(), "thread", threadID, "stale", active, "err", perr)
 		}
@@ -857,7 +849,8 @@ func (h *HandoffAgent) EndConversation(ctx context.Context, threadID string) err
 	if st == nil {
 		return nil
 	}
-	return st.Put(ctx, handoffActiveNS(h.name, compose_v2.GetOwner(ctx), threadID), handoffActiveKey, nil) // nil 等价 Delete
+	owner := compose_v2.GetOwner(compose_v2.TaskCommitContext(ctx))
+	return st.Put(ctx, handoffActiveNS(h.name, owner, threadID), handoffActiveKey, nil) // nil 等价 Delete
 }
 
 var _ Agent = (*HandoffAgent)(nil)

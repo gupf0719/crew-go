@@ -83,6 +83,8 @@ func TestStreamableHTTPClient_ParsesAnnotations(t *testing.T) {
 			return
 		}
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{"protocolVersion": "2025-03-26"})
 		case "tools/list":
@@ -135,6 +137,8 @@ func TestStreamableHTTPClient_MalformedAnnotationsDropped(t *testing.T) {
 			return
 		}
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{"protocolVersion": "2025-03-26"})
 		case "tools/list":

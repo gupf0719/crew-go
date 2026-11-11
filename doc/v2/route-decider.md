@@ -71,7 +71,7 @@ RoutingAgent 的路由决策二选一：
    └─采纳              └─采纳                       └─选中分支
 ```
 
-- **决策方**：`WithRouteDecider(d, minConfidence, opts...)` 挂一档，可以挂多档，按调用
+- **决策方**：`WithRouteDecider(stageName, d, minConfidence, opts...)` 挂一档，可以挂多档，按调用
   顺序执行。每档只拿自己的门槛比，不同决策方的分数不需要可比。
 - **classifier**：`WithRoutingClassifier` 的 LLM classifier，决策方都拿不准之后的下一档。
   它不报置信度，给出合法分支就直接采纳。它自己失败时的降级见 §2.4。
@@ -190,11 +190,10 @@ if errors.As(err, &undecided) {
 - **每一档有自己的调用身份**。提问 ID 按它派生，不同档的提问不会共用一个答案位，哪怕
   Resume 时前面某一档走了别的路。以失败收尾后被重新调用时，身份带上失败重试代数，问的是
   新问题，见 §2.4；中断续跑不加代数，提问 ID 保持稳定。这个身份借的是 tool_call 的那几个
-  维度：决策方里 `compose_v2.GetCurrentToolCallID` 读到的是 `route_decider_<档位下标>`，
-  以失败收尾后被重新调用时是 `route_decider_<档位下标>_retry<代数>`（中断续跑那一档也会
-  重新执行，但身份不变）。⚠️ 因此**同一个输入要问同一个问题**：中断续跑时这一档重新执行、
+  维度：决策方里 `compose_v2.GetCurrentToolCallID` 返回 `route_decider_<档名>#<代数>`，
+  影子档使用 `route_shadow_<档名>#<代数>`。中断续跑保持身份，失败后的重判会递增代数。⚠️ 因此**同一个输入要问同一个问题**：中断续跑时这一档重新执行、
   身份不变，用户的回答按身份兑现，这次改口问别的就会拿到上一个问题的答案。问题内容取决于
-  前面各档的结果时没关系——那些档在这条路上是原样重放的。它跨任务可能相同，不是 LLM 的
+  前面各档的结果时，续跑使用发问时的 `Escalations` 快照。它跨任务可能相同，不是 LLM 的
   tool_call ID，别拿它当幂等键或缓存键。
 - **框架调决策方时已经套了 `WithoutHistoryCtx`**。决策是内部控制信号，产出不进会话历史。
   决策方里要跑子 agent 时用 `RunSubAgent`：它按这一档的调用身份派生子存档命名空间，不会
@@ -243,12 +242,11 @@ if errors.As(err, &undecided) {
 | `ClassifierFailure` | classifier 那一档没给出可用结果时的原因：它返回的错误、它没给出目标，或它给的目标不是候选分支，截断到 300 个字符。只在 classifier 失败后转兜底时有值 |
 | `Escalations` | 这次路由里没被采纳的决策方，按执行顺序，每条带原因与那一档的判断，含影子档的记录（`Shadow` 为 true，见 §2.8）；非有限的置信度记为 0，非有限的分数被丢掉 |
 
-`crew.route.decisions` 指标只读 `AgentName` 与 `Target`，这次没有新增指标或标签。
-升级率、置信度分布这类统计，业务订阅 `OnNodeEvent` 自己算，写法见 §4.5。
+`crew.route.decisions` 按 agent 和目标计数。`crew.route.escalations` 统计至少升级一次的决策，可除以决策总数得到升级率；`crew.route.confidence` 记录被采纳与低置信度升级档的样本。影子档仍通过事件观察。
 
 ### 2.8 影子档
 
-`WithRouteDecider(d, 门槛, WithShadow())` 把这一档设成影子档：照常调用、如实记录，但永远不采纳。用途是拿一个新的
+`WithRouteDecider(stageName, d, 门槛, WithShadow())` 把这一档设成影子档：照常调用、如实记录，但永远不采纳。用途是拿一个新的
 决策方和现有路由在线上并跑，攒够样本、定好门槛之后，去掉这个选项让它接管（用法见 §4.6）。
 
 它要守的不变量是**对路由不可见**：配了影子档时，选中哪个分支、后面各档收到的请求、Resume 与失败重判时哪些档重放
@@ -258,7 +256,7 @@ if errors.As(err, &undecided) {
 |---|---|
 | 判定 | 照 §2.3 判出原因；够得上这一档的门槛时原因记 `shadow`（`RouteReasonShadow`），不采纳，交给下一档 |
 | 记录 | 一条 `RouteEscalation`，`Shadow` 为 true，目标、置信度、分数、来源照实记；`DeciderIndex` 是它在影子档里的序号 |
-| 下标与续跑记录 | 影子档不占真实档的下标：真实档的 `DeciderIndex`、调用身份（`route_decider_<i>`）与续跑记录都不算它；影子档的身份是 `route_shadow_<j>`，续跑记录另存。所以在途的任务挂上或摘掉影子档，续跑不错位 |
+| 下标与续跑记录 | 影子档独立编号。两类档的续跑记录按注册名称和角色匹配，观测序号使用当前挂载顺序 |
 | 后面各档的请求 | `RouteRequest.Escalations` 里没有影子记录 |
 | 报错 | 记为 `error`、交给下一档；panic 也一样（当场兜住）。不进 `RouteUndecidedError.LastErr`，也不算「有档报错」，不挪动 §2.4 的重判起点；以失败收尾时它的记录不留，重试时重新调用 |
 | 错误文本 | `RouteUndecidedError` 的错误文本里没有影子记录：包成工具时这段文本会交给模型。记录留在 `Escalations` 字段里 |
@@ -268,8 +266,7 @@ if errors.As(err, &undecided) {
 
 没决定的路由以 `RouteUndecidedError` 收尾时不发事件，影子档的记录在它的 `Escalations` 字段里。
 
-⚠️ **接管不在「不可见」之内**：去掉 `WithShadow()` 等于在链上加一个真实档，排在它后面的真实档下标都加一。停在后面某一档
-等用户回答的在途任务，续跑会错位——这跟在链上加删任何一个真实档是同一个问题（续跑按真实档下标对齐，见中心 backlog）。
+挂起任务优先续原待答档，跳过这次部署新增的前置档，使用发问时的前序决策快照。待答档改名、移除或切换影子与生效角色时，返回 `ErrCheckpointNotResumable`。使用旧下标身份的升级链存档会因 GraphID 变化拒绝恢复，应在部署前完成或放弃这类任务。
 接管要等这类任务收尾再部署，或者把影子档挂在最后（接管时前面各档不受影响，代价是只有前面的档都没定下来才轮到它）。
 
 上面每一行都配了哨兵（[`route_decider_shadow_test.go`](../../agent_v2/route_decider_shadow_test.go)）。影子档与普通档处理不同的
@@ -287,15 +284,15 @@ if errors.As(err, &undecided) {
 | `type RouteDecider func(ctx, RouteRequest) (RouteDecision, error)` | 决策方 |
 | `RouteRequest{Input, Candidates, Escalations}` | 一次路由请求 |
 | `RouteDecision{Target, Confidence, Scores, Source}` | 一次判断 |
-| `RouteEscalation{DeciderIndex, Reason, Target, Confidence, Scores, Source, Err, Shadow}` | 一档没被采纳的记录；`Shadow` 表示来自影子档 |
-| `WithRouteDecider(d, minConfidence, opts...)` | 挂一档决策方 |
+| `RouteEscalation{DeciderIndex, DeciderName, Reason, Target, Confidence, Scores, Source, Err, Shadow}` | 一档没被采纳的记录；`Shadow` 表示来自影子档 |
+| `WithRouteDecider(stageName, d, minConfidence, opts...)` | 挂一档决策方 |
 | `RouteDeciderOption` | `WithRouteDecider` 的可选参数类型 |
 | `WithBranchMinConfidence(branch, minConfidence)` | 给某个分支单独设门槛，作为 `WithRouteDecider` 的可选参数 |
 | `WithShadow()` | 把这一档设成影子档：照常调用、如实记录、永不采纳，见 §2.8，作为 `WithRouteDecider` 的可选参数 |
 | `RouteUndecidedError{AgentName, Escalations, ClassifierFailure, LastErr}` | 每一档都没决定又无处升级时（含 classifier 失败又没有兜底）Run 返回的错误；任务层面的失败，存档留着可 Resume，默认判据下外层不自动重试 |
 | `RouteReasonLowConfidence` / `RouteReasonAbstain` / `RouteReasonUnknownTarget` / `RouteReasonInvalidConfidence` / `RouteReasonError` / `RouteReasonShadow` | 升级原因；`shadow` 只出现在影子档上，表示它的判断够得上门槛 |
 | `RouteStageDecider` / `RouteStageClassifier` / `RouteStageFallback` | 做出决定的档位 |
-| `RouteDecisionAction` 新增 `Stage` / `DeciderIndex` / `Confidence` / `Scores` / `Source` / `ClassifierFailure` / `Escalations` | 事件载荷 |
+| `RouteDecisionAction` 新增 `Stage` / `DeciderIndex` / `DeciderName` / `Confidence` / `Scores` / `Source` / `ClassifierFailure` / `Escalations` | 事件载荷 |
 | `RouteDecisionOf(ev agent_v2.Event) (*RouteDecisionAction, bool)` | 从事件里取载荷；手上是 `compose_v2.Event` 时先转换成 `agent_v2.Event` |
 | `EmitRouteDecisionEvent(ctx, *RouteDecisionAction)` | 签名改为接收整个载荷 |
 
@@ -339,7 +336,7 @@ client := jev.NewClient(os.Getenv("TYPESAFE_API_KEY"))
 // client := bailian.NewClient(os.Getenv("DASHSCOPE_API_KEY"), bailian.Beijing, "llm-xxxx")
 router := agent_v2.NewRoutingAgent(
     agent_v2.WithRoutingName("support"),
-    agent_v2.WithRouteDecider(decision.NewRouteDecider(client), 0.85),
+    agent_v2.WithRouteDecider("provider", decision.NewRouteDecider(client), 0.85),
     agent_v2.WithRoutingClassifier(llmClassifier),
     agent_v2.WithRoutingFallback(humanAgent),
     agent_v2.WithRoutingDescriptions(descriptions),
@@ -385,7 +382,7 @@ bounded := func(ctx context.Context, req agent_v2.RouteRequest) (agent_v2.RouteD
 }
 router := agent_v2.NewRoutingAgent(
     agent_v2.WithRoutingName("support"),
-    agent_v2.WithRouteDecider(bounded, 0.85),
+    agent_v2.WithRouteDecider("provider", bounded, 0.85),
     agent_v2.WithRoutingClassifier(llmClassifier),
     agent_v2.WithRoutingDescriptions(descriptions),
 )
@@ -397,7 +394,7 @@ Run 失败，不会升级。
 ### 4.2 高风险分支更严
 
 ```go
-agent_v2.WithRouteDecider(decider, 0.85,
+agent_v2.WithRouteDecider("decider", decider, 0.85,
     agent_v2.WithBranchMinConfidence("approve_transfer", 0.95),
     agent_v2.WithBranchMinConfidence("chitchat", 0.6),
 )
@@ -422,8 +419,8 @@ askUser := func(ctx context.Context, req agent_v2.RouteRequest) (agent_v2.RouteD
 
 router := agent_v2.NewRoutingAgent(
     agent_v2.WithRoutingName("support"),
-    agent_v2.WithRouteDecider(decision.NewRouteDecider(client), 0.85),
-    agent_v2.WithRouteDecider(askUser, 0),
+    agent_v2.WithRouteDecider("provider", decision.NewRouteDecider(client), 0.85),
+    agent_v2.WithRouteDecider("askUser", askUser, 0),
 )
 ```
 
@@ -479,7 +476,7 @@ shadow := func(ctx context.Context, req agent_v2.RouteRequest) (agent_v2.RouteDe
 }
 router := agent_v2.NewRoutingAgent(
     agent_v2.WithRoutingName("support"),
-    agent_v2.WithRouteDecider(shadow, 0.85, agent_v2.WithShadow()),
+    agent_v2.WithRouteDecider("shadow", shadow, 0.85, agent_v2.WithShadow()),
     agent_v2.WithRoutingClassifier(llmClassifier),
     agent_v2.WithRoutingDescriptions(descriptions),
 )
@@ -515,8 +512,8 @@ for _, e := range a.Escalations {
 | 档 | 怎么装配 | 效果 |
 |---|---|---|
 | 关 | 不加 `WithRouteDecider` | 不调用决策模型，路由由 classifier 决定；不用构造客户端，也不需要 key |
-| 观察 | `WithRouteDecider(d, 门槛, WithShadow())` | 照常调用、记录它的判断，路由仍由 classifier 决定（§2.8、§4.6） |
-| 生效 | `WithRouteDecider(d, 门槛)` | 置信度够门槛就直接定路由，拿不准交给 classifier |
+| 观察 | `WithRouteDecider(stageName, d, 门槛, WithShadow())` | 照常调用、记录它的判断，路由仍由 classifier 决定（§2.8、§4.6） |
+| 生效 | `WithRouteDecider(stageName, d, 门槛)` | 置信度够门槛就直接定路由，拿不准交给 classifier |
 
 业务从自己的配置里读出用哪一档，按它拼选项：
 
@@ -534,7 +531,7 @@ if cfg.DecisionMode == "on" || cfg.DecisionMode == "shadow" {
     if cfg.DecisionMode == "shadow" {
         deciderOpts = append(deciderOpts, agent_v2.WithShadow())
     }
-    opts = append(opts, agent_v2.WithRouteDecider(decide, 0.85, deciderOpts...))
+    opts = append(opts, agent_v2.WithRouteDecider("decide", decide, 0.85, deciderOpts...))
 }
 router := agent_v2.NewRoutingAgent(opts...).
     AddBranch("billing", billingAgent).
@@ -549,9 +546,7 @@ router := agent_v2.NewRoutingAgent(opts...).
   Run 入口」那一行）。
 - **改档要重新装配。** 改了配置要重建 RoutingAgent 才生效，一般就是重启服务。同一个 agent 在运行中途切换不支持，原因见
   下一条与 §6。
-- **关与观察之间切换不影响在途任务，涉及「生效」的切换会。** 影子档不占真实档的位置，挂上或摘掉都不错位。从关或观察
-  切到生效、或者反过来，等于在链上增删一个真实档：有任务正停在路由这一步等用户回答时（比如 §4.3 那种拿不准时问用户的），
-  续跑可能丢掉用户的回答、按错误的分支路由（§2.8 末尾）。这类切换要等这类任务收尾再部署。
+- **按档名保护在途答复。** 新任务使用新配置；在途任务继续原待答档。要切换待答档的角色，先处理该档已发出的提问。
 
 ---
 
@@ -703,5 +698,4 @@ router := agent_v2.NewRoutingAgent(opts...).
 
 ## 7. 限制与待办
 
-开放项在 [中心 backlog](../code/todo.md)：升级率与置信度指标、LLM classifier 不报置信度、
-实测样本需线上日志复核、其它决策点还没有同样的接缝、子 agent 失败后续跑不看新输入。
+开放项见 [中心 backlog](../code/todo.md)，包括 LLM classifier 置信度、线上样本回放和其它决策点。

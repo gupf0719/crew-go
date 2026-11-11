@@ -30,8 +30,12 @@ func TestParseRetryAfter(t *testing.T) {
 		{"无法解析", map[string]string{"Retry-After": "soon-ish"}, 0},
 		{"毫秒头优先于秒数头", map[string]string{"retry-after-ms": "250", "Retry-After": "9"}, 250 * time.Millisecond},
 		{"毫秒头不是数字时看秒数头", map[string]string{"retry-after-ms": "x", "Retry-After": "9"}, 9 * time.Second},
+		{"毫秒头为负时看秒数头", map[string]string{"retry-after-ms": "-1", "Retry-After": "0.5"}, 500 * time.Millisecond},
+		{"毫秒头溢出时看秒数头", map[string]string{"retry-after-ms": "1e300", "Retry-After": "0.5"}, 500 * time.Millisecond},
+		{"HTTP-date 恰好当前", map[string]string{"Retry-After": now.Format(http.TimeFormat)}, 0},
 		// 溢出带：按坏数据处理，不封顶成最大值——封顶等于睡到 ctx 超时。
 		{"溢出：绕回正数那一档", map[string]string{"Retry-After": "20000000000"}, 0},
+		{"溢出：刚过秒数上限", map[string]string{"Retry-After": "9223372037"}, 0},
 		{"溢出：毫秒头", map[string]string{"retry-after-ms": "1e300"}, 0},
 		{"上限内的最大值照收", map[string]string{"Retry-After": "9223372036"}, time.Duration(9223372036 * float64(time.Second))},
 		// 合法的长等待不拒：上面那道闸挡的是溢出，不是「等太久」。

@@ -352,6 +352,7 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 		fireAgentEnd(ctxOut, hooks, info, &hook.AgentOutput{Messages: msgs}, retErr)
 	}()
 
+	ctx, commit := compose_v2.WithTaskCommitBarrier(ctx)
 	final, err := g.runGraph(ctx, &cfg, session, input)
 	if ownsHistory {
 		endRootInputWindow(ctx)
@@ -396,6 +397,7 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	if ownsHistory {
 		settleHistoryTopLevel(ctx, g.Name(), input, final)
 	}
+	commit()
 	return collectEvents(session, startOffset), nil
 }
 
@@ -520,6 +522,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 
 	// Resume 拿不到授予：放一份空的，遮住外层放的那份。
 	ctx = withNodeGrants(ctx, memberGrants{})
+	ctx, commit := compose_v2.WithTaskCommitBarrier(ctx)
 	runErr := compose_v2.Run(ctx, g.graph, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := g.outputReader(cm.Channels())
 	finalRef = final
@@ -538,6 +541,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	if ownsHistory {
 		settleHistoryTopLevel(ctx, g.Name(), nil, final)
 	}
+	commit()
 	return collectEvents(session, startOffset), nil
 }
 

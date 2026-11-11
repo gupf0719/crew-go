@@ -394,7 +394,7 @@ routing := agent_v2.NewRoutingAgent(
 ```go
 routing := agent_v2.NewRoutingAgent(
     agent_v2.WithRoutingName("assistant"),
-    agent_v2.WithRouteDecider(decision.NewRouteDecider(client), 0.85), // client 由 jev.NewClient 或 bailian.NewClient 构造
+    agent_v2.WithRouteDecider("provider", decision.NewRouteDecider(client), 0.85), // client 由 jev.NewClient 或 bailian.NewClient 构造
     agent_v2.WithRoutingClassifier(classifier),
     agent_v2.WithRoutingDescriptions(descriptions),
     agent_v2.WithRoutingFallback(defaultAgent),
@@ -410,7 +410,7 @@ routing := agent_v2.NewRoutingAgent(
 | `NewRoutingAgent(opts...)` | 构造 |
 | `.AddBranch(name, agent)` 链式 | 添加候选分支 |
 | `WithRouter(fn)` | 业务规则路由；与决策方、classifier、兜底互斥，同时配构造期 panic |
-| `WithRouteDecider(d, minConfidence, opts...)` | 带置信度的决策方，拿不准交给下一档；可多次调用排成升级链，`WithBranchMinConfidence` 按分支设门槛 |
+| `WithRouteDecider(stageName, d, minConfidence, opts...)` | 带置信度的决策方，拿不准交给下一档；可多次调用排成升级链，`WithBranchMinConfidence` 按分支设门槛 |
 | `WithRoutingClassifier(ag)` | LLM 分类路由；配了决策方时是它们之后的下一档 |
 | `WithRouteTool()` | classifier 声明愿意定路由：被 RoutingAgent 授予路由能力时框架给它注入内置 return-direct `route_to` 工具（**要用工具定路由就只能用它**——裸 ToolInfo/普通 FuncTool 形态做不出路由决定，见 `RouteTool` 常量 godoc；纯文本小模型也可以不配，靠整段文本等于分支名，对格式敏感）。**能力是签名不是环境**：只有分类器这个对象被授予；编排分类器自动转授给成员（`ParallelAgent` 的分支并发、不转授），业务壳要显式 `RegrantRouteTo(opts, self, inner)`，GraphAgent 节点 / BasicAgent 工具里要显式 `RegrantFromNode(ctx, sub)`——分类器请教的别的 agent 没被转授就定不了路由（见 `agent_v2/route_grant.go`）|
 | `WithRoutingDescriptions(map)` | 分支描述——框架自动 prepend `branch_name: 描述` 清单到 classifier 收到的 input，让 LLM 按描述选目标（省 caller 在 classifier system prompt 手抄候选清单）；按 branch 注册顺序、仅列非空 description。决策方收到的候选清单也带着这些描述 |

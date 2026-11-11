@@ -27,6 +27,7 @@ var taskExecutionCtxKeys = []any{
 	inboxCtxKey{},
 	interjectionLedgerCtxKey{},
 	callerHistoryKey{},
+	modelUserContextKey{},
 }
 
 // taskEnvironmentCtxKeys 是 agent_v2 的环境：每个都实现 compose_v2.EnvironmentKey（DetachTask 留下；采纳

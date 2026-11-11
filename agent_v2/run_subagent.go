@@ -266,7 +266,9 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	}
 	// 6. 记住这次调用已经完成：父节点重跑时直接拿回结果，不再执行
 	if mode.remember {
-		rememberNestedCall(ctx, call, events, sigs, streamIDs, !streams.Uncertain(), mode.finalOnly)
+		if rememberNestedCall(ctx, call, events, sigs, streamIDs, !streams.Uncertain(), mode.finalOnly) {
+			compose_v2.FinishHandOver(subCtx)
+		}
 	}
 	compose_v2.EmitSignals(ctx, sigs)
 	// 7. 边界补记：业务塞进来的 sub 可能不是 BasicAgent（远程 / 自研 / 别的框架的壳），
@@ -390,7 +392,7 @@ func recallNestedCall(ctx context.Context, call nestedCall) ([]*AgentEvent, bool
 // [WithRerunnable] 时记成「可重做」的那种（compose_v2.Rerunnable）：父节点的条件出边按
 // CondFailRerunFrom 否决、要求父节点重新产出时，它跟着作废、重跑时重新调用。finalOnly 时只留
 // 最后那条退出事件（见 nestedMode.finalOnly）。
-func rememberNestedCall(ctx context.Context, call nestedCall, events []*AgentEvent, signals compose_v2.Signals, streams []string, streamsKnown, finalOnly bool) {
+func rememberNestedCall(ctx context.Context, call nestedCall, events []*AgentEvent, signals compose_v2.Signals, streams []string, streamsKnown, finalOnly bool) bool {
 	if finalOnly {
 		events = lastExitEvent(events)
 	}
@@ -406,7 +408,9 @@ func rememberNestedCall(ctx context.Context, call nestedCall, events []*AgentEve
 	if err := compose_v2.SaveStepResult(ctx, call.stepKey, rec, opts...); err != nil {
 		slog.WarnContext(ctx, "agent_v2: 记不住这次已完成的嵌套调用，父节点重跑时它会再执行一遍",
 			"ns", call.ns, "err", err)
+		return false
 	}
+	return true
 }
 
 // lastExitEvent 返回 events 里 [FinalMessage] 取的那一条退出事件（没有就返回 nil）。

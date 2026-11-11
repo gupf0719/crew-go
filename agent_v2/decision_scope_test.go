@@ -154,7 +154,7 @@ func TestDecisionScope_RouteDeciderDoesNotTakeInterjection(t *testing.T) {
 	branchModel := &scriptModel{steps: []func([]*schema.Message) (*schema.Message, error){reply(schema.AssistantMessage("done"))}}
 	branch := agent_v2.NewBasicAgent(agent_v2.WithName("branch"), agent_v2.WithModel(branchModel))
 	rt := agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("rt_decider"),
-		agent_v2.WithRouteDecider(func(dctx context.Context, req agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
+		agent_v2.WithRouteDecider("decision", func(dctx context.Context, req agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
 			if _, err := probe.Run(dctx, sess, req.Input); err != nil {
 				return agent_v2.RouteDecision{}, err
 			}
@@ -218,13 +218,13 @@ func TestDecisionScope_ShadowDeciderDoesNotTakeInterjection(t *testing.T) {
 	branchModel := &scriptModel{steps: []func([]*schema.Message) (*schema.Message, error){reply(schema.AssistantMessage("done"))}}
 	branch := agent_v2.NewBasicAgent(agent_v2.WithName("branch"), agent_v2.WithModel(branchModel))
 	rt := agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("rt_shadow"),
-		agent_v2.WithRouteDecider(func(dctx context.Context, req agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
+		agent_v2.WithRouteDecider("decision", func(dctx context.Context, req agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
 			if _, err := probe.Run(dctx, sess, req.Input); err != nil {
 				return agent_v2.RouteDecision{}, err
 			}
 			return agent_v2.RouteDecision{Target: "b", Confidence: 1}, nil
 		}, 0, agent_v2.WithShadow()),
-		agent_v2.WithRouteDecider(func(context.Context, agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
+		agent_v2.WithRouteDecider("second", func(context.Context, agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
 			return agent_v2.RouteDecision{Target: "b", Confidence: 1}, nil
 		}, 0)).AddBranch("b", branch)
 	if _, err := rt.Run(agent_v2.WithInboxCtx(context.Background(), inbox), sess, schema.UserMessage("原话")); err != nil {

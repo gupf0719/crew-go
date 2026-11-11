@@ -226,7 +226,7 @@ func TestRoutingAgent_RouterExclusiveWithOtherSources(t *testing.T) {
 	combos := map[string]agent_v2.RoutingOption{
 		"classifier": agent_v2.WithRoutingClassifier(other),
 		"fallback":   agent_v2.WithRoutingFallback(other),
-		"decider":    agent_v2.WithRouteDecider(decider, 0),
+		"decider":    agent_v2.WithRouteDecider("decider", decider, 0),
 	}
 	for name, opt := range combos {
 		t.Run(name, func(t *testing.T) {

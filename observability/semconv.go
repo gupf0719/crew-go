@@ -41,35 +41,38 @@ const (
 
 	// AttrOutcome 是一次执行的结局：success / error / timeout / cancelled / blocked（等人答复的挂起）。
 	// span status 只有 Unset / Error 两档有用，「用户点了停止」「等人审批」都不该算错误，靠它区分。
-	AttrOutcome        = attribute.Key("crew.outcome")
-	AttrAgentKind      = attribute.Key("crew.agent.kind") // AgentInfo.Type：base / sequential / parallel / loop / routing / handoff / plan / reflect / graph / a2a_remote，业务自研 agent 自己定
-	AttrAgentRound     = attribute.Key("crew.agent.round")
-	AttrRunID          = attribute.Key("crew.run.id") // RunSession.RunID：一个任务的身份
-	AttrGraphNS        = attribute.Key("crew.graph.ns")
-	AttrNodeID         = attribute.Key("crew.node.id")
-	AttrNodeInstance   = attribute.Key("crew.node.instance")
-	AttrNodeComponent  = attribute.Key("crew.node.component")
-	AttrToolCategory   = attribute.Key("crew.tool.category")
-	AttrToolOutcome    = attribute.Key("crew.tool.outcome")  // denied：被审批拒绝、没有执行（crew.outcome=blocked）
-	AttrToolReplayed   = attribute.Key("crew.tool.replayed") // true：续跑时从工具账重放，这一次没有执行
-	AttrResumeAction   = attribute.Key("crew.resume.action")
-	AttrInterruptID    = attribute.Key("crew.interrupt.id")
-	AttrInterruptCount = attribute.Key("crew.interrupt.queries")
-	AttrStreamChunks   = attribute.Key("crew.stream.chunks")
-	AttrCompactLayer   = attribute.Key("crew.compact.layer")
-	AttrCheckpointOp   = attribute.Key("crew.checkpoint.op")
-	AttrStaleOp        = attribute.Key("crew.checkpoint.stale_op")
-	AttrFanoutKind     = attribute.Key("crew.fanout.kind")
-	AttrFailoverReason = attribute.Key("crew.failover.reason")
-	AttrFailoverFrom   = attribute.Key("crew.failover.from")
-	AttrTrippedMember  = attribute.Key("crew.fallback.member")
-	AttrTrippedReason  = attribute.Key("crew.fallback.reason")
-	AttrPlanPhase      = attribute.Key("crew.plan.phase")
-	AttrRouteTarget    = attribute.Key("crew.route.target")
-	AttrA2AOperation   = attribute.Key("crew.a2a.operation")
-	AttrA2AMethod      = attribute.Key("crew.a2a.method")
-	AttrA2ATransport   = attribute.Key("crew.a2a.transport")
-	AttrA2ATaskID      = attribute.Key("crew.a2a.task_id")
+	AttrOutcome         = attribute.Key("crew.outcome")
+	AttrAgentKind       = attribute.Key("crew.agent.kind") // AgentInfo.Type：base / sequential / parallel / loop / routing / handoff / plan / reflect / graph / a2a_remote，业务自研 agent 自己定
+	AttrAgentRound      = attribute.Key("crew.agent.round")
+	AttrRunID           = attribute.Key("crew.run.id") // RunSession.RunID：一个任务的身份
+	AttrGraphNS         = attribute.Key("crew.graph.ns")
+	AttrNodeID          = attribute.Key("crew.node.id")
+	AttrNodeInstance    = attribute.Key("crew.node.instance")
+	AttrNodeComponent   = attribute.Key("crew.node.component")
+	AttrToolCategory    = attribute.Key("crew.tool.category")
+	AttrToolOutcome     = attribute.Key("crew.tool.outcome")  // denied：被审批拒绝、没有执行（crew.outcome=blocked）
+	AttrToolReplayed    = attribute.Key("crew.tool.replayed") // true：续跑时从工具账重放，这一次没有执行
+	AttrToolOutputBytes = attribute.Key("crew.tool.output.size_bytes")
+	AttrResumeAction    = attribute.Key("crew.resume.action")
+	AttrInterruptID     = attribute.Key("crew.interrupt.id")
+	AttrInterruptCount  = attribute.Key("crew.interrupt.queries")
+	AttrStreamChunks    = attribute.Key("crew.stream.chunks")
+	AttrCompactLayer    = attribute.Key("crew.compact.layer")
+	AttrCheckpointOp    = attribute.Key("crew.checkpoint.op")
+	AttrStaleOp         = attribute.Key("crew.checkpoint.stale_op")
+	AttrFanoutKind      = attribute.Key("crew.fanout.kind")
+	AttrFailoverReason  = attribute.Key("crew.failover.reason")
+	AttrFailoverFrom    = attribute.Key("crew.failover.from")
+	AttrTrippedMember   = attribute.Key("crew.fallback.member")
+	AttrTrippedReason   = attribute.Key("crew.fallback.reason")
+	AttrPlanPhase       = attribute.Key("crew.plan.phase")
+	AttrRouteTarget     = attribute.Key("crew.route.target")
+	AttrRouteStage      = attribute.Key("crew.route.stage")
+	AttrRouteDecider    = attribute.Key("crew.route.decider")
+	AttrA2AOperation    = attribute.Key("crew.a2a.operation")
+	AttrA2AMethod       = attribute.Key("crew.a2a.method")
+	AttrA2ATransport    = attribute.Key("crew.a2a.transport")
+	AttrA2ATaskID       = attribute.Key("crew.a2a.task_id")
 )
 
 // gen_ai.operation.name 的取值。
@@ -124,4 +127,6 @@ const (
 	MetricNodeExecutions       = "crew.node.executions"
 	MetricPlanReplans          = "crew.plan.replans"
 	MetricRouteDecisions       = "crew.route.decisions"
+	MetricRouteEscalations     = "crew.route.escalations"
+	MetricRouteConfidence      = "crew.route.confidence"
 )

@@ -182,6 +182,32 @@ func TestValueEqual_And_RangeOps_ExactIntegers(t *testing.T) {
 	}
 }
 
+func TestInMemoryStore_DecimalFiltersUseFloat64(t *testing.T) {
+	ctx := t.Context()
+	st := store.NewInMemoryStore()
+	ns := store.NS("decimals")
+	if err := st.Put(ctx, ns, "baseline", map[string]any{"price": json.Number("0.1")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Put(ctx, ns, "nearby", map[string]any{"price": json.Number("0.100000000000000001")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		operator string
+		value    json.Number
+		count    int
+	}{
+		{"$eq", "0.1", 2},
+		{"$gt", "0.1", 0},
+		{"$gt", "0.09", 2},
+	} {
+		matches, err := st.Search(ctx, ns, store.WithFilter(map[string]any{"price": map[string]any{tc.operator: tc.value}}))
+		if err != nil || len(matches) != tc.count {
+			t.Errorf("%s %s 得到 %d 条，预期 %d，错误 %v", tc.operator, tc.value, len(matches), tc.count, err)
+		}
+	}
+}
+
 // TestValidateFilter_NestedAndMixed_Rejected 钉「嵌套 / 混用 $ 与非 $ 键一律拒」。
 //
 // 修前：{"f":{"g":1}} 客户端按嵌套部分匹配算、sql 报错（同一写法两种语义）；

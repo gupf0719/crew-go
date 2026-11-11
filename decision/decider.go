@@ -86,7 +86,7 @@ func WithStateFunc(fn func(ctx context.Context, req agent_v2.RouteRequest) (any,
 //	decider := decision.NewRouteDecider(jev.NewClient(apiKey))
 //	router := agent_v2.NewRoutingAgent(
 //	    agent_v2.WithRoutingName("support"),
-//	    agent_v2.WithRouteDecider(decider, 0.85),
+//	    agent_v2.WithRouteDecider("decider", decider, 0.85),
 //	    agent_v2.WithRoutingClassifier(llmClassifier),
 //	    agent_v2.WithRoutingDescriptions(descriptions),
 //	)

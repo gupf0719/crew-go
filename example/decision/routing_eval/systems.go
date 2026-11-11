@@ -262,7 +262,7 @@ func (s *deciderSystem) decide(ctx context.Context, sc scenario, c evalCase, con
 	}
 	ra := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName(s.provider+"_router"),
-		agent_v2.WithRouteDecider(timed, 0),
+		agent_v2.WithRouteDecider("decision", timed, 0),
 		agent_v2.WithRoutingDescriptions(descriptionsFor(sc, cond.CriteriaLang)),
 	)
 	addStubBranches(ra, sc)
@@ -442,7 +442,7 @@ func (s *cascadeSystem) decide(ctx context.Context, sc scenario, c evalCase, con
 	)
 	ra := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("cascade_router"),
-		agent_v2.WithRouteDecider(decider, s.threshold),
+		agent_v2.WithRouteDecider("decider", decider, s.threshold),
 		agent_v2.WithRoutingClassifier(classifier),
 		agent_v2.WithRoutingDescriptions(descriptionsFor(sc, cond.CriteriaLang)),
 	)

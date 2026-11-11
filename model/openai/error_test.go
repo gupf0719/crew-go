@@ -94,16 +94,17 @@ func TestClient_NetworkError_APIError(t *testing.T) {
 // TestClient_FillsRetryAfterFromResponseHeader 钉住**客户端真的把响应头读进了
 // APIError.RetryAfter**——Generate 与 Stream 两条路径各一次。
 //
-// **为什么这条必须独立存在**：这个特性的其余测试都绕开了这一环——`parseRetryAfter`
+// **为什么这条必须独立存在**：这个特性的其余测试都绕开了这一环——[model.ParseRetryAfter]
 // 是拿字符串喂的纯函数单测，重试层那两条是拿**手搓的** `*model.APIError` 喂的。也就是
-// 说把 client 里那行 `RetryAfter: parseRetryAfter(...)` 整个删掉，**全仓一条测试都不会红**，
+// 说把 client 里填写 RetryAfter 的那行删掉，其余测试都不会红，
 // 而线上的表现是退避悄悄退回瞎猜（服务端明明说了等多久）。
 //
-// 用 429 + `Retry-After: 3`：秒数形式是 provider 实际最常发的那种。
+// 同时带毫秒与秒数响应头，断言毫秒优先。
 func TestClient_FillsRetryAfterFromResponseHeader(t *testing.T) {
 	newSrv := func() *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Retry-After", "3")
+			w.Header().Set("retry-after-ms", "250")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
 		}))
@@ -132,13 +133,13 @@ func TestClient_FillsRetryAfterFromResponseHeader(t *testing.T) {
 			if !errors.As(err, &apiErr) {
 				t.Fatalf("err 不是 *model.APIError: %T %v", err, err)
 			}
-			if apiErr.RetryAfter != 3*time.Second {
-				t.Errorf("RetryAfter = %v, want 3s——响应头没被读进来，"+
+			if apiErr.RetryAfter != 250*time.Millisecond {
+				t.Errorf("RetryAfter = %v, want 250ms——响应头没被读进来，"+
 					"重试层会退回按自己猜的指数退避等待", apiErr.RetryAfter)
 			}
 			// 顺带钉住它确实经接口被重试层取得到（两者之间还隔着一个方法）
-			if got := compose_v2.RetryAfterFromError(err); got != 3*time.Second {
-				t.Errorf("RetryAfterFromError = %v, want 3s——字段填了但重试层取不到", got)
+			if got := compose_v2.RetryAfterFromError(err); got != 250*time.Millisecond {
+				t.Errorf("RetryAfterFromError = %v, want 250ms——字段填了但重试层取不到", got)
 			}
 		})
 	}
@@ -162,7 +163,9 @@ func TestClient_StatusIsWiredToRetryClassification(t *testing.T) {
 	}{
 		{http.StatusBadRequest, false, false, "参数错，重发必然同样失败"},
 		{http.StatusUnauthorized, false, false, "鉴权失败，重发必然同样失败"},
+		{http.StatusPaymentRequired, false, false, "计费失败，重发必然同样失败"},
 		{http.StatusNotFound, false, false, "模型不存在，重发必然同样失败"},
+		{http.StatusRequestEntityTooLarge, false, false, "请求体超限，重发必然同样失败"},
 		{http.StatusTooManyRequests, true, true, "限流，等一会儿就好——且要走独立的限流预算"},
 		{http.StatusServiceUnavailable, true, false, "provider 故障，值得重试"},
 	}

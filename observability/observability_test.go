@@ -539,6 +539,25 @@ func TestToolFailure_ErrorType(t *testing.T) {
 	}
 }
 
+func TestToolSpanReportsOriginalOutputSize(t *testing.T) {
+	h := newHarness(t)
+	const rawSize = 8192
+	tk := weatherToolkit(func(string) *tool.Result { return tool.Success(strings.Repeat("x", rawSize)) })
+	ctx, opts := h.obs.Install(t.Context(), agent_v2.WithName("sizer"), agent_v2.WithToolkit(tk),
+		agent_v2.WithModel(&scriptModel{toolName: "get_weather", toolArgs: `{"city":"北京"}`}), agent_v2.WithToolResultMaxBytes(256))
+	ag := agent_v2.NewBasicAgent(opts...)
+	if _, err := ag.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("查天气")); err != nil {
+		t.Fatal(err)
+	}
+	span := h.span(t, "execute_tool get_weather")
+	for _, attr := range span.Attributes() {
+		if attr.Key == observability.AttrToolOutputBytes && attr.Value.AsInt64() == rawSize {
+			return
+		}
+	}
+	t.Fatalf("应记录截断前的 %d 字节，实际 %v", rawSize, span.Attributes())
+}
+
 // TestTimeout_OutcomeTimeout：ctx 到期时 agent / chat span 记 timeout（失败），而不是笼统的 error。
 func TestTimeout_OutcomeTimeout(t *testing.T) {
 	h := newHarness(t)
@@ -742,6 +761,65 @@ func TestInterruptResume(t *testing.T) {
 	}
 	if n := sumInt(t, rm, observability.MetricAgentInvocations, map[string]string{"crew.outcome": "blocked"}); n != 1 {
 		t.Errorf("blocked 的 agent 调用=%d 应=1", n)
+	}
+}
+
+func TestNestedResumeMetricsFollowActualCheckpoint(t *testing.T) {
+	h := newHarness(t)
+	ctx := compose_v2.WithCheckpointerCtx(t.Context(), compose_v2.NewInMemoryCheckpointer())
+	ctx = agent_v2.WithCtxOrchHooks(ctx, h.obs.OrchHooks())
+	child := agent_v2.NewBasicAgent(agent_v2.WithName("nested_ask"), agent_v2.WithHooks(h.obs.AgentHooks()),
+		agent_v2.WithModel(&scriptModel{toolName: agent_v2.AskUserToolName, toolArgs: `{"question":"城市？"}`}), agent_v2.WithAskUser())
+	fresh := agent_v2.NewBasicAgent(agent_v2.WithName("new_member"), agent_v2.WithHooks(h.obs.AgentHooks()),
+		agent_v2.WithModel(&scriptModel{}))
+	parent := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("parent"), agent_v2.WithSequentialHooks(h.obs.AgentHooks())).
+		AddStep("question", child).AddStep("new", fresh)
+	sess := agent_v2.NewRunSession()
+	_, err := parent.Run(ctx, sess, schema.UserMessage("查天气"))
+	ie, ok := compose_v2.IsInterrupt(err)
+	if !ok {
+		t.Fatalf("子任务应挂起，实际 %v", err)
+	}
+	if _, err := parent.Resume(ctx, sess.RunID, agent_v2.WithResumeUserInputs(map[string]*schema.Message{
+		ie.Query.InterruptID: schema.UserMessage("北京"),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	rm := h.collect(t)
+	for name, want := range map[string]int64{"parent": 1, "nested_ask": 1, "new_member": 0} {
+		if got := sumInt(t, rm, observability.MetricResumes, map[string]string{"gen_ai.agent.name": name}); got != want {
+			t.Errorf("%s 的续跑计数为 %d，预期 %d", name, got, want)
+		}
+	}
+	if _, ok := hasEvent(h.span(t, "invoke_agent new_member"), "crew.resume"); ok {
+		t.Fatal("本次首次启动的成员不应带 crew.resume 事件")
+	}
+}
+
+func TestRouteMetricsCountActualEscalationAndConfidence(t *testing.T) {
+	h := newHarness(t)
+	ctx := agent_v2.WithCtxOrchHooks(t.Context(), h.obs.OrchHooks())
+	decide := func(confidence float64) agent_v2.RouteDecider {
+		return func(context.Context, agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
+			return agent_v2.RouteDecision{Target: "billing", Confidence: confidence}, nil
+		}
+	}
+	branch := agent_v2.NewBasicAgent(agent_v2.WithName("billing"), agent_v2.WithModel(&scriptModel{}))
+	ag := agent_v2.NewRoutingAgent(agent_v2.WithRoutingName("routes"),
+		agent_v2.WithRouteDecider("shadow", decide(0.2), 0, agent_v2.WithShadow()),
+		agent_v2.WithRouteDecider("fast", decide(0.4), 0.8),
+		agent_v2.WithRouteDecider("deep", decide(0.9), 0)).AddBranch("billing", branch)
+	if _, err := ag.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("账单")); err != nil {
+		t.Fatal(err)
+	}
+	rm := h.collect(t)
+	if got := sumInt(t, rm, observability.MetricRouteEscalations, map[string]string{"crew.route.stage": "decider"}); got != 1 {
+		t.Errorf("升级路由计数应为 1，实际 %d", got)
+	}
+	for stage, want := range map[string]uint64{"fast": 1, "deep": 1, "shadow": 0} {
+		if got := histCount(t, rm, observability.MetricRouteConfidence, map[string]string{"crew.route.decider": stage}); got != want {
+			t.Errorf("%s 的置信度样本数为 %d，预期 %d", stage, got, want)
+		}
 	}
 }
 

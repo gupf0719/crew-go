@@ -150,7 +150,7 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 
 上下文管理换成服务端压缩（`WithCompaction`）就不冲突：客户端历史不改，前缀校验从最近的 compaction 块算起，压缩之后产生的 thinking 照常回放（见 5.5 实测）；代价是压缩让 prompt cache 从头开始，压缩之前的 thinking 不带到之后。已知局限：客户端仍发全量历史，ReactiveCompact 按本地全量估 token、从最旧的组删起，而最新 compaction 块之前的内容服务端本来就不看——它的头几次重试在服务端眼里输入没变；另外 SDK 累积流式响应时 `compaction_delta` 是赋值不是追加，真 API 若把摘要拆成多段 delta 只剩最后一段（SDK 行为，未见实例）。
 
-`agent_v2.NewLLMPlanner` 固定发 `tool_choice=required`、不看 `StructuredCapability`：本适配器把它降为不指定，模型回自由文本时 planner 报 `ErrPlannerNoToolCall`。
+`agent_v2.NewLLMPlanner` 读取 `StructuredCapability`。Claude 由提示词引导自动选择本轮绑定的 `plan` 或 `respond`，模型没有返回工具调用时可用 `errors.Is` 判断 `ErrPlannerNoToolCall`。
 
 另外，`EstimateMessageTokens` 看不到回放快照里的 thinking，而 preserved thinking 计入输入 token——按估算触发的压缩会偏晚。
 

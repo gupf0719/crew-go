@@ -20,8 +20,7 @@ import (
 //   - **走 EventSink 协议** (NodeFunc scope 内 framework 自动 push nodeEventSink)
 //   - **零开销 sink nil**: 业务不订阅时不付任何代价
 //   - **router 路径不 fire** (业务显式 Router 函数业务自负统计 — observability 不能侵入)
-//   - **指标只读 AgentName 与 Target**：Stage / Confidence / Escalations 这些字段给订阅
-//     OnNodeEvent 的业务看升级率、置信度分布，不进指标标签
+//   - observability 使用 Stage、Confidence 和 Escalations 记录升级率与有效置信度，影子档保留在事件中。
 // ────────────────────────────────────────────────────────────
 
 // RouteDecisionEventType 是 compose_v2.Event.Type 字符串. observability 的 OnNodeEvent
@@ -43,6 +42,8 @@ type RouteDecisionAction struct {
 	// DeciderIndex 是被采纳的决策方在 WithRouteDecider 挂载顺序里的下标，不算影子档。Stage 不是
 	// RouteStageDecider 时恒为 0，没有意义。
 	DeciderIndex int `json:"decider_index"`
+	// DeciderName 是被采纳档的稳定名称，仅在 Stage 为 RouteStageDecider 时填写。
+	DeciderName string `json:"decider_name,omitempty"`
 	// Confidence 是被采纳的决策方给出的置信度，只在 Stage 为 RouteStageDecider 时非 nil。
 	Confidence *float64 `json:"confidence,omitempty"`
 	// Scores 是被采纳的决策方给出的各候选分数，决策方没给时为空。

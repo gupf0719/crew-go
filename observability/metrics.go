@@ -46,6 +46,8 @@ type instruments struct {
 	nodeExecutions     metric.Int64Counter
 	planReplans        metric.Int64Counter
 	routeDecisions     metric.Int64Counter
+	routeEscalations   metric.Int64Counter
+	routeConfidence    metric.Float64Histogram
 }
 
 // newInstruments 建全部指标。建失败（名字非法这类，正常不会发生）交给 otel.Handle，那一个指标退成
@@ -108,5 +110,7 @@ func newInstruments(m metric.Meter) *instruments {
 		nodeExecutions:     ctr(MetricNodeExecutions, "{execution}", "图节点执行次数"),
 		planReplans:        ctr(MetricPlanReplans, "{plan}", "PlanAgent 规划次数，按阶段（initial / replan）分"),
 		routeDecisions:     ctr(MetricRouteDecisions, "{decision}", "RoutingAgent 路由决策次数，按目标分"),
+		routeEscalations:   ctr(MetricRouteEscalations, "{decision}", "至少升级一次的路由决策次数"),
+		routeConfidence:    f64h(MetricRouteConfidence, "1", "路由决策方的有效置信度", []float64{0, 0.1, 0.25, 0.5, 0.75, 0.85, 0.9, 0.95, 1}),
 	}
 }

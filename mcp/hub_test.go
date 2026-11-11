@@ -208,6 +208,8 @@ func TestStreamableHTTPClientEndToEnd(t *testing.T) {
 			return
 		}
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{"protocolVersion": "2025-03-26"})
 		case "tools/list":
@@ -270,6 +272,8 @@ func TestAllowToolsFilter(t *testing.T) {
 		var req rpcReq
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
 		case "initialize":
 			writeResult(w, req.ID, map[string]any{})
 		case "tools/list":

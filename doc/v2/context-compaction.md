@@ -146,7 +146,7 @@ type MicroCompactConfig struct {
 **Offload 模式的两项业务责任**（启用 `OffloadEnabled` 前必读）：
 
 1. **自管 cleanup**——offload 到 store 的数据**不**走 cp `DeleteSubtree` 自动清理（cp 清理只管 checkpoint，不碰业务 store）。长跑 / 高 QPS 场景 offload data 会在 store 持续累积，业务需自行清理（Run 结束后按 `cfg.OffloadNamespace(ctx)` 算出的 NS 用 `Search` + `Delete` 批量清；⚠️ 这个 ctx 必须带 sid（`compose_v2.WithSessionIDCtx`）——不带时它回落全局 `_micro_offload`，按前缀清会扫到所有会话的数据）。⚠️ 「给 store 后端配 TTL」这条路走不通：框架的 offload `Put` 不带 TTL、也不接收 option，内置后端都没有默认过期配置（InMemory / sql 本就不支持 TTL）——压缩产物的回收策略还没有决策，见中心 backlog（2026-09-18 核验）。默认 per-sid 隔离 NS 正是为了让业务能按 sid 批量清。
-2. **LLM 重读需业务注册工具**——占位符 `[offloaded:<key>] preview: <前 200 字节>` 只给 LLM 看预览。想让 LLM 主动取回完整原始 tool_result，业务需注册一个类似 `read_offloaded_result(key)` 的工具，内部 `store.Get(ctx, cfg.OffloadNamespace(ctx), key)` 取回（ctx 同样要带 sid；key 从占位符文本或 `MicroCompactOffloadKeyAnnotation` marker 拿；**别用裸 `cfg.OffloadNS`**——默认档它为空，实际写入 NS 按 sid 派生）。注册之后把工具名填进 `MicroCompactConfig.OffloadReadToolName`，占位符会提示模型用它读回。⚠️ 两点（2026-09-18 核验）：持久后端（redis / sql）读回的是 `map[string]any`（JSON 往返）不是 `*schema.Message`，自己 decode；开了 `WithToolResultMaxBytes` 时存进去的已是截断版。框架**不内置**此工具——offload 默认假设"预览足够，极少需要回溯完整内容"。
+2. **LLM 重读需业务注册工具**——占位符 `[offloaded:<key>] preview: <前 200 字节>` 只给 LLM 看预览。想让 LLM 取回实际卸载的 tool_result（已截断时为截断版），业务需注册一个类似 `read_offloaded_result(key)` 的工具，内部 `store.Get(ctx, cfg.OffloadNamespace(ctx), key)` 取回（ctx 同样要带 sid；key 从占位符文本或 `MicroCompactOffloadKeyAnnotation` marker 拿；**别用裸 `cfg.OffloadNS`**——默认档它为空，实际写入 NS 按 sid 派生）。注册之后把工具名填进 `MicroCompactConfig.OffloadReadToolName`，占位符会提示模型用它读回。⚠️ 两点（2026-09-18 核验）：持久后端（redis / sql）读回的是 `map[string]any`（JSON 往返）不是 `*schema.Message`，自己 decode；开了 `WithToolResultMaxBytes` 时存进去的已是截断版。框架**不内置**此工具——offload 默认假设"预览足够，极少需要回溯完整内容"。
 
 ### 不做的
 

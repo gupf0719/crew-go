@@ -183,7 +183,7 @@ func TestRouteDecider_BoundedDeciderEscalatesWhenItsTimeRunsOut(t *testing.T) {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(bounded, 0.85),
+		agent_v2.WithRouteDecider("provider", bounded, 0.85),
 		agent_v2.WithRoutingFallback(replyAgent("human")),
 	).AddBranch("billing", replyAgent("billing")).AddBranch("tech", replyAgent("tech"))
 
@@ -254,7 +254,7 @@ func TestRouteDecider_WithRoutingAgent(t *testing.T) {
 
 			r := agent_v2.NewRoutingAgent(
 				agent_v2.WithRoutingName("support"),
-				agent_v2.WithRouteDecider(decision.NewRouteDecider(jev.NewClient("k", decision.WithBaseURL(srv.URL))), 0.85),
+				agent_v2.WithRouteDecider("provider", decision.NewRouteDecider(jev.NewClient("k", decision.WithBaseURL(srv.URL))), 0.85),
 				agent_v2.WithRoutingFallback(replyAgent("human")),
 				agent_v2.WithRoutingDescriptions(map[string]string{"billing": "账单", "tech": "故障"}),
 			).AddBranch("billing", replyAgent("billing")).AddBranch("tech", replyAgent("tech"))
@@ -312,7 +312,7 @@ func TestRouteDecider_RateLimitWithRunDeadlineDoesNotEscalate(t *testing.T) {
 
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decision.NewRouteDecider(jev.NewClient("k", decision.WithBaseURL(srv.URL))), 0.85),
+		agent_v2.WithRouteDecider("provider", decision.NewRouteDecider(jev.NewClient("k", decision.WithBaseURL(srv.URL))), 0.85),
 		agent_v2.WithRoutingFallback(replyAgent("human")),
 	).AddBranch("billing", replyAgent("billing")).AddBranch("tech", replyAgent("tech"))
 

@@ -8,10 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -20,48 +18,6 @@ import (
 	"crew-go/model"
 	"crew-go/schema"
 )
-
-// maxRetryAfterSeconds 是 delta-seconds 形式能安全换算成 [time.Duration] 的上限
-// （`math.MaxInt64 / int64(time.Second)`，约 292 年）。
-//
-// ⚠️ **这道上限挡的是整数溢出，不是「等太久」的策略**。`time.Duration(secs) * time.Second`
-// 在 int64 上乘 1e9，超过这个数就绕回——实测 `Retry-After: 10000000000` 算出
-// **-2346317h**，`20000000000` 算出 **+431459h（约 49 年）**。前者三个消费点都 gate
-// 了 `> 0` 所以只是把负数塞进公开字段 `APIError.RetryAfter`（业务写
-// `if e.RetryAfter != 0` 就会当成「服务端给了」）；**后者更糟——它是正的，会被原样采纳
-// 睡下去**，只有 ctx deadline 捞得回来。
-//
-// 「服务端说多久就等多久、不设策略上限」那条取舍不受影响：`Retry-After: 86400`
-// （日配额重置，合法且常见）照旧返 24h。
-const maxRetryAfterSeconds = math.MaxInt64 / int64(time.Second)
-
-// parseRetryAfter 解析 HTTP `Retry-After` 响应头，返回建议等待时长；解析不出返 0。
-//
-// RFC 9110 定义两种合法形式，provider 两种都在用：
-//   - delta-seconds：`Retry-After: 120`
-//   - HTTP-date：`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`
-//
-// now 由调用方传入而非内部取 time.Now()——HTTP-date 形式要算相对时长，注入时钟才能
-// 稳定测试。已过期的 HTTP-date（服务端时钟偏移 / 传输延迟）返 0 走常规退避，不返负值。
-func parseRetryAfter(v string, now time.Time) time.Duration {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return 0
-	}
-	if secs, err := strconv.Atoi(v); err == nil {
-		// int64(secs) 而非裸 secs：常量被 int64(time.Second) 定成了 int64，而 Atoi 返 int。
-		if secs <= 0 || int64(secs) > maxRetryAfterSeconds {
-			return 0
-		}
-		return time.Duration(secs) * time.Second
-	}
-	if t, err := http.ParseTime(v); err == nil {
-		if d := t.Sub(now); d > 0 {
-			return d
-		}
-	}
-	return 0
-}
 
 // Client 使用 OpenAI 聊天完成 API 实现 model.ChatModel。
 type Client struct {
@@ -267,7 +223,7 @@ func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ..
 			Provider:   c.providerName(),
 			StatusCode: httpResp.StatusCode,
 			Body:       string(body),
-			RetryAfter: parseRetryAfter(httpResp.Header.Get("Retry-After"), time.Now()),
+			RetryAfter: model.ParseRetryAfter(httpResp.Header, time.Now()),
 		}
 	}
 
@@ -421,7 +377,7 @@ func (c *Client) doRequest(ctx context.Context, req *openaiRequest) ([]byte, err
 			Provider:   c.providerName(),
 			StatusCode: resp.StatusCode,
 			Body:       string(body),
-			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+			RetryAfter: model.ParseRetryAfter(resp.Header, time.Now()),
 		}
 	}
 	return body, nil

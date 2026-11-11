@@ -206,7 +206,7 @@ func routeThroughDecider(ctx context.Context, c *decision.Client) error {
 	}
 	r := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support"),
-		agent_v2.WithRouteDecider(decision.NewRouteDecider(c), 0),
+		agent_v2.WithRouteDecider("provider", decision.NewRouteDecider(c), 0),
 		agent_v2.WithRoutingDescriptions(descriptions),
 	)
 	for _, name := range []string{"billing", "tech", "refund"} {

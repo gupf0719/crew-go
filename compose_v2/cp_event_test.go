@@ -395,10 +395,13 @@ func TestPhase2Sub3_CpLoadOnResume_EmitsEvent(t *testing.T) {
 	)
 
 	actions := hooks2.cpActions()
-	var sawLoad bool
+	var loads int
 	for _, a := range actions {
 		if a.Type == compose_v2.CpOperationLoad && a.Load != nil {
-			sawLoad = true
+			loads++
+			if a.Load.Source != "auto_load" || !a.Load.WouldResume {
+				t.Errorf("应报告一次真实的自动恢复，实际 %+v", a.Load)
+			}
 			if !a.Load.Found {
 				t.Errorf("Load.Found 应 true (Run 1 已存 cp), got false")
 			}
@@ -407,10 +410,8 @@ func TestPhase2Sub3_CpLoadOnResume_EmitsEvent(t *testing.T) {
 			}
 		}
 	}
-	if !sawLoad {
-		t.Errorf("Phase 2 Sub-3 regression: Resume 路径应 fire cp.load event\n"+
-			"sanity-revert: 删 graph_loop.go::LoadNS EmitCpEvent block → 此测 fail\n"+
-			"got actions %+v", actions)
+	if loads != 1 {
+		t.Errorf("自动恢复应恰好发一次 cp.load，实际 %d", loads)
 	}
 }
 

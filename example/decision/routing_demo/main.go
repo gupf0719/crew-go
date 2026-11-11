@@ -149,7 +149,7 @@ func buildRouter(client *decision.Client, threshold float64, shadow bool) *agent
 
 	router := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("support_router"),
-		agent_v2.WithRouteDecider(bounded, threshold, deciderOpts...),
+		agent_v2.WithRouteDecider("provider", bounded, threshold, deciderOpts...),
 		agent_v2.WithRoutingClassifier(classifier),
 		agent_v2.WithRoutingFallback(&stubBranch{name: "fallback", reply: "没判出该交给谁，转人工处理"}),
 		agent_v2.WithRoutingDescriptions(branches),

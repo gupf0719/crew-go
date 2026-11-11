@@ -132,7 +132,7 @@ func ValidateRetryConfig(cfg RetryConfig, optionName string) {
 // 那个默认，而不是忘了想。⚠️ 那个默认排除四类：控制流信号（[IsControlFlowSignal]——它认的是
 // **错误链上**有没有 ctx 错，后端自己的超时也算，见 `doc/code/todo.md` 同名条目）、终局失败
 // （`ErrRunAborted` / `ErrCheckpointNotResumable`）、自己实现 [NonRetryable] 声明不重试的错、
-// 以及**确定性的 provider HTTP 失败**（400/401/403/404/422，见 isDeterministicHTTPFailure）。
+// 以及**确定性的 provider HTTP 失败**（400/401/402/403/404/413/422，见 isDeterministicHTTPFailure）。
 func SimpleRetry(n int) RetryConfig {
 	return RetryConfig{MaxRetries: n, ShouldRetry: IsRetryable}
 }
@@ -519,7 +519,7 @@ func IsRetryable(err error) bool {
 // 未知 4xx 保守判**可重试**：宁可多试一次，也不要把一个其实瞬时的错误钉死成永久失败。
 func isDeterministicHTTPFailure(code int) bool {
 	switch code {
-	case 400, 401, 403, 404, 422:
+	case 400, 401, 402, 403, 404, 413, 422:
 		return true
 	default:
 		return false

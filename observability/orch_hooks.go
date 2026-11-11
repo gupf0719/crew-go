@@ -323,11 +323,7 @@ func (o *Observability) recordEventMetric(ctx context.Context, ev agent_v2.Event
 		}
 	case agent_v2.RouteDecisionEventType:
 		if a, ok := agent_v2.RouteDecisionOf(ev); ok {
-			target := a.Target
-			if target == "" {
-				target = "__none__"
-			}
-			o.inst.routeDecisions.Add(ctx, 1, metric.WithAttributes(AttrAgentName.String(a.AgentName), AttrRouteTarget.String(target)))
+			o.recordRouteMetrics(ctx, a)
 		}
 	case fallback.FailoverEventType:
 		if a, ok := ev.Metadata["action"].(*fallback.FailoverAction); ok && a != nil {
@@ -339,5 +335,35 @@ func (o *Observability) recordEventMetric(ctx context.Context, ev agent_v2.Event
 			o.inst.memberTrips.Add(ctx, 1, metric.WithAttributes(AttrTrippedMember.String(strconv.Itoa(a.MemberIdx)),
 				AttrTrippedReason.String(a.Reason)))
 		}
+	}
+}
+
+func (o *Observability) recordRouteMetrics(ctx context.Context, a *agent_v2.RouteDecisionAction) {
+	target := a.Target
+	if target == "" {
+		target = "__none__"
+	}
+	name := AttrAgentName.String(a.AgentName)
+	o.inst.routeDecisions.Add(ctx, 1, metric.WithAttributes(name, AttrRouteTarget.String(target)))
+	confidence := func(stage string, value float64) {
+		if value >= 0 && value <= 1 {
+			o.inst.routeConfidence.Record(ctx, value, metric.WithAttributes(name, AttrRouteDecider.String(stage)))
+		}
+	}
+	if a.Confidence != nil {
+		confidence(a.DeciderName, *a.Confidence)
+	}
+	escalated := a.ClassifierFailure != ""
+	for _, prior := range a.Escalations {
+		if prior.Shadow {
+			continue
+		}
+		escalated = true
+		if prior.Reason == agent_v2.RouteReasonLowConfidence {
+			confidence(prior.DeciderName, prior.Confidence)
+		}
+	}
+	if escalated {
+		o.inst.routeEscalations.Add(ctx, 1, metric.WithAttributes(name, AttrRouteStage.String(a.Stage)))
 	}
 }

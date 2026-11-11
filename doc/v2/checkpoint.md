@@ -630,11 +630,13 @@ typed nil），上面范式里的 `done == nil` 判断不是多余的守卫。
 
 Redis 和 SQL 内建方言的 Checkpointer 以存储域和任务 ID 为键，在框架读取存档前取得独占租约。配置这类 Checkpointer 时，内建 Agent 的 `Run`、`Resume`、`Abort`、`WithAbandonedTasks` 和 AG-UI 删档使用同一套租约。直接调用 `compose_v2.Run` 时还需提供非空的 session ID。冲突返回 `compose_v2.ErrTaskBusy`。正常结束在存档和历史收尾后归还许可，嵌套调用沿用同一存储域的租约。
 
+同一任务的嵌套执行使用相等的租约存储值时直接复用外层租约。经另一客户端访问同一存储域时，目标后端须用外层令牌成功续约，子调用才可复用。最初取得租约的调用负责归还。若新句柄取得了新租约，框架也会在读档前核对外层租约的归属。确认外层失租时，归还新租约并返回 `compose_v2.ErrTaskLeaseLost`。
+
 租约有效期为 30 秒，每 10 秒续约。续约失败会取消执行，保存或删除存档时由后端原子校验令牌。过期持有者的存档变更返回 `compose_v2.ErrTaskLeaseLost`。已经开始的外部工具调用和独立历史存储写入仍依赖各自的取消和幂等机制。
 
-- SQL 升级时先运行 `Checkpointer.Setup` 创建租约表。手工维护 schema 时参照 [建表定义](../../sql/checkpointer_schema.go)。各进程使用同一数据库、schema 和存档表。进程内的嵌套调用复用同一 `*sql.DB`。
-- Redis 的应用副本使用同一主库、逻辑库及存档前缀，配置 Redis 保留租约键。嵌套调用复用同一 Redis client。
-- 自定义共享 Checkpointer 需要实现 `TaskLeaseProvider` 和 `TaskLeaseStore` 的原子校验，或由调用方协调。嵌套调用需要 provider 返回可比较且相等的租约存储值。同一存储域中的所有工作进程需使用同一协议。调用方直接修改存档、调用 `Cleanup` 或手动传入旧快照时，自行管理这些操作的归属。
+- SQL 升级时先运行 `Checkpointer.Setup` 创建租约表。手工维护 schema 时参照 [建表定义](../../sql/checkpointer_schema.go)。各进程使用同一数据库、schema 和存档表。
+- Redis 的应用副本使用同一主库、逻辑库及存档前缀，配置 Redis 保留租约键。
+- 自定义共享 Checkpointer 需要实现 `TaskLeaseProvider` 和 `TaskLeaseStore` 的原子校验，或由调用方协调。租约存储值须可比较，相等的值须指向同一存储域。同一存储域中的所有工作进程需使用同一协议。调用方直接修改存档、调用 `Cleanup` 或手动传入旧快照时，自行管理这些操作的归属。
 
 ### 6.2 陈旧写回检测
 

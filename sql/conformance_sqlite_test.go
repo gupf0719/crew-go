@@ -14,6 +14,7 @@ package sql_test
 
 import (
 	databasesql "database/sql"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动（无 cgo、无外部进程）
@@ -53,7 +54,9 @@ func TestSQLiteCheckpointer_TaskLeases(t *testing.T) {
 	if err := cp.Setup(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	peer := agentSQL.NewCheckpointer(db, agentSQL.SQLite{})
+	// SQLite 将未加引号的表名按大小写无关的规则解析。
+	peer := agentSQL.NewCheckpointer(db, agentSQL.SQLite{},
+		agentSQL.WithCheckpointerTable(strings.ToUpper(agentSQL.DefaultCheckpointTable)))
 	checkpointer_conformance.RunTaskLeaseTests(t, cp, peer, func(sid string) {
 		if _, err := db.ExecContext(t.Context(), "UPDATE crew_checkpoint_task_lease SET expires_at = 0 WHERE sid = ?", sid); err != nil {
 			t.Fatal(err)

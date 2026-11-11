@@ -9,7 +9,7 @@ import (
 	"crew-go/compose_v2"
 )
 
-// RunTaskLeaseTests 验证同一存储域的两个 Checkpointer 客户端的互斥、续约、换手及存档围栏。
+// RunTaskLeaseTests 验证同一存储域的两个 Checkpointer 客户端的嵌套复用、互斥、续约、换手及存档围栏。
 // expire 在测试存储端让指定任务的租约立即到期。
 func RunTaskLeaseTests(t *testing.T, cp, peer compose_v2.Checkpointer, expire func(string)) {
 	t.Helper()
@@ -27,8 +27,20 @@ func RunTaskLeaseTests(t *testing.T, cp, peer compose_v2.Checkpointer, expire fu
 	if first == "" {
 		t.Fatal("执行入口没有持有租约")
 	}
+	nestedCtx, nested, err := compose_v2.BeginTaskActivity(compose_v2.WithCheckpointerCtx(ownedCtx, peer), sid, nil)
+	if err != nil {
+		t.Fatalf("同一存储域的嵌套执行应复用租约，实际 %v", err)
+	}
+	defer nested.Release()
+	if got := compose_v2.CheckpointTaskLeaseToken(nestedCtx, remote, sid); got != first {
+		t.Fatal("子调用和父调用应使用同一个令牌")
+	}
+	if err := peer.SaveNS(nestedCtx, sid, ns, &compose_v2.Checkpoint{CreatedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+	nested.Release()
 	if acquired, err := remote.TryAcquireTaskLease(ctx, sid, next, ttl); err != nil || acquired {
-		t.Fatalf("其他客户端不应取得活跃任务的租约，实际 acquired=%t err=%v", acquired, err)
+		t.Fatalf("子调用退出后父调用应继续持有租约，实际 acquired=%t err=%v", acquired, err)
 	}
 	if renewed, err := primary.RenewTaskLease(ctx, sid, first, ttl); err != nil || !renewed {
 		t.Fatalf("当前持有者应能续约，实际 renewed=%t err=%v", renewed, err)
@@ -57,6 +69,9 @@ func RunTaskLeaseTests(t *testing.T, cp, peer compose_v2.Checkpointer, expire fu
 	}
 	if count, err := cp.DeleteSubtree(ownedCtx, sid, ""); count != 0 || !errors.Is(err, compose_v2.ErrTaskLeaseLost) {
 		t.Fatalf("失租者不能删新档，实际 count=%d err=%v", count, err)
+	}
+	if count, err := peer.DeleteSubtree(context.WithoutCancel(nestedCtx), sid, ""); count != 0 || !errors.Is(err, compose_v2.ErrTaskLeaseLost) {
+		t.Fatalf("经别名绑定的旧令牌也不能删新档，实际 count=%d err=%v", count, err)
 	}
 	activity.Release()
 	if renewed, err := remote.RenewTaskLease(ctx, sid, next, ttl); err != nil || !renewed {

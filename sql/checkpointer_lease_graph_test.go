@@ -3,6 +3,7 @@ package sql_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,4 +133,96 @@ func TestSQLiteCheckpointer_SubgraphLeasesItsOwnBackend(t *testing.T) {
 	if err != nil || childRuns != 1 || observed.loads == 0 || observed.drops == 0 {
 		t.Fatalf("子图应读档、执行并清理，实际 err=%v runs=%d loads=%d drops=%d", err, childRuns, observed.loads, observed.drops)
 	}
+}
+
+func TestSQLiteCheckpointer_NestedLeaseRejectsDifferentOwner(t *testing.T) {
+	ctx := t.Context()
+	db := newSQLiteDB(t)
+	root := crewsql.NewCheckpointer(db, crewsql.SQLite{}, crewsql.WithCheckpointerTable("root_lease_cp"))
+	other := crewsql.NewCheckpointer(db, crewsql.SQLite{}, crewsql.WithCheckpointerTable("other_lease_cp"))
+	for _, cp := range []*crewsql.Checkpointer{root, other} {
+		if err := cp.Setup(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const sid, remoteToken = "shared-sid", "other-owner"
+	ownedCtx, activity, err := compose_v2.BeginTaskActivity(compose_v2.WithCheckpointerCtx(ctx, root), sid, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer activity.Release()
+
+	remote := other.CheckpointTaskLeases()
+	ok, err := remote.TryAcquireTaskLease(ctx, sid, remoteToken, time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("另一存储域应能持有同名任务，实际 ok=%t err=%v", ok, err)
+	}
+	t.Cleanup(func() {
+		if err := remote.ReleaseTaskLease(context.Background(), sid, remoteToken); err != nil {
+			t.Error(err)
+		}
+	})
+
+	_, nested, err := compose_v2.BeginTaskActivity(compose_v2.WithCheckpointerCtx(ownedCtx, other), sid, nil)
+	if nested != nil {
+		nested.Release()
+	}
+	if !errors.Is(err, compose_v2.ErrTaskBusy) {
+		t.Fatalf("不同令牌的租约冲突应返回 ErrTaskBusy，实际 %v", err)
+	}
+	if renewed, err := remote.RenewTaskLease(ctx, sid, remoteToken, time.Minute); err != nil || !renewed {
+		t.Fatalf("被拒的子调用应保留另一持有者的租约，实际 renewed=%t err=%v", renewed, err)
+	}
+}
+
+func TestSQLiteCheckpointer_ExpiredParentCannotAcquireViaAlias(t *testing.T) {
+	ctx := t.Context()
+	db := newSQLiteDB(t)
+	cp := crewsql.NewCheckpointer(db, crewsql.SQLite{})
+	if err := cp.Setup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	alias := crewsql.NewCheckpointer(db, crewsql.SQLite{},
+		crewsql.WithCheckpointerTable(strings.ToUpper(crewsql.DefaultCheckpointTable)))
+	const sid, ns = "expired-parent", "successor"
+	current := compose_v2.WithCheckpointerCtx(ctx, cp)
+	parent, activity, err := compose_v2.BeginTaskActivity(current, sid, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer activity.Release()
+
+	if _, err := db.ExecContext(ctx, "UPDATE crew_checkpoint_task_lease SET expires_at = 0 WHERE sid = ?", sid); err != nil {
+		t.Fatal(err)
+	}
+	newOwner, next, err := compose_v2.BeginTaskActivity(current, sid, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Release()
+	if err := cp.SaveNS(newOwner, sid, ns, &compose_v2.Checkpoint{CreatedAt: 2}); err != nil {
+		t.Fatal(err)
+	}
+	next.Release()
+	if err := cp.SaveNS(parent, sid, ns, &compose_v2.Checkpoint{CreatedAt: 3}); !errors.Is(err, compose_v2.ErrTaskLeaseLost) {
+		t.Fatalf("存储已拒绝父调用的旧令牌，实际 %v", err)
+	}
+
+	nestedCtx, nested, err := compose_v2.BeginTaskActivity(compose_v2.WithCheckpointerCtx(parent, alias), sid, nil)
+	if nested != nil {
+		defer nested.Release()
+		deleted, delErr := alias.DeleteSubtree(nestedCtx, sid, "")
+		t.Fatalf("失租的父调用经别名获得了新租约，删档 count=%d err=%v", deleted, delErr)
+	}
+	if !errors.Is(err, compose_v2.ErrTaskLeaseLost) || !errors.Is(context.Cause(parent), compose_v2.ErrTaskLeaseLost) {
+		t.Fatalf("存储确认失租后应拒绝子调用并通知父调用，实际 err=%v cause=%v", err, context.Cause(parent))
+	}
+	if got, err := cp.LoadNS(ctx, sid, ns); err != nil || got == nil || got.CreatedAt != 2 {
+		t.Fatalf("接管者的存档应保留，实际 cp=%v err=%v", got, err)
+	}
+	_, fresh, err := compose_v2.BeginTaskActivity(current, sid, nil)
+	if err != nil {
+		t.Fatalf("被拒的子调用应归还刚取得的租约，实际 %v", err)
+	}
+	fresh.Release()
 }

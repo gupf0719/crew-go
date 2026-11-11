@@ -12,13 +12,14 @@ import (
 	"time"
 )
 
-// TaskLeaseProvider 是支持多进程协调的 Checkpointer 扩展。同一存储域的嵌套调用需复用可比较且相等的租约存储值。
+// TaskLeaseProvider 是支持多进程协调的 Checkpointer 扩展。租约存储值须可比较，相等的值须指向同一存储域。
 type TaskLeaseProvider interface {
 	CheckpointTaskLeases() TaskLeaseStore
 }
 
 // TaskLeaseStore 按存档存储域和任务 ID 原子协调执行和放弃。租约有效期使用存储端时间，各方法遵守 ctx 取消。
-// 过期的持有者不能续约或释放新持有者的租约。SaveNS 和 DeleteSubtree 需将 [CheckpointTaskLeaseToken]
+// RenewTaskLease 只为当前未过期且令牌匹配的租约续约并返回 true。过期的持有者不能释放新持有者的租约。
+// SaveNS 和 DeleteSubtree 需将 [CheckpointTaskLeaseToken]
 // 给出的 token 与有效租约的比较和实际变更放在同一个原子操作中。
 type TaskLeaseStore interface {
 	TryAcquireTaskLease(ctx context.Context, sid, token string, ttl time.Duration) (bool, error)
@@ -34,8 +35,13 @@ const (
 
 type checkpointTaskLeaseKey struct{}
 
+type checkpointTaskLeaseBinding struct {
+	parent *checkpointTaskLeaseBinding
+	store  TaskLeaseStore
+	lease  *checkpointTaskLease
+}
+
 type checkpointTaskLease struct {
-	parent   *checkpointTaskLease
 	store    TaskLeaseStore
 	sid      string
 	token    string
@@ -47,11 +53,23 @@ type checkpointTaskLease struct {
 	released atomic.Bool
 }
 
+func checkpointTaskLeaseBindings(ctx context.Context) *checkpointTaskLeaseBinding {
+	binding, _ := ctx.Value(checkpointTaskLeaseKey{}).(*checkpointTaskLeaseBinding)
+	return binding
+}
+
+func bindCheckpointTaskLease(ctx context.Context, store TaskLeaseStore, lease *checkpointTaskLease) context.Context {
+	return context.WithValue(ctx, checkpointTaskLeaseKey{}, &checkpointTaskLeaseBinding{
+		parent: checkpointTaskLeaseBindings(ctx),
+		store:  store,
+		lease:  lease,
+	})
+}
+
 func taskLeaseFrom(ctx context.Context, store TaskLeaseStore, sid string) *checkpointTaskLease {
-	lease, _ := ctx.Value(checkpointTaskLeaseKey{}).(*checkpointTaskLease)
-	for ; lease != nil; lease = lease.parent {
-		if lease.sid == sid && lease.store == store {
-			return lease
+	for binding := checkpointTaskLeaseBindings(ctx); binding != nil; binding = binding.parent {
+		if binding.lease.sid == sid && binding.store == store {
+			return binding.lease
 		}
 	}
 	return nil
@@ -69,14 +87,15 @@ func CheckpointTaskLeaseToken(ctx context.Context, store TaskLeaseStore, sid str
 // CheckCheckpointTaskLease 在执行边界检查续约失败及保守的本地有效期。
 // 存档变更仍由存储端在同一原子操作中校验 token。
 func CheckCheckpointTaskLease(ctx context.Context) error {
-	lease, _ := ctx.Value(checkpointTaskLeaseKey{}).(*checkpointTaskLease)
-	if lease == nil {
+	binding := checkpointTaskLeaseBindings(ctx)
+	if binding == nil {
 		return nil
 	}
 	if cause := context.Cause(ctx); errors.Is(cause, ErrTaskLeaseLost) {
 		return cause
 	}
-	for ; lease != nil; lease = lease.parent {
+	for ; binding != nil; binding = binding.parent {
+		lease := binding.lease
 		if !lease.released.Load() && (lease.lost.Load() || !time.Now().Before(*lease.expires.Load())) {
 			return lease.markLost()
 		}
@@ -115,10 +134,16 @@ func (a *TaskActivity) acquireCheckpointLeases(ctx context.Context, cp Checkpoin
 	}
 	ctx, a.cancel = context.WithCancelCause(ctx)
 	if acquireRun {
+		outerCtx := ctx
 		var err error
-		ctx, a.sharedRun, err = acquireCheckpointTaskLease(ctx, store, a.sid, a.cancel)
+		ctx, a.sharedRun, err = acquireCheckpointExecutionLease(ctx, store, a.sid, a.cancel)
 		if err != nil {
 			return ctx, err
+		}
+		if a.sharedRun != nil {
+			if err := verifyOuterCheckpointLeases(outerCtx, a.sid); err != nil {
+				return ctx, err
+			}
 		}
 	}
 	for _, id := range a.abandoned {
@@ -138,6 +163,59 @@ func (a *TaskActivity) acquireCheckpointLeases(ctx context.Context, cp Checkpoin
 	return ctx, nil
 }
 
+// verifyOuterCheckpointLeases 在新租约成功后检查同一任务的外层持有者。
+// 目标可能是刚失租的存储域的另一个句柄，重新申请不能替代外层令牌。
+func verifyOuterCheckpointLeases(ctx context.Context, sid string) error {
+	for binding := checkpointTaskLeaseBindings(ctx); binding != nil; binding = binding.parent {
+		lease := binding.lease
+		// 通过最初的存储值验证一次即可，跳过借用这个持有者的别名。
+		if lease.sid != sid || binding.store != lease.store || lease.released.Load() {
+			continue
+		}
+		ok, err := renewCheckpointTaskLease(ctx, lease.store, lease)
+		if err != nil {
+			return fmt.Errorf("verify outer checkpoint lease for task %q: %w", sid, err)
+		}
+		if !ok {
+			return lease.markLost()
+		}
+	}
+	return CheckCheckpointTaskLease(ctx)
+}
+
+// acquireCheckpointExecutionLease 允许嵌套执行经不同客户端复用外层的租约。
+// 目标后端必须用同一令牌成功续约，才把这个客户端绑定到外层持有者。
+func acquireCheckpointExecutionLease(ctx context.Context, store TaskLeaseStore, sid string, cancel context.CancelCauseFunc) (context.Context, *checkpointTaskLease, error) {
+	ctx, own, err := acquireCheckpointTaskLease(ctx, store, sid, cancel)
+	if !errors.Is(err, ErrTaskBusy) {
+		return ctx, own, err
+	}
+	for binding := checkpointTaskLeaseBindings(ctx); binding != nil; binding = binding.parent {
+		lease := binding.lease
+		if lease.sid != sid || lease.released.Load() || lease.lost.Load() {
+			continue
+		}
+		ok, renewErr := renewCheckpointTaskLease(ctx, store, lease)
+		if renewErr != nil {
+			return ctx, nil, fmt.Errorf("verify inherited checkpoint lease for task %q: %w", sid, renewErr)
+		}
+		if !ok || lease.released.Load() {
+			continue
+		}
+		if err := CheckCheckpointTaskLease(ctx); err != nil {
+			return ctx, nil, err
+		}
+		return bindCheckpointTaskLease(ctx, store, lease), nil, nil
+	}
+	return ctx, nil, err
+}
+
+func renewCheckpointTaskLease(ctx context.Context, store TaskLeaseStore, lease *checkpointTaskLease) (bool, error) {
+	ioCtx, stopIO := context.WithTimeout(ctx, taskLeaseIOTimeout)
+	defer stopIO()
+	return store.RenewTaskLease(ioCtx, lease.sid, lease.token, taskLeaseTTL)
+}
+
 func acquireCheckpointTaskLease(ctx context.Context, store TaskLeaseStore, sid string, cancel context.CancelCauseFunc) (context.Context, *checkpointTaskLease, error) {
 	token := rand.Text()
 	expires := time.Now().Add(taskLeaseTTL)
@@ -153,12 +231,11 @@ func acquireCheckpointTaskLease(ctx context.Context, store TaskLeaseStore, sid s
 		return ctx, nil, fmt.Errorf("cannot acquire checkpoint lease for task %q: %w", sid, ErrTaskBusy)
 	}
 
-	parent, _ := ctx.Value(checkpointTaskLeaseKey{}).(*checkpointTaskLease)
 	renewCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
-	lease := &checkpointTaskLease{parent: parent, store: store, sid: sid, token: token, stop: stop, cancel: cancel, done: make(chan struct{})}
+	lease := &checkpointTaskLease{store: store, sid: sid, token: token, stop: stop, cancel: cancel, done: make(chan struct{})}
 	lease.expires.Store(&expires)
 	go lease.renew(renewCtx, taskLeaseRenewal)
-	return context.WithValue(ctx, checkpointTaskLeaseKey{}, lease), lease, nil
+	return bindCheckpointTaskLease(ctx, store, lease), lease, nil
 }
 
 func (l *checkpointTaskLease) renew(ctx context.Context, interval time.Duration) {
@@ -171,9 +248,7 @@ func (l *checkpointTaskLease) renew(ctx context.Context, interval time.Duration)
 			return
 		case <-ticker.C:
 			expires := time.Now().Add(taskLeaseTTL)
-			ioCtx, stop := context.WithTimeout(ctx, taskLeaseIOTimeout)
-			ok, err := l.store.RenewTaskLease(ioCtx, l.sid, l.token, taskLeaseTTL)
-			stop()
+			ok, err := renewCheckpointTaskLease(ctx, l.store, l)
 			if ctx.Err() != nil {
 				return
 			}

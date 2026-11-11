@@ -21,7 +21,7 @@ func TestCheckpointTaskLease_RenewalLossSurvivesDetachedCancellation(t *testing.
 	l := &checkpointTaskLease{store: rejectedRenewal{}, sid: "task", cancel: cancel, done: make(chan struct{})}
 	expires := time.Now().Add(time.Minute)
 	l.expires.Store(&expires)
-	ctx = context.WithValue(ctx, checkpointTaskLeaseKey{}, l)
+	ctx = bindCheckpointTaskLease(ctx, l.store, l)
 	renewCtx, stop := context.WithCancel(t.Context())
 	defer func() {
 		stop()

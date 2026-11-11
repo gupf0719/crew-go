@@ -12,7 +12,7 @@ import (
 	"crew-go/tool"
 )
 
-// isAgentNil 已迁移到 agent_v2/agent_helpers.go 让 7 编排 + 4 With* options 全用
+// IsNilAgent 已迁移到 agent_v2/agent_helpers.go 让 7 编排 + 4 With* options 全用
 // (audit³ 视角 1 HIGH-1: 协议对称性 — 之前只 PlanAgent 用其他编排漏防).
 
 // TmpSubAgentConfig 定义按计划步骤动态生成的一次性 BasicAgent。
@@ -199,7 +199,7 @@ func WithSubAgents(agents map[string]Agent) PlanOption {
 			if err := checkPlanSubAgentName(name); err != nil {
 				panic(fmt.Sprintf("WithSubAgents: name %q %v", name, err))
 			}
-			if isAgentNil(ag) {
+			if IsNilAgent(ag) {
 				panic(fmt.Sprintf("WithSubAgents: name %q has nil agent (含 Go typed nil interface 陷阱)", name))
 			}
 			if _, exists := p.subAgents[name]; exists {
@@ -300,9 +300,9 @@ func WithPlanHooks(h hook.Hooks) PlanOption {
 //
 // 链式 API：返回 self。
 func (p *PlanAgent) SetExecutor(a Agent) *PlanAgent {
-	// audit⁴ HIGH-1 fix: isAgentNil 检 typed nil interface 陷阱 (与 7 编排 + 4 With* options 协议对称)
-	// audit³ 自报"7/7 编排 + 4 With* options 全用 isAgentNil" 实际漏 SetExecutor — 同 commit 0aa15bf 谎报模式四复证.
-	if isAgentNil(a) {
+	// audit⁴ HIGH-1 fix: IsNilAgent 检 typed nil interface 陷阱 (与 7 编排 + 4 With* options 协议对称)
+	// audit³ 自报"7/7 编排 + 4 With* options 全用 IsNilAgent" 实际漏 SetExecutor — 同 commit 0aa15bf 谎报模式四复证.
+	if IsNilAgent(a) {
 		panic("PlanAgent.SetExecutor: nil agent (含 Go typed nil interface 陷阱)")
 	}
 	p.executor = a
@@ -326,7 +326,7 @@ func (p *PlanAgent) AddSubAgent(name string, a Agent) *PlanAgent {
 	if err := checkPlanSubAgentName(name); err != nil {
 		panic(fmt.Sprintf("PlanAgent.AddSubAgent: name %q %v", name, err))
 	}
-	if isAgentNil(a) {
+	if IsNilAgent(a) {
 		panic(fmt.Sprintf("PlanAgent.AddSubAgent: name %q has nil agent (含 Go typed nil interface 陷阱)", name))
 	}
 	if p.subAgents == nil {
@@ -448,9 +448,7 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 	abandonTasksAtEntry(ctx, cfg.abandoned, p.Name())
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return p.hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, startErr = CallAgentStart(ctx, p.hooks, info, agentIn)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = p.hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
@@ -556,9 +554,7 @@ func (p *PlanAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 	agentIn := &hook.AgentInput{}
 	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return p.hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, startErr = CallAgentStart(ctx, p.hooks, info, agentIn)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = p.hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})

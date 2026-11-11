@@ -167,19 +167,22 @@ func approvalRulesKey(s *RunSession) string { return approvedToolsKey + "\x00" +
 // ——`bash` 可能只该比前几个词、文件工具可能只该比目录前缀、而转账必须整串都比。所以
 // 框架只给机制（`WithApprovalScope` 让业务插自己的归一化），默认取最保守的那档。
 // 这跟本文件开头写的分工一致：框架给机制，安全策略业务自负。
-func approvalRuleKey(cfg *Config, tc schema.ToolCall) string {
+func approvalRuleKey(cfg *Config, tc schema.ToolCall, scope string) string {
 	fp := tc.Function.Arguments
 	if cfg != nil && cfg.ApprovalScope != nil {
 		fp = cfg.ApprovalScope(tc)
 	}
-	return approvalToolKey(cfg, tc.Function.Name) + "\x00" + fp
+	return approvalToolKey(cfg, tc.Function.Name, scope) + "\x00" + fp
 }
 
 // approvalToolKey 是「这个 agent 的这个工具」：规则 key 的前半，工具级规则在它后面接通配（见 approvedToolsKey）。
-func approvalToolKey(cfg *Config, name string) string {
+func approvalToolKey(cfg *Config, name, scope string) string {
 	owner := ""
 	if cfg != nil {
 		owner = cfg.approvalOwner
+	}
+	if scope != "" {
+		return "\x01" + identityString(owner, name, scope)
 	}
 	return owner + "\x00" + name
 }
@@ -197,7 +200,7 @@ var approvalMu sync.Mutex
 // isToolApproved 查这次调用有没有被 don't-ask-again 规则覆盖。
 //
 // 两档都查：**这件事**（工具+参数指纹）和**这个工具**（通配）。
-func isToolApproved(s *RunSession, cfg *Config, tc schema.ToolCall) bool {
+func isToolApproved(s *RunSession, cfg *Config, tc schema.ToolCall, scope string) bool {
 	if s == nil {
 		return false
 	}
@@ -208,11 +211,11 @@ func isToolApproved(s *RunSession, cfg *Config, tc schema.ToolCall) bool {
 	if m == nil {
 		return false
 	}
-	return m[approvalRuleKey(cfg, tc)] || m[approvalToolKey(cfg, tc.Function.Name)+"\x00"+approvalToolWildcard]
+	return m[approvalRuleKey(cfg, tc, scope)] || m[approvalToolKey(cfg, tc.Function.Name, scope)+"\x00"+approvalToolWildcard]
 }
 
 // markToolApproved 记一条 don't-ask-again 规则。toolWide=true 时覆盖该工具全部调用。
-func markToolApproved(s *RunSession, cfg *Config, tc schema.ToolCall, toolWide bool) {
+func markToolApproved(s *RunSession, cfg *Config, tc schema.ToolCall, scope string, toolWide bool) {
 	if s == nil {
 		return
 	}
@@ -225,9 +228,9 @@ func markToolApproved(s *RunSession, cfg *Config, tc schema.ToolCall, toolWide b
 		m = map[string]bool{}
 	}
 	if toolWide {
-		m[approvalToolKey(cfg, tc.Function.Name)+"\x00"+approvalToolWildcard] = true
+		m[approvalToolKey(cfg, tc.Function.Name, scope)+"\x00"+approvalToolWildcard] = true
 	} else {
-		m[approvalRuleKey(cfg, tc)] = true
+		m[approvalRuleKey(cfg, tc, scope)] = true
 	}
 	s.SetValue(key, m)
 }
@@ -417,8 +420,8 @@ type approvalResult struct {
 	err error
 }
 
-// checkToolApproval 在工具执行前查审批决策链（仅业务工具；minted 为真——这次派发的是框架铸的那件，
-// 见 frameworkMintedTool——直接放行，问人、交出转交决定这类事审批无意义）：
+// checkToolApproval 在工具执行前查审批决策链。框架自身的控制工具直接放行，业务 skill action
+// 按普通工具审批。scope 把该 action 的长期规则限定在其 skill 和 action 名上。
 //
 //	这次调用记下的结论 / ApprovalMode 默认 → 启发式覆盖（每次调用只形成一次，见 approvalDecisionOf）
 //	→（若 Ask）这次调用已准入过 → 本次 Resume 答案 → don't-ask-again 规则 fast-path → 首次抛中断
@@ -435,8 +438,8 @@ type approvalResult struct {
 // `approve_always` / `approve_always_tool` 的**规则集**存 RunSession KV、按任务（RunID）分
 // （不走 cp），规则只对答应它的那个 agent 实例生效（键带构造时铸的身份，见 approvedToolsKey），跨 Resume 持久需
 // caller 传 `WithResumeSession` 复用同一 session（默认 Resume 新建空 session，规则丢失会重新询问）。
-func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, args map[string]any, minted, readOnly bool) approvalResult {
-	if minted {
+func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, args map[string]any, scope string, exempt, readOnly bool) approvalResult {
+	if exempt {
 		return approvalResult{proceed: true}
 	}
 	name := tc.Function.Name
@@ -484,12 +487,12 @@ func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, arg
 			return approvalResult{proceed: true}
 		case ApprovalOptionApproveAlways:
 			// 「这件事」——同工具同参数下次不再问，换了参数照样问
-			markToolApproved(session, cfg, tc, false)
+			markToolApproved(session, cfg, tc, scope, false)
 			markCallApproved(ctx)
 			return approvalResult{proceed: true}
 		case ApprovalOptionApproveAlwaysTool:
 			// 「这个工具」——它的任何调用都不再问。用户得显式选这一档才拿得到。
-			markToolApproved(session, cfg, tc, true)
+			markToolApproved(session, cfg, tc, scope, true)
 			markCallApproved(ctx)
 			return approvalResult{proceed: true}
 		default: // deny / 空 / 未识别 → 拒绝（保守 fail-closed）
@@ -502,15 +505,19 @@ func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, arg
 	//    caller 传 WithResumeSession 复用同一 session 对象**（默认 Resume 新建空 session，规则会丢、重新询问）。
 	//    经规则放行同样记下「这次调用已准入」：工具之后自己中断、续跑没带原 session 时规则跟着丢了，不记的话这次调用
 	//    被再问一次审批，用户答 deny 就只执行了一半（审计实测）。
-	if isToolApproved(session, cfg, tc) {
+	if isToolApproved(session, cfg, tc, scope) {
 		markCallApproved(ctx)
 		return approvalResult{proceed: true}
 	}
 	// 3) 首次 → 抛 InterruptError（Query.InterruptID 填稳定 ID 让 caller 配对答案）
+	question := fmt.Sprintf("是否允许执行工具 %q？参数：%s", name, tc.Function.Arguments)
+	if scope != "" {
+		question += " 工具级长期放行只适用于本次指定的 skill action。"
+	}
 	return approvalResult{err: &compose_v2.InterruptError{
 		Reason: ApprovalInterruptReason,
 		Query: &compose_v2.AskQuery{
-			Question: fmt.Sprintf("是否允许执行工具 %q？参数：%s", name, tc.Function.Arguments),
+			Question: question,
 			Options: []string{ApprovalOptionApprove, ApprovalOptionApproveAlways,
 				ApprovalOptionApproveAlwaysTool, ApprovalOptionDeny},
 			InterruptID: stableID,

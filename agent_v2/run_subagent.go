@@ -157,9 +157,14 @@ type nestedMode struct {
 	finalOnly bool
 }
 
+// nestedOutputRestorer 允许集成在重放已完成调用时，从该调用的私有态恢复结果所引用的会话状态。
+type nestedOutputRestorer interface {
+	RestoreNestedOutput(context.Context, *RunSession, *schema.Message, *schema.Message)
+}
+
 // runNestedCall 是 [RunSubAgent] / AgentAsTool / skill fork 共用的嵌套调用执行器。
 func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Message, mode nestedMode, opts ...RunOption) ([]*AgentEvent, error) {
-	if isAgentNil(sub) {
+	if IsNilAgent(sub) {
 		return nil, fmt.Errorf("RunSubAgent: nil sub-agent (含 Go typed nil interface 陷阱)")
 	}
 	if err := compose_v2.ValidateNodeIDForNS(name); err != nil {
@@ -172,17 +177,15 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	if err != nil {
 		return nil, fmt.Errorf("RunSubAgent: %w", err)
 	}
-	// 已完成过的调用：拿回记下的结果，不再执行（父节点重跑时）
-	if mode.remember {
-		if events, ok := recallNestedCall(ctx, call); ok {
-			return events, nil
-		}
-	}
 	// 归属位置：name（业务在自己的图里保证唯一）。**不用子 ns**——子 ns 带身份哈希、每次调用
 	// 都不同，拿它当归属会让同一个 sub-agent 每次归属不同、跨轮读不回自己的历史。
 	subCtx = WithHistorySlot(subCtx, name)
 	// 被当成工具 / 嵌套调用的子 agent 不取用户的运行中插话：用户是在跟调用它的那个 agent 说话（见 Inbox）
 	subCtx = withoutInbox(subCtx)
+	if inStart, _ := ctx.Value(topLevelAgentStartKey{}).(bool); inStart && !compose_v2.WithinNodeScope(ctx) {
+		// 顶层入口拒绝中断。屏蔽子调用的存档，避免留下没有父节点能恢复的子树。
+		subCtx = compose_v2.WithoutCheckpointing(subCtx)
+	}
 	// ⚠️ **AgentAsTool 传的 name 是 `t.agent.Name()`**（见 agent_tool.go），所以那条路径上
 	// 子 agent 的位置就是它自己的名字。未命名的 agent 自动名每次构造都不同，位置跟着变、
 	// 跨 Run 读不回自己的历史——这是 warnUnnamedAgentInHistory 要提醒的两档后果里更重的
@@ -216,6 +219,15 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 的序号）、不算调起它的那次 tool_call 本身；它的主图（落在子 ns 上）的输入算调用方产的，入口
 	// 条件边否决时作废的是调用方按 Rerunnable 记下的产出。子 ns 已在 enterNestedCall 里推好。
 	subCtx = compose_v2.HandOver(subCtx, call.identity)
+	// 已完成的调用重放结果，集成可从同一交接相位恢复结果引用的会话状态。
+	if mode.remember {
+		if events, ok := recallNestedCall(ctx, call); ok {
+			if restore, ok := sub.(nestedOutputRestorer); ok {
+				restore.RestoreNestedOutput(subCtx, childSess, input, FinalMessage(events))
+			}
+			return events, nil
+		}
+	}
 
 	// 调用方输入的摘要交给被调方：记进它的存档、续跑时核对（见 withNestedCallDigest）。
 	// 只取位置的调用不交——它的输入由框架现拼、续跑时可以合法地不同。

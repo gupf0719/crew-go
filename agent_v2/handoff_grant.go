@@ -164,7 +164,7 @@ func entityID(v any) (uintptr, reflect.Type, bool) {
 // 多个匿名字段时返 nil（歧义不猜——猜错就是悄悄放宽授权）。
 func innerOf(v any) any {
 	if u, ok := v.(unwrapper); ok {
-		if in := u.Unwrap(); !isAgentNil(in) {
+		if in := u.Unwrap(); !IsNilAgent(in) {
 			return in
 		}
 		return nil
@@ -206,7 +206,7 @@ func innerOf(v any) any {
 //
 // nil 接收者返 nil，让「本层没被授予」自然地不往下传（调用点不必写 if）。
 func (g *handoffGrant) regrant(child Agent) *handoffGrant {
-	if g == nil || isAgentNil(child) {
+	if g == nil || IsNilAgent(child) {
 		return nil
 	}
 	return &handoffGrant{grantee: child, candidates: g.candidates}
@@ -250,7 +250,7 @@ func (g *handoffGrant) regrant(child Agent) *handoffGrant {
 // 这些都是「业务声明这一层是我的组成部分」的直接后果，跟框架编排替自己的成员 regrant
 // 是同一件事。**不能做到**的是把别人的授予改寄（见 self）。
 func RegrantHandoffTo(opts []RunOption, self Agent, to Agent) []RunOption {
-	if isAgentNil(self) || isAgentNil(to) {
+	if IsNilAgent(self) || IsNilAgent(to) {
 		return opts
 	}
 	g := grantFromOpts(opts).grantFor(self)
@@ -312,7 +312,7 @@ func RegrantHandoffTo(opts []RunOption, self Agent, to Agent) []RunOption {
 // 而这些层没有一个知道自己在改控制流。控制决策要走**只有被授予方能调用的入口**，不能
 // 搭在人人可改的数据上。
 func HandoffTo(ctx context.Context, opts []RunOption, self Agent, target string) error {
-	if isAgentNil(self) {
+	if IsNilAgent(self) {
 		return fmt.Errorf("handoff: self 为 nil（含 Go typed nil interface 陷阱）: %w", compose_v2.ErrRunAborted)
 	}
 	if target == "" {

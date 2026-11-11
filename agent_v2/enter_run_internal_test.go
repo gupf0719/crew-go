@@ -14,10 +14,10 @@ import (
 // 照绿（审计实测），这里把另一半钉住。
 func TestEnterRun_SameEntryAsOrchestrations(t *testing.T) {
 	approve := func(s *RunSession) {
-		markToolApproved(s, &Config{}, schema.ToolCall{Function: schema.FunctionCall{Name: "pay"}}, true)
+		markToolApproved(s, &Config{}, schema.ToolCall{Function: schema.FunctionCall{Name: "pay"}}, "", true)
 	}
 	approved := func(s *RunSession) bool {
-		return isToolApproved(s, &Config{}, schema.ToolCall{Function: schema.FunctionCall{Name: "pay"}})
+		return isToolApproved(s, &Config{}, schema.ToolCall{Function: schema.FunctionCall{Name: "pay"}}, "")
 	}
 	callerGrants := withNodeGrants(context.Background(), memberGrants{route: &routeGrant{}})
 

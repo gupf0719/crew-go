@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
@@ -60,6 +61,36 @@ func TestHookInterrupt_TopLevelRejected(t *testing.T) {
 	}
 	if pend, _ := cp.ListPending(ctx, sess.RunID); len(pend) != 0 {
 		t.Errorf("拒绝路径不该留档，实际 %d 份", len(pend))
+	}
+}
+
+type startCallsAskingAgent struct {
+	hook.NoOpHooks
+	child agent_v2.Agent
+	asked bool
+}
+
+func (h *startCallsAskingAgent) OnAgentStart(ctx context.Context, _ *hook.AgentInfo, _ *hook.AgentInput) (context.Context, error) {
+	_, err := agent_v2.RunSubAgent(ctx, "child", h.child, schema.UserMessage("nested"))
+	_, h.asked = compose_v2.IsInterrupt(err)
+	return ctx, err
+}
+
+func TestHookInterrupt_TopLevelNestedCallLeavesNoOrphan(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cp := compose_v2.NewInMemoryCheckpointer()
+	ctx = compose_v2.WithCheckpointerCtx(ctx, cp)
+	h := &startCallsAskingAgent{child: doAsker(t, "child", "需要答案")}
+	parent := agent_v2.NewBasicAgent(agent_v2.WithName("parent"), agent_v2.WithHooks(h),
+		agent_v2.WithModel(newStubModel([]*schema.Message{schema.AssistantMessage("done")})))
+	sess := agent_v2.NewRunSession()
+	_, err := parent.Run(ctx, sess, schema.UserMessage("start"))
+	if _, isInt := compose_v2.IsInterrupt(err); !h.asked || err == nil || isInt {
+		t.Fatalf("子调用应实际提问，入口应拒绝中断，asked=%v err=%v", h.asked, err)
+	}
+	if pending, err := cp.ListPending(ctx, sess.RunID); err != nil || len(pending) != 0 {
+		t.Fatalf("顶层拒绝的提问留下了挂起档，pending=%v err=%v", pending, err)
 	}
 }
 

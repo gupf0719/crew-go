@@ -82,9 +82,14 @@ func (t *skillActionTool) InputSchema() map[string]any {
 	}
 }
 
-func (t *skillActionTool) Call(ctx context.Context, args map[string]any) (*tool.Result, error) {
+func skillActionNames(args map[string]any) (string, string) {
 	skillName, _ := args["skill"].(string)
 	actionName, _ := args["action"].(string)
+	return skillName, actionName
+}
+
+func (t *skillActionTool) Call(ctx context.Context, args map[string]any) (*tool.Result, error) {
+	skillName, actionName := skillActionNames(args)
 	if skillName == "" || actionName == "" {
 		return tool.Failure(tool.ErrCodeInvalidArguments, "run_skill_action 需要 skill + action"), nil
 	}

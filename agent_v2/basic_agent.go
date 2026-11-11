@@ -95,7 +95,8 @@ func (a *schemaStreamAdapter) Close() error {
 //
 // 实现：spawn 桥接 goroutine 把 hook reader 的 chunks pump 到内部 schema.StreamReader。
 func streamReaderToSchema(ctx context.Context, hookReader specModel.MessageStreamReader) *schema.StreamReader[*schema.Message] {
-	out, send := schema.NewStreamReader[*schema.Message](16)
+	recvCtx, cancel := context.WithCancel(ctx)
+	out, send := schema.NewStreamReaderWithCancel[*schema.Message](16, cancel)
 	go func() {
 		// **无条件收尾**：生产者无论怎么退出（EOF / 错误 / panic / `runtime.Goexit`），
 		// `out` 都必须闭合，否则消费方 `Recv` 永久阻塞——Goexit 会跑 defer 但 recover
@@ -103,6 +104,7 @@ func streamReaderToSchema(ctx context.Context, hookReader specModel.MessageStrea
 		// `CloseSend` 幂等（sendOnce），EOF 分支的显式关闭不冲突。
 		// **注册在最前 ⟹ 跑在最后**（LIFO）：错误先进流（SendError）、流再闭合。
 		defer schema.CloseSend(out)
+		defer cancel()
 		// **`concluded` 旗：流必须带着一个结论收尾，不许静默截断。**
 		//
 		// 光有上面那道无条件闭流只解了「消费方永久阻塞」；剩下的一半是**闭流本身没有
@@ -140,8 +142,11 @@ func streamReaderToSchema(ctx context.Context, hookReader specModel.MessageStrea
 		}()
 		// stream 关闭 error 无意义 (goroutine 退出清理), 显式忽略
 		defer func() { _ = hookReader.Close() }()
-		for {
-			msg, err := hookReader.Recv(ctx)
+		for recvCtx.Err() == nil {
+			msg, err := hookReader.Recv(recvCtx)
+			if recvCtx.Err() != nil {
+				break
+			}
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					schema.CloseSend(out)
@@ -154,6 +159,13 @@ func streamReaderToSchema(ctx context.Context, hookReader specModel.MessageStrea
 			}
 			send(msg)
 		}
+		select {
+		case <-out.Done():
+			schema.SendError(out, schema.ErrStreamCanceled)
+		default:
+			schema.SendError(out, recvCtx.Err())
+		}
+		concluded = true
 	}()
 	return out
 }
@@ -286,9 +298,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	abandonTasksAtEntry(ctx, cfg.abandoned, a.config.Name)
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return a.config.Hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, startErr = CallAgentStart(ctx, a.config.Hooks, info, agentIn)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = a.config.Hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
@@ -457,9 +467,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	ctx = withBackgroundScope(ctx, &a.config, true) // Resume 只在顶层调（见 commonResumePrep）
 	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return a.config.Hooks.OnAgentStart(c, info, agentInResume)
-	})
+	ctx, startErr = CallAgentStart(ctx, a.config.Hooks, info, agentInResume)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = a.config.Hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
@@ -3575,8 +3583,14 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				},
 			})
 			// 只读放行档要知道这次派发的那件工具有没有声明只读——按实例认（tool.IsReadOnly），不按名字
-			readOnly := tool.IsReadOnly(dispatchToolkit.Get(tc.Function.Name))
-			if ar := checkToolApproval(callCtx, &cfg, tc, args, minted, readOnly); ar.err != nil {
+			target := dispatchToolkit.Get(tc.Function.Name)
+			readOnly := tool.IsReadOnly(target)
+			var approvalScope string
+			if _, ok := target.(*skillActionTool); ok {
+				skillName, actionName := skillActionNames(args)
+				approvalScope = identityString(skillName, actionName)
+			}
+			if ar := checkToolApproval(callCtx, &cfg, tc, args, approvalScope, minted && approvalScope == "", readOnly); ar.err != nil {
 				return outcome{err: ar.err}
 			} else if !ar.proceed {
 				return outcome{toolMsg: ar.denyMsg}

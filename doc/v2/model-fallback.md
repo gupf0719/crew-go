@@ -310,6 +310,8 @@ func (f *FallbackChatModel) Generate(ctx context.Context, msgs []*schema.Message
 
 **第一版策略（保守，无歧义）**：只在**建流阶段**切换——即 `m.model.Stream(ctx, ...)` 同步返回 error 时（如 `client.go:141` 的 HTTP 非 200 在拿到首 chunk 前就返回了），按 §5 流程切下一个候选。一旦 `Stream` 成功返回 reader、开始投递 chunk，就**不再切换**，流中途错误照常向下游传递。
 
+流的断路器按消费方观察到的结局结算。读到 EOF 记成功，候选故障由 `FailoverPolicy` 分类并记失败。提前 `Close` 或调用方取消归还半开探测名额。调用方应在退出时关闭 reader。每次探测只结算自己的名额。
+
 **增强项（列入 §11 待定）**，两种思路别混为一谈：
 - **eino 式全流预消费**：`retry_chatmodel.go:252` 用 `stream.Copy(2)` 复制一份，`consumeStreamForError`（`:156`）**消费到 EOF** 确认整条流无误后才返回另一份。代价大——长流要等 buffer 完才返回，基本**牺牲流式实时性**，不适合 BasicAgent 的 chunk 实时投递。**这是把「检错窗口」拉到整条流，不是「首 chunk 落地前」。**
 - **首 chunk peek（更轻）**：只预读第一个 chunk 检错，把切换窗口从「建流阶段」扩到「首 chunk 落地前」。**不需要**给 `schema.StreamReader` 加 `Copy`——它定义在 `schema/stream.go`（不是 alias），只有 Recv / Close / Done，用这三个写一个转发 wrapper 就能 peek（2026-09-18 核验，探针 `-race` 通过；§11.1）。

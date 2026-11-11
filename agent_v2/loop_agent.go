@@ -134,8 +134,8 @@ func WithLoopMaxRetries(n int) LoopOption {
 
 // WithBody 设 sub-agent 作循环 body（必填，链式）。
 func (l *LoopAgent) WithBody(ag Agent) *LoopAgent {
-	// audit³ HIGH-1 fix: isAgentNil 检 typed nil interface 陷阱
-	if isAgentNil(ag) {
+	// audit³ HIGH-1 fix: IsNilAgent 检 typed nil interface 陷阱
+	if IsNilAgent(ag) {
 		panic("LoopAgent.WithBody: nil agent (含 Go typed nil interface 陷阱)")
 	}
 	l.body = ag
@@ -198,9 +198,7 @@ func (l *LoopAgent) Run(ctx context.Context, session *RunSession, input *schema.
 	abandonTasksAtEntry(ctx, cfg.abandoned, l.Name())
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentIn)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
@@ -286,9 +284,7 @@ func (l *LoopAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 	agentInResume := &hook.AgentInput{}
 	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentInResume)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentInResume)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})

@@ -23,13 +23,16 @@ type StreamReader[T any] struct {
 	ch       chan T
 	errCh    chan error // 业务错通道——SendError 写入；Recv 优先排空 ch 后从此读
 	done     chan struct{}
+	cancel   context.CancelFunc
 	recvOnce sync.Once // 保护 close(done)   — 消费者端
 	sendOnce sync.Once // 保护 close(ch)      — 生产者端
 
 	// heldErr 是 Recv 已经从 errCh 取出、但 ch 里还有错误之前发出的项而暂缓交出的错误：
 	// 错误必须排在它之前发出的项后面。只有 Recv 读写它。
-	mu      sync.Mutex
-	heldErr error
+	mu        sync.Mutex
+	heldErr   error
+	terminal  error
+	observers []func(error)
 }
 
 // ErrStreamCanceled 表示消费者主动调 Close 中止了流（Recv 应返此错给生产者）。
@@ -56,10 +59,17 @@ var ErrStreamCanceled = errors.New("stream canceled by consumer")
 //	reader, _ := llm.Stream(ctx, msgs)
 //	defer reader.Close() // ★ 必须 defer
 func NewStreamReader[T any](bufSize int) (*StreamReader[T], func(T)) {
+	return NewStreamReaderWithCancel[T](bufSize, nil)
+}
+
+// NewStreamReaderWithCancel 创建流，消费方第一次 Close 时取消生产方的读取。
+// 生产方结束时仍负责释放自己的资源并调用 CloseSend。
+func NewStreamReaderWithCancel[T any](bufSize int, cancel context.CancelFunc) (*StreamReader[T], func(T)) {
 	sr := &StreamReader[T]{
-		ch:    make(chan T, bufSize),
-		errCh: make(chan error, 1), // 容量 1：业务错只投递一次
-		done:  make(chan struct{}),
+		ch:     make(chan T, bufSize),
+		errCh:  make(chan error, 1), // 容量 1：业务错只投递一次
+		done:   make(chan struct{}),
+		cancel: cancel,
 	}
 	send := func(item T) {
 		select {
@@ -105,7 +115,7 @@ func (sr *StreamReader[T]) Recv(ctx context.Context) (T, error) {
 	default:
 	}
 	if err := sr.takeHeldErr(); err != nil {
-		return zero, err
+		return zero, sr.observeTerminal(err)
 	}
 	// ch 为空时同时监听 done / errCh / ctx
 	select {
@@ -137,23 +147,62 @@ func (sr *StreamReader[T]) deliverErr(err error) (T, error) {
 	default:
 	}
 	var zero T
-	return zero, err
+	return zero, sr.observeTerminal(err)
 }
 
 // endErr 是 ch 已关闭时的结论：暂缓的错误 > errCh 里的错误 > io.EOF。
 func (sr *StreamReader[T]) endErr() error {
 	if err := sr.takeHeldErr(); err != nil {
-		return err
+		return sr.observeTerminal(err)
 	}
 	select {
 	case err := <-sr.errCh:
 		if err == nil {
-			return io.EOF
+			err = io.EOF
 		}
-		return err
+		return sr.observeTerminal(err)
 	default:
-		return io.EOF
+		return sr.observeTerminal(io.EOF)
 	}
+}
+
+// ObserveEnd 登记一次结局通知。消费方读到生产方的结局或提前 Close 时同步通知，
+// 结局已经可见时立即通知。单次 Recv 的 ctx 到期不会结算整条流。
+func (sr *StreamReader[T]) ObserveEnd(observe func(error)) {
+	if observe == nil {
+		return
+	}
+	sr.mu.Lock()
+	terminal := sr.terminal
+	if terminal == nil {
+		sr.observers = append(sr.observers, observe)
+	}
+	sr.mu.Unlock()
+	if terminal != nil {
+		observe(terminal)
+	}
+}
+
+func (sr *StreamReader[T]) observeTerminal(err error) error {
+	sr.mu.Lock()
+	if sr.terminal != nil {
+		sr.mu.Unlock()
+		return err
+	}
+	terminal := err
+	select {
+	case <-sr.done:
+		terminal = ErrStreamCanceled
+	default:
+	}
+	sr.terminal = terminal
+	observers := sr.observers
+	sr.observers = nil
+	sr.mu.Unlock()
+	for _, observe := range observers {
+		observe(terminal)
+	}
+	return err
 }
 
 func (sr *StreamReader[T]) holdErr(err error) {
@@ -178,7 +227,11 @@ func (sr *StreamReader[T]) takeHeldErr() error {
 func (sr *StreamReader[T]) Close() {
 	sr.recvOnce.Do(func() {
 		close(sr.done)
+		if sr.cancel != nil {
+			sr.cancel()
+		}
 	})
+	sr.observeTerminal(ErrStreamCanceled)
 }
 
 // Done 返回一个 channel，消费者调用 Close() 后该 channel 被关闭。

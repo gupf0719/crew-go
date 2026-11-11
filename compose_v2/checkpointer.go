@@ -820,6 +820,20 @@ var _ Checkpointer = (*InMemoryCheckpointer)(nil)
 // ── ctx 协议 ──
 
 type checkpointerKey struct{}
+type checkpointingDisabledKey struct{}
+
+func (checkpointingDisabledKey) ExecutionState() {}
+
+// WithoutCheckpointing 关闭当前执行范围内图的存档。显式放弃操作仍使用原后端，独立任务可照常存档。
+func WithoutCheckpointing(ctx context.Context) context.Context {
+	return context.WithValue(ctx, checkpointingDisabledKey{}, true)
+}
+
+func checkpointingDisabled(ctx context.Context) bool {
+	disabled, _ := ctx.Value(checkpointingDisabledKey{}).(bool)
+	return disabled
+}
+
 type sessionIDKey struct{}
 type threadIDKey struct{}
 
@@ -835,7 +849,7 @@ func withCheckpointer(ctx context.Context, cp Checkpointer) context.Context {
 //
 // 业务（如 agent_v2 高层 wrapper）想让下游 Run 调用从 ctx 取 Checkpointer 而不是
 // 显式传 RunOption 时用此 helper。区别于 RunOption WithCheckpointer——RunOption
-// 是显式给某次 Run 注入，本 helper 是把 cp 沿 ctx 链透传给所有下游调用。
+// 是显式给某次 Run 注入，本 helper 是把 cp 沿 ctx 链透传给所有下游调用。传 nil 会屏蔽继承的 Checkpointer。
 //
 // 典型用法：
 //
@@ -844,7 +858,7 @@ func withCheckpointer(ctx context.Context, cp Checkpointer) context.Context {
 func WithCheckpointerCtx(ctx context.Context, cp Checkpointer) context.Context {
 	// audit¹¹ HIGH-2 fix: isFrameworkNil 检 typed nil Checkpointer (与 WithCheckpointer 协议对称).
 	if isFrameworkNil(cp) {
-		return withCheckpointer(ctx, nil) // 等价 untyped nil 注 nil — 不破坏 "无 cp" idiom
+		return context.WithValue(ctx, checkpointerKey{}, nil)
 	}
 	return withCheckpointer(ctx, cp)
 }

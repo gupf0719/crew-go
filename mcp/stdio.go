@@ -21,6 +21,7 @@ type StdioClient struct {
 	command         string
 	args            []string
 	env             []string
+	envAllowlist    []string
 	protocolVersion string
 	clientName      string
 	clientVersion   string
@@ -47,9 +48,15 @@ type StdioClient struct {
 // StdioOption 配置 StdioClient。
 type StdioOption func(*StdioClient)
 
-// WithStdioEnv 追加子进程环境变量（格式 "KEY=VAL"），默认继承当前 os.Environ。
+// WithStdioEnv 给子进程设置环境变量（格式 "KEY=VAL"），同名值覆盖继承值。
 func WithStdioEnv(env ...string) StdioOption {
 	return func(s *StdioClient) { s.env = append(s.env, env...) }
+}
+
+// WithStdioEnvAllowlist 限制从父进程继承的环境变量。未配置时继承全部，空名单不继承任何变量。
+// WithStdioEnv 显式设置的变量照常交给子进程。Windows 上 os/exec 会补入 SYSTEMROOT。
+func WithStdioEnvAllowlist(names ...string) StdioOption {
+	return func(s *StdioClient) { s.envAllowlist = append([]string{}, names...) }
 }
 
 // WithStdioProtocolVersion 设置 MCP 协议版本。
@@ -217,8 +224,16 @@ func (c *StdioClient) Close() error {
 // start 启动子进程并拉起 stdout 读取 goroutine。
 func (c *StdioClient) start() error {
 	cmd := exec.Command(c.command, c.args...)
+	if c.envAllowlist != nil {
+		cmd.Env = make([]string, 0, len(c.envAllowlist)+len(c.env))
+		for _, name := range c.envAllowlist {
+			if value, ok := os.LookupEnv(name); ok {
+				cmd.Env = append(cmd.Env, name+"="+value)
+			}
+		}
+	}
 	if len(c.env) > 0 {
-		cmd.Env = append(os.Environ(), c.env...)
+		cmd.Env = append(cmd.Environ(), c.env...)
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

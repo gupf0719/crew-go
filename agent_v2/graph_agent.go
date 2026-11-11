@@ -304,9 +304,7 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	abandonTasksAtEntry(ctx, cfg.abandoned, g.Name())
 	activity.FinishAbandon()
 	var hookErr error
-	ctx, hookErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, hookErr = CallAgentStart(ctx, hooks, info, agentIn)
 	if hookErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(hookErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: hookErr.Error()})
@@ -333,7 +331,7 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 
 	// **R30 audit C-H1 fix**: defer OnAgentEnd 注册必须在 OnAgentStart 成功**之后**
 	// (跟其他 8 编排架构对称 — fef2ca5 PlanAgent Run fix 当时漏改 GraphAgent, 跟 R32
-	// isAgentNil 漏 SetExecutor 同款 "修一个漏一个" 模式).
+	// IsNilAgent 漏 SetExecutor 同款 "修一个漏一个" 模式).
 	// 否则 OnAgentStart 报错时 defer 仍 fire → OTel span Start 未发 End 单飞 → 配对断裂.
 	// P0 observability: push retErr 让 observability OnAgentEnd 识别 InterruptError 路径
 	var finalRef *schema.Message
@@ -495,9 +493,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	agentIn := &hook.AgentInput{}
 	ctx = enterGraphResumeTask(ctx, session)
 	var hookErr error
-	ctx, hookErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, hookErr = CallAgentStart(ctx, hooks, info, agentIn)
 	if hookErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(hookErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: hookErr.Error()})

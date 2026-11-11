@@ -20,6 +20,12 @@ type agentToolConfig struct {
 	callKey           func(args map[string]any) string
 }
 
+type agentToolAdapter interface {
+	AgentToolInputSchema() map[string]any
+	AgentToolInput(args map[string]any) (*schema.Message, error)
+	AgentToolOutput(output *schema.Message) string
+}
+
 // WithAgentToolDescription override agent tool 的 description.
 //
 // 不传时默认从 `agent.Description()` 取——让业务**一处定义复用**
@@ -98,6 +104,8 @@ func WithAgentToolCallKey(fn func(args map[string]any) string) AgentAsToolOption
 // **一处定义复用**, 不再 caller 手动 wrap.
 // 业务想 override 用 `WithAgentToolDescription(desc)`. 业务想定制 input schema
 // 用 `WithAgentToolInputSchema(schema)` 或 `WithAgentToolFullHistoryInput()`.
+// 未指定这两个选项时，agent 可实现 AgentToolInputSchema、AgentToolInput 和 AgentToolOutput，
+// 为默认包装提供参数 schema、输入消息和给模型看的工具结果。
 //
 // **空 description 行为**: agent.Description() 空 + 业务也没传 `WithAgentToolDescription`
 // → 构造期 **panic** (fail-fast). 业务 init 期发现, 不延迟到 runtime LLM 调 tool 时.
@@ -128,9 +136,9 @@ func WithAgentToolCallKey(fn func(args map[string]any) string) AgentAsToolOption
 //     没有地方传 [WithRerunnable]——产出要被条件边按 CondFailRerunFrom 判、否决后要重做的那一次，
 //     改在节点体里用 RunSubAgent 调；中间件在 next 之后校验产出、不合格时返 error 也拿不到新的一份
 //     （重跑拿回的是同一份），要换一份就返 `tool.Failure`，让模型重发一个 tool_call（新的一次调用）；
-//   - **身份**：默认按交给被调方的输入定——默认 schema 下是 `input` 那一个字段（别的字段不进身份），
-//     自定义 schema 下是整个 args。中间件往参数里注入每次都变的值（请求号、时间戳）时，只有它落进了
-//     这些字段（自定义 schema，或改写了 `input` 的文本本身）才会让每次续跑都成为新调用，那时用
+//   - **身份**：按交给被调方的输入定。通用默认 schema 取 `input`，自定义 schema 取整个 args，
+//     agent 提供默认包装时取 AgentToolInput 生成的消息。中间件往参数里注入每次都变的值（请求号、
+//     时间戳）时，只有它进入输入消息才会让每次续跑都成为新调用，那时用
 //     [WithAgentToolCallKey] 声明身份（`OnToolStart` 的注入续跑不变：一批调用的内容在第一次执行时
 //     定下）。全历史输入（且没有自定义 schema）由框架从
 //     session 事件现拼、续跑时可能不同，只按位置定；
@@ -154,8 +162,8 @@ func WithAgentToolCallKey(fn func(args map[string]any) string) AgentAsToolOption
 // values map，如两 sub-agent 都用 `"current_step"` 作 key 会互相覆盖。建议加
 // 「sub-agent 名」前缀，如 `"researcher.current_step"`。
 func AgentAsTool(a Agent, opts ...AgentAsToolOption) tool.Tool {
-	// audit⁵ HIGH-1 fix: isAgentNil 检 typed nil interface (五复证 — audit⁴ 漏此公开 API).
-	if isAgentNil(a) {
+	// audit⁵ HIGH-1 fix: IsNilAgent 检 typed nil interface (五复证 — audit⁴ 漏此公开 API).
+	if IsNilAgent(a) {
 		panic("AgentAsTool: nil agent (含 Go typed nil interface 陷阱)")
 	}
 	cfg := agentToolConfig{}
@@ -171,12 +179,17 @@ func AgentAsTool(a Agent, opts ...AgentAsToolOption) tool.Tool {
 	if desc == "" {
 		panic("AgentAsTool: 'description' required (agent.Description() empty + no WithAgentToolDescription) — fail-fast: 业务想给 sub-agent 配 tool description 必填一处")
 	}
+	var adapter agentToolAdapter
+	if cfg.customInputSchema == nil && !cfg.fullHistoryInput {
+		adapter, _ = a.(agentToolAdapter)
+	}
 	return &agentTool{
 		agent:             a,
 		description:       desc,
 		customInputSchema: cfg.customInputSchema,
 		fullHistoryInput:  cfg.fullHistoryInput,
 		callKey:           cfg.callKey,
+		adapter:           adapter,
 	}
 }
 
@@ -186,6 +199,7 @@ type agentTool struct {
 	customInputSchema map[string]any
 	fullHistoryInput  bool
 	callKey           func(args map[string]any) string
+	adapter           agentToolAdapter
 }
 
 // usesHistory 报这次的输入是不是框架从父 session 拼的全历史：两个选项同时设时自定义 schema 优先
@@ -203,6 +217,9 @@ func (t *agentTool) InputSchema() map[string]any {
 	if t.customInputSchema != nil {
 		return t.customInputSchema
 	}
+	if t.adapter != nil {
+		return t.adapter.AgentToolInputSchema()
+	}
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -216,18 +233,19 @@ func (t *agentTool) InputSchema() map[string]any {
 }
 
 func (t *agentTool) Call(ctx context.Context, args map[string]any) (*tool.Result, error) {
-	// #7 F1 fix: 输入 schema 三模式
+	// 输入优先级
 	//   1. customInputSchema 非 nil → args 整体 marshal JSON 作 input.Content
 	//   2. fullHistoryInput 启用 → 从父 sess.HistoryFor("") 拼 messages 作 input.Content
-	//   3. 默认 → args["input"] 字符串作 input.Content
-	var inputStr string
+	//   3. agent 提供默认 schema 与输入转换 → 按其契约构造消息
+	//   4. 默认 → args["input"] 字符串作 input.Content
+	var subInput *schema.Message
 	switch {
 	case t.customInputSchema != nil:
 		raw, err := json.Marshal(args)
 		if err != nil {
 			return tool.Failure(tool.ErrCodeInternal, "AgentAsTool: marshal custom args: "+err.Error()), nil
 		}
-		inputStr = string(raw)
+		subInput = schema.UserMessage(string(raw))
 	case t.usesHistory():
 		// 父 sess 含完整对话历史 — 取所有 messages 拼成 single user message
 		//
@@ -239,6 +257,7 @@ func (t *agentTool) Call(ctx context.Context, args map[string]any) (*tool.Result
 		// 原样返回、annotation 完好）；skill body 打在 tool_result 上，从来就没被挡住过。
 		//
 		// 真要挡父的框架元信息，得在 rewrite 之前按角色/内容判，或让 HistoryFor 带 owner。
+		var inputStr string
 		if parentSess := GetSession(ctx); parentSess != nil {
 			// 调用方提供的前文不放进来：子 agent 读历史时照它自己的规则已经看得到它（以客户端为准时排在它的前文最前，以
 			// 服务端为准时在写进历史层的记录里，见 caller_history.go），这里再放一份，同一次调用里子 agent 看到两遍
@@ -259,6 +278,7 @@ func (t *agentTool) Call(ctx context.Context, args map[string]any) (*tool.Result
 			}
 			inputStr = sb.String()
 		}
+		subInput = schema.UserMessage(inputStr)
 		// 父 sess 为空 (caller 裸调 tool.Call) → 退化空 input
 		// **注意** (audit H2-b doc warn): FullHistoryInput 只取**当前 sess** events.
 		// 多层嵌套 AgentAsTool(sub) → sub 内 AgentAsTool(grandchild) +
@@ -266,11 +286,20 @@ func (t *agentTool) Call(ctx context.Context, args map[string]any) (*tool.Result
 		// events (NewSharedChildSession events 独立父, 入口空)——不含**根 sess**
 		// 内容. 业务想完整对话走 `sess.RootSession().HistoryFor("")` 自管 wrap.
 		// (同款限制: 只取当前 sess 的 messages, 不递归上追根 sess.)
+	case t.adapter != nil:
+		var err error
+		subInput, err = t.adapter.AgentToolInput(args)
+		if err != nil {
+			return tool.Failure(tool.ErrCodeInvalidArguments, err.Error()), nil
+		}
+		if subInput == nil {
+			return tool.Failure(tool.ErrCodeInvalidArguments, "agent tool returned no input message"), nil
+		}
 	default:
-		inputStr, _ = args["input"].(string)
+		inputStr, _ := args["input"].(string)
+		subInput = schema.UserMessage(inputStr)
 	}
 
-	subInput := schema.UserMessage(inputStr)
 	// **fullHistoryInput 拼出来的那份要标派生**，否则子 agent 会把它当真实用户输入记进
 	// 会话历史。判据是「拼进去的东西是不是已经在历史里」：这一份 100% 由框架从父对话
 	// 拍扁而来，父自己的输入 / 每轮产出 / 工具结果都已各自记过，全可重算。
@@ -339,6 +368,9 @@ func (t *agentTool) Call(ctx context.Context, args map[string]any) (*tool.Result
 	out := FinalMessage(events)
 	if out == nil {
 		return tool.Success(""), nil
+	}
+	if t.adapter != nil {
+		return tool.Success(t.adapter.AgentToolOutput(out)), nil
 	}
 	return tool.Success(out.Content), nil
 }

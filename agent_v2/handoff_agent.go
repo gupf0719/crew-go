@@ -173,8 +173,8 @@ func (h *HandoffAgent) AddAgent(name string, ag Agent) *HandoffAgent {
 	if err := compose_v2.ValidateNodeIDForNS(name); err != nil {
 		panic(fmt.Sprintf("HandoffAgent.AddAgent: name %q invalid for ns: %v", name, err))
 	}
-	// audit³ HIGH-1 fix: isAgentNil 检 typed nil interface
-	if isAgentNil(ag) {
+	// audit³ HIGH-1 fix: IsNilAgent 检 typed nil interface
+	if IsNilAgent(ag) {
 		panic(fmt.Sprintf("HandoffAgent.AddAgent: name %q has nil agent (含 Go typed nil interface 陷阱)", name))
 	}
 	// review-v6 M-12 fix: dup name 校验 — 之前 `h.agents[name] = ag` map 写入 silent
@@ -296,9 +296,7 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 	abandonTasksAtEntry(ctx, cfg.abandoned, h.Name())
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentIn)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
@@ -384,9 +382,7 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	agentInResume := &hook.AgentInput{}
 	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentInResume)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentInResume)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})

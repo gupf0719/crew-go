@@ -55,36 +55,36 @@ func TestToolApprovedRule(t *testing.T) {
 	other := call("read_file", `{"path":"a.txt"}`)
 	cfg := &Config{}
 
-	if isToolApproved(nil, cfg, transfer5000) {
+	if isToolApproved(nil, cfg, transfer5000, "") {
 		t.Error("nil session 应返 false 不 panic")
 	}
 
 	t.Run("approve_always 只批这件事", func(t *testing.T) {
 		s := NewRunSession()
-		if isToolApproved(s, cfg, transfer5000) {
+		if isToolApproved(s, cfg, transfer5000, "") {
 			t.Fatal("未标记不应命中")
 		}
-		markToolApproved(s, cfg, transfer5000, false)
-		if !isToolApproved(s, cfg, transfer5000) {
+		markToolApproved(s, cfg, transfer5000, "", false)
+		if !isToolApproved(s, cfg, transfer5000, "") {
 			t.Error("同工具同参数应命中")
 		}
 		// **承重**：换了参数就是另一件事，必须重新问
-		if isToolApproved(s, cfg, transfer9999) {
+		if isToolApproved(s, cfg, transfer9999, "") {
 			t.Error("批了「转张三 5000」不该顺带批准「转李四 9999」——" +
 				"这正是把 key 从裸工具名收紧到参数级要挡住的")
 		}
-		if isToolApproved(s, cfg, other) {
+		if isToolApproved(s, cfg, other, "") {
 			t.Error("不同工具不该命中")
 		}
 	})
 
 	t.Run("approve_always_tool 批整个工具", func(t *testing.T) {
 		s := NewRunSession()
-		markToolApproved(s, cfg, transfer5000, true)
-		if !isToolApproved(s, cfg, transfer9999) {
+		markToolApproved(s, cfg, transfer5000, "", true)
+		if !isToolApproved(s, cfg, transfer9999, "") {
 			t.Error("工具级规则应覆盖该工具的任何调用")
 		}
-		if isToolApproved(s, cfg, other) {
+		if isToolApproved(s, cfg, other, "") {
 			t.Error("工具级规则不该外溢到别的工具")
 		}
 	})
@@ -98,21 +98,21 @@ func TestToolApprovedRule(t *testing.T) {
 			return tc.Function.Arguments
 		}}
 		s := NewRunSession()
-		markToolApproved(s, scoped, transfer5000, false)
+		markToolApproved(s, scoped, transfer5000, "", false)
 		same := call("transfer_money", `{"to":"张三","amount":1}`)
-		if !isToolApproved(s, scoped, same) {
+		if !isToolApproved(s, scoped, same, "") {
 			t.Error("按业务归一化后应算同一件事")
 		}
-		if isToolApproved(s, scoped, transfer9999) {
+		if isToolApproved(s, scoped, transfer9999, "") {
 			t.Error("归一化后不同的仍应重新问")
 		}
 	})
 
 	t.Run("多条规则并存不互相覆盖", func(t *testing.T) {
 		s := NewRunSession()
-		markToolApproved(s, cfg, transfer5000, false)
-		markToolApproved(s, cfg, other, false)
-		if !isToolApproved(s, cfg, transfer5000) || !isToolApproved(s, cfg, other) {
+		markToolApproved(s, cfg, transfer5000, "", false)
+		markToolApproved(s, cfg, other, "", false)
+		if !isToolApproved(s, cfg, transfer5000, "") || !isToolApproved(s, cfg, other, "") {
 			t.Error("二次写入不应覆盖首次（read-modify-write）")
 		}
 	})
@@ -159,7 +159,7 @@ func TestCallApprovalFns(t *testing.T) {
 	// 承重：跟 don't-ask-again 规则集是两套独立的东西，互不污染
 	s := NewRunSession()
 	anyCall := schema.ToolCall{ID: "k1", Function: schema.FunctionCall{Name: "k1", Arguments: "{}"}}
-	if isToolApproved(s, &Config{}, anyCall) {
+	if isToolApproved(s, &Config{}, anyCall, "") {
 		t.Error("「这次调用批过」不该让 don't-ask-again 规则命中")
 	}
 }

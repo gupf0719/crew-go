@@ -8,7 +8,7 @@ package agent_v2
 // 把授予改寄给任意对象——那正是 self 参数要挡的东西。哨兵 TestGrantBreak_B6c 用它证明
 // 「省掉 self 会当场重开 B8g」。
 func RegrantHandoffToNoSelfCheck(opts []RunOption, to Agent) []RunOption {
-	if isAgentNil(to) {
+	if IsNilAgent(to) {
 		return opts
 	}
 	g := grantFromOpts(opts)

@@ -115,15 +115,19 @@ func TestServeRun_DoesNotRestoreEntryDeletedBeforeTaskConflict(t *testing.T) {
 	key := sessionKey{owner: "o", threadID: "late-conflict"}
 	sid := seedPending(t, h, cp, key, 0)
 	h.build = func(hooks hook.Hooks) agent_v2.Agent {
-		if hasCP(sid) {
-			t.Fatal("旧存档应在构造新 Agent 前清理")
+		return &beforeReplacementRun{
+			Agent: agent_v2.NewBasicAgent(agent_v2.WithName("busy-replace"), agent_v2.WithModel(&capModel{}), agent_v2.WithHooks(hooks)),
+			before: func() {
+				if hasCP(sid) {
+					t.Fatal("开始新 Run 前应已删掉旧存档")
+				}
+				_, activity, err := compose_v2.BeginTaskActivity(t.Context(), sid, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(activity.Release)
+			},
 		}
-		_, activity, err := compose_v2.BeginTaskActivity(t.Context(), sid, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(activity.Release)
-		return agent_v2.NewBasicAgent(agent_v2.WithName("busy-replace"), agent_v2.WithModel(&capModel{}), agent_v2.WithHooks(hooks))
 	}
 	w := httptest.NewRecorder()
 	sse, ok := NewSSEWriter(w)
@@ -136,6 +140,16 @@ func TestServeRun_DoesNotRestoreEntryDeletedBeforeTaskConflict(t *testing.T) {
 	if !strings.Contains(w.Body.String(), `"code":"busy"`) || h.sessions[key] != nil {
 		t.Fatalf("删档后的任务冲突应报 busy，旧入口应移除，实际 %s", w.Body.String())
 	}
+}
+
+type beforeReplacementRun struct {
+	agent_v2.Agent
+	before func()
+}
+
+func (a *beforeReplacementRun) Run(ctx context.Context, s *agent_v2.RunSession, input *schema.Message, opts ...agent_v2.RunOption) ([]*agent_v2.AgentEvent, error) {
+	a.before()
+	return a.Agent.Run(ctx, s, input, opts...)
 }
 
 // TestSessionTTL_BusyEntryNeverReclaimed 钉住在途的动不得。

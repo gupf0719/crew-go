@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"crew-go/agent_v2"
@@ -123,6 +124,47 @@ func TestToolSearch_EndToEnd(t *testing.T) {
 
 	if final := agent_v2.FinalMessage(events); final == nil || !strings.Contains(final.Content, "天气") {
 		t.Errorf("应有最终答案，实际 %v", final)
+	}
+}
+
+func TestToolSearch_EndHookVetoDiscardsOnlyItsMatches(t *testing.T) {
+	var denied, allowed atomic.Int32
+	tk := tool.NewToolkit()
+	for name, count := range map[string]*atomic.Int32{"mcp_x_denied": &denied, "mcp_x_allowed": &allowed} {
+		tk.Register(tool.NewFuncTool(name, name, map[string]any{"type": "object"},
+			func(context.Context, map[string]any) (*tool.Result, error) {
+				count.Add(1)
+				return tool.Success(name), nil
+			}))
+	}
+	m := &captureToolsModel{responses: []*schema.Message{
+		schema.AssistantToolCallMessage([]schema.ToolCall{
+			{ID: "s1", Function: schema.FunctionCall{Name: "tool_search", Arguments: `{"query":"mcp_x_denied"}`}},
+			{ID: "s2", Function: schema.FunctionCall{Name: "tool_search", Arguments: `{"query":"mcp_x_allowed"}`}},
+		}),
+		schema.AssistantToolCallMessage([]schema.ToolCall{
+			{ID: "t1", Function: schema.FunctionCall{Name: "mcp_x_denied", Arguments: `{}`}},
+			{ID: "t2", Function: schema.FunctionCall{Name: "mcp_x_allowed", Arguments: `{}`}},
+		}),
+		schema.AssistantMessage("done"),
+	}}
+	h := &toolEndRecorder{rewrite: func(result *schema.ToolCallResult) {
+		if strings.HasPrefix(result.Output, "已解锁") && strings.Contains(result.Output, "mcp_x_denied") {
+			result.Success, result.Error, result.ErrorCode = false, "检索被拒绝", "policy_denied"
+		}
+	}}
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("search_veto"), agent_v2.WithModel(m), agent_v2.WithToolkit(tk),
+		agent_v2.WithHooks(h), agent_v2.WithToolSearch(&agent_v2.ToolSearchConfig{
+			Enabled: true, Deferred: mcpStylePrefix,
+			Retriever: func(_ context.Context, query string, _ []tool.Tool) []string { return []string{query} },
+		}), agent_v2.WithMaxRounds(5))
+	events, err := ag.Run(t.Context(), agent_v2.NewRunSession(), schema.UserMessage("检索"))
+	if msg := agent_v2.FinalMessage(events); err != nil || msg == nil || msg.Content != "done" {
+		t.Fatalf("应执行到第三轮，实际 %v，%v", msg, err)
+	}
+	if len(m.bound) < 2 || sliceHas(m.bound[1], "mcp_x_denied") || !sliceHas(m.bound[1], "mcp_x_allowed") ||
+		denied.Load() != 0 || allowed.Load() != 1 {
+		t.Fatalf("只应提交未被否决的检索结果，实际绑定 %v，执行次数 %d / %d", m.bound, denied.Load(), allowed.Load())
 	}
 }
 

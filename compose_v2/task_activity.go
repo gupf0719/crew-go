@@ -44,7 +44,7 @@ func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandon
 	taskActivities.Lock()
 	if taskActivities.byID[sid].abandoning {
 		taskActivities.Unlock()
-		return ctx, nil, fmt.Errorf("cannot execute task %q: %w", sid, ErrTaskBusy)
+		return ctx, nil, &TaskBusyError{TaskID: sid, operation: "cannot execute task"}
 	}
 	for _, id := range abandoned {
 		if id == "" || id == sid {
@@ -53,7 +53,7 @@ func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandon
 		}
 		if _, busy := taskActivities.byID[id]; busy {
 			taskActivities.Unlock()
-			return ctx, nil, fmt.Errorf("cannot abandon task %q: %w", id, ErrTaskBusy)
+			return ctx, nil, &TaskBusyError{TaskID: id, operation: "cannot abandon task"}
 		}
 	}
 	if sid != "" {

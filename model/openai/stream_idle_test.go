@@ -163,3 +163,40 @@ func TestStreamIdleTimeout_DefaultOnAndDisable(t *testing.T) {
 		t.Fatalf("关掉空闲超时后应由调用方 ctx 结束，实际 %v", err)
 	}
 }
+
+func TestStream_ConsumerCloseCancelsRequest(t *testing.T) {
+	finished := make(chan struct{})
+	release := make(chan struct{})
+	frame := sseFrame(contentChunk(t, "半截"))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, frame) // 测试端检查实际收到的片段。
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+			close(finished)
+		case <-release:
+		}
+	}))
+	t.Cleanup(func() { close(release); srv.Close() })
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	c := newStreamClient(srv, openai.WithStreamIdleTimeout(0))
+	sr, err := c.Stream(ctx, []*schema.Message{schema.UserMessage("hi")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sr.Close()
+	if chunk, err := sr.Recv(ctx); err != nil || chunk == nil || chunk.Content != "半截" {
+		t.Fatalf("关闭前应收到片段，实际 %v, %v", chunk, err)
+	}
+	sr.Close()
+	select {
+	case <-finished:
+		if ctx.Err() != nil {
+			t.Fatal("请求取消不应依赖调用方 ctx 到期")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("关流后 HTTP 服务端没有收到请求取消")
+	}
+}

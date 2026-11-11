@@ -657,13 +657,13 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// ID 再问一遍（`config_single_source_test.go` 钉着这条）。
 	//
 	// 回落之后两个方向都闭合：缺省从 ctx 取 ⟹ 根子必然同源；下方既有的 push-down 又把
-	// 合并结果写回 ctx ⟹ 下游只见合并后的单一真相。**没有「显式禁用」档**——
-	// `WithCheckpointer(nil)` 归一成「未设」（见其 typed-nil 归一），「根层明确不要持久化
-	// 但 ctx 里有」这一档在项目里没有真实调用方，不为脑补场景加哨兵。
+	// 合并结果写回 ctx ⟹ 下游只见合并后的配置。WithoutCheckpointing 作用于整个执行范围。
 	//
 	// graphNS 同批回落：不回落的话「ctx push 了 ns + 裸 Run」会让根档落在 ""、子档落在
 	// `ctxNS/...`——根不是子的 ns 祖先，树自身错位。
-	if cfg.checkpointer == nil {
+	if checkpointingDisabled(ctx) {
+		cfg.checkpointer = nil
+	} else if cfg.checkpointer == nil {
 		cfg.checkpointer = GetCheckpointer(ctx)
 	}
 	if cfg.sessionID == "" {

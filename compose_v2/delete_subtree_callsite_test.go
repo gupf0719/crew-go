@@ -6,7 +6,7 @@ package compose_v2_test
 // 那句提醒**三版一次都没拦住**。第一版对账用文本 grep + 硬编码目录白名单，独立审计实测
 // **12 种写法只抓到 5 种**，而且当时就漏着一个真调用点（`example/` 里那个）。
 //
-// 这一版按 go/ast 做，逐 `FuncDecl` 遍历（不用滚动的「当前函数名」游标），找**任何**
+// 这一版按 go/ast 做，逐 `ast.FuncDecl` 遍历（不用滚动的「当前函数名」游标），找**任何**
 // `X.DeleteSubtree` 形态的引用——调用、method value、跨行点号、defer、embedding 提升、
 // 字段链都是同一个 `*ast.SelectorExpr`，一并落网。
 //
@@ -25,7 +25,7 @@ package compose_v2_test
 // # 覆盖边界（如实写，不假装）
 //
 // 钉的是「**主 module 非测试代码**的调用点集合与条数」，不是「DeleteSubtree 调用点」。
-// 拦不住的：反射（`MethodByName`，任何静态手段都拦不住）、`_test.go`（按设计）、
+// 拦不住的：反射（`reflect.Value.MethodByName`，任何静态手段都拦不住）、`_test.go`（按设计）、
 // 独立 module（`sql/` `redis/` `a2a/zk/` 各有自己的 go.mod；`redis/checkpointer_cleanup.go`
 // 今天就有两个未入账的生产调用点，属声明过的范围）。
 
@@ -54,6 +54,7 @@ var knownDeleteSubtreeCallSites = map[string]callSiteNote{
 	"agent_v2/resume_helpers.go:commonResumePrep":            {1, "Abort——顶层空前缀；嵌套 Abort 无更外层清理者，残留留着"},
 	"agent_v2/history_slot.go:abandonTasksAtEntry":           {1, "WithAbandonedTasks 放弃旧任务，持有放弃许可并以空前缀删整个旧任务"},
 	"agui/handler.go:(*handler).deleteCP":                    {1, "会话丢弃，持有删档许可并以空前缀删整个任务"},
+	"a2a/server/executor.go:(*Executor).discardFailed":       {1, "终态失败失去续接入口，持有任务的放弃许可后按空前缀清理"},
 	"example/store/redis_smoke/main.go:demoCheckpointer":     {1, "example 演示，空前缀"},
 }
 
@@ -180,7 +181,7 @@ func TestDeleteSubtree_CallSitesAccountedFor(t *testing.T) {
 	}
 }
 
-// renderFuncKey 把 FuncDecl 渲染成带 receiver 的 key：`(*handler).dropCP` / `plainFn`。
+// renderFuncKey 把 ast.FuncDecl 渲染成带接收者的方法键，普通函数仅保留函数名。
 // 不带 receiver 时同名方法会塌成一个 key（审计实测：同文件里另一个类型上的 dropCP
 // 直接白蹭已登记那条的答案）。
 func renderFuncKey(fd *ast.FuncDecl) string {

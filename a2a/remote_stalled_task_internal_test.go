@@ -90,16 +90,18 @@ func TestReattach_StalledTaskIsAnErrorNotAnEmptyAnswer(t *testing.T) {
 	}
 	ctx := context.Background()
 	sess := agent_v2.NewRunSession()
-	if _, err := ra.Run(ctx, sess, schema.UserMessage("hi")); err != nil {
+	first, err := ra.Run(ctx, sess, schema.UserMessage("hi"))
+	if err != nil {
 		t.Fatalf("前置：远端要人时默认模式交回追问，实际 %v", err)
 	}
-	taskID, _ := ra.loadIDs(sess)
-	if taskID == "" || !ra.loadHandleWaiting(sess) {
-		t.Fatalf("fixture 没搭对：句柄应留着、在等人，实际 task=%q", taskID)
+	token := Continuation(agent_v2.FinalMessage(first))
+	if token == "" {
+		t.Fatal("前置：普通追问应交回续接句柄")
 	}
+	answer := WithContinuation(schema.UserMessage("more"), token)
 
 	stalled.Store(true) // 远端重启：任务留在 working、没有执行
-	evs, err := ra.Run(ctx, sess, schema.UserMessage("more"))
+	evs, err := ra.Run(ctx, sess, answer)
 	if err == nil {
 		final := ""
 		if m := agent_v2.FinalMessage(evs); m != nil {
@@ -110,13 +112,9 @@ func TestReattach_StalledTaskIsAnErrorNotAnEmptyAnswer(t *testing.T) {
 	if !strings.Contains(err.Error(), "not working on it") {
 		t.Fatalf("错误应说明远端没在办这个任务，实际 %v", err)
 	}
-	if got, _ := ra.loadIDs(sess); got != taskID {
-		t.Fatalf("句柄应留着（task=%q），实际 %q", taskID, got)
-	}
-
 	// 远端恢复：同一个句柄续得上，答复照常送到
 	stalled.Store(false)
-	evs, err = ra.Run(ctx, sess, schema.UserMessage("more"))
+	evs, err = ra.Run(ctx, sess, answer)
 	if err != nil {
 		t.Fatalf("远端恢复之后应续上原来的任务：%v", err)
 	}
@@ -125,8 +123,8 @@ func TestReattach_StalledTaskIsAnErrorNotAnEmptyAnswer(t *testing.T) {
 	}
 }
 
-// 远端流里给出一个本版本 SDK 认不出的任务状态（映射成 Unspecified）然后关流：按「流停在中间状态上」处理，句柄留着，
-// 不跟「远端只回了一条消息、没有任务」混成已完成（曾经清掉句柄、把状态消息当最终答复，审计实测）。
+// 远端流里给出一个本版本 SDK 认不出的任务状态（映射成 Unspecified）然后关流：保留会话线程，
+// 不把那条状态消息当最终答复或后续普通委派的目标。
 func TestConsume_UnrecognizedTaskStateIsNotCompleted(t *testing.T) {
 	mux := http.NewServeMux()
 	srv := httptest.NewUnstartedServer(mux)
@@ -161,8 +159,8 @@ func TestConsume_UnrecognizedTaskStateIsNotCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run：%v", err)
 	}
-	if tid, _ := ra.loadIDs(sess); tid != "t1" {
-		t.Fatalf("认不出的状态不算结束，句柄应留着（t1），实际 %q", tid)
+	if tid, cid := ra.loadIDs(sess); tid != "" || cid != "c1" {
+		t.Fatalf("普通委派只应保留会话线程，实际 task=%q context=%q", tid, cid)
 	}
 	if m := agent_v2.FinalMessage(evs); m != nil && m.Content == "paused" {
 		t.Fatal("认不出的状态不该被当成已完成、把状态消息当最终答复")

@@ -171,8 +171,8 @@ func WithReflectMaxRetries(n int) ReflectOption {
 // 与 ReflectorAgent 配合：未达标时 reflector_agent 跑产 Opinion 喂下一轮 actor。
 func WithEvaluator(ag Agent) ReflectOption {
 	return func(r *ReflectAgent) {
-		// audit³ HIGH-1 fix: isAgentNil 检 typed nil interface
-		if isAgentNil(ag) {
+		// audit³ HIGH-1 fix: IsNilAgent 检 typed nil interface
+		if IsNilAgent(ag) {
 			panic("WithEvaluator: nil agent (含 Go typed nil interface 陷阱)")
 		}
 		r.evaluator = ag
@@ -187,8 +187,8 @@ func WithEvaluator(ag Agent) ReflectOption {
 // 不设 ReflectorAgent 时未达标的 Opinion 留空（actor 看不到具体改进方向）。
 func WithReflectorAgent(ag Agent) ReflectOption {
 	return func(r *ReflectAgent) {
-		// audit³ HIGH-1 fix: isAgentNil 检 typed nil interface
-		if isAgentNil(ag) {
+		// audit³ HIGH-1 fix: IsNilAgent 检 typed nil interface
+		if IsNilAgent(ag) {
 			panic("WithReflectorAgent: nil agent (含 Go typed nil interface 陷阱)")
 		}
 		r.reflectorAgent = ag
@@ -197,8 +197,8 @@ func WithReflectorAgent(ag Agent) ReflectOption {
 
 // WithActor 设 actor sub-agent（必填，链式）。
 func (r *ReflectAgent) WithActor(ag Agent) *ReflectAgent {
-	// audit³ HIGH-1 fix: isAgentNil 检 typed nil interface
-	if isAgentNil(ag) {
+	// audit³ HIGH-1 fix: IsNilAgent 检 typed nil interface
+	if IsNilAgent(ag) {
 		panic("ReflectAgent.WithActor: nil agent (含 Go typed nil interface 陷阱)")
 	}
 	r.actor = ag
@@ -261,9 +261,7 @@ func (r *ReflectAgent) Run(ctx context.Context, session *RunSession, input *sche
 	abandonTasksAtEntry(ctx, cfg.abandoned, r.Name())
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentIn)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
@@ -349,9 +347,7 @@ func (r *ReflectAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	agentInResume := &hook.AgentInput{}
 	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentInResume)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentInResume)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})

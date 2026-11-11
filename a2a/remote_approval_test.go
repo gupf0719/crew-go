@@ -196,8 +196,7 @@ func TestRemoteAgent_ApprovalInEngineHook_AbortsAndCancelsRemote(t *testing.T) {
 	}
 }
 
-// 默认模式下节点里的普通追问：补信息再调一次，续的是同一个远端任务。节点里的提问位置一律取之后，默认模式照旧靠
-// session 上的句柄续跑——换成 gate 模式那样不用句柄的话，补的信息会被当成新任务的请求发出去、原始请求丢了。
+// 默认模式下，节点用追问返回的句柄补充信息，续同一个远端任务。
 func TestRemoteAgent_DefaultMode_InNodeFollowUpContinuesSameTask(t *testing.T) {
 	r := &waitingRemote{stop: a2atypes.TaskStateInputRequired}
 	ra, err := a2a.NewRemoteAgent(context.Background(), startServer(t, r))
@@ -213,7 +212,11 @@ func TestRemoteAgent_DefaultMode_InNodeFollowUpContinuesSameTask(t *testing.T) {
 		if m := agent_v2.FinalMessage(first); m == nil || !strings.Contains(m.Content, "[input_required]") {
 			return "", errors.New("前置：第一次调用应返回远端的追问")
 		}
-		second, err := ra.Run(ctx, sess, schema.UserMessage("补充信息"))
+		token := a2a.Continuation(agent_v2.FinalMessage(first))
+		if token == "" {
+			return "", errors.New("普通追问缺续接句柄")
+		}
+		second, err := ra.Run(ctx, sess, a2a.WithContinuation(schema.UserMessage("补充信息"), token))
 		if err != nil {
 			return "", err
 		}

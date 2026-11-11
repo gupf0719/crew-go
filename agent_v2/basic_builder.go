@@ -1531,7 +1531,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 本轮 tool_search 解锁的工具进 channel——权威副本随 checkpoint 走，续跑后
 		// 不必依赖消息历史还在（见 basicRevealedCh）。
 		unlockedNew := false
-		if names := newlyRevealed(turn.list(), revealed); len(names) > 0 {
+		if names := newlyRevealed(turn.accepted(results), revealed); len(names) > 0 {
 			writes = append(writes, compose_v2.Write(basicRevealedCh, names))
 			unlockedNew = true
 		}

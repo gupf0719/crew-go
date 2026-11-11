@@ -381,7 +381,7 @@ func WithAgentsMD(paths ...string) Option {
 
 // WithModel 设置 LLM ChatModel。
 //
-// **audit⁶ HIGH-2 fix**: isFrameworkNil 检 typed nil (协议六复证 — audit² isAgentNil
+// **audit⁶ HIGH-2 fix**: isFrameworkNil 检 typed nil (协议六复证 — audit² IsNilAgent
 // 只防 Agent, model.ChatModel 等其他 framework interface 全漏). 业务
 // `var m *MyModel; WithModel(m)` typed nil → Generate() 远 stack nil deref.
 func WithModel(m model.ChatModel) Option {

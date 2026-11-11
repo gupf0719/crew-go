@@ -1139,6 +1139,7 @@ go run ./example/orchestration/nested_smoke
 > 的接线错误（`errUncatchableHookInterrupt`，实现 `compose_v2.NonRetryable`；不用
 > `ErrRunAborted` 是因为那捆绑「清 cp 子树」，而这个错抛在图执行之前、什么档都没写，
 > 清档会误伤同 sid 下无关的残档）。哨兵 `agent_v2/hook_interrupt_scope_test.go`。
+> 在该钩子里经 `RunSubAgent` 发起的同任务调用也没有接收挂起的父节点，框架在子调用内关闭存档。
 >
 > Web 示例用顶层 BasicAgent 的 `OnModelEnd` 和嵌套成员的 `OnAgentStart` 响应暂停。要在超步边界停止，使用 `WithSoftCancel`。
 

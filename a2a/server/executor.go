@@ -63,6 +63,7 @@ import (
 	"iter"
 	"log/slog"
 	"sync"
+	"time"
 
 	"crew-go/a2a"
 	"crew-go/agent_v2"
@@ -601,6 +602,10 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateInputRequired, pendingMessage(qs, "")), nil)
 			return
 		}
+		if compose_v2.LeavesResumableCheckpoint(r.err) && !stale && !notResumable && !graphConflict && !notPersisted &&
+			!errors.Is(r.err, compose_v2.ErrTaskLeaseLost) && !taskMayBeBusy(r.err, st.sess.RunID) {
+			e.discardFailed(ctx, st.sess.RunID)
+		}
 		if notResumable {
 			// 同款脱敏：`ErrCheckpointNotResumable` 的文案含 sid / ns / graphID / 各字段
 			// 计数，那是给服务端日志排查用的，不该跨进程回传给远端对端。
@@ -661,6 +666,29 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		}
 	}
 	yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateCompleted, msg), nil)
+}
+
+func taskMayBeBusy(err error, sid string) bool {
+	if !errors.Is(err, compose_v2.ErrTaskBusy) {
+		return false
+	}
+	var busy *compose_v2.TaskBusyError
+	return !errors.As(err, &busy) || busy.TaskID == sid
+}
+
+// discardFailed 回收已失去续接入口的失败任务。在本地及后端许可下清理整棵任务子树。
+func (e *Executor) discardFailed(ctx context.Context, sid string) {
+	ctx = compose_v2.WithCheckpointerCtx(context.WithoutCancel(ctx), e.cp)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cleanupCtx, activity, err := compose_v2.BeginTaskActivity(ctx, "", []string{sid})
+	if err == nil {
+		defer activity.Release()
+		_, err = e.cp.DeleteSubtree(cleanupCtx, sid, "")
+	}
+	if err != nil {
+		slog.WarnContext(ctx, "a2a server: 失败任务的存档清理未完成", "sid", sid, "err", err)
+	}
 }
 
 // acquire 取出 task 状态并标 busy（防同 task 并发续发）。canceled tombstone 拒绝续发。

@@ -75,7 +75,11 @@ func TestRemoteAgent_DistinctApprovalAfterOrdinaryQuestion(t *testing.T) {
 	if msg := agent_v2.FinalMessage(events); err != nil || msg == nil || !strings.Contains(msg.Content, "reference number?") {
 		t.Fatalf("应收到普通追问，实际 final=%+v err=%v", msg, err)
 	}
-	_, err = ra.Run(ctx, sess, schema.UserMessage("42"))
+	token := a2a.Continuation(agent_v2.FinalMessage(events))
+	if token == "" {
+		t.Fatal("普通追问缺续接句柄")
+	}
+	_, err = ra.Run(ctx, sess, a2a.WithContinuation(schema.UserMessage("42"), token))
 	if ie, ok := compose_v2.IsInterrupt(err); !ok || !strings.Contains(ie.Query.Question, "approve deletion?") {
 		t.Fatalf("应收到第二项审批，实际 %v", err)
 	}
@@ -180,9 +184,14 @@ func checkLostApproval(t *testing.T, hosted, stale, firstApproval bool) {
 	}
 	events, err := agUnderTest.Run(ctx, sess, schema.UserMessage("request"))
 	ie, ok := compose_v2.IsInterrupt(err)
+	var token string
 	if !hosted && !firstApproval {
 		if msg := agent_v2.FinalMessage(events); err != nil || msg == nil || !strings.Contains(msg.Content, "approve refund?") {
 			t.Fatalf("fixture ordinary question: final=%+v err=%v", msg, err)
+		}
+		token = a2a.Continuation(agent_v2.FinalMessage(events))
+		if token == "" {
+			t.Fatal("普通追问缺续接句柄")
 		}
 	} else if !ok || !strings.Contains(ie.Query.Question, "approve refund?") {
 		t.Fatalf("fixture first question: %v", err)
@@ -195,6 +204,9 @@ func checkLostApproval(t *testing.T, hosted, stale, firstApproval bool) {
 		}
 		if hosted {
 			return agUnderTest.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess), agent_v2.WithResumeUserInputs(map[string]*schema.Message{ie.Query.InterruptID: msg}))
+		}
+		if first && token != "" {
+			msg = a2a.WithContinuation(msg, token)
 		}
 		return agUnderTest.Run(ctx, sess, msg)
 	}

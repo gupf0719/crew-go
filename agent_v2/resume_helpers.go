@@ -52,7 +52,7 @@ type resumePrep struct {
 //   - res.AbortDone=true: caller 直接 `return nil, nil`
 //   - 否则 caller 用 res.Cper / res.Rcfg / res.Session + newCtx 继续
 //
-// **历史教训** (CLAUDE.md "协议变更四复证"): commit `dc142c3` isAgentNil 7 编排
+// **历史教训** (CLAUDE.md "协议变更四复证"): commit `dc142c3` IsNilAgent 7 编排
 // 漏 SetExecutor + WithLLMPlannerSubAgents 2 处, 协议落地不完整. 抽 helper 后
 // 9 编排走同一 code path, 未来协议改 (e.g., R29 视角 4/5 forward graphNS to abort)
 // 一次改 helper 覆盖 9 编排, 不再漏修.

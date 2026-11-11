@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"crew-go/compose_v2"
 	"crew-go/schema"
 	"crew-go/skill"
 	"crew-go/tool"
@@ -112,24 +113,31 @@ func revealedFromChannelCtx(ctx context.Context) []string {
 	return names
 }
 
-// revealTurn 记 tools 节点这一次执行里 tool_search 解锁了哪些名字。工具体拿不到 channel 写入口，记在这里，节点成功后
-// 由 tools 节点写进 basicRevealedCh；节点失败或中断时随这次执行一起丢掉，续跑重跑这一批时检索重新记一遍（tool_search
-// 不进工具账）。一批里几个 tool_search 并发跑（N≥2 走 goroutine），所以带锁。
+// revealTurn 按批内下标记 tool_search 命中的候选。tools 节点在结束钩子裁决后只提交成功调用的候选。
 type revealTurn struct {
-	mu    sync.Mutex
-	names []string
+	mu     sync.Mutex
+	byCall map[int][]string
 }
 
-func (t *revealTurn) add(names ...string) {
+func (t *revealTurn) add(index int, names ...string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.names = append(t.names, names...)
+	if t.byCall == nil {
+		t.byCall = make(map[int][]string)
+	}
+	t.byCall[index] = append(t.byCall[index], names...)
 }
 
-func (t *revealTurn) list() []string {
+func (t *revealTurn) accepted(results []*schema.Message) []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return append([]string(nil), t.names...)
+	var names []string
+	for i, result := range results {
+		if isToolSearchCall(result) && !isFailedToolResult(result) {
+			names = append(names, t.byCall[i]...)
+		}
+	}
+	return names
 }
 
 // revealTurnKey 把 [revealTurn] 交给这一批的工具体。它是执行状态：钩子返回别处存下的 ctx 时，采纳取框架这次的。
@@ -348,7 +356,7 @@ func (t *toolSearchTool) Call(ctx context.Context, args map[string]any) (*tool.R
 	}
 	// 记进这一批的解锁记录，tools 节点成功后写进 basicRevealedCh（工具体拿不到 channel 写入口）。这一批里的
 	// 执行闸不认它：闸只认这一批开始前已提交的解锁集（见 revealedNames）。
-	turn.add(matched...)
+	turn.add(compose_v2.GetCurrentToolCallIndex(ctx), matched...)
 	// 把解锁的工具名 + 描述回给 LLM，让它知道从下一轮起能调哪些。
 	var b strings.Builder
 	fmt.Fprintf(&b, "已解锁 %d 个工具，现在可直接调用：\n", len(matched))

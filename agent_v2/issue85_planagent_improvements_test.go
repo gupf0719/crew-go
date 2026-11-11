@@ -487,7 +487,7 @@ func TestISSUE85_AuditFollowup_HIGH2_WithSubAgentsMergesNotOverwrite(t *testing.
 // `var b *BasicAgent` (nil pointer) → 传 Agent interface 时 header 持非 nil type tag
 // → `a == nil` false → 旧 fail-fast 漏检 → 业务后续 ag.Run nil deref panic 难定位。
 //
-// **sanity-revert**: isAgentNil 改回 `if a == nil` → typed nil 不 panic → 测试 fail。
+// **sanity-revert**: IsNilAgent 改回 `if a == nil` → typed nil 不 panic → 测试 fail。
 func TestISSUE85_AuditFollowup2_HIGH2_AddSubAgentTypedNilTrap(t *testing.T) {
 	pl := func(_ context.Context, _ *agent_v2.RunSession, _ string, _ []agent_v2.ExecutedStep) ([]agent_v2.PlanStep, string, error) {
 		return nil, "", nil
@@ -496,7 +496,7 @@ func TestISSUE85_AuditFollowup2_HIGH2_AddSubAgentTypedNilTrap(t *testing.T) {
 		r := recover()
 		if r == nil {
 			t.Errorf("audit² HIGH-A2 fix: AddSubAgent typed nil interface 应 panic, got no panic\n" +
-				"sanity-revert: isAgentNil 改回 `if a == nil` → typed nil 不 panic → 测试 fail")
+				"sanity-revert: IsNilAgent 改回 `if a == nil` → typed nil 不 panic → 测试 fail")
 			return
 		}
 		if !strings.Contains(fmt.Sprint(r), "typed nil") {

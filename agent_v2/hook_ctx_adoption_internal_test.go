@@ -239,6 +239,18 @@ func TestHookCtx_AdoptedHooksOnlyThroughCallHook(t *testing.T) {
 						return false // 钩子方法自己的实现；返回 false 时不会再收到这个节点的 nil
 					}
 					stack = append(stack, n)
+					if call, ok := n.(*ast.CallExpr); ok {
+						switch fn := call.Fun.(type) {
+						case *ast.Ident:
+							if pkg.Name == "agent_v2" && fn.Name == "CallAgentStart" {
+								calls++
+							}
+						case *ast.SelectorExpr:
+							if ident, ok := fn.X.(*ast.Ident); ok && ident.Name == "agent_v2" && fn.Sel.Name == "CallAgentStart" {
+								calls++
+							}
+						}
+					}
 					sel, ok := n.(*ast.SelectorExpr)
 					if !ok || !adoptedHookMethods[sel.Sel.Name] {
 						return true

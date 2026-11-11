@@ -165,8 +165,8 @@ func WithRouter(fn RoutingAgentRouter) RoutingOption {
 // 小模型也可以不配工具，靠最后一种（整段文本等于分支名，格式敏感）。
 func WithRoutingClassifier(ag Agent) RoutingOption {
 	return func(r *RoutingAgent) {
-		// audit³ HIGH-1 fix: isAgentNil 检 typed nil interface
-		if isAgentNil(ag) {
+		// audit³ HIGH-1 fix: IsNilAgent 检 typed nil interface
+		if IsNilAgent(ag) {
 			panic("WithRoutingClassifier: nil agent (含 Go typed nil interface 陷阱)")
 		}
 		r.classifier = ag
@@ -180,8 +180,8 @@ func WithRoutingClassifier(ag Agent) RoutingOption {
 // 不设时 classifier 失败返回 [*RouteUndecidedError]，与决策方都拿不准又无处升级时一样。
 func WithRoutingFallback(ag Agent) RoutingOption {
 	return func(r *RoutingAgent) {
-		// audit³ HIGH-1 fix: isAgentNil 检 typed nil interface
-		if isAgentNil(ag) {
+		// audit³ HIGH-1 fix: IsNilAgent 检 typed nil interface
+		if IsNilAgent(ag) {
 			panic("WithRoutingFallback: nil agent (含 Go typed nil interface 陷阱)")
 		}
 		r.fallback = ag
@@ -229,8 +229,8 @@ func WithRoutingMaxRetries(n int) RoutingOption {
 // 或为空）、name 是 "__fallback__"（兜底分支的内部名）或 "__end__"（路由目标 "__end__" 会被
 // 当成图的终点，同名分支永远跑不到）、name 重复。
 func (r *RoutingAgent) AddBranch(name string, ag Agent) *RoutingAgent {
-	// audit³ HIGH-1 fix: isAgentNil 检 typed nil interface
-	if isAgentNil(ag) {
+	// audit³ HIGH-1 fix: IsNilAgent 检 typed nil interface
+	if IsNilAgent(ag) {
 		panic(fmt.Sprintf("RoutingAgent.AddBranch: name %q has nil agent (含 Go typed nil interface 陷阱)", name))
 	}
 	// 名字会拼进分支的节点 ID 与存档命名空间，不符合 ns 命名规范的在构造期就报，不等到 Run 期
@@ -327,9 +327,7 @@ func (r *RoutingAgent) Run(ctx context.Context, session *RunSession, input *sche
 	abandonTasksAtEntry(ctx, cfg.abandoned, r.Name())
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentIn)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
@@ -417,9 +415,7 @@ func (r *RoutingAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	agentInResume := &hook.AgentInput{}
 	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentInResume)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentInResume)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})

@@ -134,8 +134,8 @@ func WithSequentialMaxRetries(n int) SequentialOption {
 //
 // 必须在 Run 之前调用。返回自身以便链式。
 func (s *SequentialAgent) AddStep(name string, ag Agent) *SequentialAgent {
-	// audit³ HIGH-1 fix: isAgentNil 检 typed nil interface 陷阱 (与 PlanAgent 协议对称)
-	if isAgentNil(ag) {
+	// audit³ HIGH-1 fix: IsNilAgent 检 typed nil interface 陷阱 (与 PlanAgent 协议对称)
+	if IsNilAgent(ag) {
 		panic(fmt.Sprintf("SequentialAgent.AddStep: name %q has nil agent (含 Go typed nil interface 陷阱)", name))
 	}
 	// review-v6 M-12 + M-17 fix: dup name 校验 — 之前 silent 覆盖 agA 让 step name 错乱
@@ -230,9 +230,7 @@ func (s *SequentialAgent) Run(ctx context.Context, session *RunSession, input *s
 	abandonTasksAtEntry(ctx, cfg.abandoned, s.Name())
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentIn)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
@@ -326,9 +324,7 @@ func (s *SequentialAgent) Resume(ctx context.Context, sessionID string, opts ...
 	agentInResume := &hook.AgentInput{}
 	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentInResume)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentInResume)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})

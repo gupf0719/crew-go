@@ -600,12 +600,19 @@ func sessionHandleNextRequest(t *testing.T, opts ...a2a.RemoteOption) []string {
 	}
 	ctx := context.Background()
 	sess := agent_v2.NewRunSession()
+	var continuation string
 	for _, in := range []string{"req-A", "答:批准吗:req-A", "req-B"} {
-		if _, err := ra.Run(ctx, sess, schema.UserMessage(in)); err != nil {
+		msg := schema.UserMessage(in)
+		if continuation != "" {
+			msg = a2a.WithContinuation(msg, continuation)
+		}
+		events, err := ra.Run(ctx, sess, msg)
+		if err != nil {
 			if _, ok := compose_v2.IsInterrupt(err); !ok {
 				t.Fatalf("Run(%q)：%v（远端收到 %q）", in, err, r.snapshot())
 			}
 		}
+		continuation = a2a.Continuation(agent_v2.FinalMessage(events))
 	}
 	r.check(t)
 	return r.snapshot()

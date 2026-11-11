@@ -86,8 +86,7 @@ func scenarioA(ctx context.Context) {
 	expect("A/Task 完成", final, "task done: complete now")
 }
 
-// 场景 B：input-required 默认（返追问）+ taskID 续跑——同 session 再发，RemoteAgent
-// loadIDs 拿上轮存的 taskID → server StoredTask 命中 → "got it: blue"。
+// 场景 B：默认模式返回追问，随后用续接句柄补答。
 func scenarioB(ctx context.Context) {
 	ra := mustAgent(ctx, false) // 不开 humanGate
 	sess := agent_v2.NewRunSession()
@@ -98,7 +97,18 @@ func scenarioB(ctx context.Context) {
 	}
 	fmt.Printf("✓ B/input-required 默认返追问: %q\n", first.Content)
 
-	second := mustRun(ra, sess, "blue") // 同 session → 续同一远程 task
+	token := a2a.Continuation(first)
+	if token == "" {
+		log.Fatal("B/普通追问缺少续接句柄")
+	}
+	events, err := ra.Run(ctx, sess, a2a.WithContinuation(schema.UserMessage("blue"), token))
+	if err != nil {
+		log.Fatalf("B/续接失败：%v", err)
+	}
+	second := agent_v2.FinalMessage(events)
+	if second == nil {
+		log.Fatal("B/续接没有最终答复")
+	}
 	expect("B/taskID 续跑", second, "got it: blue")
 }
 

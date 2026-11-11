@@ -168,4 +168,5 @@ query 值与长路径段），响应体再截到 512 字节（不切断多字节
   `initialize` 处 400；加 `WithHTTPHeader("Accept", "application/json, text/event-stream")` 之后只有
   `StreamableHTTPOptions{Stateless: true, JSONResponse: true}` 能用（另三种败在 SSE 响应或缺 initialized 通知）。
 - 图片、音频不交给模型（只有一行说明）：要原样交，得让 tool_result 带图片块（Anthropic 支持），牵涉 schema 与各家适配器，没做。
-- stdio 子进程继承主进程的全部环境变量（`WithStdioEnv` 只能追加）。
+
+stdio 子进程默认继承父进程环境。`WithStdioEnvAllowlist` 选择允许继承的变量名，传空名单可清空继承项。`WithStdioEnv` 设置的值照常传入，同名值覆盖继承值。Windows 上 `os/exec` 会补入 `SYSTEMROOT`。

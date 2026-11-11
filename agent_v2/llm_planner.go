@@ -60,10 +60,10 @@ func WithLLMPlannerSubAgents(agents map[string]Agent) LLMPlannerOption {
 	return func(c *llmPlannerConfig) {
 		c.subAgents = make([]llmSubAgentMeta, 0, len(agents))
 		for name, ag := range agents {
-			// audit⁴ HIGH-2 fix: isAgentNil 检 typed nil interface (与 WithSubAgents 协议对称).
+			// audit⁴ HIGH-2 fix: IsNilAgent 检 typed nil interface (与 WithSubAgents 协议对称).
 			// 旧 `if ag != nil` 漏 Go typed nil interface: `var b *BasicAgent; WithLLMPlannerSubAgents(map{...})`
 			// 时 ag != nil 为 true → ag.Description() nil deref panic.
-			if isAgentNil(ag) {
+			if IsNilAgent(ag) {
 				panic(fmt.Sprintf("WithLLMPlannerSubAgents: name %q has nil agent (含 Go typed nil interface 陷阱)", name))
 			}
 			desc := ag.Description()

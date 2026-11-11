@@ -179,6 +179,7 @@ type Hooks interface {
 	// schema.ErrStreamCanceled——这次模型调用按失败处理。要在半路截断、把已有内容当完整输出，
 	// 就在自己的 Recv 里返回 io.EOF。这类失败默认可重试：按确定的规则掐流（如内容审核）时，配了
 	// 重试的编排会重跑到次数用完，想让它不重试就在 Recv 里返回实现了 compose_v2.NonRetryable 的错误。
+	// 替换流的 Recv 需要响应传入的 ctx 取消。消费方提前关闭时，框架取消读取，再关闭替换流。
 	OnModelEndStream(ctx context.Context, info *AgentInfo, sr specModel.MessageStreamReader) (context.Context, specModel.MessageStreamReader, error)
 	// OnToolStart 在**整批** tool_call 派发之前串行触发一次/个，位置在工具执行单位
 	// **外面**——拿不到 memo、审批状态、批量合并。

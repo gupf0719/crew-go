@@ -520,9 +520,9 @@ func (t *skillTool) runForkMode(ctx context.Context, active *skill.ActiveSkill, 
 		}
 		subAgent = resolved
 	}
-	// audit⁵ HIGH-2 fix: isAgentNil 检 typed nil interface (resolver 返 `(*BasicAgent)(nil), nil`
+	// audit⁵ HIGH-2 fix: IsNilAgent 检 typed nil interface (resolver 返 `(*BasicAgent)(nil), nil`
 	// 是 Go 经典误区, subAgent != nil 通过 → 后续 subAgent.Run / subAgent.Name 远 stack nil deref).
-	if isAgentNil(subAgent) {
+	if IsNilAgent(subAgent) {
 		// 默认路径：创建新 BasicAgent + skill body 作 sysPrompt + per-skill model（或 parent model 兜底）
 		subModel := t.parentModel
 		if active.Skill.Model != "" && t.modelResolver != nil {

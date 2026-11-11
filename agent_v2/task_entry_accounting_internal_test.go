@@ -51,6 +51,9 @@ func TestTaskEntry_EveryEntryDecidesBeforeOnAgentStart(t *testing.T) {
 							hookPos = ce.Pos()
 						}
 					case *ast.Ident:
+						if fn.Name == "CallAgentStart" && hookPos == token.NoPos {
+							hookPos = ce.Pos()
+						}
 						if fn.Name == want && entryPos == token.NoPos {
 							entryPos = ce.Pos()
 						}

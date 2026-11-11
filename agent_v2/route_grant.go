@@ -54,7 +54,7 @@ func (g *routeGrant) grantFor(self any) *routeGrant {
 
 // regrant 铸一份发给 child 的新授予。只有已经自查过的授予才该调它；nil 接收者返 nil。
 func (g *routeGrant) regrant(child Agent) *routeGrant {
-	if g == nil || isAgentNil(child) {
+	if g == nil || IsNilAgent(child) {
 		return nil
 	}
 	return &routeGrant{grantee: child}
@@ -73,7 +73,7 @@ func (g *routeGrant) regrant(child Agent) *routeGrant {
 // fallback），**不报错**：「这一层不该替我定路由」是绝大多数调用的正确答案，框架分不出「你忘了」
 // 和「你就是不想给」。
 func RegrantRouteTo(opts []RunOption, self Agent, to Agent) []RunOption {
-	if isAgentNil(self) || isAgentNil(to) {
+	if IsNilAgent(self) || IsNilAgent(to) {
 		return opts
 	}
 	g := routeGrantFromOpts(opts).grantFor(self)
@@ -172,7 +172,7 @@ func shadowNodeGrants(ctx context.Context) context.Context {
 // （裸调还会让被调方的存档撞进外层的槽）。
 func RegrantFromNode(ctx context.Context, to Agent) []RunOption {
 	g, _ := ctx.Value(nodeGrantsKey{}).(*memberGrants)
-	if g == nil || isAgentNil(to) {
+	if g == nil || IsNilAgent(to) {
 		return nil
 	}
 	return g.regrantOpts(to)

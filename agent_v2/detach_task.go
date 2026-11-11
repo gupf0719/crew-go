@@ -87,6 +87,7 @@ func detachedFromRunning(ctx context.Context, runID string) bool {
 // context.WithValue / Value 调用，两边都没实现就红。
 func (sessionKey) ExecutionState()               {}
 func (slotClaimKey) ExecutionState()             {}
+func (topLevelAgentStartKey) ExecutionState()    {}
 func (taskScopeKey) ExecutionState()             {}
 func (callApprovalKey) ExecutionState()          {}
 func (finalRoundKey) ExecutionState()            {}

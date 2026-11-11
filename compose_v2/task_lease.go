@@ -149,7 +149,7 @@ func (a *TaskActivity) acquireCheckpointLeases(ctx context.Context, cp Checkpoin
 	for _, id := range a.abandoned {
 		if existing := taskLeaseFrom(ctx, store, id); existing != nil && !existing.released.Load() {
 			if !slices.Contains(a.sharedAbandons, existing) {
-				return ctx, fmt.Errorf("cannot abandon task %q: %w", id, ErrTaskBusy)
+				return ctx, &TaskBusyError{TaskID: id, operation: "cannot abandon task"}
 			}
 			continue // 同一次调用里重复声明同一个旧任务。
 		}
@@ -228,7 +228,7 @@ func acquireCheckpointTaskLease(ctx context.Context, store TaskLeaseStore, sid s
 		return ctx, nil, fmt.Errorf("acquire checkpoint lease for task %q: %w", sid, err)
 	}
 	if !ok {
-		return ctx, nil, fmt.Errorf("cannot acquire checkpoint lease for task %q: %w", sid, ErrTaskBusy)
+		return ctx, nil, &TaskBusyError{TaskID: sid, operation: "cannot acquire checkpoint lease for task"}
 	}
 
 	renewCtx, stop := context.WithCancel(context.WithoutCancel(ctx))

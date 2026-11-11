@@ -102,11 +102,16 @@ func TestRemoteAgent_TaskIDSurvivesWithinSameTask(t *testing.T) {
 
 	sess := agent_v2.NewRunSession()
 	ctx := context.Background()
-	if _, err := ra.Run(ctx, sess, schema.UserMessage("订个会议室")); err != nil {
+	first, err := ra.Run(ctx, sess, schema.UserMessage("订个会议室"))
+	if err != nil {
 		t.Fatalf("第一轮: %v", err)
 	}
+	token := a2a.Continuation(agent_v2.FinalMessage(first))
+	if token == "" {
+		t.Fatal("普通追问缺续接句柄")
+	}
 	// **不调 NextTask**——这仍是同一个任务，只是在补远端要的信息
-	if _, err := ra.Run(ctx, sess, schema.UserMessage("下午三点")); err != nil {
+	if _, err := ra.Run(ctx, sess, a2a.WithContinuation(schema.UserMessage("下午三点"), token)); err != nil {
 		t.Fatalf("同任务续跑: %v", err)
 	}
 

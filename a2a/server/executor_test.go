@@ -240,7 +240,7 @@ func TestServerHITL_FullLoop(t *testing.T) {
 }
 
 // TestServerHITL_DefaultMode 客户端不开 humanGate：input-required 当普通追问返回，
-// 同 session 再调（续 taskID）→ 服务端 Resume → 终答。
+// 同 session 带追问句柄再调 → 服务端 Resume → 终答。
 func TestServerHITL_DefaultMode(t *testing.T) {
 	base := serveAgent(t, newAsker(t, "Which color do you prefer?"))
 	ctx := context.Background()
@@ -260,7 +260,7 @@ func TestServerHITL_DefaultMode(t *testing.T) {
 		t.Fatalf("默认模式应返追问，got %v", first)
 	}
 
-	ev2, err := ra.Run(ctx, sess, schema.UserMessage("blue"))
+	ev2, err := ra.Run(ctx, sess, a2a.WithContinuation(schema.UserMessage("blue"), a2a.Continuation(first)))
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestServerMultiQueryJoin(t *testing.T) {
 		t.Fatalf("两问都应带上 interruptId，got %q", first.Content)
 	}
 
-	ev2, err := ra.Run(ctx, sess, schema.UserMessage("both-ok"))
+	ev2, err := ra.Run(ctx, sess, a2a.WithContinuation(schema.UserMessage("both-ok"), a2a.Continuation(first)))
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestServerMultiQueryJoin(t *testing.T) {
 	}
 
 	answer := fmt.Sprintf(`{%q: "a-ans", %q: "b-ans"}`, ids[0][1], ids[1][1])
-	ev3, err := ra.Run(ctx, sess, schema.UserMessage(answer))
+	ev3, err := ra.Run(ctx, sess, a2a.WithContinuation(schema.UserMessage(answer), a2a.Continuation(second)))
 	if err != nil {
 		t.Fatalf("Run 3: %v", err)
 	}

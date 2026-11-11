@@ -127,7 +127,7 @@ func TestToolsGate_IgnoresSameBatchReveals(t *testing.T) {
 	call := []schema.ToolCall{{ID: "l", Type: "function", Function: schema.FunctionCall{Name: "lookup", Arguments: `{}`}}}
 
 	turn := &revealTurn{}
-	turn.add("lookup")
+	turn.add(0, "lookup")
 	ctx := withRevealTurn(withRevealedFromChannel(context.Background(), nil), turn)
 	results, err := toolsFn(ctx, call, []context.Context{ctx})
 	if err != nil {

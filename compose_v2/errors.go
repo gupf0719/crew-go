@@ -178,6 +178,18 @@ var ErrRunAborted = errors.New("compose_v2: run aborted (terminal failure, check
 // ErrTaskBusy 表示同一个任务有与当前操作冲突的执行或放弃。冲突操作返回后可重试。
 var ErrTaskBusy = errors.New("compose_v2: task is busy")
 
+// TaskBusyError 标出拒绝操作的任务。父任务的失败收尾可区分自己的冲突和子任务的冲突。
+type TaskBusyError struct {
+	TaskID    string
+	operation string
+}
+
+func (e *TaskBusyError) Error() string {
+	return fmt.Sprintf("%s %q: %s", e.operation, e.TaskID, ErrTaskBusy)
+}
+
+func (e *TaskBusyError) Unwrap() error { return ErrTaskBusy }
+
 // ErrTaskLeaseLost 表示本次执行已失去存档任务租约，不能再变更该任务的存档。
 var ErrTaskLeaseLost = errors.New("compose_v2: checkpoint task lease lost")
 

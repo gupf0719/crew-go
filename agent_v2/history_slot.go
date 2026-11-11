@@ -555,7 +555,7 @@ func walkHistorySubs(subs []Agent, visit func(Agent) bool) (exhausted bool) {
 	var walk func(subs []Agent) bool
 	walk = func(subs []Agent) bool {
 		for _, sub := range subs {
-			if isAgentNil(sub) {
+			if IsNilAgent(sub) {
 				continue
 			}
 			if reflect.ValueOf(sub).Comparable() {

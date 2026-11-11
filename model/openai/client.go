@@ -238,6 +238,7 @@ func (c *Client) Generate(ctx context.Context, messages []*schema.Message, opts 
 //   - 不要 token: Content=="" 的 message 跳过即可 (不影响文本拼接)
 //
 // BasicAgent.streamOrGenerate 已自动聚合此 usage 到 final message.Metadata.Usage.
+// 消费方提前关闭流时会取消 HTTP 请求。
 func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
 	if c.streamUnsupported {
 		return nil, model.ErrStreamUnsupported
@@ -245,19 +246,23 @@ func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ..
 	o := model.Apply(opts...)
 	req := c.buildRequest(messages, o, true)
 
-	httpReq, err := c.newHTTPRequest(ctx, req)
+	streamCtx, cancel := context.WithCancel(ctx)
+	httpReq, err := c.newHTTPRequest(streamCtx, req)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	httpResp, err := c.client.Do(httpReq)
 	if err != nil {
+		cancel()
 		return nil, &model.APIError{Provider: c.providerName(), Err: fmt.Errorf("request failed: %w", err)}
 	}
 
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(httpResp.Body)
 		httpResp.Body.Close()
+		cancel()
 		return nil, &model.APIError{
 			Provider:   c.providerName(),
 			StatusCode: httpResp.StatusCode,
@@ -270,8 +275,8 @@ func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ..
 	if c.streamIdleTimeout > 0 {
 		body = newIdleReader(body, c.streamIdleTimeout)
 	}
-	sr, send := schema.NewStreamReader[*schema.Message](8)
-	go c.consumeStream(ctx, body, sr, send)
+	sr, send := schema.NewStreamReaderWithCancel[*schema.Message](8, cancel)
+	go c.consumeStream(ctx, cancel, body, sr, send)
 	return sr, nil
 }
 
@@ -533,7 +538,8 @@ type streamState struct {
 // 也算）。下面这些都报错，不当正常结束：读响应体出错、调用方 ctx 取消、错误帧（data 里带
 // error 键，或 event: error）、data 不是 JSON、结束原因表示输出被截掉或生成被打断、流结束时
 // 没收到结束原因。只闭流不报错的话，消费方读到 io.EOF，会把半截内容当成完整答复。
-func (c *Client) consumeStream(ctx context.Context, body io.ReadCloser, sr *schema.StreamReader[*schema.Message], send func(*schema.Message)) {
+func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, sr *schema.StreamReader[*schema.Message], send func(*schema.Message)) {
+	defer cancel()
 	defer body.Close()
 	defer schema.CloseSend(sr)
 	// review-v6 M-23 fix: SSE 流处理某 chunk 字段类型变更 / send 闭包路径 panic 时
@@ -564,6 +570,11 @@ func (c *Client) consumeStream(ctx context.Context, body io.ReadCloser, sr *sche
 		}
 		ev, err := dec.next()
 		if err != nil {
+			select {
+			case <-sr.Done():
+				return
+			default:
+			}
 			c.endStream(ctx, sr, &st, err)
 			return
 		}

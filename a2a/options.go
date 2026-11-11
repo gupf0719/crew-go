@@ -77,7 +77,7 @@ func WithObservability(obs *observability.Observability) RemoteOption {
 // crew-go 时，要真人把关就开 WithHumanGate。
 //
 // **默认（不开）**：普通追问（input-required）当普通输出返回——host BasicAgent 的 LLM 看到远程
-// 追问后在 ReAct 循环里自动补信息再调一次（续同一远程 task，零中断零 cp）。适合"host
+// 追问后在 ReAct 循环里回传 continuation 参数、补信息再调一次（续同一远程 task）。适合"host
 // 自己能答"。**前提是有 LLM host**：默认模式返的
 // "call this tool again" 追问需一个 ReAct LLM 看到后再调。若把**非 humanGate** 的
 // RemoteAgent 嵌进**无 LLM 的确定性编排**（Sequential/Parallel/Loop），追问会变成
@@ -98,7 +98,7 @@ func WithObservability(obs *observability.Observability) RemoteOption {
 //     retryCfg 重试——发原始请求；新任务再来要人是新问题，换一个 ID 问人。曾经人的回答被当成新任务的第一条
 //     消息发出去、原始请求丢了（实测）。
 //   - 发送在网络层失败（远端任务还在等人）时记录留着，重跑带同一个答复续同一个任务、不重问。
-//   - 远端答完这一问之后改问一个交给宿主模型的普通追问（默认模式）：记录同样清掉，人的答复不会再发给远端。曾经
+//   - 远端答完这一问之后改问一个交给宿主模型的普通追问（默认模式）：记下新的追问供节点重放，人的答复不会再发给远端。曾经
 //     记录留着，节点再跑时把人的批准又发了一遍、被当成那个追问的答复（实测）。
 //   - 记录按调用位置分开：节点里先后几次调用、同一批几个 tool_call、几个并行分支各续各的。曾经整个任务
 //     共用 session 上的一个句柄，一个调用续掉另一个调用挂着的远端任务（实测）。

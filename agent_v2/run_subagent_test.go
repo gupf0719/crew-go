@@ -158,12 +158,12 @@ func TestRunSubAgent_InvalidNodeID(t *testing.T) {
 
 // TestRunSubAgent_NilSubAgent 验证 sub nil 时 fail-fast (不 panic).
 //
-// **#7 audit follow-up M6 fix**: 加 typed nil interface case 让 isAgentNil reflect
+// **#7 audit follow-up M6 fix**: 加 typed nil interface case 让 IsNilAgent reflect
 // 路径被覆盖 (CLAUDE.md "Go interface typed nil 陷阱"). 之前只测 untyped nil literal,
-// `var b *captureSubAgent; RunSubAgent(..., b, ...)` typed nil 路径漏 — 砍 isAgentNil
+// `var b *captureSubAgent; RunSubAgent(..., b, ...)` typed nil 路径漏 — 砍 IsNilAgent
 // 内 reflect.IsNil 让 `a == nil` 早出, 测试仍 PASS silent.
 //
-// sanity-revert: 砍 agent_helpers.go::isAgentNil 内 reflect 部分让 `return a == nil`,
+// sanity-revert: 砍 agent_helpers.go::IsNilAgent 内 reflect 部分让 `return a == nil`,
 // typed nil case 测试 fail.
 func TestRunSubAgent_NilSubAgent(t *testing.T) {
 	// Case 1: untyped nil literal — 早期出 (a == nil)
@@ -177,7 +177,7 @@ func TestRunSubAgent_NilSubAgent(t *testing.T) {
 	var asIface agent_v2.Agent = typedNil
 	_, err = agent_v2.RunSubAgent(context.Background(), "child", asIface, schema.UserMessage("hi"))
 	if err == nil || !strings.Contains(err.Error(), "nil sub-agent") {
-		t.Errorf("typed nil interface 应 fail-fast 含 'nil sub-agent' (isAgentNil reflect 路径), got %v", err)
+		t.Errorf("typed nil interface 应 fail-fast 含 'nil sub-agent' (IsNilAgent reflect 路径), got %v", err)
 	}
 }
 

@@ -84,9 +84,9 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 	// 跟 [runNestedCall] 对称的 fail-fast。少了它，typed nil 成员会在**错误路径**上炸——
 	// `m.agent.Run` 自己的 recover 把 panic 转成 error，控制流进到下面的 err 分支，
 	// 然后 `m.agent.Name()` 在 runMember 内部裸 panic（独立审计实测的调用栈）。
-	// 今天所有注册入口都查过 isAgentNil 故不可达，但两个姊妹 helper 一个有一个没有
+	// 今天所有注册入口都查过 IsNilAgent 故不可达，但两个姊妹 helper 一个有一个没有
 	// 本身就是下一个人的坑。
-	if isAgentNil(m.agent) {
+	if IsNilAgent(m.agent) {
 		return nil, fmt.Errorf("runMember: nil member agent (含 Go typed nil interface 陷阱)")
 	}
 	subCtx := compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), m.nsSuffix))

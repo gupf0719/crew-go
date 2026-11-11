@@ -136,13 +136,19 @@ func TestRemoteAgent_LostResponse_SessionHandleRecoversResult(t *testing.T) {
 	}
 	ctx := context.Background()
 	sess := agent_v2.NewRunSession()
-	if _, err := ra.Run(ctx, sess, schema.UserMessage("原始请求")); err != nil {
+	first, err := ra.Run(ctx, sess, schema.UserMessage("原始请求"))
+	if err != nil {
 		t.Fatalf("第一次 Run 应返回追问：%v", err)
 	}
-	if _, err := ra.Run(ctx, sess, schema.UserMessage("补充")); err == nil || !lost.Load() {
+	token := a2a.Continuation(agent_v2.FinalMessage(first))
+	if token == "" {
+		t.Fatal("普通追问缺续接句柄")
+	}
+	answer := a2a.WithContinuation(schema.UserMessage("补充"), token)
+	if _, err := ra.Run(ctx, sess, answer); err == nil || !lost.Load() {
 		t.Fatalf("fixture 没搭对：第二次 Run 的响应应丢失并报错，实际 err=%v lost=%v", err, lost.Load())
 	}
-	evs, err := ra.Run(ctx, sess, schema.UserMessage("补充"))
+	evs, err := ra.Run(ctx, sess, answer)
 	if err != nil {
 		t.Fatalf("第三次 Run 应取回已完成任务的结果，实际 %v（远端收到 %q）", err, r.snapshot())
 	}

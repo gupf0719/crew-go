@@ -40,6 +40,55 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
+type recordFailedSave struct {
+	compose_v2.Checkpointer
+	saved chan string
+}
+
+func (c *recordFailedSave) SaveNS(ctx context.Context, sid, ns string, cp *compose_v2.Checkpoint) error {
+	if err := c.Checkpointer.SaveNS(ctx, sid, ns, cp); err != nil {
+		return err
+	}
+	c.saved <- sid
+	return nil
+}
+
+func TestExecutor_FailedRunDiscardsCheckpoint(t *testing.T) {
+	b := compose_v2.NewBuilder().WithName("failed_task")
+	b.AddNode("work", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		return nil, errors.New("temporary work failure")
+	})
+	b.AddEdge(compose_v2.StartNode, "work")
+	b.AddEdge("work", compose_v2.EndNode)
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ag := agent_v2.NewGraphAgent(g, agent_v2.WithGraphAgentName("failed_task"),
+		agent_v2.WithGraphInputWriter(func(*schema.Message) []compose_v2.ChannelWrite { return nil }),
+		agent_v2.WithGraphOutputReader(func(compose_v2.Channels) *schema.Message { return nil }))
+	e := NewExecutor(ag, WithOwnerResolver(func(context.Context) string { return "tenant" }))
+	cp := &recordFailedSave{Checkpointer: compose_v2.NewInMemoryCheckpointer(), saved: make(chan string, 8)}
+	e.cp = cp
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	events := drain(e.Execute(ctx, &a2asrv.ExecutorContext{
+		TaskID: "failed-task", ContextID: "thread",
+		Message: a2atypes.NewMessage(a2atypes.MessageRoleUser, a2atypes.NewTextPart("run")),
+	}))
+	if state := lastStatus(events); state != a2atypes.TaskStateFailed || !strings.Contains(lastMessageText(events), "temporary work failure") {
+		t.Fatalf("任务应以节点的业务错误结束，实际 %s %q", state, lastMessageText(events))
+	}
+	select {
+	case sid := <-cp.saved:
+		if all, err := cp.LoadAllInSession(t.Context(), sid); err != nil || len(all) != 0 {
+			t.Fatalf("失败任务没有续接入口，应删掉已写入的档，实际 %v，%v", all, err)
+		}
+	default:
+		t.Fatal("测试应实际写入失败存档")
+	}
+}
+
 // reAskGateModel：round1 → ask_user("Q1")；resume 轮（见 tool_result）→ 发 hit 信号、阻塞 gate
 // 直到测试放行，然后**再问** ask_user("Q2")（触发第二次中断 SaveNS——判别器的关键）。
 type reAskGateModel struct {
@@ -484,5 +533,95 @@ func TestServerSpan_TimeoutAndCancelOutcomes(t *testing.T) {
 				t.Errorf("error.type=%q 应=%q", attrs["error.type"], c.errType)
 			}
 		})
+	}
+}
+
+func TestExecutor_InconsistentCheckpointRemainsForDiagnosis(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("a"), agent_v2.WithModel(&askThenDone{}), agent_v2.WithAskUser())
+	e := NewExecutor(ag, WithOwnerResolver(func(context.Context) string { return "tenant" }))
+	const tid, cid = "broken-task", "thread"
+	first := drain(e.Execute(ctx, &a2asrv.ExecutorContext{
+		TaskID: tid, ContextID: cid,
+		Message: a2atypes.NewMessage(a2atypes.MessageRoleUser, a2atypes.NewTextPart("ask")),
+	}))
+	if got := lastStatus(first); got != a2atypes.TaskStateInputRequired {
+		t.Fatalf("fixture did not interrupt: %s %s", got, lastMessageText(first))
+	}
+	state := e.tasks[taskKey{owner: "tenant", taskID: tid}]
+	sid := state.sess.RunID
+	cp, err := e.cp.LoadNS(ctx, sid, "")
+	if err != nil || cp == nil || len(cp.PendingInterrupts) == 0 {
+		t.Fatalf("fixture did not persist interrupt: %v %v", cp, err)
+	}
+	cp.CurrentFrontier = nil
+	if err := e.cp.SaveNS(ctx, sid, "", cp); err != nil {
+		t.Fatal(err)
+	}
+	result := drain(e.Execute(ctx, &a2asrv.ExecutorContext{
+		TaskID: tid, ContextID: cid, StoredTask: &a2atypes.Task{ID: tid, ContextID: cid},
+		Message: a2atypes.NewMessageForTask(a2atypes.MessageRoleUser,
+			a2atypes.TaskInfo{TaskID: tid, ContextID: cid}, a2atypes.NewTextPart("Alice")),
+	}))
+	if got, message := lastStatus(result), lastMessageText(result); got != a2atypes.TaskStateFailed || !strings.Contains(message, "inconsistent") {
+		t.Fatalf("expected inconsistent checkpoint failure: state=%s message=%q", got, message)
+	}
+	if cp, err := e.cp.LoadNS(ctx, sid, ""); err != nil || cp == nil {
+		t.Fatalf("failed A2A task purged inconsistent checkpoint: cp=%v err=%v", cp, err)
+	}
+}
+
+func TestExecutor_NestedBusyDiscardsOwnFailedArchive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	const other = "other-task"
+	_, abandon, err := compose_v2.BeginTaskActivity(ctx, "", []string{other})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer abandon.Release()
+	graph := func(name string, work compose_v2.NodeFunc) *compose_v2.Graph {
+		b := compose_v2.NewBuilder().WithName(name)
+		b.AddNode("work", work)
+		b.AddEdge(compose_v2.StartNode, "work")
+		b.AddEdge("work", compose_v2.EndNode)
+		g, err := b.Compile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+	child := graph("inner", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		t.Error("busy child should not run")
+		return nil, nil
+	})
+	parent := graph("outer", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		err := compose_v2.Run(ctx, child, compose_v2.NewChannelManager(), compose_v2.WithSessionID(other), compose_v2.WithRunNS("child"))
+		return nil, err
+	})
+	ag := agent_v2.NewGraphAgent(parent, agent_v2.WithGraphAgentName("outer"),
+		agent_v2.WithGraphInputWriter(func(*schema.Message) []compose_v2.ChannelWrite { return nil }),
+		agent_v2.WithGraphOutputReader(func(compose_v2.Channels) *schema.Message { return nil }))
+	e := NewExecutor(ag, WithOwnerResolver(func(context.Context) string { return "tenant" }))
+	cp := &recordFailedSave{Checkpointer: compose_v2.NewInMemoryCheckpointer(), saved: make(chan string, 8)}
+	e.cp = cp
+	events := drain(e.Execute(ctx, &a2asrv.ExecutorContext{
+		TaskID: "parent-failed", ContextID: "thread",
+		Message: a2atypes.NewMessage(a2atypes.MessageRoleUser, a2atypes.NewTextPart("run")),
+	}))
+	if state, msg := lastStatus(events), lastMessageText(events); state != a2atypes.TaskStateFailed || !strings.Contains(msg, "task is busy") {
+		t.Fatalf("expected parent failure from busy child: %s %q", state, msg)
+	}
+	select {
+	case sid := <-cp.saved:
+		if sid == other {
+			t.Fatal("parent overwrote other task")
+		}
+		if all, err := cp.LoadAllInSession(ctx, sid); err != nil || len(all) != 0 {
+			t.Fatalf("terminal parent left its own failed archive: %v err=%v", all, err)
+		}
+	default:
+		t.Fatal("fixture did not save a failed archive")
 	}
 }

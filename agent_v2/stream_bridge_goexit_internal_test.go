@@ -205,3 +205,41 @@ func TestStreamBridge_ErrorReachesBlockedConsumer(t *testing.T) {
 			"  （CloseSend 必须注册在最前 ⟹ 跑在最后：错误先进流、流再闭合）")
 	}
 }
+
+type waitingHookReader struct {
+	reading chan struct{}
+	closed  chan struct{}
+}
+
+func (r *waitingHookReader) Recv(ctx context.Context) (*crew_modules_common.Message, error) {
+	close(r.reading)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (r *waitingHookReader) Close() error {
+	close(r.closed)
+	return nil
+}
+
+func TestStreamBridge_CloseCancelsHookRecv(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	reader := &waitingHookReader{reading: make(chan struct{}), closed: make(chan struct{})}
+	out := streamReaderToSchema(ctx, reader)
+	defer out.Close()
+	select {
+	case <-reader.reading:
+	case <-ctx.Done():
+		t.Fatal("桥接没有读取钩子的流")
+	}
+	out.Close()
+	select {
+	case <-reader.closed:
+		if ctx.Err() != nil {
+			t.Fatal("关流不应依赖调用方 ctx 到期")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("消费方关流后没有取消 Recv 并释放钩子的流")
+	}
+}

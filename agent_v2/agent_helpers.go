@@ -322,7 +322,7 @@ func isFrameworkNil(v any) bool {
 	return false
 }
 
-// isAgentNil 检 Agent 是否真 nil — 防 Go interface "typed nil" 经典陷阱:
+// IsNilAgent 检 Agent 是否真 nil — 防 Go interface "typed nil" 经典陷阱:
 // `var b *BasicAgent; seq.AddStep("x", b)` 时 b 是 typed nil pointer 但
 // `Agent` interface header 持非 nil type tag → `a == nil` 是 false 不触发 fail-fast,
 // 业务后续 `ag.Run(...)` 在 worker 远 stack nil deref panic 难定位。
@@ -334,7 +334,7 @@ func isFrameworkNil(v any) bool {
 // **业务自定义 Agent 实现注意**: 假设 Agent 实现是 ptr/interface/map/slice/chan/func
 // (Go reflect 可 IsNil 的 kind). struct value 实现 (非 ptr receiver) 不在保护范围
 // — 业务自负 (struct value 没"nil"概念是 zero value 不是 nil).
-func isAgentNil(a Agent) bool {
+func IsNilAgent(a Agent) bool {
 	if a == nil {
 		return true
 	}
@@ -358,6 +358,19 @@ func (e *errUncatchableHookInterrupt) Error() string { return e.msg }
 
 // NonRetryable 实现 [compose_v2.NonRetryable]——接线错误重试必然一样。
 func (e *errUncatchableHookInterrupt) NonRetryable() {}
+
+type topLevelAgentStartKey struct{}
+
+// CallAgentStart 调用入口钩子并采纳它派生的 ctx。顶层入口钩子里发起的同任务子调用
+// 没有父节点接收挂起，框架在该子调用内关闭存档。独立任务可以先用 DetachTask 脱离。
+func CallAgentStart(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo, input *hook.AgentInput) (context.Context, error) {
+	return compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
+		if !compose_v2.WithinNodeScope(c) {
+			c = context.WithValue(c, topLevelAgentStartKey{}, true)
+		}
+		return hooks.OnAgentStart(c, info, input)
+	})
+}
 
 // WrapAgentStartErr 包装 OnAgentStart 返回的错误——**没人能接住的 hook 中断在这里被拒**。
 //

@@ -53,6 +53,7 @@ type CircuitBreaker struct {
 	// probeAt 是探测放行时刻——**防探测方 panic/忘记回报致 probing 永久卡死永久禁用**：
 	// 探测超过一个 cooldownDuration 未回报则视为过期，允许新探测（自愈兜底）。
 	probeAt time.Time
+	probeID uint64
 }
 
 // 默认 cooldown：trip 后 5 分钟允许第一次探测。覆盖大部分 quota 反弹 / API
@@ -80,17 +81,58 @@ func NewCircuitBreakerWithCooldown(maxFailures int, cooldown time.Duration) *Cir
 //   - tripped 但 cooldown 已过（cooldownDuration > 0）：true（让调用方探测）
 //   - tripped 且 cooldown 未过：false
 func (cb *CircuitBreaker) Allow() bool {
+	_, ok := cb.AllowWithProbe()
+	return ok
+}
+
+// AllowWithProbe 放行一次请求，并为半开探测返回非零编号。延迟结算的调用方用此编号
+// 将结局交给 RecordAttempt，防止过期探测影响后来取得名额的请求。
+func (cb *CircuitBreaker) AllowWithProbe() (uint64, bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	if !cb.wouldAllowLocked() {
-		return false
+		return 0, false
 	}
 	if cb.tripped {
 		// cooldown 过——**half-open 单次探测**：占下探测名额，其他并发 Allow 返 false 防 thundering herd。
 		cb.probing = true
 		cb.probeAt = time.Now()
+		cb.probeID++
+		return cb.probeID, true
 	}
-	return true
+	return 0, true
+}
+
+// CircuitBreakerResult 表示一次放行请求的结局。
+type CircuitBreakerResult uint8
+
+const (
+	CircuitBreakerIgnored CircuitBreakerResult = iota // 取消或请求自身有误，只归还探测名额。
+	CircuitBreakerSucceeded
+	CircuitBreakerFailed
+)
+
+// RecordAttempt 结算 AllowWithProbe 放行的请求。编号为零表示普通请求。探测名额在途时
+// 只接受持有者的结局。返回值表示此次失败触发了熔断。
+func (cb *CircuitBreaker) RecordAttempt(probeID uint64, result CircuitBreakerResult) bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.probing {
+		if probeID != cb.probeID {
+			return false
+		}
+	} else if probeID != 0 {
+		return false
+	}
+	switch result {
+	case CircuitBreakerSucceeded:
+		cb.recordSuccessLocked()
+	case CircuitBreakerFailed:
+		return cb.recordFailureLocked()
+	case CircuitBreakerIgnored:
+		cb.probing = false
+	}
+	return false
 }
 
 // WouldAllow 是 Allow 的只读版本：此刻调 Allow 会不会放行。不占半开的探测名额、不改任何状态，给只想预估
@@ -125,6 +167,10 @@ func (cb *CircuitBreaker) wouldAllowLocked() bool {
 func (cb *CircuitBreaker) RecordFailure() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	return cb.recordFailureLocked()
+}
+
+func (cb *CircuitBreaker) recordFailureLocked() bool {
 	cb.failures++
 	cb.probing = false // 探测结束（失败）——下个 cooldown 后可再放行单次探测
 	justTripped := false
@@ -142,6 +188,10 @@ func (cb *CircuitBreaker) RecordFailure() bool {
 func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	cb.recordSuccessLocked()
+}
+
+func (cb *CircuitBreaker) recordSuccessLocked() {
 	cb.failures = 0
 	cb.tripped = false
 	cb.probing = false // 探测成功——解除熔断 + 清探测标志

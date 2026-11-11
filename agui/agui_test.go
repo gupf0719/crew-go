@@ -945,6 +945,65 @@ func TestHandler_ClientDisconnect_ShortCircuit(t *testing.T) {
 	}
 }
 
+func TestHandler_ReplacementStartupFailureKeepsPreviousQuestion(t *testing.T) {
+	for _, failure := range []string{"disconnect", "nil_factory", "typed_nil_factory", "delete_panic"} {
+		t.Run(failure, func(t *testing.T) {
+			cp := &panicOnReplacementDrop{Checkpointer: compose_v2.NewInMemoryCheckpointer()}
+			m := &askThenAnswerModel{}
+			var factoryFailure string
+			h := ownedHandler(func(hooks hook.Hooks) agent_v2.Agent {
+				switch factoryFailure {
+				case "nil_factory":
+					return nil
+				case "typed_nil_factory":
+					return (*agent_v2.BasicAgent)(nil)
+				}
+				return agent_v2.NewBasicAgent(agent_v2.WithName("old_task"), agent_v2.WithModel(m),
+					agent_v2.WithAskUser(), agent_v2.WithHooks(hooks), agent_v2.WithMaxRounds(4))
+			}, agui.WithCheckpointer(cp))
+			first := postAGUI(h, `{"threadId":"t1","runId":"first","messages":[{"role":"user","content":"帮我"}]}`)
+			qid := findInterruptID(parseSSE(first.Body.String()))
+			if qid == "" {
+				t.Fatalf("旧任务没有挂起：%s", first.Body.String())
+			}
+			const replacement = `{"threadId":"t1","runId":"second","messages":[{"role":"user","content":"换个问题"}]}`
+			switch failure {
+			case "nil_factory", "typed_nil_factory":
+				factoryFailure = failure
+				if rec := postAGUI(h, replacement); rec.Code != http.StatusInternalServerError {
+					t.Fatalf("工厂失败应返回 500，实际 %d", rec.Code)
+				}
+				factoryFailure = ""
+			case "disconnect":
+				h.ServeHTTP(&failWriter{}, httptest.NewRequest(http.MethodPost, "/agui", strings.NewReader(replacement)))
+			case "delete_panic":
+				cp.fail = true
+				rec := postAGUI(h, replacement)
+				cp.fail = false
+				if !strings.Contains(rec.Body.String(), "replacement storage panic") {
+					t.Fatalf("替换应在删档前触发测试异常，实际 %s", rec.Body.String())
+				}
+			}
+			resumed := postAGUI(h, `{"threadId":"t1","resume":[{"interruptId":"`+qid+`","status":"resolved","payload":"张三"}]}`)
+			if outcomeType(parseSSE(resumed.Body.String())) != "success" || !strings.Contains(resumed.Body.String(), "张三") {
+				t.Fatalf("旧任务应接受原问题的答案并完成，实际 %s", resumed.Body.String())
+			}
+		})
+	}
+}
+
+type panicOnReplacementDrop struct {
+	compose_v2.Checkpointer
+	fail bool
+}
+
+func (cp *panicOnReplacementDrop) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+	if cp.fail {
+		panic("replacement storage panic")
+	}
+	return cp.Checkpointer.DeleteSubtree(ctx, sid, ns)
+}
+
 // twoToolsModel 第一轮一次发两个 tool_call，第二轮给终局答复。
 // 用来暴露「所有工具结果共用一个 messageId」——单工具时看不出来。
 type twoToolsModel struct {

@@ -2,6 +2,7 @@ package a2a
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -44,17 +45,9 @@ import (
 // WithHumanGate）。续一个远端任务之前先查它此刻的状态（见 reconcileTask）：上一次续它时响应在路上丢了、远端其实已经
 // 办完或换了一问的，不再去续一个已结束的任务、不把旧答复再发一次。
 //
-// **并发约束（默认模式下 ParallelAgent 多分支别复用同一 RemoteAgent 实例）**：默认模式（不开
-// WithHumanGate）的远程 taskID 按
-// `a2a:<name>:task_id:<sess.RunID>` 存共享 session values map。同一 RemoteAgent 实例放进 ParallelAgent
-// 多个并发分支、且远程返**可续 task**（input-required / working）时，多分支写同一 key
-// → last-writer-wins 互覆 → Resume 续错 task（跟 FinalMessageByAgent "分支用 distinct
-// 名" 同款约束）。修法本可按位置维度 scope key，但那会破坏默认模式 ReAct 跨轮续跑
-// （AgentAsTool 路径 graphNS 含调用身份的哈希、每个 tool_call 都不同 → key 每轮变 → 续跑 miss），
-// 得不偿失。
-// **正确用法：每分支用独立 RemoteAgent 实例**（各自 client/card，taskID 天然不撞）。
-// 单实例顺序复用（同 session 多次 Run / BasicAgent 单 tool 跨轮）不受影响。gate 模式在节点执行里不受这条
-// 约束：等人答复的那一问按调用位置记，并行分支、同一批几个 tool_call、节点里先后几次调用各是各的。
+// 普通请求只沿用远端会话的 contextId。默认模式的普通追问通过 [Continuation] 返回续接句柄，
+// 同一个 Run 内经 [WithContinuation] 或工具的 continuation 参数补答。各次委派的待答任务独立，
+// 句柄绑定当前客户端和 Run。真人追问在节点内由宿主存档恢复，顶层直接调用时由原 session 接续。
 type RemoteAgent struct {
 	client    *a2aclient.Client
 	card      *a2atypes.AgentCard
@@ -63,6 +56,7 @@ type RemoteAgent struct {
 	humanGate bool
 	hooks     hook.Hooks                   // WithHooks 注入；nil 时 NoOp（agent 形态观测见 WithHooks godoc）
 	obs       *observability.Observability // WithObservability 注入；nil 时无 a2a 跨语言 trace
+	binding   string                       // 普通追问句柄绑定创建它的客户端实例。
 }
 
 var _ agent_v2.Agent = (*RemoteAgent)(nil)
@@ -99,7 +93,8 @@ func NewRemoteAgentFromCard(ctx context.Context, card *a2atypes.AgentCard, opts 
 	}
 	desc := firstNonEmpty(cfg.description, card.Description)
 	desc = firstNonEmpty(desc, "delegate a task to the remote A2A agent "+card.Name)
-	return &RemoteAgent{client: client, card: card, name: name, desc: desc, humanGate: cfg.humanGate, hooks: cfg.hooks, obs: cfg.obs}, nil
+	return &RemoteAgent{client: client, card: card, name: name, desc: desc, humanGate: cfg.humanGate,
+		hooks: cfg.hooks, obs: cfg.obs, binding: rand.Text()}, nil
 }
 
 // Name 返回 agent/tool 名（OpenAI 合规）。
@@ -121,6 +116,13 @@ func (a *RemoteAgent) Run(ctx context.Context, session *agent_v2.RunSession, inp
 	if input == nil {
 		input = schema.UserMessage("")
 	}
+	var continuation string
+	if v, ok := input.Annotations[answerContinuationAnnotation]; ok {
+		continuation, _ = v.(string)
+		if continuation == "" {
+			return nil, fmt.Errorf("a2a: continuation must be a non-empty string")
+		}
+	}
 	// 同 9 个编排的入口（agent_v2.EnterRun）：在一个正在执行的任务里 session 必须属于它（远端 task
 	// 句柄按 RunID 存——随手给新 session 的话父节点每次重跑都是一个新的远端 task，用户的回答被当成
 	// 新 task 的第一条消息发出去，原来那个一直挂着，实测）；nil 时补一个属于所在任务的。同时盖任务章、
@@ -133,7 +135,7 @@ func (a *RemoteAgent) Run(ctx context.Context, session *agent_v2.RunSession, inp
 	// 在节点执行里：这次调用连同它的 agent 级钩子放进它自己的相位（见 callPhase）。远端要人时提问不占调用它的那段代码
 	// 的序号——调用方在节点体、工具体、交接相位还是钩子里都一样，它按进度跳过这次调用时后面的提问不挪位。
 	if compose_v2.WithinNodeScope(ctx) {
-		ctx = compose_v2.EnterPhase(ctx, a.callPhase(ctx, input))
+		ctx = compose_v2.EnterPhase(ctx, a.callPhase(ctx, input, continuation))
 	}
 	// 不 emit input 的 OutputEvent（区别于编排 wrapper / BasicAgent）：RemoteAgent 是
 	// 无自己 cp 的 leaf，HITL 经 host 重跑 RemoteAgent.Run 续跑——编排靠
@@ -156,9 +158,7 @@ func (a *RemoteAgent) Run(ctx context.Context, session *agent_v2.RunSession, inp
 	// 放标记、调、采纳收在 compose_v2.CallHook 一处（同 9 编排）：钩子返回别处缓存的 ctx 时，另一次执行的状态、
 	// 另一个请求的环境与取消都不会被带进来。
 	var hErr error
-	ctx, hErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, hErr = agent_v2.CallAgentStart(ctx, hooks, info, agentIn)
 	if hErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(hErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: hErr.Error()})
@@ -194,7 +194,7 @@ func (a *RemoteAgent) Run(ctx context.Context, session *agent_v2.RunSession, inp
 		_ = hooks.OnAgentEnd(ctxOut, info, &hook.AgentOutput{Messages: finalMessagesRef})
 	}()
 
-	final, err := a.consume(ctx, session, input)
+	final, err := a.consume(ctx, session, input, continuation)
 	if err != nil {
 		// InterruptError / ctx 错 / 业务错统一 propagate——InterruptError 让 host cp 存挂起态
 		return eventsSince(session, startOffset), err
@@ -216,7 +216,15 @@ func (a *RemoteAgent) Resume(_ context.Context, _ string, _ ...agent_v2.ResumeOp
 
 // consume 是核心 A2A 消费逻辑：发消息（或重新挂上一个在等带外授权的任务）→ 迭代事件流 → 按 Task 终态返结果 /
 // 抛中断 / 返错误。
-func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession, input *schema.Message) (final *schema.Message, retErr error) {
+func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession, input *schema.Message, continuation string) (final *schema.Message, retErr error) {
+	inNode := compose_v2.WithinNodeScope(ctx)
+	if !inNode {
+		release, err := a.claimTopLevelCall(session, continuation)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+	}
 	taskID, contextID := a.loadIDs(session)
 	sendMsg := input // 首发用完整 input（含多模态 ContentBlocks）；续一个在等人答复的远端任务时换成人的答复
 	// reattach：续的是一个停在 AUTH_REQUIRED 上的远端任务、人没有拒绝——不发消息，重新挂上那个任务接着读（见
@@ -236,21 +244,19 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 	//     不续任何任务、也不碰 session 上的句柄，远端要人时报错。用 session 句柄的话，下一次调用会把上一次在等
 	//     的那一问当成已答、远端照着执行（两个节点的 OnNodeEnd 各调一次，实测 `err == nil`）。
 	//   - 不在任何节点执行里（顶层直接调、脱离出来的独立任务）：没有存档接得住中断（中断的 ID 为空），业务拿
-	//     同一个 session 带上人的答复再 Run 一次就续刚才那个任务——沿用 session 上的句柄，同默认模式。只按位置
+	//     同一个 session 带上人的答复再 Run 一次就续刚才那个任务。只按位置
 	//     记的话顶层再 Run 一次会新开任务、把人的答复当成请求（复审实测）。
 	//
 	// 远端的审批请求（挂起清单里标了审批的问题、任务状态 AUTH_REQUIRED）不管开没开 WithHumanGate 都交给真人，所以节点
-	// 里的提问位置一律要取。WithHumanGate 只决定普通追问交给谁：没开时普通追问照旧交给宿主模型、靠 session 上的句柄
-	// 续同一个远端任务。
-	inNode := compose_v2.WithinNodeScope(ctx)
+	// 里的提问位置一律要取。WithHumanGate 只决定普通追问交给谁。宿主模型用续接句柄选择要补答的任务。
 	pos := ""
 	if inNode {
 		pos = compose_v2.CurrentInterruptSite(ctx).InterruptID()
 	}
 	var pend gatePending
 	byPosition := inNode && pos != ""
-	sessionHandles := !(a.humanGate && inNode) // gate 模式在节点里不用 session 上的句柄（见上）
-	var sendParts a2atypes.ContentParts        // 非 nil 时直接发它（按 interruptId 的答复），不再由 sendMsg 转
+	sessionHandles := !inNode && continuation == "" // 顶层真人答复通过原 session 续接。
+	var sendParts a2atypes.ContentParts             // 非 nil 时直接发它（按 interruptId 的答复），不再由 sendMsg 转
 	// handleWaiting：session 上的句柄是在远端等人（input-required）时留下的——这次的输入是答复，续之前要对账；不是（上一次
 	// 的流停在远端还在办的状态上就断了）时这次是新的请求（见下面对账那一段）。seenArtifacts：问人那一刻任务里各 artifact 的状态。
 	handleWaiting := false
@@ -266,6 +272,7 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 			if sessionQuestion.TaskID != taskID {
 				sessionQuestion = gatePending{}
 			}
+			contextID = firstNonEmpty(sessionQuestion.ContextID, contextID)
 		}
 		seenArtifacts = a.loadSeenArtifacts(session)
 		if a.loadAuthWait(session) {
@@ -284,7 +291,14 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 		}
 	}
 	if byPosition {
-		if p, ok := compose_v2.GetStepResult[gatePending](ctx, gateStepKey(pos)); ok && p.TaskID != "" {
+		p, _ := compose_v2.GetStepResult[gatePending](ctx, gateStepKey(pos))
+		if p.FollowUp != nil {
+			if token := Continuation(p.FollowUp); token != "" && p.TaskID != "" {
+				a.rememberContinuation(session, token, p)
+			}
+			return p.FollowUp, nil
+		}
+		if p.TaskID != "" {
 			pend = p
 			seenArtifacts = p.SeenArtifacts
 			if len(p.Items) > 1 {
@@ -319,6 +333,21 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 				}
 			}
 			contextID = firstNonEmpty(p.ContextID, contextID)
+		}
+	}
+
+	explicit := continuation != "" && pend.TaskID == ""
+	retireContinuation := false
+	if explicit {
+		question, finish, err := a.beginContinuation(session, continuation)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { finish(retireContinuation) }()
+		sessionQuestion, handleWaiting = question, true
+		taskID, contextID, seenArtifacts = question.TaskID, question.ContextID, question.SeenArtifacts
+		if len(question.Items) > 1 {
+			sendParts = answerPartsFromJSON(input, question.Items)
 		}
 	}
 
@@ -369,6 +398,8 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 			question, questionPos := sessionQuestion, "session"
 			if answering {
 				question, questionPos = pend, pos
+			} else if explicit {
+				questionPos = "continuation:" + continuation
 			}
 			sentID := ""
 			if question.TaskID == taskID {
@@ -376,6 +407,9 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 				msg.ID = sentID
 			}
 			snap, how, rerr := a.reconcileTask(ctx, taskID, sentID, question.QuestionMsgID)
+			if explicit && how == reconcileSend && questionChanged(question, snap) {
+				how = reconcileSnapshot
+			}
 			switch how {
 			case reconcileSend:
 				switch items := question.Items; {
@@ -399,6 +433,7 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 				msg, recovered = nil, true
 				source, method = a.reattach(ctx, taskID), "subscribe_task"
 			case reconcileGone:
+				retireContinuation = true
 				// 远端没有这个任务了：清掉句柄与在等的那一问，之后再跑发原始请求（同远端任务失败）
 				if answering {
 					if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), gatePending{}); err != nil {
@@ -539,105 +574,117 @@ stream:
 	// 流意外结束）就清掉，之后再跑发原始请求；交给真人时下面按新的一问重记。只在收到远端的回应之后清——发送在网络层
 	// 失败时（上面早退）记录留着，续跑拿回同一个答案续同一个任务。曾经只在「远端不再等人」时清：批准之后远端改问
 	// 一个交给宿主模型的普通追问，记录还在，节点再跑时把人的批准又发给了远端、被当成那个追问的答复（实测）
-	if byPosition && pend.TaskID != "" && !toHuman {
+	if byPosition && pend.TaskID != "" && !waitsForInput(lastState) {
 		if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), gatePending{}); err != nil {
 			return nil, fmt.Errorf("a2a: remote agent %q: clear the answered question: %w", a.card.Name, err)
 		}
 	}
-	if !sessionHandles {
-		// 会话线程标识跨任务存活（见 clearIDs）；远端任务的句柄在 gate 模式下只记在调用位置上
-		a.storeIDs(session, "", newContextID)
-	}
+	// 会话线程标识跨任务存活。续接时使用问题记录里与该远端任务配对的线程标识。
+	a.storeIDs(session, "", newContextID)
 
 	switch lastState {
 	case a2atypes.TaskStateInputRequired, a2atypes.TaskStateAuthRequired:
 		askTask := firstNonEmpty(newTaskID, taskID)
-		if toHuman && askTask == "" {
+		if askTask == "" {
 			// 缺少任务句柄会让下一次调用重发原始请求，反复问同一个问题。
 			return nil, fmt.Errorf("a2a: remote agent %q asked for input without a task id, the answer could not be routed back to it", a.card.Name)
 		}
-		if !toHuman || !inNode {
+		if !toHuman {
+			if sessionHandles {
+				a.clearIDs(session)
+			}
+			rec := gatePending{
+				TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: 1,
+				Question: q, QuestionMsgID: statusMsgID, Items: items, SeenArtifacts: a.artifactStates(ctx, askTask),
+				Binding: a.binding,
+			}
+			out := a.askForContinuation(session, rec)
+			if byPosition {
+				// 宿主节点重跑时交回同一个普通追问，并恢复该结果引用的句柄。
+				rec.FollowUp = out
+				if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), rec); err != nil {
+					return nil, fmt.Errorf("a2a: remote agent %q: record the follow-up: %w", a.card.Name, err)
+				}
+			}
+			retireContinuation = true
+			return out, nil
+		}
+		if !inNode {
 			a.storeIDs(session, askTask, newContextID)
 			round := 1
 			if sessionQuestion.TaskID == askTask {
 				round = sessionQuestion.Round + 1
 			}
 			session.SetValue(a.pendingKey(session), gatePending{
-				TaskID: askTask, Round: round, QuestionMsgID: statusMsgID, Items: items,
+				TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, QuestionMsgID: statusMsgID, Items: items,
 			})
 			a.storeAuthWait(session, auth)
 			a.storeHandleWaiting(session, true, a.artifactStates(ctx, askTask))
 		}
-		if toHuman {
-			if !inNode {
-				// 不在节点执行里：句柄记在 session 上，中断没有 ID（没有位置可派生）。挂多问时业务用同一个
-				// session 再 Run 一次、输入给 interruptId → 答复的 JSON 对象（见 answerPartsFromJSON）；要授权时输入
-				// 人的答复（deny 取消远端任务，别的重新挂上它，见 authRefused）。
-				if auth {
-					return nil, authInterrupt("", q)
-				}
-				if len(items) > 1 {
-					q += "\n" + jsonAnswerHint
-				}
-				return nil, gateInterrupt("", q, items)
-			}
-			if !byPosition {
-				// 引擎钩子、条件边里：没有提问位置，抛中断也接不住。调用放错了位置，重跑必然一样：终局失败（不重试、
-				// 清掉存档）。普通错误会被外面的重试一遍遍重跑，每次多开一个停在要人上、没人去续的远端任务（实测）。
-				// 远端那个在等人的任务没人会去续，尽力取消掉
-				a.cancelRemoteTask(ctx, askTask)
-				return nil, fmt.Errorf("%w: a2a: remote agent %q asked for input or approval inside an engine hook or edge condition (ns=%q), where no interrupt can be caught; call it from a node body, a tool or an orchestration member instead",
-					compose_v2.ErrRunAborted, a.card.Name, compose_v2.GetGraphNS(ctx))
-			}
-			// 同一个远端任务里的第几问：续着的那个任务又来要人就是下一问，新任务从第 1 问数起
-			round := 1
-			if pend.TaskID == askTask {
-				round = pend.Round + 1
-			}
-			// 记的是已经发生的事：远端这个任务在等人答这一问
-			rec := gatePending{TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, Question: q, Items: items, Auth: auth,
-				QuestionMsgID: statusMsgID, SeenArtifacts: a.artifactStates(ctx, askTask)}
-			if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), rec); err != nil {
-				return nil, fmt.Errorf("a2a: remote agent %q: record the pending question: %w", a.card.Name, err)
-			}
-			// 真人 HITL：抛 InterruptError 骑 host cp（续跑时按同一个身份取回人的答复、续这个远端任务）。远端挂多问时
-			// 每一问各抛一个提问，人分别作答。
-			id := gateQuestionID(pos, askTask, round)
+		if !inNode {
+			retireContinuation = true
+			// 不在节点执行里：句柄记在 session 上，中断没有 ID（没有位置可派生）。挂多问时业务用同一个
+			// session 再 Run 一次、输入给 interruptId → 答复的 JSON 对象（见 answerPartsFromJSON）；要授权时输入
+			// 人的答复（deny 取消远端任务，别的重新挂上它，见 authRefused）。
 			if auth {
-				return nil, authInterrupt(id, q)
+				return nil, authInterrupt("", q)
 			}
 			if len(items) > 1 {
-				return nil, gateItemsInterrupt(pos, askTask, round, items)
+				q += "\n" + jsonAnswerHint
 			}
-			return nil, gateInterrupt(id, q, items)
+			return nil, gateInterrupt("", q, items)
 		}
-		// 默认：把追问当输出返回——host BasicAgent 的 LLM 看到后补信息再调一次（续同一 task）
+		if !byPosition {
+			// 引擎钩子、条件边里：没有提问位置，抛中断也接不住。调用放错了位置，重跑必然一样：终局失败（不重试、
+			// 清掉存档）。普通错误会被外面的重试一遍遍重跑，每次多开一个停在要人上、没人去续的远端任务（实测）。
+			// 远端那个在等人的任务没人会去续，尽力取消掉
+			a.cancelRemoteTask(ctx, askTask)
+			retireContinuation = true
+			return nil, fmt.Errorf("%w: a2a: remote agent %q asked for input or approval inside an engine hook or edge condition (ns=%q), where no interrupt can be caught; call it from a node body, a tool or an orchestration member instead",
+				compose_v2.ErrRunAborted, a.card.Name, compose_v2.GetGraphNS(ctx))
+		}
+		// 同一个远端任务里的第几问：续着的那个任务又来要人就是下一问，新任务从第 1 问数起
+		round := 1
+		if pend.TaskID == askTask {
+			round = pend.Round + 1
+		}
+		// 记的是已经发生的事：远端这个任务在等人答这一问
+		rec := gatePending{TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, Question: q, Items: items, Auth: auth,
+			QuestionMsgID: statusMsgID, SeenArtifacts: a.artifactStates(ctx, askTask)}
+		if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), rec); err != nil {
+			return nil, fmt.Errorf("a2a: remote agent %q: record the pending question: %w", a.card.Name, err)
+		}
+		retireContinuation = true
+		// 真人 HITL：抛 InterruptError 骑 host cp（续跑时按同一个身份取回人的答复、续这个远端任务）。远端挂多问时
+		// 每一问各抛一个提问，人分别作答。
+		id := gateQuestionID(pos, askTask, round)
+		if auth {
+			return nil, authInterrupt(id, q)
+		}
 		if len(items) > 1 {
-			return schema.AssistantMessage(fmt.Sprintf(
-				"[input_required] remote agent %q is waiting for answers to several questions:\n%s\n(%s)",
-				a.card.Name, q, jsonAnswerHint)), nil
+			return nil, gateItemsInterrupt(pos, askTask, round, items)
 		}
-		return schema.AssistantMessage(fmt.Sprintf(
-			"[input_required] remote agent %q needs more information: %s\n(Provide it by calling this tool again with the additional info.)",
-			a.card.Name, q)), nil
+		return nil, gateInterrupt(id, q, items)
 	case a2atypes.TaskStateCompleted, a2atypes.TaskStateUnspecified: // Unspecified：远端只回了消息、没有任务
+		retireContinuation = true
 		if sessionHandles {
 			a.clearIDs(session)
 		}
 		return assistantWithBlocks(firstNonEmpty(result.String(), statusMsg), result.Blocks()), nil
 	case a2atypes.TaskStateFailed, a2atypes.TaskStateRejected, a2atypes.TaskStateCanceled:
+		retireContinuation = true
 		if sessionHandles {
 			a.clearIDs(session)
 		}
 		return nil, fmt.Errorf("a2a: remote agent %q task ended %s: %s", a.card.Name, lastState, firstNonEmpty(statusMsg, "(no detail)"))
 	default:
-		// working/submitted 但流意外结束——存 ID 供续跑，返已聚合内容。合规 server 不会以它们结束流——仅连接异常断开
-		// 才落这里（AUTH_REQUIRED 是挂起态，上面按审批请求处理）。best-effort 返已收内容，
-		// 但部分内容伪装完整答案对业务是静默错——warn 给观测信号（"什么算成功"防御）。
-		// 节点执行里的 gate 不留句柄：这个任务没在等人，下一次调用发它自己的请求。
+		if explicit {
+			return nil, fmt.Errorf("a2a: remote agent %q stream ended while task %s was still running; retry the continuation", a.card.Name, taskID)
+		}
+		// 普通请求遇到未结束的流时交出已收内容，并记录远端状态。顶层真人续接保留原来的任务句柄。
 		slog.WarnContext(ctx, "a2a: remote stream ended on non-terminal state (partial content returned)",
 			"agent", a.card.Name, "state", string(lastState))
-		if sessionHandles {
+		if sessionHandles && taskID != "" {
 			a.storeIDs(session, newTaskID, newContextID)
 			a.storeHandleWaiting(session, false, nil)
 		}
@@ -791,7 +838,12 @@ func anyApproval(items []PendingQuestion) bool {
 //
 // 两种名字里都有远端名（a.name）：续跑之间它要不变（配 WithName；没配时取 card 名，服务发现挑到 card 名不同的实例时
 // 就变了）。变了的话挂着的那一问找不回来，原始请求作为新任务重发、远端要人时再问一次人，不会拿错答案。
-func (a *RemoteAgent) callPhase(ctx context.Context, input *schema.Message) string {
+func (a *RemoteAgent) callPhase(ctx context.Context, input *schema.Message, continuation string) string {
+	if continuation != "" {
+		sum := sha256.Sum256([]byte(continuation))
+		key := compose_v2.SubCallScope(ctx) + "\x00a2a\x00" + a.name + "\x00continuation\x00" + hex.EncodeToString(sum[:16])
+		return key + "#" + strconv.Itoa(compose_v2.NextSubCallIndex(ctx, key))
+	}
 	if outer := compose_v2.SubCallScope(ctx); outer != "" {
 		key := outer + "\x00a2a\x00" + a.name
 		return key + "#" + strconv.Itoa(compose_v2.NextSubCallIndex(ctx, key))
@@ -1340,6 +1392,9 @@ type gatePending struct {
 	// SeenArtifacts 是问这一问的那一刻，这个远端任务里各 artifact 的状态：对账取回快照、或重新挂上任务时，那时已有的内容不算
 	// 回应这一问的产出（正常续任务的流里只有这一轮的，见 seenArtifact）。
 	SeenArtifacts []seenArtifact `json:"seen_artifacts,omitempty"`
+	// FollowUp 记返回给宿主的普通追问，节点重跑时原样交回。Binding 限制恢复该句柄的客户端实例。
+	FollowUp *schema.Message `json:"follow_up,omitempty"`
+	Binding  string          `json:"binding,omitempty"`
 }
 
 func init() {

@@ -436,27 +436,40 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		_ = sse.Reject(http.StatusConflict, "busy", "run already in progress for this thread")
 		return
 	}
-	// 已有挂起 sess（用户开新对话、放弃旧中断）→ 清旧 cp 防孤儿泄漏，并让这次 Run 在入口给它悬空的工具调用补结果
-	// （agent_v2.WithAbandonedTasks：同一场会话、这次 Run 自己的 agent 与 ctx，不另起调用、不跑钩子）。删档先在这里做：
-	// 它不依赖业务代码、有自己的上限；那个选项里再删一次是幂等的（同样有上限）。被淘汰、过期回收的是别的 thread，这里没有它的 agent 与
-	// ctx，只删存档、悬空的调用交给读侧（见 doc/code/todo.md 第 263 行附近）。
+	started, replacing := false, false
+	defer func() {
+		if started {
+			return
+		}
+		if stale != nil && (!replacing || h.hasTaskCheckpoint(ctx, stale.sess.RunID)) {
+			h.restoreEntry(key, stale)
+		} else {
+			h.removeEntry(key)
+		}
+	}()
+
+	// 先占旧任务的放弃许可，在开始事件成功送达后才删档。客户端断开或启动失败时恢复原入口。
 	var abandonOpts []agent_v2.RunOption
 	var staleMayBeResumable bool
+	var dropCtx context.Context
+	var dropActivity *compose_v2.TaskActivity
 	if stale != nil && stale.sess != nil {
-		dropErr := h.dropCP(ctx, stale.sess.RunID)
+		var dropErr error
+		dropCtx, dropActivity, dropErr = h.beginDropCP(ctx, stale.sess.RunID)
 		if errors.Is(dropErr, compose_v2.ErrTaskBusy) {
-			h.restoreEntry(key, stale)
 			_ = sse.Reject(http.StatusConflict, "busy", "an operation on the previous task is in progress")
 			return
 		}
 		staleMayBeResumable = dropErr != nil
+		if dropActivity != nil {
+			defer dropActivity.Release()
+		}
 		abandonOpts = append(abandonOpts, agent_v2.WithAbandonedTasks(stale.sess.RunID))
 	}
 
 	adapter := newSSEAdapter(sse, in.RunID, in.Messages)
 	ag := h.build(adapter)
-	if ag == nil {
-		h.removeEntry(key) // 清 acquireForRun 建的空壳，避免泄漏
+	if agent_v2.IsNilAgent(ag) {
 		_ = sse.Reject(http.StatusInternalServerError, "nil_agent", "agui: AgentFactory returned nil agent")
 		return
 	}
@@ -474,9 +487,14 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	// RunStarted 写失败 = client 已断开——短路不跑 agent，省 LLM/工具开销。（agent 跑
 	// 期间断开由 r.Context() canceled 触发框架超步边界 ctx.Err() 停 + handleOutcome 清 sess。）
 	if err := sse.WriteEvent(NewRunStarted(in.ThreadID, runID)); err != nil {
-		h.removeEntry(key) // 清 acquireForRun 建的空壳，避免泄漏
 		return
 	}
+	if dropActivity != nil {
+		replacing = true
+		staleMayBeResumable = h.deleteCP(dropCtx, stale.sess.RunID) != nil
+		dropActivity.Release()
+	}
+	started = true
 	// **收尾必须挂在 defer 上，不能写成 ag.Run 之后的普通语句。**
 	//
 	// `runtime.Goexit`（业务 hook 里调了 testify 的 require.* / zap.WithFatalHook 之类）
@@ -611,7 +629,7 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 
 	adapter := newSSEAdapter(sse, wireRunID, in.Messages)
 	ag := h.build(adapter)
-	if ag == nil {
+	if agent_v2.IsNilAgent(ag) {
 		_ = sse.Reject(http.StatusInternalServerError, "nil_agent", "agui: AgentFactory returned nil agent")
 		return
 	}
@@ -1177,17 +1195,33 @@ func (h *handler) evictIfNeededLocked(inserter string, skipped map[sessionKey]bo
 // dropCP 尽力清一个 sid 的 cp 子树（覆盖旧挂起 / 淘汰时防 cp 孤儿泄漏）。任务正忙时返回 ErrTaskBusy。
 // 用 DeleteSubtree 直删而非 Resume(Abort)——淘汰场景不需 agent 层 emit，省 build 开销。
 func (h *handler) dropCP(ctx context.Context, sid string) error {
+	cleanupCtx, activity, err := h.beginDropCP(ctx, sid)
+	if activity == nil {
+		return err
+	}
+	defer activity.Release()
+	return h.deleteCP(cleanupCtx, sid)
+}
+
+func (h *handler) beginDropCP(ctx context.Context, sid string) (context.Context, *compose_v2.TaskActivity, error) {
 	if h.cp == nil || sid == "" {
-		return nil
+		return ctx, nil, nil
 	}
 	cleanupCtx := compose_v2.WithCheckpointerCtx(context.WithoutCancel(ctx), h.cp)
 	cleanupCtx, activity, err := compose_v2.BeginTaskActivity(cleanupCtx, "", []string{sid})
 	if err != nil {
 		slog.WarnContext(ctx, "agui: 跳过仍有操作在途的任务存档清理", "sid", sid, "err", err)
-		return err
+		return ctx, nil, err
 	}
-	defer activity.Release()
-	return h.deleteCP(cleanupCtx, sid)
+	return cleanupCtx, activity, nil
+}
+
+// hasTaskCheckpoint 核对异常退出的替换操作是否已经删掉了旧档。读取失败时保留原入口。
+func (h *handler) hasTaskCheckpoint(ctx context.Context, sid string) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropCPTimeout)
+	defer cancel()
+	all, err := h.cp.LoadAllInSession(ctx, sid)
+	return err != nil || len(all) > 0
 }
 
 // deleteCP 在持有任务的删档许可时调用。

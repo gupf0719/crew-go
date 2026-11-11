@@ -57,6 +57,16 @@ func runMockMCPServer(mode string) {
 			}
 		case "tools/call":
 			switch mode {
+			case "env":
+				_, blocked := os.LookupEnv("CREW_TEST_MCP_BLOCKED")
+				b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": req["id"], "result": map[string]any{
+					"structuredContent": map[string]any{
+						"allowed": os.Getenv("CREW_TEST_MCP_ALLOWED"), "override": os.Getenv("CREW_TEST_MCP_OVERRIDE"), "blocked": blocked,
+					},
+				}})
+				w.Write(b)
+				w.WriteByte('\n')
+				w.Flush()
 			case "hang":
 				time.Sleep(60 * time.Second) // 阻塞让 rpc 真挂在等响应（不用 select{}——纯 Go 子进程触发 runtime deadlock panic 会提前崩溃）；测试 Close kill 子进程
 			case "exit":
@@ -68,6 +78,32 @@ func runMockMCPServer(mode string) {
 				w.Flush()
 			}
 		}
+	}
+}
+
+func TestStdio_EnvAllowlistKeepsOnlySelectedVariables(t *testing.T) {
+	t.Setenv("CREW_TEST_MCP_ALLOWED", "allow")
+	t.Setenv("CREW_TEST_MCP_OVERRIDE", "parent")
+	t.Setenv("CREW_TEST_MCP_BLOCKED", "synthetic")
+	c, err := mcp.NewStdioClient("env", os.Args[0], nil,
+		mcp.WithStdioEnvAllowlist("CREW_TEST_MCP_ALLOWED", "CREW_TEST_MCP_OVERRIDE"),
+		mcp.WithStdioEnv("MCP_MOCK_MODE=env", "CREW_TEST_MCP_OVERRIDE=child"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := c.Initialize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result, err := c.CallTool(ctx, "t", nil)
+	if err != nil || result == nil {
+		t.Fatalf("子进程读取环境失败：%v", err)
+	}
+	env, ok := result.Structured.(map[string]any)
+	if !ok || env["allowed"] != "allow" || env["override"] != "child" || env["blocked"] != false {
+		t.Fatalf("子进程继承结果不符合白名单：%v", result.Structured)
 	}
 }
 

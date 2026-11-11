@@ -192,8 +192,8 @@ func (p *ParallelAgent) AddBranch(name string, ag Agent) *ParallelAgent {
 			panic(fmt.Sprintf("ParallelAgent.AddBranch: duplicate branch name %q (会让前一个分支静默被覆盖 + cp ns 互覆)", name))
 		}
 	}
-	// audit³ HIGH-1 fix: isAgentNil 检 typed nil interface
-	if isAgentNil(ag) {
+	// audit³ HIGH-1 fix: IsNilAgent 检 typed nil interface
+	if IsNilAgent(ag) {
 		panic(fmt.Sprintf("ParallelAgent.AddBranch: name %q has nil agent (含 Go typed nil interface 陷阱)", name))
 	}
 	p.branches = append(p.branches, ParallelBranch{Name: name, Agent: ag})
@@ -259,9 +259,7 @@ func (p *ParallelAgent) Run(ctx context.Context, session *RunSession, input *sch
 	abandonTasksAtEntry(ctx, cfg.abandoned, p.Name())
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentIn)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentIn)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
@@ -349,9 +347,7 @@ func (p *ParallelAgent) Resume(ctx context.Context, sessionID string, opts ...Re
 	agentInResume := &hook.AgentInput{}
 	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
-	ctx, startErr = compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
-		return hooks.OnAgentStart(c, info, agentInResume)
-	})
+	ctx, startErr = CallAgentStart(ctx, hooks, info, agentInResume)
 	if startErr != nil {
 		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
 			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})

@@ -48,17 +48,21 @@ func TestFilterVisibleTools_NoDeferred(t *testing.T) {
 // TestRevealTurn_Concurrent：这一批的解锁记录并发记（-race 验 ISSUE-81 fanout 多个 tool_search 同时跑）。
 func TestRevealTurn_Concurrent(t *testing.T) {
 	turn := &revealTurn{}
+	results := make([]*schema.Message, 16)
+	for i := range results {
+		results[i] = &schema.Message{Annotations: map[string]any{toolSearchCallAnnotation: true}}
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			turn.add("t")
-			_ = turn.list()
+			turn.add(i, "t")
+			_ = turn.accepted(results)
 		}()
 	}
 	wg.Wait()
-	if got := turn.list(); len(got) != 16 {
+	if got := turn.accepted(results); len(got) != 16 {
 		t.Errorf("并发记 16 次应有 16 条，实际 %d", len(got))
 	}
 }

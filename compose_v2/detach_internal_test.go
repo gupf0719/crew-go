@@ -21,6 +21,7 @@ import (
 var executionCtxKeys = []any{
 	sessionIDKey{}, runTaskIDKey{}, currentTaskIDKey{}, freshRunCtxKey{}, resumeCtxKey{}, answerLedgerKey{},
 	graphNSKey{}, nodeIDKey{}, nodeVisitKey{}, nodeInstanceIDKey{}, nodeInterruptCounterKey{},
+	checkpointingDisabledKey{},
 	toolCallIdxKey{}, currentToolCallIDKey{}, inToolCallKey{}, withinNodeScopeKey{},
 	nodeStateAccessorKey{}, subCallCounterKey{}, subCallScopeKey{}, abnormalNodeExitKey{},
 	componentKindKey{}, eventSinkKey{}, sendSinkKey{}, toolCategoryLookupKey{}, outerRerunGensKey{}, outerRegensKey{},

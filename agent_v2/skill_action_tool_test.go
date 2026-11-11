@@ -8,12 +8,13 @@ import (
 	"testing"
 
 	"crew-go/agent_v2"
+	"crew-go/compose_v2"
 	"crew-go/schema"
 	"crew-go/skill"
 )
 
 // actionSkillBox 建含 calc skill 的 box；withAction 时注册 go-func action add。
-func actionSkillBox(t *testing.T, withAction bool) skill.SkillBox {
+func actionSkillBox(t *testing.T, withAction bool, opts ...skill.SkillBoxOption) skill.SkillBox {
 	t.Helper()
 	root := t.TempDir()
 	dir := filepath.Join(root, "calc")
@@ -24,7 +25,6 @@ func actionSkillBox(t *testing.T, withAction bool) skill.SkillBox {
 		[]byte("---\nname: calc\ndescription: 计算\n---\n计算助手\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	var opts []skill.SkillBoxOption
 	if withAction {
 		opts = append(opts, skill.WithSkillActionFunc("calc",
 			skill.SkillActionDescriptor{Name: "add", Description: "加法"},
@@ -38,6 +38,49 @@ func actionSkillBox(t *testing.T, withAction bool) skill.SkillBox {
 		t.Fatal(err)
 	}
 	return box
+}
+
+func TestRunSkillAction_ApprovalAlwaysToolIsScopedToAction(t *testing.T) {
+	var adds []string
+	subtracts := 0
+	box := actionSkillBox(t, false,
+		skill.WithSkillActionFunc("calc", skill.SkillActionDescriptor{Name: "add", Description: "加法"},
+			func(_ context.Context, args map[string]any) (*skill.SkillExecutionResult, error) {
+				adds = append(adds, args["x"].(string))
+				return &skill.SkillExecutionResult{Success: true, Output: "added"}, nil
+			}),
+		skill.WithSkillActionFunc("calc", skill.SkillActionDescriptor{Name: "subtract", Description: "减法"},
+			func(context.Context, map[string]any) (*skill.SkillExecutionResult, error) {
+				subtracts++
+				return &skill.SkillExecutionResult{Success: true, Output: "subtracted"}, nil
+			}))
+	call := func(id, action, value string) *schema.Message {
+		return schema.AssistantToolCallMessage([]schema.ToolCall{{ID: id,
+			Function: schema.FunctionCall{Name: agent_v2.RunSkillActionToolName,
+				Arguments: `{"skill":"calc","action":"` + action + `","args":{"x":"` + value + `"}}`}}})
+	}
+	m := &captureToolsModel{responses: []*schema.Message{
+		call("c1", "add", "1"), call("c2", "add", "2"), call("c3", "subtract", "3"), schema.AssistantMessage("done"),
+	}}
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("skill_approval"), agent_v2.WithModel(m),
+		agent_v2.WithSkills(skill.SkillSource{SkillBox: box}), agent_v2.WithApprovalMode(agent_v2.ApprovalAsk), agent_v2.WithMaxRounds(5))
+	ctx := compose_v2.WithCheckpointerCtx(t.Context(), compose_v2.NewInMemoryCheckpointer())
+	sess := agent_v2.NewRunSession()
+	_, err := ag.Run(ctx, sess, schema.UserMessage("calculate"))
+	first, ok := compose_v2.IsInterrupt(err)
+	if !ok || len(adds) != 0 || first.Query.ToolCallID != "c1" {
+		t.Fatalf("应在首个 action 执行前询问，实际加法 %v，%v", adds, err)
+	}
+	_, err = ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess),
+		agent_v2.WithResumeUserInputs(map[string]*schema.Message{first.Query.InterruptID: schema.UserMessage(agent_v2.ApprovalOptionApproveAlwaysTool)}))
+	third, ok := compose_v2.IsInterrupt(err)
+	if !ok || third.Query.ToolCallID != "c3" || strings.Join(adds, ",") != "1,2" || subtracts != 0 {
+		t.Fatalf("长期放行应覆盖两次加法，减法应另行询问，实际加法 %v，减法 %d，%v", adds, subtracts, err)
+	}
+	if _, err := ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess),
+		agent_v2.WithResumeUserInputs(map[string]*schema.Message{third.Query.InterruptID: schema.UserMessage(agent_v2.ApprovalOptionDeny)})); err != nil || subtracts != 0 {
+		t.Fatalf("拒绝减法后应完成且不执行减法，实际 %d，%v", subtracts, err)
+	}
 }
 
 // TestRunSkillAction_EndToEnd：有 action 的 skill → run_skill_action 进 bind list（条件注册）→

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -55,7 +56,7 @@ type reporter struct {
 func renderReport(cases []evalCase, runs []runResult, rl roles, review bool, preface string) string {
 	var b strings.Builder
 	b.WriteString(preface)
-	for _, t := range tiers {
+	for _, t := range append(slices.Clone(tiers), externalTier) {
 		sub := make([]evalCase, 0, len(cases))
 		for _, c := range cases {
 			if c.Tier == t.ID {
@@ -131,6 +132,7 @@ func (r *reporter) render(t tier, review bool) string {
 	r.byTag()
 	r.confidence()
 	r.hybrid()
+	r.cascade()
 	r.consistency()
 	for _, d := range r.roles.deciders() {
 		r.mistakes(d.key, d.title)
@@ -144,7 +146,7 @@ func (r *reporter) render(t tier, review bool) string {
 
 func (r *reporter) overview() {
 	r.p("## 概况\n\n")
-	r.p("| 系统 / 条件 | 有效样本 | 基础设施错误 | 准确率 | 95%% 置信区间 | 决策延迟 p50 / p90 | 端到端 p50 / p90 | 平均输入 token | 实际模型 |\n")
+	r.p("| 系统 / 条件 | 有效样本 | 基础设施错误 | 准确率 | 95%% 置信区间 | 决策延迟 p50 / p90 | 端到端 p50 / p90 / p95 | 平均输入 token | 实际模型 |\n")
 	r.p("|---|---|---|---|---|---|---|---|---|\n")
 	for _, run := range r.runs {
 		var k, n, errs, inTok int
@@ -172,10 +174,10 @@ func (r *reporter) overview() {
 			}
 		}
 		lo, hi := wilson(k, n)
-		r.p("| %s | %d | %d | %s | %.1f%% – %.1f%% | %s / %s ms | %s / %s ms | %s | %s |\n",
+		r.p("| %s | %d | %d | %s | %.1f%% – %.1f%% | %s / %s ms | %s / %s / %s ms | %s | %s |\n",
 			run.label(), n, errs, pct(k, n), lo*100, hi*100,
 			fmtMS(percentile(decide, 50)), fmtMS(percentile(decide, 90)),
-			fmtMS(percentile(total, 50)), fmtMS(percentile(total, 90)),
+			fmtMS(percentile(total, 50)), fmtMS(percentile(total, 90)), fmtMS(percentile(total, 95)),
 			fmtMean(inTok, n), joinCounts(models))
 	}
 	r.p("\n决策延迟：决策模型（Jev、百炼）是那次 HTTP 调用（含重试），qwen 是 classifier 的模型调用。端到端是整个 RoutingAgent.Run。\n\n")
@@ -246,18 +248,17 @@ func (r *reporter) pairs() {
 	r.p("\n")
 }
 
-// scenariosPresent 按定义顺序返回这批样本涉及的场景。
+// scenariosPresent 按场景 ID 排序，外部业务分支也参与统计。
 func (r *reporter) scenariosPresent() []scenario {
-	present := make(map[string]bool, len(scenarios))
+	present := make(map[string]scenario)
 	for _, c := range r.cases {
-		present[c.Scenario] = true
+		present[c.Scenario] = c.scenario
 	}
 	out := make([]scenario, 0, len(present))
-	for _, sc := range scenarios {
-		if present[sc.ID] {
-			out = append(out, sc)
-		}
+	for _, sc := range present {
+		out = append(out, sc)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -305,32 +306,33 @@ func (r *reporter) byScenario() {
 
 func (r *reporter) byTag() {
 	runs := r.firstPassRuns()
-	tags := make([]string, 0, len(knownTags))
-	for t := range knownTags {
-		tags = append(tags, t)
+	byTag := make(map[string][]string)
+	for _, c := range r.cases {
+		for _, tag := range c.Tags {
+			ids := byTag[tag]
+			if len(ids) == 0 || ids[len(ids)-1] != c.ID {
+				byTag[tag] = append(ids, c.ID)
+			}
+		}
+	}
+	if len(byTag) == 0 {
+		return
+	}
+	tags := make([]string, 0, len(byTag))
+	for tag := range byTag {
+		tags = append(tags, tag)
 	}
 	sort.Strings(tags)
-	r.p("## 按语言现象\n\n")
-	r.p("一条样本可带多个标签。typo、trad、mixed、dialect、slang 是中文特有现象，英文译文里保留不了，看英文条件时忽略这几行。\n\n")
+	r.p("## 按样本标签\n\n")
+	r.p("一条样本可带多个标签。typo、trad、mixed、dialect、slang 是中文特有现象。\n\n")
 	r.p("| 标签 | 含义 | 样本 |")
 	for _, run := range runs {
 		r.p(" %s |", run.label())
 	}
 	r.p("\n|---|---|---|%s\n", strings.Repeat("---|", len(runs)))
 	for _, t := range tags {
-		ids := make([]string, 0, 32)
-		for _, c := range r.cases {
-			for _, ct := range c.Tags {
-				if ct == t {
-					ids = append(ids, c.ID)
-					break
-				}
-			}
-		}
-		if len(ids) == 0 {
-			continue
-		}
-		r.p("| %s | %s | %d |", t, knownTags[t], len(ids))
+		ids := byTag[t]
+		r.p("| %s | %s | %d |", mdCell(t), knownTags[t], len(ids))
 		for _, run := range runs {
 			var k, n int
 			for _, id := range ids {
@@ -429,7 +431,7 @@ func (r *reporter) hybridWith(decider, title string) {
 	}
 	r.p("## 混合方案模拟（中文）：%s\n\n", title)
 	r.p("%s 置信度达到阈值时直接用它的判定，否则回落 qwen classifier。只统计两边都有有效结果的样本。\n\n", title)
-	r.p("| 阈值 | %s 承接占比 | 混合准确率 | 省掉的 LLM 调用 |\n|---|---|---|---|\n", title)
+	r.p("| 阈值 | %s 自动承接 | 升级比例 | 自动承接错路由 | 混合准确率 |\n|---|---|---|---|---|\n", title)
 	var n, qRight int
 	for _, c := range r.cases {
 		_, okA := r.correct(jr, c.ID)
@@ -442,7 +444,7 @@ func (r *reporter) hybridWith(decider, title string) {
 		}
 	}
 	for _, t := range []float64{0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.99} {
-		var handled, right int
+		var handled, wrongAuto, right int
 		for _, c := range r.cases {
 			jc, okA := r.correct(jr, c.ID)
 			qc, okB := r.correct(qr, c.ID)
@@ -454,6 +456,8 @@ func (r *reporter) hybridWith(decider, title string) {
 				handled++
 				if jc {
 					right++
+				} else {
+					wrongAuto++
 				}
 				continue
 			}
@@ -461,9 +465,45 @@ func (r *reporter) hybridWith(decider, title string) {
 				right++
 			}
 		}
-		r.p("| %.2f | %s | %s | %s |\n", t, pct(handled, n), pct(right, n), pct(handled, n))
+		r.p("| %.2f | %s | %s | %s | %s |\n", t, pct(handled, n), pct(n-handled, n), pct(wrongAuto, handled), pct(right, n))
 	}
-	r.p("| 只用 qwen | 0%% | %s | 0%% |\n\n", pct(qRight, n))
+	r.p("| 只用 qwen | 0%% | 100%% | — | %s |\n\n", pct(qRight, n))
+}
+
+// cascade 用真实执行的阶段和耗时计算升级情况，基础设施失败单列在概况。
+func (r *reporter) cascade() {
+	var heading bool
+	for _, run := range r.firstPassRuns() {
+		if !strings.HasPrefix(run.System, "cascade:") {
+			continue
+		}
+		var n, auto, wrong, escalated int
+		var latencies []float64
+		for _, c := range r.cases {
+			rec, ok := run.Records[c.ID]
+			if !ok || rec.Err != "" || rec.Escalated == nil {
+				continue
+			}
+			n++
+			latencies = append(latencies, rec.TotalMS)
+			if *rec.Escalated {
+				escalated++
+			} else if rec.Pred != "" && rec.Pred != noRoute {
+				auto++
+				if rec.Pred != c.Gold {
+					wrong++
+				}
+			}
+		}
+		if !heading {
+			r.p("## 升级链实测\n\n| 系统 | 有效样本 | 自动承接 | 升级比例 | 自动承接错路由 | 端到端 P95 (ms) |\n|---|---|---|---|---|---|\n")
+			heading = true
+		}
+		r.p("| %s | %d | %s | %s | %s | %s |\n", run.label(), n, pct(auto, n), pct(escalated, n), pct(wrong, auto), fmtMS(percentile(latencies, 95)))
+	}
+	if heading {
+		r.p("\n")
+	}
 }
 
 // consistency 比较同一系统两轮判定的一致率。

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1781,7 +1782,14 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			// 全部不只第一条。
 			batch := make([]*AskQuery, 0, len(res.AllInterrupts))
 			for _, ie := range res.AllInterrupts {
-				batch = append(batch, ie.AllQueries()...)
+				for _, query := range ie.AllQueries() {
+					if query.Reason == "" && ie.Reason != "" {
+						copy := *query
+						copy.Reason = ie.Reason
+						query = &copy
+					}
+					batch = append(batch, query)
+				}
 			}
 			// ⚠️ **撞 ID 只记下事实，不在这儿 return**：下面还有 SuccessWrites 的
 			// ApplyAll 和 appendCompletedSiblingsLocked——从这儿跳出去会让成功兄弟的 writes
@@ -3114,12 +3122,19 @@ func warnUnmatchedAnswerIDs(ctx context.Context, resumeFrom *Checkpoint, answers
 	// 重跑会以**同一个位置派生 ID** 重新问出来，ResumeContext 里的答案照样配上。
 	// 真会丢的是另一类：重跑分支根本不提问（纯业务错重试），答案没有认领人。
 	// 框架分不出这两类（取决于节点重跑后干什么），所以只提示、不拒绝。
+	replayed, _ := ctx.Value(replayedResumeAnswersKey{}).(map[string]bool)
 	if len(resumeFrom.PendingInterrupts) == 0 {
 		if len(answers) > 0 {
 			ids := make([]string, 0, len(answers))
 			for id := range answers {
-				ids = append(ids, id)
+				if !replayed[id] {
+					ids = append(ids, id)
+				}
 			}
+			if len(ids) == 0 {
+				return
+			}
+			sort.Strings(ids)
 			slog.WarnContext(ctx, "compose_v2: 带了答案但这份存档里没有待答问题",
 				"answer_ids", ids, "cp_status", resumeFrom.Status.String(),
 				"hint", "这份档是「有活没跑完」而不是「有人在等回答」。两种可能：(a) 重跑分支会以"+
@@ -3145,11 +3160,12 @@ func warnUnmatchedAnswerIDs(ctx context.Context, resumeFrom *Checkpoint, answers
 	if len(answers) > 0 {
 		var unmatched []string
 		for id := range answers {
-			if !pendingIDs[id] {
+			if !pendingIDs[id] && !replayed[id] {
 				unmatched = append(unmatched, id)
 			}
 		}
 		if len(unmatched) > 0 {
+			sort.Strings(unmatched)
 			slog.WarnContext(ctx, "compose_v2: WithResumeAnswers 含 unmatched InterruptIDs",
 				"unmatched", unmatched, "pending_count", len(pendingIDs),
 				"hint", "三种场景: (a) 业务拼错 ID / cp 无对应 pending — 真异常; (b) 业务把历次答案累积在一个 map 里一起传 — 这是预期, 上几轮的 ID 自然 unmatched (example/compose/identity_guard_smoke 与 example/orchestration/nested_smoke 都是这个形态, 后者是必跑冒烟); (c) 同一个问题每次续跑都换了 ID、永远答不完 — 典型是嵌套调用的输入每次都变（工具中间件往 AgentAsTool 的参数里注入时间戳、trace_id），每次续跑都被当成一次新调用重问：给调用声明身份（agent_v2.WithAgentToolCallKey / agent_v2.WithCallKey）. 业务监控可按场景区分。**别升级成 error**: (b) 合法且真实存在, 拒掉会当场打断那条闭环")

@@ -651,6 +651,35 @@ router := agent_v2.NewRoutingAgent(opts...).
 
 ---
 
+### 用外部业务样本复测
+
+用 `-cases` 读取外部 JSONL，每行包含唯一的 `id`、场景 `sc`、人工标注的 `gold` 和中文输入 `zh`。
+`tags` 和英文原文 `en` 可选。可把脱敏的前文和最新消息放进 `zh`。`-scenarios` 可另读一个 JSON
+数组，为业务场景声明 `id`、`title` 和 `routes`，每个分支填写 `name`、`desc_zh` 及可选的 `desc_en`。
+省略 `-scenarios` 时沿用内嵌分支。样本填写 `en` 时，对应场景的每个分支都需填写 `desc_en`。
+评测跳过缺少相应原文或分支说明的语言组合。
+
+```json
+[{"id":"support","title":"客服","routes":[
+  {"name":"order","desc_zh":"订单与物流"},
+  {"name":"refund","desc_zh":"退款与售后"}
+]}]
+```
+
+```jsonl
+{"id":"case-01","sc":"support","gold":"order","zh":"订单昨天发出，今天能送到吗？","tags":["物流"]}
+```
+
+```bash
+go run ./example/decision/routing_eval -cases requests.jsonl -scenarios routes.json \
+  -systems jev,qwen,cascade -conds zh -cascade-threshold 0.85 -out /tmp/crew-routing-eval
+```
+
+在同一批标注上比较不同阈值的自动承接率、升级率、自动承接错路由率和端到端 P95。
+混合方案模拟只用两条路径都判定过的样本，真实 cascade 数据用实际执行的阶段与耗时。
+改变标注可复用输入指纹命中的模型预测，修改输入或分支说明会重跑。
+线上复核可以按请求抽样挂 `agent_v2.WithShadow` 并设短超时，影子与线上结果交给人工标注复核。
+
 ## 6. 决策记录
 
 | 决策 | 理由 |

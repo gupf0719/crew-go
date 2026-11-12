@@ -297,8 +297,8 @@ func TestSessionTTL_ExpiredIsUnusableBeforeSweep(t *testing.T) {
 	seedPending(t, h, cp, key, 2*time.Hour)
 	h.lastSweep = time.Now().UnixNano() // 刚扫过 ⟹ 限频内，sweep 一定不跑
 
-	sess, _, _, ok, busy := h.acquireForResume(key)
-	if ok || sess != nil {
+	entry, busy := h.acquireForResume(key)
+	if entry != nil {
 		t.Errorf("过期会话仍然续得起来——语义上界被回收节奏绑架了")
 	}
 	if busy {

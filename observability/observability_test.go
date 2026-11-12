@@ -1109,6 +1109,13 @@ func TestNodeComponent_RetrievalSpan(t *testing.T) {
 	if len(h.spansNamed("invoke_workflow rag")) != 1 {
 		t.Errorf("GraphAgent 应有一个 invoke_workflow span，且外层 agent 已建 span 时图不再重复建；全部：%v", names(h.spans()))
 	}
+	metrics := h.collect(t)
+	if n := histCount(t, metrics, observability.MetricInvokeWorkflowDuration, nil); n != 1 {
+		t.Errorf("GraphAgent 与同层图只记一次工作流时长，got %d", n)
+	}
+	if n := histCount(t, metrics, observability.MetricInvokeAgentDuration, nil); n != 0 {
+		t.Errorf("工作流样本不应进 agent 时长序列，got %d", n)
+	}
 }
 
 // ─── 审计修复的哨兵 ───

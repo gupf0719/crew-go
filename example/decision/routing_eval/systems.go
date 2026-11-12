@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -119,6 +120,7 @@ type record struct {
 	TotalMS    float64            `json:"total_ms"`
 	Attempts   int                `json:"attempts"`
 	Err        string             `json:"err,omitempty"`
+	Escalated  *bool              `json:"escalated,omitempty"`
 	Raw        string             `json:"raw,omitempty"`
 	At         string             `json:"at"`
 }
@@ -197,6 +199,7 @@ type deciderSystem struct {
 	// provider 是缓存键与报告里的服务方名：jev 或 bailian。
 	provider  string
 	model     string
+	endpoint  string
 	transport http.RoundTripper // 所有请求共用的连接池
 	// newClient 用给定的 HTTP 客户端构造这一家的客户端。
 	newClient func(hc *http.Client) *decision.Client
@@ -205,7 +208,7 @@ type deciderSystem struct {
 // newJevSystem 直连 TypeSafe 的 Jev。
 func newJevSystem(apiKey, baseURL, model string, concurrency int) *deciderSystem {
 	return &deciderSystem{
-		provider: "jev", model: model, transport: pooledTransport(concurrency),
+		provider: "jev", model: model, endpoint: baseURL, transport: pooledTransport(concurrency),
 		newClient: func(hc *http.Client) *decision.Client {
 			return jev.NewClient(apiKey, decision.WithBaseURL(baseURL), decision.WithModel(model), decision.WithHTTPClient(hc))
 		},
@@ -215,7 +218,7 @@ func newJevSystem(apiKey, baseURL, model string, concurrency int) *deciderSystem
 // newBailianSystem 调阿里云百炼的决策模型。
 func newBailianSystem(apiKey string, region bailian.Region, workspaceID, model string, concurrency int) *deciderSystem {
 	return &deciderSystem{
-		provider: "bailian", model: model, transport: pooledTransport(concurrency),
+		provider: "bailian", model: model, endpoint: string(region) + "/" + workspaceID, transport: pooledTransport(concurrency),
 		newClient: func(hc *http.Client) *decision.Client {
 			return bailian.NewClient(apiKey, region, workspaceID, decision.WithModel(model), decision.WithHTTPClient(hc))
 		},
@@ -239,9 +242,9 @@ func (s *deciderSystem) client(usage *usageRecorder) *decision.Client {
 // signature 里的 "route-decider" 标明走的是框架路径：换了实现路径，旧缓存必须作废。
 func (s *deciderSystem) signature(cond condition, c evalCase) string {
 	if cond.DefaultInstructions {
-		return "route-decider\x00default:" + decision.DefaultRouteInstructions
+		return "route-decider\x00" + s.endpoint + "\x00default:" + decision.DefaultRouteInstructions
 	}
-	return "route-decider\x00" + deciderInstructions(cond.CriteriaLang, c.Tier)
+	return "route-decider\x00" + s.endpoint + "\x00" + deciderInstructions(cond.CriteriaLang, c.Tier)
 }
 
 func (s *deciderSystem) decide(ctx context.Context, sc scenario, c evalCase, cond condition) record {
@@ -421,11 +424,11 @@ type cascadeSystem struct {
 }
 
 func (s *cascadeSystem) key() string {
-	return fmt.Sprintf("cascade:%s>%s@%.2f", s.decider.provider, s.qwen.modelName, s.threshold)
+	return fmt.Sprintf("cascade:%s>%s@%s", s.decider.provider, s.qwen.modelName, strconv.FormatFloat(s.threshold, 'f', -1, 64))
 }
 
 func (s *cascadeSystem) signature(cond condition, c evalCase) string {
-	return s.decider.signature(cond, c) + "\x00" + s.qwen.signature(cond, c)
+	return "cascade-v2\x00" + s.decider.key() + "\x00" + strconv.FormatFloat(s.threshold, 'g', -1, 64) + "\x00" + s.decider.signature(cond, c) + "\x00" + s.qwen.signature(cond, c)
 }
 
 func (s *cascadeSystem) decide(ctx context.Context, sc scenario, c evalCase, cond condition) record {
@@ -456,7 +459,14 @@ func (s *cascadeSystem) decide(ctx context.Context, sc scenario, c evalCase, con
 	rec.DecideMS = rec.TotalMS
 	jin, jout := usage.totals()
 	rec.InTokens, rec.OutTokens = jin+obs.inTokens, jout+obs.outTokens
+	action := decisions.last()
+	if action != nil {
+		escalated := len(action.Escalations) > 0
+		rec.Escalated = &escalated
+	}
 	if undecided, ok := undecidedPrediction(err, true); ok {
+		escalated := len(undecided.Escalations) > 0
+		rec.Escalated = &escalated
 		recordUndecided(&rec, undecided)
 		return rec
 	}
@@ -468,7 +478,6 @@ func (s *cascadeSystem) decide(ctx context.Context, sc scenario, c evalCase, con
 		rec.Err = "classifier: " + msg
 		return rec
 	}
-	action := decisions.last()
 	if action == nil {
 		rec.Err = "no route_decision event"
 		return rec

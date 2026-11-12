@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -63,29 +64,32 @@ type job struct {
 func main() {
 	envloader.Load()
 	var (
-		systemsFlag = flag.String("systems", "jev,qwen", "要跑的系统，逗号分隔：jev、bailian、qwen、cascade（Jev 拿不准交给 qwen 的升级链）、cascade-bailian（百炼拿不准交给 qwen）")
-		cascadeMin  = flag.Float64("cascade-threshold", 0.85, "升级链里决策模型那一档的门槛")
-		condsFlag   = flag.String("conds", "zh,zh-en,en,zh-default", "要跑的语言条件，逗号分隔；qwen 不跑 zh-en 与 zh-default")
-		setsFlag    = flag.String("set", "standard,hard,real", "要跑的样本子集，逗号分隔：standard、hard、real")
-		qwenModel   = flag.String("qwen-model", qwen.TestModelCandidates[0], "qwen 基线模型快照")
-		cascadeQwen = flag.String("cascade-qwen-model", "", "升级链里 classifier 用的 qwen 模型，留空同 -qwen-model；基线快照额度用完时换一个，基线仍可用缓存")
-		qwenRef     = flag.String("qwen-ref", "", "可选的 qwen 参考模型，只跑 zh，用作上限参照与标注复核")
-		jevModel    = flag.String("jev-model", jev.Model, "Jev 模型名")
-		jevBaseURL  = flag.String("jev-base-url", jev.BaseURL, "TypeSafe API 地址")
-		blWorkspace = flag.String("bailian-workspace", os.Getenv("BAILIAN_WORKSPACE_ID"), "百炼业务空间 ID，形如 llm-xxxx")
-		blRegion    = flag.String("bailian-region", string(bailian.Beijing), "百炼地域：cn-beijing 或 ap-southeast-1")
-		blModel     = flag.String("bailian-model", bailian.Model, "百炼决策模型名")
-		concurrency = flag.Int("concurrency", 4, "每个「系统 × 条件」的并发请求数")
-		limit       = flag.Int("limit", 0, "只跑均匀抽取的 N 条样本，0 表示全部")
-		repeat      = flag.Bool("repeat", false, "zh 条件额外再跑一轮，测同一输入的判定一致性")
-		rerun       = flag.Bool("rerun", false, "忽略缓存全部重跑")
-		outDir      = flag.String("out", defaultOutDir(), "结果缓存与报告目录")
-		review      = flag.Bool("review", false, "报告附上参考模型与标注不一致的样本，用于复核标注")
+		systemsFlag  = flag.String("systems", "jev,qwen", "要跑的系统，逗号分隔：jev、bailian、qwen、cascade（Jev 拿不准交给 qwen 的升级链）、cascade-bailian（百炼拿不准交给 qwen）")
+		cascadeMin   = flag.Float64("cascade-threshold", 0.85, "升级链里决策模型那一档的门槛")
+		condsFlag    = flag.String("conds", "zh,zh-en,en,zh-default", "要跑的语言条件，逗号分隔；qwen 不跑 zh-en 与 zh-default")
+		setsFlag     = flag.String("set", "", "内嵌样本子集，逗号分隔：standard、hard、real（默认全选）")
+		casePath     = flag.String("cases", "", "业务标注 JSONL 文件，配置后只评测该文件")
+		scenarioPath = flag.String("scenarios", "", "外部样本的分支定义 JSON 文件，留空沿用内嵌定义")
+		qwenModel    = flag.String("qwen-model", qwen.TestModelCandidates[0], "qwen 基线模型快照")
+		cascadeQwen  = flag.String("cascade-qwen-model", "", "升级链里 classifier 用的 qwen 模型，留空同 -qwen-model；基线快照额度用完时换一个，基线仍可用缓存")
+		qwenRef      = flag.String("qwen-ref", "", "可选的 qwen 参考模型，只跑 zh，用作上限参照与标注复核")
+		jevModel     = flag.String("jev-model", jev.Model, "Jev 模型名")
+		jevBaseURL   = flag.String("jev-base-url", jev.BaseURL, "TypeSafe API 地址")
+		blWorkspace  = flag.String("bailian-workspace", os.Getenv("BAILIAN_WORKSPACE_ID"), "百炼业务空间 ID，形如 llm-xxxx")
+		blRegion     = flag.String("bailian-region", string(bailian.Beijing), "百炼地域：cn-beijing 或 ap-southeast-1")
+		blModel      = flag.String("bailian-model", bailian.Model, "百炼决策模型名")
+		concurrency  = flag.Int("concurrency", 4, "每个「系统 × 条件」的并发请求数")
+		limit        = flag.Int("limit", 0, "只跑均匀抽取的 N 条样本，0 表示全部")
+		repeat       = flag.Bool("repeat", false, "zh 条件额外再跑一轮，测同一输入的判定一致性")
+		rerun        = flag.Bool("rerun", false, "忽略缓存全部重跑")
+		outDir       = flag.String("out", defaultOutDir(), "结果缓存与报告目录")
+		review       = flag.Bool("review", false, "报告附上参考模型与标注不一致的样本，用于复核标注")
 	)
 	flag.Parse()
 
 	if err := run(options{
 		systems: splitList(*systemsFlag), conds: splitList(*condsFlag), sets: splitList(*setsFlag),
+		casePath: *casePath, scenarioPath: *scenarioPath,
 		qwenModel: *qwenModel, qwenRef: *qwenRef, jevModel: *jevModel, jevBaseURL: *jevBaseURL,
 		bailianWorkspace: *blWorkspace, bailianRegion: *blRegion, bailianModel: *blModel,
 		concurrency: *concurrency, limit: *limit, repeat: *repeat, rerun: *rerun, cascadeMin: *cascadeMin,
@@ -99,6 +103,7 @@ func main() {
 
 type options struct {
 	systems, conds, sets                     []string
+	casePath, scenarioPath                   string
 	qwenModel, qwenRef, jevModel, jevBaseURL string
 	bailianWorkspace, bailianRegion          string
 	bailianModel                             string
@@ -113,13 +118,18 @@ func run(opt options) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	all, err := loadCases()
+	if opt.casePath != "" && len(opt.sets) > 0 {
+		return fmt.Errorf("-cases and -set are mutually exclusive")
+	}
+	cases, err := loadCases(opt.casePath, opt.scenarioPath)
 	if err != nil {
 		return err
 	}
-	cases, err := selectTiers(all, opt.sets)
-	if err != nil {
-		return err
+	if len(opt.sets) > 0 {
+		cases, err = selectTiers(cases, opt.sets)
+		if err != nil {
+			return err
+		}
 	}
 	cases = sample(cases, opt.limit)
 
@@ -289,27 +299,26 @@ func runJob(ctx context.Context, jb job, cases []evalCase, opt options) (runResu
 	if err != nil {
 		return runResult{}, err
 	}
-	applicable := make([]evalCase, 0, len(cases))
+	current := make(map[string]record, len(cases))
+	todo := make([]evalCase, 0, len(cases))
 	for _, c := range cases {
-		if strings.TrimSpace(c.text(jb.cond.StateLang)) != "" {
-			applicable = append(applicable, c)
+		if !caseApplies(c, jb.cond) {
+			continue
 		}
-	}
-	todo := make([]evalCase, 0, len(applicable))
-	for _, c := range applicable {
-		sc, _ := scenarioByID(c.Scenario) // loadCases 已校验场景存在
 		rec, ok := cached[c.ID]
-		if opt.rerun || !ok || rec.Err != "" || rec.InputHash != inputHash(jb.sys, sc, c, jb.cond) {
+		if opt.rerun || !ok || rec.Err != "" || rec.InputHash != inputHash(jb.sys, c.scenario, c, jb.cond) {
 			todo = append(todo, c)
+			continue
 		}
+		current[c.ID] = rec
 	}
-	res := runResult{System: jb.sys.key(), Cond: jb.cond.Name, Pass: jb.pass, Records: cached}
+	res := runResult{System: jb.sys.key(), Cond: jb.cond.Name, Pass: jb.pass, Records: current}
 	label := res.label()
 	if len(todo) == 0 {
-		fmt.Fprintf(os.Stderr, "[%s] all %d cached\n", label, len(applicable))
+		fmt.Fprintf(os.Stderr, "[%s] all %d cached\n", label, len(current))
 		return res, nil
 	}
-	fmt.Fprintf(os.Stderr, "[%s] running %d of %d (%d cached)\n", label, len(todo), len(applicable), len(applicable)-len(todo))
+	fmt.Fprintf(os.Stderr, "[%s] running %d of %d (%d cached)\n", label, len(todo), len(todo)+len(current), len(current))
 
 	var (
 		mu       sync.Mutex
@@ -350,7 +359,8 @@ func runJob(ctx context.Context, jb job, cases []evalCase, opt options) (runResu
 	close(queue)
 	wg.Wait()
 
-	if err := saveCache(path, cases, res.Records); err != nil {
+	maps.Copy(cached, current)
+	if err := saveCache(path, cases, cached); err != nil {
 		return runResult{}, err
 	}
 	if ctx.Err() != nil {
@@ -359,15 +369,29 @@ func runJob(ctx context.Context, jb job, cases []evalCase, opt options) (runResu
 	return res, nil
 }
 
+// caseApplies 跳过缺少对应语种原文或分支描述的组合。
+func caseApplies(c evalCase, cond condition) bool {
+	if strings.TrimSpace(c.text(cond.StateLang)) == "" {
+		return false
+	}
+	if cond.CriteriaLang == langEN {
+		for _, r := range c.scenario.Routes {
+			if strings.TrimSpace(r.DescEN) == "" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // decideWithRetry 对单条样本做判定；基础设施错误（网络、限流、模型调用失败）重试，
 // 路由判错不重试。
 func decideWithRetry(ctx context.Context, jb job, c evalCase) record {
-	sc, _ := scenarioByID(c.Scenario) // loadCases 已校验场景存在
 	var rec record
 	const maxAttempts = 3
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		ictx, cancel := context.WithTimeout(ctx, 90*time.Second)
-		rec = jb.sys.decide(ictx, sc, c, jb.cond)
+		rec = jb.sys.decide(ictx, c.scenario, c, jb.cond)
 		cancel()
 		rec.Attempts = attempt
 		if rec.Err == "" || ctx.Err() != nil || attempt == maxAttempts {
@@ -379,7 +403,7 @@ func decideWithRetry(ctx context.Context, jb job, c evalCase) record {
 		}
 	}
 	rec.ID = c.ID
-	rec.InputHash = inputHash(jb.sys, sc, c, jb.cond)
+	rec.InputHash = inputHash(jb.sys, c.scenario, c, jb.cond)
 	rec.At = time.Now().Format(time.RFC3339)
 	return rec
 }

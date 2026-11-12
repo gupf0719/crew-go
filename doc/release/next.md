@@ -72,4 +72,5 @@ CREATE TABLE IF NOT EXISTS crew_checkpoint_task_lease (
 - Plan Web 可配置共享 Redis，支持跨副本续跑、会话状态查询、删除和完成即清理。 [Plan Web](../issue/issue-90-plan-chat-web-lifecycle-prod.md)
 - 外部文本函数可用 `agent_v2.NewAgentFunc` 加入编排。配置存档后，失败或取消的函数可能重跑，外部副作用需保持幂等。 [外部 Agent](../issue/issue-91-external-agent-adapter.md)
 - Skill 的核心流程留在 `SKILL.md`，详细资料放在参考文件，激活后按预算自动读取或由模型按需读取。 [Skill 参考文档](../v2/skill.md#按需读取参考文档)
-- AG-UI 用户媒体按模型适配器支持的格式透传。A2A JSON-RPC 默认传输按 HTTP 状态识别 `GetTask` 的 401/403，首次答复可发出，已经开始投递的答复在无法对账时保留挂起。 [AG-UI](../v2/agui.md) · [A2A](../v2/a2a.md)
+- AG-UI 用户媒体按模型适配器支持的格式透传。配置共享 SQL 会话后，审批可跨实例续跑，重连可查询当前挂起项。 [AG-UI](../v2/agui.md#共享会话)
+- A2A JSON-RPC 默认传输按 HTTP 状态识别 `GetTask` 的 401/403，首次答复可发出，已经开始投递的答复在无法对账时保留挂起。 [A2A](../v2/a2a.md)

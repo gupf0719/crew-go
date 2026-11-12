@@ -23,7 +23,7 @@ import (
 //
 // chs 决定它看得见什么：
 //
-//   - 正在执行的成员 → 传 `cm.channelsWithPending(它自己的 writes)`
+//   - 正在执行的成员 → 传实例视图和该成员的写入叠加层。
 //   - completedSibling（写入早已提交、本超步不执行）→ 传 `cm.Channels()` 即可
 //
 // 返回的 targets 可能含 EndNode；去重与 isEnd 判定交给 [assembleFrontier]。
@@ -82,13 +82,13 @@ func evalOutEdges(ctx context.Context, g *Graph, from NodeID, chs Channels, ph c
 	return targets, nil
 }
 
-// validateSendTargets 校验成员 from 这次经 SendFrom 发出的投递目标：目标必须是图里注册过的节点（EndNode 与空串照旧
+// validateSendDirectives 校验成员 from 经 SendFrom 发出的目标与私有输入。目标必须是图里注册过的节点（EndNode 与空串
 // 跳过不投递）。跟条件边返回的目标同一条判据、同一个处置——图里没有的节点、起点 sentinel 是图定义错，重跑必然一样
 // ⟹ `%w ErrRunAborted`（不重试 + Run 出口清 cp 子树），算在这个成员名下、在提交之前。
 //
 // 不在这里拦的话，坏目标进了下一超步的 frontier 才炸在「node 未注册」上：那是普通错误（默认可重试），存档里带着这个
 // 跑不动的目标，每次续跑原地再炸（实测）。
-func validateSendTargets(g *Graph, from NodeID, directives []SendDirective) error {
+func validateSendDirectives(g *Graph, cm *ChannelManager, from NodeID, directives []SendDirective) error {
 	for i, d := range directives {
 		if d.Target == "" || d.Target == EndNode {
 			continue
@@ -98,11 +98,16 @@ func validateSendTargets(g *Graph, from NodeID, directives []SendDirective) erro
 				"%w: node %q 的第 %d 条 SendFrom 投递目标 %q 不是图里注册过的节点（StartNode 入口 sentinel 也不能作投递目标; graph nodes: %d）",
 				ErrRunAborted, from, i, d.Target, len(g.nodes))
 		}
+		if len(d.Input) > 0 {
+			if err := cm.validateSendInput(d.Input); err != nil {
+				return fmt.Errorf("%w: node %q 的第 %d 条 SendFrom 到 %q 的私有输入: %w", ErrRunAborted, from, i, d.Target, err)
+			}
+		}
 	}
 	return nil
 }
 
-// evalMemberOutEdges 算正在执行的成员 m 的出边（视图 = 已提交 + m 自己的写入 ws）。
+// evalMemberOutEdges 算正在执行的成员 m 的出边，视图叠加该实例的私有输入与自己的写入 ws。
 //
 // cond 按 [CondFailRerunFrom] **否决**时（[condRejected]），推进 m 这次执行的重做代际：此前按
 // [Rerunnable] 记下的步骤随之不可达，续跑重跑 m 时那些步骤重新做，m 重做时问的问题也是新问题
@@ -118,7 +123,7 @@ func evalMemberOutEdges(ctx context.Context, g *Graph, cm *ChannelManager, m Fro
 	visit := cm.GetVisitCount(m.NodeID)
 	nodeKey := nodeStateKey(m.NodeID, m.InstanceID, visit)
 	sc := &signalScope{}
-	targets, err := evalOutEdges(withSignalScope(ctx, sc), g, m.NodeID, cm.channelsWithPending(ws), condPhase{
+	targets, err := evalOutEdges(withSignalScope(ctx, sc), g, m.NodeID, cm.channelsForMember(m).withPending(ws), condPhase{
 		from:       m.NodeID,
 		instanceID: m.InstanceID,
 		visit:      visit,

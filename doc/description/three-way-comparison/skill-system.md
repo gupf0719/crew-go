@@ -447,7 +447,7 @@ AutoCompact breaker 双层物理隔离：① **per-BasicAgent**（`config.go::Wi
 > 预算闸门），把累积主体从 body 层迁到 reference 层。业内 3-0 验证（Anthropic Agent Skills 三级官方 /
 > SkillReducer arXiv 2603.29919 / AGENTS.md spec #135）。**完整设计（三级分层 / `read_skill_resource`
 > 工具 / L3a-d 触发缓解 / over-read 预算闸门伪代码 / L2 简化边界 / 5 条风险 / 实施顺序）见
-> [ISSUE-92](../../issue/issue-92-skill-source-layering.md)**。📋 待实施 2026-06。
+> [ISSUE-92](../../issue/issue-92-skill-source-layering.md)**。当前实现见 [Skill 参考文档](../../v2/skill.md#按需读取参考文档)。
 
 ## 决策记录
 

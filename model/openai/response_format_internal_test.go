@@ -11,7 +11,10 @@ import (
 // response_format={type:"json_object"}（无 json_schema 子字段）。白盒测未导出 buildRequest。
 func TestBuildRequest_ResponseFormat_JSONObject(t *testing.T) {
 	c := NewClient("k", "m")
-	req := c.buildRequest(nil, model.Apply(model.WithJSONObject()), false)
+	req, err := c.buildRequest(nil, model.Apply(model.WithJSONObject()), false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if req.ResponseFormat == nil {
 		t.Fatal("ResponseFormat nil; want json_object")
 	}
@@ -41,7 +44,10 @@ func TestBuildRequest_ResponseFormat_JSONSchema(t *testing.T) {
 		"required":             []any{"name"},
 		"additionalProperties": false,
 	}
-	req := c.buildRequest(nil, model.Apply(model.WithJSONSchema("person", sc, true)), false)
+	req, err := c.buildRequest(nil, model.Apply(model.WithJSONSchema("person", sc, true)), false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if req.ResponseFormat == nil || req.ResponseFormat.JSONSchema == nil {
 		t.Fatal("ResponseFormat/JSONSchema nil")
 	}
@@ -67,7 +73,10 @@ func TestBuildRequest_ResponseFormat_JSONSchema(t *testing.T) {
 // TestBuildRequest_NoResponseFormat 验不设时 omitempty 省略 response_format（不污染默认）。
 func TestBuildRequest_NoResponseFormat(t *testing.T) {
 	c := NewClient("k", "m")
-	req := c.buildRequest(nil, model.Apply(), false)
+	req, err := c.buildRequest(nil, model.Apply(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if req.ResponseFormat != nil {
 		t.Errorf("无 WithResponseFormat 时应为 nil, got %+v", req.ResponseFormat)
 	}

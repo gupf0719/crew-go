@@ -142,7 +142,6 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 	}
 
 	subNodeFunc := func(ctx context.Context, parentChs Channels) ([]ChannelWrite, error) {
-		parentCM := parentChs.cm
 
 		// 嵌套 cp 物理分离：从 ctx 取 Checkpointer + sessionID + 父 ns，算子 ns
 		cper := GetCheckpointer(ctx)
@@ -269,7 +268,7 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 			if err := subCM.register(ich); err != nil {
 				return nil, fmt.Errorf("subgraph %q import %q: %w", id, ich.name(), err)
 			}
-			parentVal, ok := parentCM.read(ich.name())
+			parentVal, ok := parentChs.read(ich.name())
 			if !ok {
 				continue // 父图未写入：子图读到 zero
 			}

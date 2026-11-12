@@ -417,13 +417,20 @@ func (t *skillTool) Call(ctx context.Context, args map[string]any) (*tool.Result
 		}
 		return tool.Failure(tool.ErrCodeNotFound, fmt.Sprintf("skill %q: %v", name, err)), nil
 	}
+	if active == nil {
+		return tool.Failure(tool.ErrCodeNotFound, fmt.Sprintf("skill %q returned no active skill", name)), nil
+	}
 
 	mode := strings.ToLower(strings.TrimSpace(active.Skill.Context))
 	switch mode {
 	case "fork":
 		return t.runForkMode(ctx, active, args)
 	case "", "inline":
-		return tool.Success(active.Prompt), nil
+		result := tool.Success(skillPromptWithReferences(active.Prompt, active.Resources))
+		if paths := skillReferencePaths(active.Resources); len(paths) > 0 {
+			result.Metadata = map[string]any{skillReferencePathsKey: paths}
+		}
+		return result, nil
 	default:
 		return tool.Failure(SkillForkErrCode,
 			fmt.Sprintf("skill %q has unknown context %q (expected: inline / fork)", name, active.Skill.Context)), nil

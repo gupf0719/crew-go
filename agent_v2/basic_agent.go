@@ -2648,7 +2648,8 @@ func resetRequiredToolChoice(o *model.Options) {
 // 要加时拷一份；业务的同名工具在这份里被框架那件顶掉（构造期已告警）。
 func withFrameworkTools(cfg *Config, tk *tool.Toolkit, background bool) *tool.Toolkit {
 	background = background && cfg.BackgroundTasks != nil
-	if !cfg.AskUserOptIn && cfg.OutputSchema == nil && cfg.ToolResultSpill == nil && !background {
+	references := cfg.Skill != nil && cfg.Skill.SkillBox != nil && hasSkillReferences(cfg.Skill.SkillBox)
+	if !cfg.AskUserOptIn && cfg.OutputSchema == nil && cfg.ToolResultSpill == nil && !background && !references {
 		return tk
 	}
 	out := tool.NewToolkit()
@@ -2668,6 +2669,9 @@ func withFrameworkTools(cfg *Config, tk *tool.Toolkit, background bool) *tool.To
 	}
 	if background {
 		out.Register(newBackgroundTaskTool())
+	}
+	if references {
+		out.Register(&skillReferenceTool{box: cfg.Skill.SkillBox, maxTokens: referenceMaxTokens(cfg)})
 	}
 	return out
 }
@@ -3291,6 +3295,7 @@ func (a *BasicAgent) composeDispatchToolkit(grants memberGrants, background bool
 // dispatch toolkit 是两份独立副本，见下面 dispatchToolkit 的注释）。
 func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Toolkit) BasicAgentToolFn {
 	cfg := a.config
+	_, references := dispatchToolkit.Get(readSkillResourceToolName).(*skillReferenceTool)
 	// 派发侧「哪些工具被延迟了」只认 composeDispatchToolkit 实际算出来的那份名单（挂在框架那件 tool_search 上），
 	// 不重新跑 Deferred 谓词：两边各判一次的话，算名单时的例外（tool_search 这个名字、框架工具）这边抄不全——
 	// 业务工具叫 tool_search 又是唯一被延迟的那件时，模型看得到它、调用却一律被拒，一直循环到轮次上限（审计实测）。
@@ -3388,6 +3393,10 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				memo.Done = map[string]*toolMemoEntry{}
 			}
 		}
+		if batch := toolBatchFrom(ctx); references && batch != nil {
+			batch.references = &cfg
+			batch.refReads = newSkillReferenceReads(ctx, batch.messages, memo.Done)
+		}
 		// memoKey 三维：`(tc.ID, 批内下标, 工具名)`。
 		//
 		//   - **下标**：框架别处不假设 tc.ID 唯一（同批两个 tc 用同一个 ID 时，只按 ID 记
@@ -3431,7 +3440,8 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			//
 			// 业务工具一律进记账：它里面经嵌套调用做出的决定随账走；它在工具体外留下的、
 			// 不进 cp 的副作用，命中时同样不会再做一次（那正是记账的目的）。
-			if !shouldMemoize(isFrameworkMintedIn(dispatchToolkit, tc.Function.Name), oc.signals) {
+			_, referenceRead := dispatchToolkit.Get(tc.Function.Name).(*skillReferenceTool)
+			if !referenceRead && !shouldMemoize(isFrameworkMintedIn(dispatchToolkit, tc.Function.Name), oc.signals) {
 				return
 			}
 			memoMu.Lock()
@@ -3707,10 +3717,14 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 
 			// **P2.D inline body 协议**：仅 framework activate_skill 成功 + InlineSkillBody 启用时
 			_, isSkillTool := dispatchToolkit.Get(tc.Function.Name).(*skillTool) // 按实例认：派发的是框架那件 activate_skill
-			isFrameworkActivateSkill := isSkillTool && res != nil && res.Error == nil
+			isFrameworkActivateSkill := isSkillTool && res != nil && res.Success && res.Error == nil
+			skillName, _ := args["skill"].(string)
+			var referencePaths []string
+			if references && isFrameworkActivateSkill {
+				referencePaths, _ = res.Metadata[skillReferencePathsKey].([]string)
+			}
 			isForkExecuted := res != nil && res.Metadata != nil && res.Metadata[SkillForkExecutedMetaKey] == true
 			if isFrameworkActivateSkill && cfg.InlineSkillBody && !isForkExecuted {
-				skillName, _ := args["skill"].(string)
 				body := content
 				// R22 audit HIGH-1 fix: SkillBodyMaxChars 截断
 				maxChars := cfg.SkillBodyMaxChars
@@ -3730,8 +3744,12 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				toolMsg := schema.ToolResultMessage(tc.ID, ackContent)
 				// R19 audit HIGH-1 fix: terse ack toolMsg 也打 SkillBodyAnnotation
 				toolMsg.Annotations = map[string]any{SkillBodyAnnotation: true}
+				if len(referencePaths) > 0 {
+					toolMsg.Annotations[skillReferenceActivation] = skillName
+					toolMsg.Annotations[skillReferencePathsKey] = referencePaths
+				}
 				bodyMsg := schema.UserMessage(fmt.Sprintf("[system_reminder] Skill %q content:\n%s", skillName, body))
-				bodyMsg.Annotations = map[string]any{SkillBodyAnnotation: true}
+				bodyMsg.Annotations = map[string]any{SkillBodyAnnotation: true, skillInlineCallIndex: strconv.Itoa(idx)}
 				return outcome{toolMsg: toolMsg, bodyMsg: bodyMsg}
 			}
 
@@ -3756,6 +3774,18 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 					toolMsg.Annotations = map[string]any{}
 				}
 				toolMsg.Annotations[SkillBodyAnnotation] = true
+				if len(referencePaths) > 0 {
+					toolMsg.Annotations[skillReferenceActivation] = skillName
+					toolMsg.Annotations[skillReferencePathsKey] = referencePaths
+				}
+			}
+			if target, ok := dispatchToolkit.Get(tc.Function.Name).(*skillReferenceTool); ok && target != nil && res != nil && res.Success {
+				if key, ok := res.Metadata[skillReferenceReadKey].(string); ok {
+					if toolMsg.Annotations == nil {
+						toolMsg.Annotations = make(map[string]any)
+					}
+					toolMsg.Annotations[skillReferenceReadKey] = key
+				}
 			}
 			// return-direct：工具声明 tool.Result.Metadata[ReturnDirectMetaKey]=true 时打
 			// ReturnDirectAnnotation——compose_v2 toolsNode 读它短路 ReAct、不回 model

@@ -1,7 +1,9 @@
 # ISSUE-92 · skill 源头分层（L0 progressive disclosure）+ 触发缓解 + over-read 预算闸门
 
 **优先级**：中（缓解 toolCall 模式 skill body 跨 compaction 累积，但要改 SKILL.md 格式 + 新工具，影响面大）
-**状态**：📋 设计完成待实施（2026-06）
+**状态**　默认 toolCall 的 inline 激活已接入参考分层、预算、钩子判定和跨续跑去重。手动读取走 SkillBox 激活权限。
+
+当前契约见 [Skill 参考文档](../v2/skill.md#按需读取参考文档)。以下保留立项时的设计和取舍。
 **触发**：讨论"压缩保护 skill body"时对照 Claude 发现机制根本不同（crew-go marker 就地保护 vs Claude 异地存活重打包）→ 深挖业内（deep-research，105 agent / 多源 3-0 验证）→ 源头分层是治本方向（reference 层多轮重复读仍需 per-Run 去重，非完全免控制）
 
 ## 完整设计（L0 / progressive disclosure）

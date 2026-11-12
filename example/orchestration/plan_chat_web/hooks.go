@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"strings"
-	"sync/atomic"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
@@ -11,46 +10,33 @@ import (
 	"crew-go/schema"
 )
 
-// interruptHook 在 flag 被点亮时立即抛 *compose_v2.InterruptError，触发框架自动 save
-// checkpoint。挂到所有 sub-agent 和 planner 的 hooks 链上.
-//
-// **双触发点** (audit-iter-5-N HIGH-2 修): 同时在 OnAgentStart + OnModelEnd 检 flag.
-// 原仅 OnAgentStart 触发 → LLM 调用期间 (10-30s 真 LLM) 用户点 "暂停" 没反应必须
-// 等下一轮 OnAgentStart 才生效. 加 OnModelEnd 让 LLM 调用结束立即触发, 不等
-// tools 执行 + 下一轮 model — 业务用户体感"点暂停 → 立即暂停".
-//
-// **框架协议**: OnModelEnd 返 InterruptError 走 cp save 路径；OnAgentStart 仅在
-// **有父节点路径接住时**支持（挂 sub-agent 上，中断冒进父图节点路径落父档）——
-// 挂**顶层** agent 时会被明确拒绝（图之前没有可落的档，见
-// agent_v2.WrapAgentStartErr）。⚠️ 本例的链**同样挂在顶层 chat_entry 上**——若
-// 暂停 flag 恰好在 chat_entry 的 OnAgentStart 时刻已置位，会走拒绝路径（响亮报错
-// 而非假暂停）；实际暂停体验由 OnModelEnd 触发点（图内、可落档）与 sub-agent 的
-// OnAgentStart 承担。原协议说明：
-// (`agent_v2/basic_builder.go::modelNode` line 330-336 IsInterrupt check + %w wrap
-// + graph_loop cp save). OnModelStart 也支持但 LLM 调用前抛会让本轮 LLM 调用
-// 跳过 — 业务期望"已发出 LLM 请求即应返回结果", OnModelEnd 后抛体验更好.
+// interruptHook 在可落档的位置检查会话的暂停请求。顶层 OnAgentStart 跳过检查，
+// 子 agent 启动和模型调用结束时可以中断，交给引擎保存存档。
 type interruptHook struct {
 	hook.NoOpHooks
-	flag *atomic.Bool
+	requested func(context.Context) (bool, error)
 }
 
 func (h *interruptHook) OnAgentStart(ctx context.Context, info *hook.AgentInfo, _ *hook.AgentInput) (context.Context, error) {
+	if !compose_v2.WithinNodeScope(ctx) {
+		return ctx, nil // 顶层启动还没有可以落档的节点。
+	}
 	return h.maybeInterrupt(ctx, info, "OnAgentStart")
 }
 
-// OnModelEnd 在 LLM 调用结束后检 flag — 不等下一轮 OnAgentStart 加快暂停响应.
-//
-// **跳过 round=0 第一轮检查**: ChainHooks 跑 observer + interruptHook 顺序,
-// observer 已 emit model_end 事件给前端. 中断在任意 round 都合法 — 不用判 round.
+// OnModelEnd 在模型调用结束后、工具派发前检查暂停请求。
 func (h *interruptHook) OnModelEnd(ctx context.Context, info *hook.AgentInfo, _ *schema.ModelOutput) (context.Context, error) {
 	_, err := h.maybeInterrupt(ctx, info, "OnModelEnd")
 	return ctx, err
 }
 
-// maybeInterrupt 检 flag 后抛 InterruptError, 不抛返 (ctx, nil). 共享 OnAgentStart /
-// OnModelEnd 实现.
+// maybeInterrupt 把暂停请求转换为可落档的中断。
 func (h *interruptHook) maybeInterrupt(ctx context.Context, info *hook.AgentInfo, triggerPoint string) (context.Context, error) {
-	if h.flag != nil && h.flag.Load() {
+	requested, err := h.requested(ctx)
+	if err != nil {
+		return ctx, err
+	}
+	if requested {
 		return ctx, &compose_v2.InterruptError{
 			Reason: "user requested pause",
 			Query: &compose_v2.AskQuery{

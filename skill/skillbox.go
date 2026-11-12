@@ -181,10 +181,18 @@ func (b *DefaultSkillBox) MatchSkills(_ context.Context, query string) []SkillMa
 func (b *DefaultSkillBox) ListSkillResources(name string) []SkillResource {
 	for _, s := range b.skills {
 		if s.descriptor.Name == name {
-			return s.resources
+			return copySkillResources(s.resources)
 		}
 	}
 	return nil
+}
+
+func copySkillResources(src []SkillResource) []SkillResource {
+	resources := append([]SkillResource(nil), src...)
+	for i := range resources {
+		resources[i].Topics = append([]string(nil), resources[i].Topics...)
+	}
+	return resources
 }
 
 // ReadSkillResource 读取 skill 内指定路径的资源文件内容，失败时返回空字符串。
@@ -193,12 +201,12 @@ func (b *DefaultSkillBox) ReadSkillResource(name, path string) string {
 		if s.descriptor.Name != name {
 			continue
 		}
-		// 防止路径穿越：path 必须在 skill 目录下
-		full := filepath.Join(s.dir, path)
-		if !strings.HasPrefix(full, s.dir+string(filepath.Separator)) && full != s.dir {
+		root, err := os.OpenRoot(s.dir)
+		if err != nil {
 			return ""
 		}
-		data, err := os.ReadFile(full)
+		defer root.Close() // 只读目录句柄。
+		data, err := root.ReadFile(path)
 		if err != nil {
 			return ""
 		}
@@ -235,7 +243,7 @@ func (b *DefaultSkillBox) ActivateSkill(_ context.Context, name string) (*Active
 				Skill:     s.descriptor,
 				RootDir:   s.dir,
 				Prompt:    s.prompt,
-				Resources: s.resources,
+				Resources: copySkillResources(s.resources),
 				Actions:   s.actions,
 			}, nil
 		}
@@ -357,7 +365,7 @@ func (b *DefaultSkillBox) scan() error {
 func scanResources(dir string) []SkillResource {
 	var resources []SkillResource
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil || !d.Type().IsRegular() {
 			return nil
 		}
 		rel, err := filepath.Rel(dir, path)
@@ -368,10 +376,14 @@ func scanResources(dir string) []SkillResource {
 			return nil
 		}
 		rt := resourceType(rel)
-		resources = append(resources, SkillResource{
+		resource := SkillResource{
 			Path:         rel,
 			ResourceType: rt,
-		})
+		}
+		if rt == "reference" {
+			loadReferenceMetadata(dir, &resource)
+		}
+		resources = append(resources, resource)
 		return nil
 	})
 	return resources

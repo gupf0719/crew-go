@@ -290,7 +290,7 @@ func UnmarshalTagged(data []byte) (any, error) {
 //   - 业务侧迁移逻辑负责按 cp.SchemaVer 分支决定 unmarshal 字段
 //   - framework 加 `Migrate(v Old, vNew int) (*Checkpoint, error)` 类工具
 //   - 不在 Unmarshal 路径加 fail-fast
-const CheckpointSchemaVer = 18
+const CheckpointSchemaVer = 19
 
 // checkpointSchemaVer (private alias 保 framework 内部 reference 兼容).
 const checkpointSchemaVer = CheckpointSchemaVer
@@ -305,23 +305,19 @@ func marshalSendDirectives(dirs []SendDirective) ([]SerializedSend, error) {
 	out := make([]SerializedSend, 0, len(dirs))
 	for _, d := range dirs {
 		sd := SerializedSend{Target: d.Target, Owner: d.owner, OwnerInstanceID: d.ownerInstanceID, InstanceID: d.instanceID}
-		for _, w := range d.Payload {
-			if w == nil {
-				continue // 对齐 ApplyAll 对 nil write 的 skip 语义（panic 在 SaveNS defer 内会吞原 InterruptError）
-			}
-			tv, err := marshalValue(w.valueAny())
-			if err != nil {
-				return nil, fmt.Errorf("marshal deferred send payload (channel %q): %w", w.channelName(), err)
-			}
-			sd.Payload = append(sd.Payload, SerializedWrite{Channel: w.channelName(), Type: tv.Type, Data: tv.Data})
+		var err error
+		if sd.Payload, err = marshalChannelWrites(d.Payload); err != nil {
+			return nil, fmt.Errorf("marshal deferred send payload: %w", err)
+		}
+		if sd.Input, err = marshalChannelWrites(d.Input); err != nil {
+			return nil, fmt.Errorf("marshal deferred send input: %w", err)
 		}
 		out = append(out, sd)
 	}
 	return out, nil
 }
 
-// marshalChannelWrites 把 ChannelWrite 列表编码为 cp wire 形态（F-B
-// pendingSendWrites 用）。与 marshalSendDirectives 的 payload 同协议。
+// marshalChannelWrites 把投递的共享写入与私有输入编码为 cp wire 形态。
 func marshalChannelWrites(writes []ChannelWrite) ([]SerializedWrite, error) {
 	if len(writes) == 0 {
 		return nil, nil
@@ -333,15 +329,14 @@ func marshalChannelWrites(writes []ChannelWrite) ([]SerializedWrite, error) {
 		}
 		tv, err := marshalValue(w.valueAny())
 		if err != nil {
-			return nil, fmt.Errorf("marshal pending send write (channel %q): %w", w.channelName(), err)
+			return nil, fmt.Errorf("channel %q: %w", w.channelName(), err)
 		}
 		out = append(out, SerializedWrite{Channel: w.channelName(), Type: tv.Type, Data: tv.Data})
 	}
 	return out, nil
 }
 
-// unmarshalChannelWrites 把 cp wire 形态还原为 ChannelWrite 列表（F-B）。
-// 重建为 rawChannelWrite——归并时走 ApplyAll 复用 reducer 协议。
+// unmarshalChannelWrites 把 cp wire 形态还原为 rawChannelWrite。
 func unmarshalChannelWrites(sws []SerializedWrite) ([]ChannelWrite, error) {
 	if len(sws) == 0 {
 		return nil, nil
@@ -350,7 +345,7 @@ func unmarshalChannelWrites(sws []SerializedWrite) ([]ChannelWrite, error) {
 	for _, sw := range sws {
 		v, err := unmarshalValue(taggedValue{Type: sw.Type, Data: sw.Data})
 		if err != nil {
-			return nil, fmt.Errorf("unmarshal pending send write (channel %q): %w", sw.Channel, err)
+			return nil, fmt.Errorf("channel %q: %w", sw.Channel, err)
 		}
 		out = append(out, &rawChannelWrite{name: sw.Channel, val: v})
 	}
@@ -366,12 +361,12 @@ func unmarshalSendDirectives(sds []SerializedSend) ([]SendDirective, error) {
 	out := make([]SendDirective, 0, len(sds))
 	for _, sd := range sds {
 		d := SendDirective{Target: sd.Target, owner: sd.Owner, ownerInstanceID: sd.OwnerInstanceID, instanceID: sd.InstanceID}
-		for _, sw := range sd.Payload {
-			v, err := unmarshalValue(taggedValue{Type: sw.Type, Data: sw.Data})
-			if err != nil {
-				return nil, fmt.Errorf("unmarshal deferred send payload (channel %q): %w", sw.Channel, err)
-			}
-			d.Payload = append(d.Payload, &rawChannelWrite{name: sw.Channel, val: v})
+		var err error
+		if d.Payload, err = unmarshalChannelWrites(sd.Payload); err != nil {
+			return nil, fmt.Errorf("unmarshal deferred send payload: %w", err)
+		}
+		if d.Input, err = unmarshalChannelWrites(sd.Input); err != nil {
+			return nil, fmt.Errorf("unmarshal deferred send input: %w", err)
 		}
 		out = append(out, d)
 	}
@@ -586,6 +581,16 @@ func (cm *ChannelManager) Snapshot() (*Checkpoint, error) {
 		}
 		cp.PendingSendWrites = sws
 	}
+	if len(cm.frontierInputs) > 0 {
+		cp.FrontierInputs = make(map[string][]SerializedWrite, len(cm.frontierInputs))
+		for id, writes := range cm.frontierInputs {
+			sws, err := marshalChannelWrites(writes)
+			if err != nil {
+				return nil, fmt.Errorf("snapshot send input for instance %q: %w", id, err)
+			}
+			cp.FrontierInputs[id] = sws
+		}
+	}
 	return cp, nil
 }
 
@@ -721,6 +726,7 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 	prevRecipientKey := cm.recipientKey
 	prevDeferred := cm.deferredSends
 	prevFrontier := cm.frontierAtExit
+	prevFrontierInputs := cm.frontierInputs
 	prevFrontierStarted := cm.frontierStarted
 	prevPendingSends := cm.pendingSendWrites
 	// nodeStates 的赋值在 DeferredSends / PendingSendWrites 两个会 rollback 的步骤**之前**
@@ -745,6 +751,7 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 		cm.recipientKey = prevRecipientKey
 		cm.deferredSends = prevDeferred
 		cm.frontierAtExit = prevFrontier
+		cm.frontierInputs = prevFrontierInputs
 		cm.frontierStarted = prevFrontierStarted
 		cm.pendingSendWrites = prevPendingSends
 		cm.nodeStates = prevNodeStates
@@ -873,6 +880,21 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 			rollbackOnErr()
 			return fmt.Errorf("Restore deferred sends: %w", derr)
 		}
+		instances := make(map[string]int, len(sends))
+		for _, send := range sends {
+			instances[send.instanceID]++
+		}
+		for _, send := range sends {
+			if len(send.Input) == 0 {
+				continue
+			}
+			if send.instanceID == "" || instances[send.instanceID] != 1 {
+				return fmt.Errorf("restore deferred send to %q without a unique instance identity", send.Target)
+			}
+			if err := validateSendInput(send.Input, cm.channels); err != nil {
+				return fmt.Errorf("restore deferred send input to %q: %w", send.Target, err)
+			}
+		}
 		cm.deferredSends = sends
 	}
 	// F-B：恢复待补 apply 的 SendDirective payload——主循环在跑任何节点之前
@@ -903,6 +925,10 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 		copy(cm.frontierAtExit, cp.CurrentFrontier)
 		cm.frontierStarted = cp.FrontierStarted
 	}
+	cm.frontierInputs, err = cm.restoreFrontierInputsLocked(cp)
+	if err != nil {
+		return err
+	}
 
 	// **实例身份发号器要跨进程续上**（ISSUE-96）：instanceCounter 是进程级的，重启后
 	// 从 0 重新发号，而这份 cp 里存着重启前发出去的 token —— 新号会**逐位撞上**旧号。
@@ -917,4 +943,29 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 	bumpInstanceCounterFromCheckpoint(cp)
 	restored = true
 	return nil
+}
+
+func (cm *ChannelManager) restoreFrontierInputsLocked(cp *Checkpoint) (map[string][]ChannelWrite, error) {
+	if len(cp.FrontierInputs) == 0 {
+		return nil, nil
+	}
+	instances := make(map[string]int, len(cp.CurrentFrontier))
+	for _, member := range cp.CurrentFrontier {
+		instances[member.InstanceID]++
+	}
+	inputs := make(map[string][]ChannelWrite, len(cp.FrontierInputs))
+	for id, serialized := range cp.FrontierInputs {
+		if id == "" || instances[id] != 1 {
+			return nil, fmt.Errorf("restore send input for instance %q without a unique frontier member", id)
+		}
+		writes, err := unmarshalChannelWrites(serialized)
+		if err == nil {
+			err = validateSendInput(writes, cm.channels)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("restore send input for instance %q: %w", id, err)
+		}
+		inputs[id] = writes
+	}
+	return inputs, nil
 }

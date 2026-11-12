@@ -166,6 +166,26 @@ agui.Handler(func(hooks hook.Hooks) agent_v2.Agent {
 
 ---
 
+### 用户消息的媒体输入
+
+`role=user` 的 `content` 可用字符串，或混合 `text`、`image`、`audio`、`video`、
+`document` 部分的数组。媒体部分的 `source` 使用以下字段。
+
+| `source.type` | `value` | 其他字段 |
+| --- | --- | --- |
+| `data` | 标准 Base64 正文 | 必填 `mimeType` |
+| `url` | HTTP(S) URL | `mimeType` 可选，可从扩展名推断 |
+| `file` | 服务商文件 ID | 仅 `document`，可用 `provider` 绑定服务商 |
+
+历史中的用户媒体也会传给 agent。文本部分按顺序合并为文本，媒体保留在内容块中。
+OpenAI Chat Completions 适配器支持图片、WAV/MP3 内联音频和 PDF 内联或文件 ID。
+DashScope 分支还支持音视频 URL，并按该服务的格式发送内联音视频。音频 URL 无可识别
+的扩展名时，显式传入 `audio/wav` 或 `audio/mpeg`。
+Anthropic 支持图片、PDF、内联纯文本文档和 Anthropic 文件 ID。具体可用的媒体取决于所选模型。
+[AG-UI Schema](https://github.com/ag-ui-protocol/ag-ui/blob/main/docs/spec/1.0/schema.mdx) ·
+[OpenAI 文件输入](https://developers.openai.com/api/docs/guides/file-inputs?api-mode=chat) ·
+[DashScope 兼容协议](https://docs.modelstudio.console.alibabacloud.com/en/model-studio/qwen-api-via-openai-chat-completions)
+
 ## 8. 限制
 
 - **session store in-process**：server 重启丢挂起会话、跨进程 Resume 不支持（同 a2a）。

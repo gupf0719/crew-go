@@ -208,7 +208,7 @@ func (a *RemoteAgent) rememberContinuation(session *agent_v2.RunSession, token s
 }
 
 // beginContinuation 独占一问，避免同一答复并发发送。网络失败时释放占用以便再次对账。
-func (a *RemoteAgent) beginContinuation(session *agent_v2.RunSession, token string) (gatePending, func(bool), error) {
+func (a *RemoteAgent) beginContinuation(session *agent_v2.RunSession, token string) (gatePending, func(consumed, attempted bool), error) {
 	set := getContinuationSet(session, false)
 	if set == nil {
 		return gatePending{}, nil, fmt.Errorf("a2a: continuation is not pending for this remote agent in the current run")
@@ -223,12 +223,13 @@ func (a *RemoteAgent) beginContinuation(session *agent_v2.RunSession, token stri
 		return gatePending{}, nil, fmt.Errorf("a2a: continuation already has an answer in progress")
 	}
 	p.inUse = true
-	return p.question, func(consumed bool) {
+	return p.question, func(consumed, attempted bool) {
 		set.mu.Lock()
 		defer set.mu.Unlock()
 		if consumed {
 			set.pending[token] = nil // 同一 session 的宿主存档重放不得复活已答的问题。
 		} else {
+			p.question.AnswerUnsent = p.question.AnswerUnsent && !attempted
 			p.inUse = false
 		}
 	}, nil

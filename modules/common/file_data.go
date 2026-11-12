@@ -7,4 +7,7 @@ type FileData struct {
 	// FileData=base64 inline bytes 映射 A2A raw part；URL=URI 引用映射 A2A url part（见
 	// a2a/convert.go）。omitempty 向后兼容，现有走 FileData inline 路径不受影响。
 	URL string `json:"url,omitempty"`
+	// ID 是已经上传到 Provider 的文档句柄。
+	ID       string `json:"id,omitempty"`
+	Provider string `json:"provider,omitempty"`
 }

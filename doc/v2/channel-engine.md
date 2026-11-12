@@ -677,12 +677,8 @@ v2 fan-out 由 `SendFrom` + `SendDirective` 协议实现——节点内部主动
 // compose_v2/send.go
 type SendDirective struct {
     Target  NodeID          // 目标节点 ID（必须已在 graph 注册）
-    Payload []ChannelWrite  // 一批 ChannelWrite，下一超步入口归并进**共享** channel 状态
-                            // ——下一超步所有节点都看到，**不是 target 的私有入参**：
-                            // 同 target 扇出 N 次时 N 条 payload 塌成一份，而实例拿不到
-                            // 自己是第几个 ⟹「同 target + 每实例不同输入」今天没有正确写法
-                            //（不同输入用不同 target；取舍见 doc/code/todo.md backlog）
-                            // 空 Payload 等价于"只调度不传参"
+    Payload []ChannelWrite  // 在下一超步入口归并到共享 channel
+    Input   []ChannelWrite  // 只提供给本次投递的目标实例
 }
 
 // SendFrom 通过 ctx 把 directives 提交给框架——非返回 ChannelWrite，节点内部直接调
@@ -698,6 +694,10 @@ func SendFrom(ctx context.Context, directives ...SendDirective)
 `branchIdx` 已被它取代，因为部分失败时 frontier 缩成失败子集、位置会重排），用于算
 InterruptID 防 ask_user 串台，**不** push 分支 ns、**不**建 per-branch 独立 cp。
 部分失败走**单 cp** + `CompletedFrontier`/`DeferredSends`（§7.3）。
+
+同一 target 的多个实例可以分别接收 `Input`。每个输入 channel 从零值按投递顺序归并，
+覆盖目标实例的读视图。条件边与 `AddSubgraphNode` 的显式导入读取这个视图，
+节点返回的写入仍进入共享提交。私有输入随延迟投递和当前 frontier 的实例 ID 存档。
 （⚠️ `JoinFanoutNS` **不是**「与引擎 fan-out 无关」：`AddSubgraphNode` 就用
 `JoinFanoutNS(parentNS, id, fanoutIdx)` 给 SendFrom 派生的子图实例分子 ns——那是**子图**这一
 层的 cp 分离，跟上面说的「分支不分裂 ns」不矛盾：分支自己不分，分支里嵌的子图分。）

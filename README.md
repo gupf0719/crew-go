@@ -87,6 +87,7 @@ crew-go/
 - [工具级渐进披露 toolsearch](doc/v2/toolsearch.md)（deferred 工具按需揭示 + 可插拔检索 + fail-closed；工具多 / MCP 聚合爆 context 时用）
 - [A2A 跨进程协作 a2a](doc/v2/a2a.md)（消费远程 / 暴露 server / 服务发现 + ZooKeeper binding）
 - [AG-UI 前端接入 agui](doc/v2/agui.md)（agent 事件流→AG-UI 标准协议 SSE / 接 CopilotKit 生态前端 / HITL Resume 闭环 / StateSnapshot opt-in）
+- [下一版升级说明](doc/release/next.md)
 - [带置信度的路由决策 route-decider](doc/v2/route-decider.md)（RouteDecider 升级链 / Jev 与百炼两家决策模型接入 / 门槛怎么定 / 中文路由实测）
 - [生命周期 hook hooks](doc/v2/hooks.md) + [流式 SSE hooks-and-streaming](doc/v2/hooks-and-streaming.md)
 - [可观测 observability](doc/v2/observability.md)（OpenTelemetry：span 树 / GenAI 语义约定属性与指标 / A2A 跨进程传播）

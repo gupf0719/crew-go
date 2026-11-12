@@ -74,7 +74,7 @@ func writeSSE(w http.ResponseWriter, r *http.Request, sink *eventSink) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // 防 nginx 缓冲
 	// 立即刷出响应头，让前端 EventSource.onopen 马上触发

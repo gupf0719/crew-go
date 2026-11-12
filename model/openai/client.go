@@ -163,7 +163,10 @@ func (c *Client) providerName() string {
 // Generate 调用 OpenAI API（非流式）。
 func (c *Client) Generate(ctx context.Context, messages []*schema.Message, opts ...model.Option) (*schema.Message, error) {
 	o := model.Apply(opts...)
-	req := c.buildRequest(messages, o, false)
+	req, err := c.buildRequest(messages, o, false)
+	if err != nil {
+		return nil, err
+	}
 
 	respBody, err := c.doRequest(ctx, req)
 	if err != nil {
@@ -200,7 +203,10 @@ func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ..
 		return nil, model.ErrStreamUnsupported
 	}
 	o := model.Apply(opts...)
-	req := c.buildRequest(messages, o, true)
+	req, err := c.buildRequest(messages, o, true)
+	if err != nil {
+		return nil, err
+	}
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	httpReq, err := c.newHTTPRequest(streamCtx, req)
@@ -238,15 +244,19 @@ func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ..
 
 // --- 内部实现 ---
 
-func (c *Client) buildRequest(messages []*schema.Message, o *model.Options, stream bool) *openaiRequest {
+func (c *Client) buildRequest(messages []*schema.Message, o *model.Options, stream bool) (*openaiRequest, error) {
 	modelName := c.model
 	if o.Model != nil && *o.Model != "" { // 空的覆盖不算（跟 model.RequestConfig、anthropic 客户端一致）
 		modelName = *o.Model
 	}
 
+	wireMessages, err := convertMessages(messages, c.providerName())
+	if err != nil {
+		return nil, err
+	}
 	req := &openaiRequest{
 		Model:    modelName,
-		Messages: convertMessages(messages),
+		Messages: wireMessages,
 		Stream:   stream,
 	}
 	// Round 8 集成验证 fix: stream 模式默认启 include_usage 让末尾 chunk 返 token
@@ -336,7 +346,7 @@ func (c *Client) buildRequest(messages []*schema.Message, o *model.Options, stre
 		req.ToolChoice = string(*o.ToolChoice)
 	}
 
-	return req
+	return req, nil
 }
 
 // wireHasTools 判断合并 ExtraBody 之后的请求体里有没有非空的 tools。
@@ -749,15 +759,25 @@ func clip(s string) string {
 	return s[:n] + "…"
 }
 
-func convertMessages(msgs []*schema.Message) []openaiMessage {
+func convertMessages(msgs []*schema.Message, provider string) ([]openaiMessage, error) {
 	out := make([]openaiMessage, 0, len(msgs))
-	for _, m := range msgs {
+	for i, m := range msgs {
+		if m == nil {
+			continue
+		}
 		om := openaiMessage{
 			Role:    string(m.Role),
 			Content: m.Content,
 			// thinking 模型多轮回传：assistant 的 reasoning_content 原样附回 wire，
 			// 否则 DeepSeek/Qwen3 thinking 第 2 轮 400（ISSUE-89）。非 thinking 为空不发。
 			ReasoningContent: m.ReasoningContent,
+		}
+		if m.Role == schema.RoleUser {
+			parts, err := userContentParts(m, provider)
+			if err != nil {
+				return nil, fmt.Errorf("%s: message %d: %w", provider, i, err)
+			}
+			om.contentParts = parts
 		}
 		// 从 ContentBlocks 中提取工具调用和工具结果。
 		// OpenAI API 要求每条 role=tool 消息只携带一个 tool_call_id。
@@ -798,7 +818,7 @@ func convertMessages(msgs []*schema.Message) []openaiMessage {
 		out = append(out, om)
 		out = append(out, extraToolResults...)
 	}
-	return out
+	return out, nil
 }
 
 // --- OpenAI API 类型 ---
@@ -846,8 +866,9 @@ type openaiResponseFormatJSONSchema struct {
 }
 
 type openaiMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content,omitempty"`
+	Role         string `json:"role"`
+	Content      string `json:"content,omitempty"`
+	contentParts []openaiContentPart
 	// ReasoningContent thinking 模型的推理过程文本（reasoning_content）——响应解析进来、
 	// 多轮回传时原样附回（DeepSeek/Qwen3 thinking 模式 wire 要求，见 ISSUE-89 /
 	// schema.Message.ReasoningContent）。非 thinking 为空 omitempty 不发。

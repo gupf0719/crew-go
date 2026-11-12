@@ -163,6 +163,9 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 				{NodeID: "node_a"},
 				{NodeID: "node_b", InstanceID: "i7"},
 			},
+			FrontierInputs: map[string][]compose_v2.SerializedWrite{
+				"i7": {{Channel: "ch2", Type: "string", Data: json.RawMessage(`"private"`)}},
+			},
 			// audit iter-3 视角 1 MED-2: 加 n3:0 zero-value 验业务 backend dropZero
 			// 序列化策略 (e.g., protobuf [default=0] / Java Map dropZero) 不破坏
 			// NodeVisits 协议 — crew-go 协议 (NodeVisits map[NodeID]int) 0 值
@@ -216,7 +219,8 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 					{Channel: "ch1", Type: "int", Data: json.RawMessage("42")},
 				}},
 				// ISSUE-96：发出者自己是 fan-out 实例之一 → OwnerInstanceID 非空
-				{Target: "y_node", Owner: "done_b", OwnerInstanceID: "i9", InstanceID: "i12"}, // 空 payload（只调度不传参）
+				{Target: "y_node", Owner: "done_b", OwnerInstanceID: "i9", InstanceID: "i12",
+					Input: []compose_v2.SerializedWrite{{Channel: "ch2", Type: "string", Data: json.RawMessage(`"deferred private"`)}}},
 			},
 			// F-B: 没能提交、待 Resume 补 apply 的 SendDirective payload——
 			// 漏了 target（已在 CurrentFrontier 里）Resume 后静默读到零值
@@ -385,6 +389,12 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 		}
 		if loaded.DeferredSends[1].Target != "y_node" || len(loaded.DeferredSends[1].Payload) != 0 {
 			t.Errorf("DeferredSends[1]（空 payload）round-trip lost: %+v", loaded.DeferredSends[1])
+		}
+		if got := loaded.DeferredSends[1].Input; len(got) != 1 || got[0].Channel != "ch2" || got[0].Type != "string" || string(got[0].Data) != `"deferred private"` {
+			t.Errorf("DeferredSends[1].Input round-trip lost: %+v", got)
+		}
+		if got := loaded.FrontierInputs["i7"]; len(loaded.FrontierInputs) != 1 || len(got) != 1 || got[0].Channel != "ch2" || got[0].Type != "string" || string(got[0].Data) != `"private"` {
+			t.Errorf("FrontierInputs round-trip lost: %+v", loaded.FrontierInputs)
 		}
 		// issue-95#1: Owner 是这批里最隐蔽的字段——漏了不报错、不丢数据，只是
 		// Resume 重跑某节点时它的旧 SendFrom 清不掉 → Target 被调度两次（业务侧

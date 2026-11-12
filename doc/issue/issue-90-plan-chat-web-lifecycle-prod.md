@@ -1,95 +1,34 @@
-# ISSUE-90 · plan_chat_web 生产化 lifecycle (历史查询 API + Redis backend)
+# ISSUE-90 · Plan Web 会话生命周期
 
-**优先级**：LOW (本 session 已对齐 LangGraph 6 状态 + TTL sweeper 模式, 缺业务诉求驱动的 production API)
-**状态**：📋 跟踪中 (2026-05-17)
-**触发**：plan_chat_web 多场景测试发现 dead 410 路径, 对照 LangGraph Platform
-设计后改为"runs 不删 + 6 状态 + TTL sweeper", 但 LangGraph 还有 2 处生产能力
-本 session 未实施 (业务诉求驱动加, YAGNI 不预先做).
+**状态**　已实现会话查询、Redis 多副本续跑、删除和临时会话。
 
-## 已完成 (本 session)
+## 配置
 
-参照 LangGraph Platform run status (`LANGGRAPH_PLATFORM.md:247,380`) 重设
-plan_chat_web lifecycle:
+`go run ./example/orchestration/plan_chat_web -mock` 使用模拟模型。Redis URL 为空时，会话存储使用进程内存。
+部署多个副本时，各副本配置相同的 `PLAN_WEB_REDIS_URL`（也可用 `-redis-url`）。会话元数据和 Checkpointer 使用同一个 Redis，
+执行、续跑和删除共用任务租约。Redis 模式在超步边界同步保存进度。生产配置应开启 Redis 持久化。
+经 HTTPS 反向代理部署时，可加 `-secure-cookie`。 [Redis 接入](../../redis/doc.go)
 
-| 改动 | 来源 |
-|---|---|
-| runSlot 加 `status string` 6 状态 (`running/interrupted/success/error/cancelled`) | LangGraph run.status |
-| 删 `runs.Delete` 完成后 (slot 留 runs 让 history 可查) | LangGraph thread 默认持久化 |
-| 加 `lastActivity time.Time` + `createdAt time.Time` | LangGraph thread.created_at |
-| `-session-ttl-minutes` flag (默认 60min, 0=永不过期) | LangGraph Store `default_ttl` (`store/base/__init__.py:556`) |
-| `-sweep-interval-minutes` flag (默认 5min) + 后台 sweeper goroutine | LangGraph `sweep_interval_minutes` (`__init__.py:566`) |
-| sweeper Range runs.Map 清 `isFinished() && expired` slot, 不清 running/interrupted | opportunistic delete pattern |
-| 410 错误 msg 含 `(status=xxx)` 让前端区分 success / cancelled / error | LangGraph thread.search status 字段语义 |
-| done/interrupted/aborted SSE event 含 status 字段 | 前端可按 status 切 UI |
+## HTTP 接口
 
-## 待实施 (业务诉求驱动)
+打开首页或开始第一场会话时服务端设置 `crew_plan_owner` Cookie。浏览器和 API 客户端
+凭同一个 Cookie 查找会话，另一浏览器的 Cookie 对该会话得到 404。应用需要组织级账号时，
+由部署网关管理身份和访问权限。
 
-### 1. 历史查询 API
+| 接口 | 行为 |
+| --- | --- |
+| `GET /api/chat?q=...` | 开启 SSE 会话，可加 `ephemeral=true` |
+| `GET /api/chat?session_id=...&action=continue` | 从存档续跑，`action=abort` 清档并标为 cancelled |
+| `POST /api/interrupt?session_id=...` | 标记暂停，执行该任务的副本在下一次图内钩子检查时处理 |
+| `GET /api/sessions?status=interrupted&limit=20` | 查询本 Cookie 的会话索引，按创建时间倒序。limit 最大 100 |
+| `GET /api/sessions/{id}` | 查询状态、模式、时间和历史计数 |
+| `DELETE /api/sessions/{id}` | 删除会话和存档。任务仍持有执行许可时返回 409，成功返回 204 |
 
-LangGraph Platform 有 `client.threads.search(status, limit)` + `client.threads.delete(thread_id)`
-(`LANGGRAPH_PLATFORM.md:214-220`). plan_chat_web 当前前端不查 history, 加 API
-工作量 vs 价值不对称 (本 session 不加).
+默认终态保留 60 分钟。Redis 使用键的过期时间，内存模式使用 sweeper。挂起任务保留供续跑。
+临时会话进入终态后立即清理。终态会话仍在索引时，Resume 返回 410。
 
-业务真要 (例如多用户 dashboard / 历史会话恢复) 时加:
+## 恢复边界
 
-```go
-// GET /api/sessions?status=running&limit=20 → [{session_id, status, created_at, ...}]
-// DELETE /api/sessions/{id} → 200 OK / 404
-```
-
-实现要点:
-- `runs.Range` 收集所有 slot + filter status + sort by createdAt + limit
-- 返 JSON array (不 stream)
-- 估 ~80 行 handler + 测试 (lifecycle 基建已就位, 0 重构)
-
-### 2. Redis / Postgres backend (单进程 → 多副本)
-
-当前 `var runs sync.Map` 是单进程内存。生产多 replica 部署 (kubernetes deployment
-2+ pods) 必须共享 backend 否则:
-- session_id 路由不到 owning pod → 假 404
-- Resume 跨 pod 失败
-
-迁移路径 (跟 LangGraph Platform Postgres checkpointer 同款):
-
-```go
-// 抽 runStore interface, 现 sync.Map 是 InMemoryRunStore impl
-type runStore interface {
-    Load(sid string) (*runSlot, bool)
-    Store(sid string, slot *runSlot)
-    Delete(sid string)
-    Range(fn func(string, *runSlot) bool)
-}
-// 加 RedisRunStore (slot 序列化 JSON + Redis SET/GET/DEL + SCAN)
-// 加 PostgresRunStore (类 LangGraph PostgresCheckpointer schema)
-```
-
-实现要点:
-- slot 内 sess / cp 也要分离持久化 (Redis Streams / Postgres rows)
-- session_id 一致 hash 路由 (业务 LB + sticky session 不必要)
-- cp 用 Postgres 子图嵌套 ns 物理分离 (已有 InMemoryCheckpointer 协议直接平移)
-- TTL 用 Redis EXPIRE / Postgres scheduled job 替代当前 in-process sweeper
-- 估 ~500 行 + 集成测试 + benchmarks
-
-### 3. on_completion="delete" opt-in (per-session 控制)
-
-LangGraph `runs.create(on_completion="delete")` 让业务声明 ephemeral session
-(完成即删不留 history). plan_chat_web 当前所有 session 都留 history (TTL 清),
-缺 per-session ephemeral 选项.
-
-实现要点:
-- `/api/chat?q=...&ephemeral=true` query param
-- runSlot 加 `ephemeral bool` 字段
-- runOrResume 完成时若 `ephemeral=true` 立即 `runs.Delete` 不留 history
-- 估 ~20 行
-
-## 决策依据
-
-**YAGNI 不预实施**: 三项都是业务诉求驱动 (有人说"我要 history API" / "我要 Redis 多副本" / "我要 ephemeral session") 才加, 不预测式过设计.
-
-**LangGraph 是 reference 不是 cargo cult**: 抄 6 状态 + TTL 设计模式 (核心 lifecycle), 不抄每个 API endpoint (那是 production service 边界).
-
-## 重审时机
-
-- 业务真上多副本生产 → 实施 Redis/Postgres backend
-- 多用户 dashboard 需求 → 实施历史查询 API
-- 业务有"完成即删不留 history" 诉求 → 实施 ephemeral 选项
+会话索引保存状态及时间，SSE 事件由当前连接消费。恢复从最近的 Checkpoint 开始。若进程在
+图已完成清档、会话终态写入之前退出，索引会暂留 running，再次 Resume 会因存档缺失进入 error。
+外部工具应按自己的幂等键处理重试。 [Plan Web 冒烟](../description/smoke-test-recipes.md#2-plan_chat_web-mock--hitl-resume30-秒)

@@ -69,7 +69,7 @@ go run ./example/orchestration/nested_smoke
 
   port=${SMOKE_PORT:-19999}
   base="http://127.0.0.1:$port"
-  curl_local() { curl --noproxy 127.0.0.1 "$@"; }
+  curl_local() { curl --noproxy 127.0.0.1 -b "$tmp/cookies" "$@"; }
   go build -o "$tmp/web" ./example/orchestration/plan_chat_web
   if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
     printf '端口 %s 已占用，请设置 SMOKE_PORT\n' "$port" >&2
@@ -81,13 +81,13 @@ go run ./example/orchestration/nested_smoke
   ready=
   for ((i=0; i<100; i++)); do
     kill -0 "$server_pid"
-    if curl_local -fs --max-time 1 "$base/" > /dev/null; then ready=1; break; fi
+    if curl_local -fs --max-time 1 -c "$tmp/cookies" "$base/" > /dev/null; then ready=1; break; fi
     sleep 0.05
   done
   test "$ready" = 1
   kill -0 "$server_pid"
 
-  curl --noproxy 127.0.0.1 -fsSN --max-time 60 "$base/api/chat?q=plan+budget+report&mode=budget" > "$tmp/chat.sse" &
+  curl_local -fsSN --max-time 60 "$base/api/chat?q=plan+budget+report&mode=budget" > "$tmp/chat.sse" &
   chat_pid=$!
   # 等模型节点开始执行，再请求挂起。
   for ((i=0; i<100; i++)); do
@@ -304,3 +304,14 @@ go run ./example/decision/client_smoke -provider bailian -workspace <业务空�
 - 响应按真服务端的形状解析成功。单测全是 httptest 桩，桩是照我们对协议的理解写的，理解偏了单测照样全绿
 - 请求 ID 读到了（Jev 在 `x-typesafe-request-id` 响应头，百炼在 `x-request-id`），错误文本里也带着
 - 4xx 只请求一次就返回，不重试
+
+## §10 Claude 流式空闲与计费
+
+设置 `ANTHROPIC_API_KEY` 后运行真实服务端冒烟。
+
+```bash
+go test -tags=integration ./example/model/anthropic_smoke -run '^TestSmoke_StreamIdleAndBilling$' -count=1 -v
+```
+
+正常响应时记录 SSE 的最大字节间隔、ping 次数和最大 ping 间隔。服务端因计费拒绝时，
+用例验证 `model.ErrBillingExhausted` 并跳过流式间隔。流式成功和真实计费拒绝分别记录结果。

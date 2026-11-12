@@ -129,6 +129,10 @@ type SkillResource struct {
 	Path         string `json:"path"`
 	ResourceType string `json:"resourceType,omitempty"`
 	Description  string `json:"description,omitempty"`
+	// When、Topics 和 AlwaysLoad 控制 reference 的自动读取。
+	When       string   `json:"when,omitempty"`
+	Topics     []string `json:"topics,omitempty"`
+	AlwaysLoad bool     `json:"alwaysLoad,omitempty"`
 }
 
 // SkillActionDescriptor 描述 skill 暴露的一个可执行 action。

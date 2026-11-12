@@ -18,13 +18,16 @@ import (
 // [LastValue]）；Append 全部累积，但**每个实例拿不到自己是第几个**——[InstanceFanoutIndex]
 // 返回的是进程级单调计数器，不是本次扇出里的 0..N-1，也没有别的 API 给序号。
 //
-// **结论：「同 target 扇出 N 个实例、每个实例不同输入」今天没有正确写法。** 这段 godoc
-// 一度教过两版都不成立的写法（先是每条 `Write(workerInputCh, t)` + 「如 LastValue 单实例」，
-// 实测三个 worker 全看到第三个 task 而 err == nil；后是 Append 装全部 + 让实例「取自己
-// 那份」，可实例根本拿不到序号），都是没验证就写下的。把 payload 做成目标实例的私有入参 /
-// 暴露扇出序号，两条路的取舍在 doc/code/todo.md backlog，未定。
+// 同一 Target 的各个实例需要不同参数时，给每条投递的 Input 填自己的写入：
 //
-// 今天能写的两种形态：
+//	for _, task := range tasks {
+//	    compose_v2.SendFrom(ctx, compose_v2.SendDirective{
+//	        Target: "worker",
+//	        Input: []compose_v2.ChannelWrite{compose_v2.Write(workerInputCh, task)},
+//	    })
+//	}
+//
+// 共享写入与仅调度的用法：
 //
 //   - **不同输入 → 不同 target**（ParallelAgent 就是这么做的，`worker_<name>` 各一个节点）：
 //
@@ -36,7 +39,7 @@ import (
 //     }
 //     compose_v2.SendFrom(ctx, directives...)
 //
-//   - **同 target 扇出 N 次**：只适合 payload **为空**——共享输入由发出方在自己的 writes 里
+//   - **同 target 扇出 N 次并共享同一输入**：Payload 留空，共享输入由发出方在自己的 writes 里
 //     写好，N 个相同 worker 读同一份。各实例靠 [GetCurrentInstanceID] 区分身份，那是不透明
 //     token，只能当 key、不能当序号。
 //     ⚠️ **别指望「N 条 payload 写同一个值」**：检测不比值，单写入者 channel 上照拒（实测
@@ -51,8 +54,13 @@ type SendDirective struct {
 	// 下一超步所有节点（不只这条指令的 target）都看到。**它不是 target 的私有入参**，
 	// 见类型 godoc 的 ⚠️ 段：同 target 扇出 N 次时 N 条 payload 塌成一份。
 	//
-	// 空 Payload 等价于"只调度不传参"。
+	// Payload 为空时没有本条投递的共享写入。
 	Payload []ChannelWrite
+
+	// Input 给本条投递产生的目标实例设置私有 channel 值。每个 channel 从零值起按顺序归并，
+	// 只覆盖这个实例及其条件边的读视图，未提供的 channel 仍读共享状态。写入和后继实例各自走超步提交。
+	// 暂停时 Input 随实例存档。值遵守 channel 的不可变约定和存档类型注册要求。
+	Input []ChannelWrite
 
 	// owner 发出本指令的节点 ID——**框架在节点 return 后 drain sink 时无条件盖写**
 	// （不导出：业务构造 SendDirective 时既填不了也不该填，伪造无效）。
@@ -111,7 +119,10 @@ func SendFrom(ctx context.Context, directives ...SendDirective) {
 		return
 	}
 	sink.mu.Lock()
-	sink.directives = append(sink.directives, directives...)
+	for _, directive := range directives {
+		directive.Input = append([]ChannelWrite(nil), directive.Input...)
+		sink.directives = append(sink.directives, directive)
+	}
 	sink.mu.Unlock()
 }
 

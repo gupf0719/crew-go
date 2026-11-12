@@ -167,6 +167,9 @@ type ChannelManager struct {
 	// 经 Snapshot/Restore 持久化到 cp.PendingSendWrites。
 	pendingSendWrites []ChannelWrite
 
+	// frontierInputs 仅持有当前 frontier 的私有输入，按投递实例身份寻址。
+	frontierInputs map[string][]ChannelWrite
+
 	// visitCount 跟踪每个节点的成功完成次数（audit Round 3 Bug #1 修复）。
 	// 用于 InterruptSite 编入 visit 维度——同节点跨多次访问（BasicAgent ReAct
 	// 多轮 / LoopAgent body 重访 / PlanAgent 循环回 plan 节点）InterruptID 不串台。
@@ -554,6 +557,43 @@ func (cm *ChannelManager) Channels() Channels {
 	return Channels{cm: cm}
 }
 
+func (cm *ChannelManager) channelsForMember(member FrontierMember) Channels {
+	chs := cm.Channels()
+	if member.InstanceID != "" {
+		cm.mu.RLock()
+		writes := cm.frontierInputs[member.InstanceID]
+		cm.mu.RUnlock()
+		if len(writes) > 0 {
+			chs.input = &pendingView{writes: writes}
+		}
+	}
+	return chs
+}
+
+func (cm *ChannelManager) validateSendInput(writes []ChannelWrite) error {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return validateSendInput(writes, cm.channels)
+}
+
+// validateSendInput 检查私有输入的写入目标与类型。
+func validateSendInput(writes []ChannelWrite, channels map[string]anyChannel) error {
+	for _, write := range writes {
+		if write == nil {
+			continue
+		}
+		name := write.channelName()
+		ch, ok := channels[name]
+		if !ok {
+			return fmt.Errorf("channel %q not registered", name)
+		}
+		if typ := reflect.TypeOf(write.valueAny()); typ != nil && !typ.AssignableTo(ch.typeRep()) {
+			return fmt.Errorf("channel %q: input has type %v, want %v", name, typ, ch.typeRep())
+		}
+	}
+	return nil
+}
+
 // updateFrontier 是 Run 内部 helper：更新当前帧 frontier 到 cm，便于中断时
 // Snapshot 自动持久化。不导出。
 func (cm *ChannelManager) updateFrontier(frontier []FrontierMember) {
@@ -571,6 +611,15 @@ func (cm *ChannelManager) markFrontierStarted() {
 
 // updateFrontierLocked 是 updateFrontier 的实现——**调用方须已持写锁**。
 func (cm *ChannelManager) updateFrontierLocked(frontier []FrontierMember) {
+	if len(cm.frontierInputs) > 0 {
+		inputs := make(map[string][]ChannelWrite)
+		for _, member := range frontier {
+			if writes, ok := cm.frontierInputs[member.InstanceID]; ok {
+				inputs[member.InstanceID] = writes
+			}
+		}
+		cm.frontierInputs = inputs
+	}
 	if len(frontier) == 0 {
 		cm.frontierAtExit = nil
 		return
@@ -690,6 +739,7 @@ func (cm *ChannelManager) commitSuperstepAdvance(
 	signals []SignalRecord,
 	nextFrontier []FrontierMember,
 	dirWrites []ChannelWrite,
+	nextInputs map[string][]ChannelWrite,
 ) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -706,7 +756,9 @@ func (cm *ChannelManager) commitSuperstepAdvance(
 	// dirWrites、信号已随上一行并入。留着会让同一批 payload 在存档里存两份，Resume 双放。
 	cm.completedFrontier, cm.deferredSends, cm.completedTargets = nil, nil, nil
 	cm.completedSignals = nil
+	cm.frontierInputs = nil
 	cm.updateFrontierLocked(nextFrontier)
+	cm.frontierInputs = nextInputs
 	cm.frontierStarted = false // 新边界，还没开始执行
 	if len(dirWrites) > 0 {
 		cm.pendingSendWrites = append([]ChannelWrite(nil), dirWrites...)

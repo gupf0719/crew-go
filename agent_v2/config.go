@@ -191,6 +191,9 @@ type Config struct {
 	// message 里所以总量持平。主要收益是**语义清晰** + 跨层 marker 协议自然衔接。
 	InlineSkillBody bool
 
+	skillReferenceBudgetTokens int
+	skillReferenceMaxTokens    int
+
 	// ToolSearch 启用工具级渐进披露（nil = 关闭）——工具多（尤其 MCP Hub 聚合多 server）时
 	// deferred 工具初始不进 LLM bind list，LLM 调 tool_search 检索后才揭示。见 tool_search.go。
 	ToolSearch *ToolSearchConfig
@@ -1040,6 +1043,16 @@ func WithSkillSubAgentResolver(resolver SkillSubAgentResolver) Option {
 //	agent_v2.WithInlineSkillBody(true)
 func WithInlineSkillBody(enabled bool) Option {
 	return func(c *Config) { c.InlineSkillBody = enabled }
+}
+
+// WithSkillReferenceBudget 设置每次工具批次的自动参考文档预算和单份读取上限（估算 token）。
+// 零值分别使用 1024、512。totalTokens 为负数时只自动读取 always_load 文档。
+// always_load 不占批次预算，仍受单份上限。手动读取也受单份上限。
+func WithSkillReferenceBudget(totalTokens, perReferenceTokens int) Option {
+	return func(c *Config) {
+		c.skillReferenceBudgetTokens = totalTokens
+		c.skillReferenceMaxTokens = perReferenceTokens
+	}
 }
 
 // WithToolSearch 启用工具级渐进披露。典型：`WithToolSearch(&agent_v2.ToolSearchConfig{

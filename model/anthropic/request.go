@@ -67,6 +67,14 @@ func (c *Client) buildRequest(ctx context.Context, messages []*schema.Message, o
 	}
 
 	var betas []anthropic.AnthropicBeta
+	for _, msg := range msgs {
+		for _, block := range msg.Content {
+			if block.OfDocument != nil && block.OfDocument.Source.OfFile != nil {
+				betas = append(betas, anthropic.AnthropicBetaFilesAPI2025_04_14)
+				break
+			}
+		}
+	}
 	if c.thinkingConfig {
 		adaptive := anthropic.BetaThinkingConfigAdaptiveParam{}
 		if c.display != "" {
@@ -330,6 +338,13 @@ func fileBlock(f *schema.FileData, mediaType string) (anthropic.BetaContentBlock
 		return anthropic.BetaContentBlockParamUnion{OfDocument: d}
 	}
 	switch {
+	case f.ID != "":
+		if f.Provider != "" && f.Provider != "anthropic" {
+			return zero, fmt.Errorf("document handle is not for anthropic")
+		}
+		return title(&anthropic.BetaRequestDocumentBlockParam{Source: anthropic.BetaRequestDocumentBlockSourceUnionParam{
+			OfFile: &anthropic.BetaFileDocumentSourceParam{FileID: f.ID},
+		}}), nil
 	case mediaType == "application/pdf" && f.FileData != "":
 		return title(&anthropic.BetaRequestDocumentBlockParam{Source: anthropic.BetaRequestDocumentBlockSourceUnionParam{
 			OfBase64: &anthropic.BetaBase64PDFSourceParam{Data: f.FileData},

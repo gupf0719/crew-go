@@ -148,6 +148,10 @@ func (w digestWriter) block(b *schema.ContentBlock) {
 			w.str("file.bytes", f.FileData)
 			w.str("file.name", f.Filename)
 			w.str("file.url", f.URL)
+			if f.ID != "" || f.Provider != "" {
+				w.str("file.id", f.ID)
+				w.str("file.provider", f.Provider)
+			}
 		}
 	}
 	w.present("toolcall", b.Toolcall != nil)

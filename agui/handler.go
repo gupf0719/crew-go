@@ -75,14 +75,15 @@ const (
 // 防长跑 OOM。淘汰按 owner 分摊、上限是软的，见 [WithMaxSessions]。
 const DefaultMaxSessions = 10000
 
-// AGUIMessage 是 AG-UI 请求里的一条消息（简化：只取 role + content 的文本）。
+// AGUIMessage 是 AG-UI 请求里的一条消息。
 //
-// content 可以是字符串，也可以是 ContentPart 数组（AG-UI 1.0 的多模态消息）：数组里的 text 部分按顺序以换行拼成
-// Content，媒体部分（image / audio / video / document）不取——模型层还不把多模态块送给模型。activity 消息的
+// content 可以是字符串或 ContentPart 数组。数组里的文本按顺序以换行拼成 Content，
+// 用户消息里的 image、audio、video 和 document 部分转成消息的媒体块。activity 消息的
 // content 是对象，不是对话内容，Content 留空；别的角色的 content 是对象时解码报错。
 type AGUIMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	media   []*schema.ContentBlock
 	// droppedParts 是 content 数组里没取的媒体部分的类型（按出现顺序），解码时填。
 	droppedParts []string
 	// raw 是这条消息的原文，解码时填：撤回一条已发出的消息时，消息快照要把前端手上的消息原样重述一遍（见 sseAdapter.snapshotLocked）。
@@ -98,7 +99,7 @@ func (m *AGUIMessage) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return err
 	}
-	m.Role, m.Content, m.droppedParts = raw.Role, "", nil
+	m.Role, m.Content, m.media, m.droppedParts = raw.Role, "", nil, nil
 	m.raw = append(json.RawMessage(nil), b...)
 	c := bytes.TrimSpace(raw.Content)
 	switch {
@@ -112,18 +113,25 @@ func (m *AGUIMessage) UnmarshalJSON(b []byte) error {
 		}
 		return nil
 	case c[0] == '[':
-		var parts []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
+		var parts []clientContentPart
 		if err := json.Unmarshal(c, &parts); err != nil {
 			return fmt.Errorf("message content: %w", err)
 		}
 		texts := make([]string, 0, len(parts))
-		for _, p := range parts {
+		for i, p := range parts {
 			if p.Type == "text" {
 				texts = append(texts, p.Text)
 				continue
+			}
+			if raw.Role == "user" {
+				block, err := p.mediaBlock()
+				if err != nil {
+					return fmt.Errorf("message content part %d: %w", i, err)
+				}
+				if block != nil {
+					m.media = append(m.media, block)
+					continue
+				}
 			}
 			m.droppedParts = append(m.droppedParts, p.Type)
 		}
@@ -425,9 +433,9 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		_ = sse.Reject(http.StatusBadRequest, "bad_request", "no user message in request")
 		return
 	}
-	if inputMsg.Content == "" && rep.inputDropped {
+	if inputMsg.Content == "" && len(inputMsg.ContentBlocks) == 0 && rep.inputDropped {
 		// 只有媒体、没有文字：照跑的话模型收到一个空问题，还以为自己看过了用户发的东西
-		_ = sse.Reject(http.StatusBadRequest, "unsupported_content", "the last user message has no text part; image / audio / video / document parts are not supported")
+		_ = sse.Reject(http.StatusBadRequest, "unsupported_content", "the last user message has no usable content part")
 		return
 	}
 	h.warnClientMessages(ctx, rep)
@@ -1338,8 +1346,8 @@ type clientMessageReport struct {
 }
 
 // splitClientMessages 把请求里的 messages 拆成这一轮的输入（最后一条 user）与此前的轮次（交给
-// agent_v2.WithCallerHistoryCtx 的调用方前文）。前文只取 user / assistant 的文本：system / developer 剥掉（计进
-// report），tool、reasoning、activity 与没有文字的消息不取；最后一条 user 之后的消息不取。没有 user 消息时 input
+// agent_v2.WithCallerHistoryCtx 的调用方前文）。前文取 user 的内容与 assistant 的文本，system / developer 剥掉（计进
+// report），tool、reasoning、activity 与没有内容的消息不取。没有 user 消息时 input
 // 为 nil。
 func splitClientMessages(msgs []AGUIMessage) (prior []*schema.Message, input *schema.Message, rep clientMessageReport) {
 	last := -1
@@ -1352,7 +1360,7 @@ func splitClientMessages(msgs []AGUIMessage) (prior []*schema.Message, input *sc
 	if last < 0 {
 		return nil, nil, rep
 	}
-	input = schema.UserMessage(msgs[last].Content)
+	input = msgs[last].userMessage()
 	rep.inputDropped = len(msgs[last].droppedParts) > 0
 	rep.droppedParts = len(msgs[last].droppedParts)
 	prior = make([]*schema.Message, 0, last)
@@ -1362,8 +1370,8 @@ func splitClientMessages(msgs []AGUIMessage) (prior []*schema.Message, input *sc
 		case "system", "developer":
 			rep.instructions++
 		case "user":
-			if m.Content != "" {
-				prior = append(prior, schema.UserMessage(m.Content))
+			if m.Content != "" || len(m.media) > 0 {
+				prior = append(prior, m.userMessage())
 			}
 		case "assistant":
 			if m.Content != "" {
@@ -1415,7 +1423,7 @@ func (h *handler) warnClientMessages(ctx context.Context, rep clientMessageRepor
 			"（本条每个 handler 只记一次）", "count", rep.instructions)
 	}
 	if rep.droppedParts > 0 && h.warnedMedia.CompareAndSwap(false, true) {
-		slog.WarnContext(ctx, "agui: 消息里的 image / audio / video / document 部分不支持、已丢弃，只取文本"+
+		slog.WarnContext(ctx, "agui: 已跳过无法识别的内容部分或用户消息以外的媒体部分"+
 			"（本条每个 handler 只记一次）", "count", rep.droppedParts)
 	}
 }

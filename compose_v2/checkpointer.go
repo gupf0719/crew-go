@@ -317,6 +317,9 @@ type Checkpoint struct {
 	// 与 CompletedFrontier 同时机重放（并入重跑超步的 next frontier + payload）。
 	DeferredSends []SerializedSend `json:"deferred_sends,omitempty"`
 
+	// FrontierInputs 按 CurrentFrontier 的投递实例 ID 保存该实例的私有 channel 输入。
+	FrontierInputs map[string][]SerializedWrite `json:"frontier_inputs,omitempty"`
+
 	// NodeStates 节点私有中断态（见 node_state.go 的类型 godoc）——键是
 	// `nodeStateKey(NodeID, InstanceID, Visit)`，值是 tagged JSON。
 	//
@@ -348,6 +351,8 @@ type SerializedSend struct {
 	Target NodeID `json:"target"`
 	// Payload 顺序保留（Append 等顺序敏感 reducer）。
 	Payload []SerializedWrite `json:"payload,omitempty"`
+	// Input 目标实例尚未调度时携带的私有输入。
+	Input []SerializedWrite `json:"input,omitempty"`
 	// Owner 发出本指令的节点 ID——Resume 时框架据此清掉"重跑目标的旧 send"防
 	// Target 双发（issue-95#1）。**业务自实现 Checkpointer 必须序列化本字段**：
 	// 漏了不报错，但重跑目标的旧 send 会残留 → 双发（跑

@@ -39,7 +39,7 @@ func WithDescription(desc string) RemoteOption {
 //
 // **认证**（解决跨网络调用安全）：远程 AgentCard 的 securitySchemes 声明所需凭证；
 // 业务用 a2aclient.WithCallInterceptors(&a2aclient.AuthInterceptor{...}) 注入凭证，
-// 或自定义 *http.Client（带 auth-injecting RoundTripper）+ a2aclient.WithJSONRPCTransport(client)。
+// 或用 [WithJSONRPCHTTPClient] 注入带认证 RoundTripper 的 HTTP client。自定义整个传输时由传输提供错误分类。
 //
 // 跨进程 trace 串联走 WithObservability（W3C trace context 写进 A2A Message.metadata，传输层不是
 // HTTP 时也能串上）。想要 HTTP 层的 span 可以另外用 otelhttp 包 transport，两者不冲突。

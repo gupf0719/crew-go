@@ -131,9 +131,8 @@ func buildMessageFromParts(parts a2atypes.ContentParts, taskID, contextID string
 // ImageUrl/InputAudio block 经 url/raw part 往返后归一为 File block（URL/bytes 内容无损，但
 // typed 身份 image_url/input_audio → file）；多个 text part 拼进 Content 无分隔。内容无损，
 // block 类型身份与跨类型顺序不保证。
-// **model 消费限制（超本 wire 层 scope）**：A2A wire 完整传多模态，但 LLM 消费这些 block 需
-// model 适配器支持——当前 model/openai 仅读 toolcall/toolresult，File/Data/ImageUrl block 喂
-// LLM 待扩（host ReAct 收到多模态 A2A 响应时 block 留在 ContentBlocks 但不进下轮 LLM 请求）。
+// 模型是否能消费媒体取决于消息角色、MIME 与适配器支持。用户媒体可由适配器编码，
+// 远端助手的媒体 artifact 留在 ContentBlocks 供应用处理。
 func PartsToContent(parts a2atypes.ContentParts) (string, []*schema.ContentBlock) {
 	var sb strings.Builder
 	var blocks []*schema.ContentBlock

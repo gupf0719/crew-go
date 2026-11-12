@@ -36,32 +36,12 @@
 //   - -feat-approval：Approval——敏感工具 ask_coder 执行前强制审批（抛 InterruptError 走 ask_user
 //     同款 cp 挂起 + Resume 链），其他工具默认放行
 //
-// 本 demo 仅为观测性演示，未做生产级 SSE 细节（断线续传 / Last-Event-ID / 心跳 /
-// backpressure 保护）。
+// # 多副本与会话查询
 //
-// # 生产部署必知 (iter-5-N audit)
+// 设置 PLAN_WEB_REDIS_URL 或 -redis-url，共享会话索引、暂停请求和 Checkpointer。
+// 会话按浏览器 Cookie 隔离。GET /api/sessions 可查询状态，DELETE /api/sessions/{id}
+// 可删除空闲任务。新建会话加 ephemeral=true 时在终态清理。
 //
-// 业务真生产部署 plan_chat_web 模式时必加:
-//
-//  1. **鉴权**: 当前 session_id = sess.RunID 暴露给前端, 业务前端拿到后可猜测 /
-//     枚举其他 session 调 /api/interrupt 干扰别人对话. 必加:
-//     - cookie / JWT 鉴权 user_id → session_id 绑定 (映射表存 Redis)
-//     - /api/chat?session_id=xxx handler 验证 user_id 是 session owner 才放行
-//     - /api/interrupt 同款验证
-//
-//  2. **cp backend**: 当前 cp 用 InMemoryCheckpointer (main.go:280) 进程重启所有
-//     HITL Pending 对话**全断**. 生产改用 crew-go/sql.NewCheckpointer (PG+MySQL)
-//     或 crew-go/redis.NewCheckpointer (Redis master-only). 详见 `redis/doc.go`
-//     "Redis 持久化配置" 章节 (业务必配 appendonly yes + 双 backend hot/cold).
-//
-//  3. **HTTP timeout**: -request-timeout-seconds 默认 0 = 无 timeout (依赖 client
-//     connection). 业务生产用 nginx / cloudflare 网关层管 timeout (业务 LLM
-//     Plan-Execute 真长跑可超 10min, 服务端不要硬切).
-//
-//  4. **SSE backpressure**: eventSink 通道容量 256, 满时 silent drop (writeSSE
-//     每 5s log warn `[plan_chat_web] SSE backpressure drop +N`). 业务生产监控
-//     stderr grep 此 warn 排查 SSE 慢消费.
-//
-//  5. **TTL sweeper**: -session-ttl-minutes 默认 60 min — 业务长跑 thread (用户
-//     conv 几天) 调大或设 0 永不过期 (但要监控 OOM, 单进程 demo 内存模式没扩展).
+// SSE 每 15 秒发送心跳。状态恢复从最近的 Checkpoint 开始。部署与恢复边界见
+// doc/issue/issue-90-plan-chat-web-lifecycle-prod.md。
 package main

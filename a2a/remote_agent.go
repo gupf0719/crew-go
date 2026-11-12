@@ -83,7 +83,11 @@ func NewRemoteAgentFromCard(ctx context.Context, card *a2atypes.AgentCard, opts 
 	for _, o := range opts {
 		o(cfg)
 	}
-	client, err := a2aclient.NewFromCard(ctx, card, cfg.clientOpts...)
+	clientOpts := cfg.clientOpts
+	if !slices.Contains(clientOpts, a2aclient.WithDefaultsDisabled()) {
+		clientOpts = append([]a2aclient.FactoryOption{jsonRPCHTTPClient(nil)}, clientOpts...)
+	}
+	client, err := a2aclient.NewFromCard(ctx, card, clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("a2a: create client for agent %q: %w", card.Name, err)
 	}
@@ -338,12 +342,13 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 
 	explicit := continuation != "" && pend.TaskID == ""
 	retireContinuation := false
+	explicitAttempted := false
 	if explicit {
 		question, finish, err := a.beginContinuation(session, continuation)
 		if err != nil {
 			return nil, err
 		}
-		defer func() { finish(retireContinuation) }()
+		defer func() { finish(retireContinuation, explicitAttempted) }()
 		sessionQuestion, handleWaiting = question, true
 		taskID, contextID, seenArtifacts = question.TaskID, question.ContextID, question.SeenArtifacts
 		if len(question.Items) > 1 {
@@ -406,7 +411,12 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 				sentID = gateMessageID(questionPos, taskID, question.Round)
 				msg.ID = sentID
 			}
-			snap, how, rerr := a.reconcileTask(ctx, taskID, sentID, question.QuestionMsgID)
+			attemptKey := "a2a.answer-attempt\x00" + sentID
+			if explicit && byPosition {
+				attempted, _ := compose_v2.GetStepResult[bool](ctx, attemptKey)
+				question.AnswerUnsent = question.AnswerUnsent && !attempted
+			}
+			snap, how, rerr := a.reconcileTask(ctx, taskID, sentID, question)
 			if explicit && how == reconcileSend && questionChanged(question, snap) {
 				how = reconcileSnapshot
 			}
@@ -425,6 +435,27 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 						ids = append(ids, item.InterruptID)
 					}
 					msg.Metadata = map[string]any{ReplyToInterruptIDsKey: ids}
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, context.Cause(ctx)
+				}
+				if sentID != "" && question.AnswerUnsent {
+					question.AnswerUnsent = false
+					switch {
+					case answering:
+						if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), question); err != nil {
+							return nil, fmt.Errorf("a2a: record answer attempt: %w", err)
+						}
+					case explicit:
+						if byPosition {
+							if err := compose_v2.SaveStepResult(ctx, attemptKey, true); err != nil {
+								return nil, fmt.Errorf("a2a: record continuation answer attempt: %w", err)
+							}
+						}
+						explicitAttempted = true
+					case sessionHandles:
+						session.SetValue(a.pendingKey(session), question)
+					}
 				}
 			case reconcileSnapshot:
 				msg, method, recovered = nil, "get_task", true
@@ -596,7 +627,7 @@ stream:
 			rec := gatePending{
 				TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: 1,
 				Question: q, QuestionMsgID: statusMsgID, Items: items, SeenArtifacts: a.artifactStates(ctx, askTask),
-				Binding: a.binding,
+				Binding: a.binding, AnswerUnsent: true,
 			}
 			out := a.askForContinuation(session, rec)
 			if byPosition {
@@ -616,7 +647,7 @@ stream:
 				round = sessionQuestion.Round + 1
 			}
 			session.SetValue(a.pendingKey(session), gatePending{
-				TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, QuestionMsgID: statusMsgID, Items: items,
+				TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, QuestionMsgID: statusMsgID, Items: items, AnswerUnsent: true,
 			})
 			a.storeAuthWait(session, auth)
 			a.storeHandleWaiting(session, true, a.artifactStates(ctx, askTask))
@@ -650,7 +681,7 @@ stream:
 		}
 		// 记的是已经发生的事：远端这个任务在等人答这一问
 		rec := gatePending{TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, Question: q, Items: items, Auth: auth,
-			QuestionMsgID: statusMsgID, SeenArtifacts: a.artifactStates(ctx, askTask)}
+			QuestionMsgID: statusMsgID, SeenArtifacts: a.artifactStates(ctx, askTask), AnswerUnsent: true}
 		if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), rec); err != nil {
 			return nil, fmt.Errorf("a2a: remote agent %q: record the pending question: %w", a.card.Name, err)
 		}
@@ -714,20 +745,23 @@ const (
 //     也按快照重新提问。历史里有答复但还没回应时轮询，最多 authReattachGrace；超时报 reconcileInFlight。
 //   - 在等人且未发现已接收的答复或新的问题：可以发。已知 interruptId 时，发送的答复绑定到已展示的问题。
 //   - 远端说没有这个任务：reconcileGone。
-//   - 查不到状态：sentID 非空时对瞬时查询失败报 reconcileUnknown。确定不支持查询时允许发送。
-func (a *RemoteAgent) reconcileTask(ctx context.Context, taskID, sentID, questionID string) (*a2atypes.Task, reconcileOutcome, error) {
+//   - 查不到状态：确定不支持查询且记录表明尚未尝试答复时允许发送，其余查询失败保留挂起。
+func (a *RemoteAgent) reconcileTask(ctx context.Context, taskID, sentID string, question gatePending) (*a2atypes.Task, reconcileOutcome, error) {
 	id := a2atypes.TaskID(taskID)
 	task, err := a.client.GetTask(ctx, &a2atypes.GetTaskRequest{ID: id})
 	if err != nil {
 		switch {
 		case errors.Is(err, a2atypes.ErrTaskNotFound):
 			return nil, reconcileGone, nil
-		case sentID != "" && !deterministicTaskQueryErr(err):
+		case sentID != "" && (!question.AnswerUnsent || !deterministicTaskQueryErr(err)):
 			return nil, reconcileUnknown, err
 		}
 		return nil, reconcileSend, nil
 	}
 	if task == nil {
+		if sentID != "" && !question.AnswerUnsent {
+			return nil, reconcileUnknown, fmt.Errorf("get task returned no snapshot for an answer with unknown delivery")
+		}
 		return nil, reconcileSend, nil
 	}
 	at := slices.IndexFunc(task.History, func(m *a2atypes.Message) bool { return m != nil && m.ID == sentID })
@@ -735,7 +769,7 @@ func (a *RemoteAgent) reconcileTask(ctx context.Context, taskID, sentID, questio
 		return task, settledOutcome(task), nil
 	}
 	responded := func(t *a2atypes.Task) bool {
-		if current := statusMessageID(t); questionID != "" && current != "" && current != questionID {
+		if current := statusMessageID(t); question.QuestionMsgID != "" && current != "" && current != question.QuestionMsgID {
 			return true
 		}
 		i := slices.IndexFunc(t.History, func(m *a2atypes.Message) bool { return m != nil && m.ID == sentID })
@@ -760,8 +794,7 @@ func (a *RemoteAgent) reconcileTask(ctx context.Context, taskID, sentID, questio
 }
 
 // deterministicTaskQueryErr 判 GetTask 的错误是不是「再查也一样」：远端不支持这个操作、请求本身被拒（参数、鉴权、版本）。
-// 这类错误下等也查不到，照常发（跟没有对账这一步时一样）；传输错误、服务端内部错误这类瞬时的才不盲发、等下一次再查——
-// 否则 GetTask 一直被拒的远端上人的答复永远发不出去（审计推断）。
+// 这类错误下可发送尚未尝试过的答复。已经尝试过或投递记录缺失时，仍需先查明远端状态。
 func deterministicTaskQueryErr(err error) bool {
 	// ErrParseError 不算：它只说明「这次的响应解不开」，分不出是不是每次都一样——JSON-RPC 下是服务端回 -32700（我们发的是良构的，
 	// 多半是传输途中坏了），REST 下是 A2A 形状的错误体后面带着多余的数据。拿不准时不盲发：规范只说远端「可以」按 messageId
@@ -769,8 +802,7 @@ func deterministicTaskQueryErr(err error) bool {
 	// 2026-06 的 a2a-python / a2a-java），照发就是远端把同一个答复再处理一遍；不发是看得见的错误、有上界。
 	//
 	// 鉴权层、网关给的不是 A2A 形状的拒绝：REST 下客户端按 HTTP 状态码映射（a2a-go v2.7.0 起 401 → ErrUnauthenticated、
-	// 403 → ErrUnauthorized、404 / 405 / 501 → ErrMethodNotFound），照常发；JSON-RPC 下非 200 只给一句文本、拿不到状态码，
-	// 按瞬时处理、一直卡住（见 doc/code/todo.md「a2a 对账：拒绝 GetTask 的确定性错误」）。
+	// 403 → ErrUnauthorized、404 / 405 / 501 → ErrMethodNotFound）。内置 JSON-RPC 传输也识别 GetTask 的 401 / 403。
 	for _, target := range []error{a2atypes.ErrMethodNotFound, a2atypes.ErrUnsupportedOperation,
 		a2atypes.ErrInvalidRequest, a2atypes.ErrInvalidParams, a2atypes.ErrVersionNotSupported, a2atypes.ErrExtensionSupportRequired,
 		a2atypes.ErrUnauthenticated, a2atypes.ErrUnauthorized} {
@@ -1389,6 +1421,8 @@ type gatePending struct {
 	// QuestionMsgID 是远端问这一问的那条状态消息的 ID：续任务之前对账时，远端的状态消息还是它就是还没回应这次的答复
 	// （见 reconcileTask）。
 	QuestionMsgID string `json:"question_msg_id,omitempty"`
+	// AnswerUnsent 表示记录确认这份答复尚未尝试投递。旧存档缺失该字段时按投递状态未知处理。
+	AnswerUnsent bool `json:"answer_unsent,omitempty"`
 	// SeenArtifacts 是问这一问的那一刻，这个远端任务里各 artifact 的状态：对账取回快照、或重新挂上任务时，那时已有的内容不算
 	// 回应这一问的产出（正常续任务的流里只有这一轮的，见 seenArtifact）。
 	SeenArtifacts []seenArtifact `json:"seen_artifacts,omitempty"`

@@ -133,8 +133,7 @@ func TestHandler_ClientInstructionsNotAdopted(t *testing.T) {
 	}
 }
 
-// content 是 ContentPart 数组时取文本部分（按顺序换行拼接），媒体部分不取；只有媒体、没有文字的输入直接报错，不让模型
-// 拿一个空问题作答。曾经数组 content 让整个请求解码失败。
+// 数组文本按顺序拼接。只有未知部分时直接拒绝，避免以空输入调用模型。
 func TestHandler_ContentPartsArray(t *testing.T) {
 	m := &aguiSeenModel{}
 	h := ownedHandler(func(hk hook.Hooks) agent_v2.Agent { return seenAgent("assistant", m, hk) })
@@ -148,12 +147,12 @@ func TestHandler_ContentPartsArray(t *testing.T) {
 		t.Errorf("模型看到 %q", calls)
 	}
 
-	events = parseSSE(postAGUI(h, runBody(t, "t-parts2", "r1", msg("user", []any{image}))).Body.String())
+	events = parseSSE(postAGUI(h, runBody(t, "t-parts2", "r1", msg("user", []any{map[string]any{"type": "future_part"}}))).Body.String())
 	if code := findErrorCode(events); code != "unsupported_content" {
-		t.Errorf("只有媒体的输入应报 unsupported_content，got %q", code)
+		t.Errorf("只有未知部分的输入应报 unsupported_content，got %q", code)
 	}
 	if n := len(m.calls()); n != 1 {
-		t.Errorf("只有媒体的输入不该调模型，模型共被调 %d 次", n)
+		t.Errorf("只有未知部分的输入不该调模型，模型共被调 %d 次", n)
 	}
 }
 

@@ -1816,6 +1816,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			nextFrontier []FrontierMember
 			isEnd        bool
 			dirWrites    []ChannelWrite
+			nextInputs   map[string][]ChannelWrite
 			// completedEarlier：部分失败续跑时，这个超步先前已成功的成员（after 断点要算上它们）
 			completedEarlier []FrontierMember
 		)
@@ -1854,6 +1855,12 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 					continue // 防御：不投递空/终止节点
 				}
 				nextFrontier = append(nextFrontier, FrontierMember{NodeID: d.Target, InstanceID: d.instanceID})
+				if len(d.Input) > 0 {
+					if nextInputs == nil {
+						nextInputs = make(map[string][]ChannelWrite)
+					}
+					nextInputs[d.instanceID] = d.Input
+				}
 				// **payload 灌的是共享 channel，不是「这条 directive 的私有入参」。**
 				//
 				// N 条 directive 的 payload 在下一超步开始前一次性归并进同一个格子，
@@ -1921,7 +1928,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 					res.SucceededBranches, res.ConsumedAnswers, res.Signals, res.SendDirectives, res.Targets)
 			} else {
 				commitErr = cm.commitSuperstepAdvance(res.SuccessWrites,
-					res.SucceededBranches, res.ConsumedAnswers, res.Signals, nextFrontier, dirWrites)
+					res.SucceededBranches, res.ConsumedAnswers, res.Signals, nextFrontier, dirWrites, nextInputs)
 			}
 			if commitErr != nil {
 				// **audit Round 11 Bug R11-1+R11-3 修复**：ApplyAll panic atomic
@@ -2327,8 +2334,6 @@ func recordWriteOwners(owners map[string]FrontierMember, m FrontierMember, ws []
 }
 
 func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, cm *ChannelManager, hooks OrchestrationHooks) frontierResult {
-	chs := cm.Channels()
-
 	// fast path: 单节点顺序
 	if len(frontier) == 1 {
 		id := frontier[0].NodeID
@@ -2339,6 +2344,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 				FirstErr:       fmt.Errorf("node %q not registered", id),
 			}
 		}
+		chs := cm.channelsForMember(frontier[0])
 		ws, directives, consumed, signals, err := runNodeWithHooks(ctx, id, fn, g.nodeComponents[id], g.nodePolicies[id], chs, hooks, cm, frontier[0].InstanceID)
 		var targets []NodeID
 		if err == nil {
@@ -2350,7 +2356,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 				signals = putSignal(signals, sg)
 			}
 			if err == nil {
-				err = validateSendTargets(g, id, directives)
+				err = validateSendDirectives(g, cm, id, directives)
 			}
 		}
 		// 成员以「它名下嵌套图的入口被否决」失败：推进产出那份输入的分域的代际
@@ -2468,6 +2474,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 						m.NodeID, GetGraphNS(ctx), m.InstanceID)}
 				}
 			}()
+			chs := cm.channelsForMember(m)
 			ws, directives, consumed, signals, err := runNodeWithHooks(ctx, m.NodeID, fn, g.nodeComponents[m.NodeID], g.nodePolicies[m.NodeID], chs, hooks, cm, m.InstanceID)
 			var targets []NodeID
 			if err == nil {
@@ -2480,7 +2487,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 					signals = putSignal(signals, sg)
 				}
 				if err == nil {
-					err = validateSendTargets(g, m.NodeID, directives)
+					err = validateSendDirectives(g, cm, m.NodeID, directives)
 				}
 			}
 			applyNestedEntryRejections(ctx, cm, m, err)

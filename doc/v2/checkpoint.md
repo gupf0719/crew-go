@@ -47,7 +47,7 @@ type Checkpoint struct {
     NS        string           // 本 cp 的 ns 路径（嵌套寻址用）
     ParentNS  string           // 父 ns（O(1) 反查祖先）
     Status    CheckpointStatus // Unset / Pending / Failed —— **只是报告位**，不参与控制流，见 §3.1
-    SchemaVer int              // 当前 CheckpointSchemaVer = 18
+    SchemaVer int              // 当前 CheckpointSchemaVer = 19
     GraphID   string           // 防 cp 串台（§4.3）
     CreatedAt int64            // UnixNano，Cleanup 按它排序；框架只在 caller 没给时盖
     Epoch     string           // 写代：每次 SaveNS 换一枚（§2.2）
@@ -65,6 +65,7 @@ type Checkpoint struct {
     CompletedSignals  []SignalRecord         // 部分失败超步里成功成员先记在一边的上行信号（整超步完成时再合并）
     RecipientKey      []byte                 // 铸收件人的密钥（compose_v2.SignalRecipient），续跑时同一个位置算出同一个收件人
     CurrentFrontier   []FrontierMember       // 下一帧要跑谁
+    FrontierInputs    map[string][]SerializedWrite // 当前投递实例的私有输入，按 InstanceID 寻址
     FrontierStarted   bool                   // 这一超步开没开始执行（成员中断 / 失败之后的档为真；停在超步边界上的——软取消、ctx 取消、断点停下——为假）——续跑时决定判不判 before 断点
     NodeVisits        map[NodeID]int         // 每节点成功跑过几次——中断 ID 的 visit 维度靠它跨 cp 递增
 
@@ -105,6 +106,7 @@ type FrontierMember struct {
 type SerializedSend struct {
     Target          NodeID
     Payload         []SerializedWrite
+    Input           []SerializedWrite // 延迟投递的私有写入
     Owner           NodeID // 谁发的——重跑它时框架据此清掉旧 send，否则 Target 双发
     OwnerInstanceID string // 执行单位是 branch 实例不是 NodeID，故按实例精确匹配
     InstanceID      string // 这条 send 派生出的 target 实例身份（重放时不换新）

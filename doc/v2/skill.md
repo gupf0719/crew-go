@@ -320,11 +320,29 @@ ag := agent_v2.NewBasicAgent(agent_v2.WithSkills(skill.SkillSource{SkillBox: box
 
 ---
 
-## 13. 未来方向：L0 源头分层
+## 按需读取参考文档
 
-当前 toolCall 模式 body 全量进 tool_result + marker 压缩保护是**治标**——多 skill 长会话累积仍占 ctx。**L0 源头分层**（progressive disclosure 进一步：core body 触发加载 + reference 文件按需 read）是治本方向，业内（Anthropic Agent Skills 三级 / SkillReducer）已验证。
+把核心流程写在 `SKILL.md`，把可单独查阅的细节放进同一 skill 的 `references/`。
+`.md` 和 `.txt` 文件可用以下 frontmatter 声明匹配条件。
 
-> 完整设计（三级分层 / `read_skill_resource` 工具 / 框架路由缓解触发 / over-read 预算闸门）→ [skill-system.md §skill 源头分层方案设计](../description/three-way-comparison/skill-system.md) + [ISSUE-92](../issue/issue-92-skill-source-layering.md)（📋 待实施）。
+```yaml
+---
+description: 退款接口的幂等和重试约定
+when: 设计或排查退款重试
+topics: [退款, 幂等, retry]
+always_load: false
+---
+```
+
+`activate_skill` 的 inline 结果列出参考文档路径。框架按当前请求匹配关键词，优先读取
+`always_load`，再按相关性和路径排序。自动读取发生在工具结束钩子接受激活结果后。
+`WithSkillReferenceBudget` 默认估算每批 1024 token、每份 512 token。配置
+`AutoCompact.ModelContextWindow` 时，批次预算还受估算剩余空间的四分之一限制。
+设为 `always_load` 的文件只受单份上限约束。
+
+模型也可用 `read_skill_resource` 传 `skill` 和相对 `path` 按需读取，沿用 SkillBox
+的激活权限和单份上限。自动和手动读取在同一次 Run 共享去重记录，工具批次重放时保留该记录。
+默认 SkillBox 只读取已登记的根内文本文件。 [设计记录](../issue/issue-92-skill-source-layering.md)
 
 ---
 

@@ -1374,7 +1374,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 每个调用执行用的 ctx）：钩子里的调用不是工具本身，交给 OnToolEnd 的 callCtxs 不带章。
 		// 收集器：框架自己的 toolsFn 把每个调用收到的上行信号登记在这里，OnToolEnd 跑完之后再定（见
 		// tool_batch_signals.go）。
-		batch := &toolBatch{}
+		batch := &toolBatch{messages: msgs}
 		execCtxs := make([]context.Context, len(callCtxs))
 		for i, c := range callCtxs {
 			execCtxs[i] = withToolBatch(withToolResultRecorder(c), batch)
@@ -1512,6 +1512,12 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				finishToolResult(ctx, toolCalls[i].Function.Name, r, failed, code)
 			}
 		}
+		results = discardRejectedSkillBodies(results, failedAfterHook)
+		var referenceMessages []*schema.Message
+		if batch.references != nil {
+			preamble, _ := compose_v2.Get(chs, basicSysPreambleCh)
+			referenceMessages = loadActivatedReferences(ctx, batch.references, batch.refReads, preamble, msgs, results, failedAfterHook)
+		}
 		// 这一批处理完了：结果定进工具账（见 agent_v2 的 finalizeToolMemo）。被裁决换掉的那几条定下的是替换后的失败结果——
 		// 不定的话账里留着它转存前、钩子脱敏前的原文，节点之后作废时随出口存档落盘（审计实测）。
 		if finalizeToolMemo != nil {
@@ -1536,7 +1542,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			recordHistory(ctx, historyOwner(ctx, name), name, results)
 		}
 
-		writes := []compose_v2.ChannelWrite{compose_v2.Write(basicMessagesCh, results)}
+		writes := []compose_v2.ChannelWrite{compose_v2.Write(basicMessagesCh, append(results, referenceMessages...))}
 		// 本轮 tool_search 解锁的工具进 channel——权威副本随 checkpoint 走，续跑后
 		// 不必依赖消息历史还在（见 basicRevealedCh）。
 		unlockedNew := false

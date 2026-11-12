@@ -80,12 +80,8 @@ func (p *pendingView) hasWriteTo(name string) bool {
 
 // reduceFor 用 name 这个 channel 注册的 reducer 算 prev ⊕ next，**不写回 cm**。
 //
-// 与 `ApplyAll` 归并段的区别只在「算完写不写回」——两者必须用同一个 reducer，否则出边看到的
-// 值和提交后的值会分叉。
-//
-// reducer panic 在这里只补归因再抛回去（下面那道 recover），不改落点：本函数只在出边计算路径上被调用，而那条
-// 路径整个跑在 `safeCondRun` 的 recover 之内 ⟹ panic 会变成「这个成员的 cond 失败」，跟 `ApplyAll`
-// 里 reducer panic 变成整批提交失败是同一档处置（都不留半应用状态）。
+// 条件边和 Send 实例输入沿用 ApplyAll 的 reducer。reducer panic 在这里补齐 channel
+// 信息后交回调用处的节点或条件边执行保护。
 func (cm *ChannelManager) reduceFor(name string, prev, next any) (v any, err error) {
 	cm.mu.RLock()
 	ch, ok := cm.channels[name]
@@ -107,13 +103,9 @@ func (cm *ChannelManager) reduceFor(name string, prev, next any) (v any, err err
 	return ch.reduceAny(prev, next), nil
 }
 
-// channelsWithPending 造一个带叠加层的只读视图——出边计算专用。
-//
-// writes 为空时返回的视图与 `Channels()` 等价（`pendingView.overlay` 遇空 writes 是
-// no-op），所以 completedSibling 那种「写入早已提交、本超步没执行」的成员直接传 nil 即可。
-func (cm *ChannelManager) channelsWithPending(writes []ChannelWrite) Channels {
-	if len(writes) == 0 {
-		return Channels{cm: cm}
+func (chs Channels) withPending(writes []ChannelWrite) Channels {
+	if len(writes) > 0 {
+		chs.pending = &pendingView{writes: writes}
 	}
-	return Channels{cm: cm, pending: &pendingView{writes: writes}}
+	return chs
 }

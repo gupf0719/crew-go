@@ -2,9 +2,9 @@ package agent_v2
 
 import "crew-go/schema"
 
-// IsFrameworkNote 报 m 是不是框架以 user 角色追加进对话流的提示——它不是用户说的话。三类：后台任务的结束通知
+// IsFrameworkNote 报 m 是不是框架以 user 角色追加进对话流的提示。包括后台任务的结束通知
 // （[IsBackgroundTaskNotification]）、工具重复调用提醒（[RepeatToolReminderAnnotation]）、inline skill 正文
-// （[WithInlineSkillBody] 下盖着 [SkillBodyAnnotation] 的那条 user 消息）。
+// （[WithInlineSkillBody] 下盖着 [SkillBodyAnnotation] 的 user 消息）和自动注入的 skill 参考正文。
 //
 // 它们都排在用户这一轮的输入之后（通知在调模型之前追加，另两类跟一批工具结果一起），按角色倒着找「用户这一轮的输入」
 // 会挑到它们。框架里这样挑的两处都跳过它：AutoCompact 定尾部（挑到了会把用户刚问的话连同这一轮的工具往返摘进摘要）、
@@ -21,5 +21,6 @@ func IsFrameworkNote(m *schema.Message) bool {
 		return true
 	}
 	body, _ := m.Annotations[SkillBodyAnnotation].(bool)
-	return body
+	reference, _ := m.Annotations[skillReferenceMessage].(bool)
+	return body || reference
 }

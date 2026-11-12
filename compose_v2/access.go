@@ -13,10 +13,11 @@ import "fmt"
 // IDE 重命名安全），不靠字符串 key + 反射读 channel。
 type Channels struct {
 	cm *ChannelManager
+	// input 是当前投递实例独占的读视图，只覆盖该投递提供的 channel。
+	input *pendingView
 
 	// pending 非 nil 时，读到的是「已提交态 + 某个成员自己那批还没提交的写入」。
-	// 只有出边计算路径会拿到这种视图（见 [pendingView]）；NodeFunc 收到的恒为 nil，
-	// 即节点读的永远是已提交态——超步内 state 不变这条不受影响。
+	// 只有出边计算路径会带 pending（见 [pendingView]），有私有输入时在 input 上叠加。
 	pending *pendingView
 }
 
@@ -27,10 +28,11 @@ func (chs Channels) read(name string) (any, bool) {
 	if chs.cm == nil {
 		return nil, false
 	}
-	base, ok := chs.cm.read(name)
-	if chs.pending == nil {
-		return base, ok
+	if chs.input.hasWriteTo(name) {
+		base, ok := chs.input.overlay(chs.cm, name, nil, false)
+		return chs.pending.overlay(chs.cm, name, base, ok)
 	}
+	base, ok := chs.cm.read(name)
 	return chs.pending.overlay(chs.cm, name, base, ok)
 }
 
@@ -42,7 +44,7 @@ func (chs Channels) has(name string) bool {
 	if chs.cm.has(name) {
 		return true
 	}
-	return chs.pending.hasWriteTo(name)
+	return chs.input.hasWriteTo(name) || chs.pending.hasWriteTo(name)
 }
 
 // ── 包级泛型 helper（用户主要 API）──

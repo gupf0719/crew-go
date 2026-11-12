@@ -39,9 +39,9 @@ import (
 //   - 前文只在服务端第一次见到这场对话时写一次。那一次读历史层失败或者写失败，这次运行照样以客户端为准、看得到前文，
 //     但历史层里随后有了这次运行的记录，之后的运行不会再写前文——那几轮从此不在服务端的记录里。
 //
-// # 只取 user / assistant 的文本
+// # 采信的对话内容
 //
-// system / developer、工具调用与结果、多模态块都不取。调用方能伪造历史：指令只认 agent 自己的前言
+// user 可以携带文本与媒体，assistant 只取文本。指令只认 agent 自己的前言
 // （[WithSystemPrompt] / [WithPromptTemplate]），工具往返的配对与可信度由服务端自己的记录承载。伪造的 user /
 // assistant 文本最多做到提示词注入，碰不到框架的控制决定——审批、转交、存档都在服务端。
 //
@@ -66,7 +66,7 @@ type callerHistoryVal struct {
 // WithCallerHistoryCtx 声明这场对话在本次之前的轮次（调用方提供的前文，按时间顺序）。谁说了算见本文件开头：有拥有
 // 这场对话的写入器时以服务端为准（服务端第一次见到这场对话时把它写进去），否则以它为准。
 //
-// 只取 role 为 user / assistant 的文本（Content），别的一概不取：system / developer、工具调用与结果、多模态块。
+// 取 user 文本与媒体、assistant 文本。工具往返和指令由服务端管理。
 // 给的是这一轮**之前**的轮次——这一轮的输入照常作为 Run 的 input 传，别放进来，否则模型看到它两遍。空的也算声明了
 // （这场对话的第一轮）。
 //
@@ -75,30 +75,64 @@ type callerHistoryVal struct {
 func WithCallerHistoryCtx(ctx context.Context, msgs []*schema.Message) context.Context {
 	kept := make([]*schema.Message, 0, len(msgs))
 	for _, m := range msgs {
-		if m == nil || m.Content == "" {
+		if m == nil {
 			continue
 		}
 		var t *schema.Message
 		switch m.Role {
 		case schema.RoleUser:
 			t = schema.UserMessage(m.Content)
+			for _, block := range m.ContentBlocks {
+				if copied := callerContentBlock(block); copied != nil {
+					t.ContentBlocks = append(t.ContentBlocks, copied)
+				}
+			}
 		case schema.RoleAssistant:
 			t = schema.AssistantMessage(m.Content)
 		default:
 			continue
 		}
+		if t.Content == "" && len(t.ContentBlocks) == 0 {
+			continue
+		}
 		// 不沿用调用方给的 ID（不可信，也不该跟服务端的消息共用一个身份空间），按位置与内容确定性派生：同一份前文
 		// 不论被谁、写进去几次，都是同一组 ID，读的时候去得了重
-		t.ID = callerTurnID(len(kept), t.Role, t.Content)
+		t.ID = callerTurnID(len(kept), t)
 		kept = append(kept, t)
 	}
 	return context.WithValue(ctx, callerHistoryKey{}, callerHistoryVal{msgs: kept})
 }
 
 // callerTurnID 是前文第 i 条的确定性 ID。前缀不与框架铸的 UUID 撞。
-func callerTurnID(i int, role schema.MessageRole, content string) string {
-	sum := sha256.Sum256([]byte(strconv.Itoa(i) + "\x00" + string(role) + "\x00" + content))
+func callerTurnID(i int, message *schema.Message) string {
+	key := strconv.Itoa(i) + "\x00" + string(message.Role) + "\x00"
+	if len(message.ContentBlocks) == 0 {
+		key += message.Content
+	} else {
+		key = "media\x00" + key + inputDigest(message)
+	}
+	sum := sha256.Sum256([]byte(key))
 	return "caller-" + hex.EncodeToString(sum[:16])
+}
+
+func callerContentBlock(block *schema.ContentBlock) *schema.ContentBlock {
+	if block == nil {
+		return nil
+	}
+	safe := &schema.ContentBlock{Type: block.Type, MediaType: block.MediaType}
+	switch {
+	case block.Text != nil:
+		safe.Text = block.Text
+	case block.ImageUrl != nil:
+		safe.ImageUrl = block.ImageUrl
+	case block.InputAudio != nil:
+		safe.InputAudio = block.InputAudio
+	case block.File != nil:
+		safe.File = block.File
+	default:
+		return nil
+	}
+	return cloneContentBlock(safe)
 }
 
 // callerPrior 返回 ctx 上声明的前文（共享的底层切片，只读）；第二个返回值报有没有声明（声明了一份空的也算）。
@@ -127,9 +161,9 @@ func callerHistory(ctx context.Context) []*schema.Message {
 
 // callerCopy 拷一条前文，标上 CallerHistoryAnnotation。消息是新拷贝、标注是新 map；ID 不变。
 func callerCopy(m *schema.Message) *schema.Message {
-	cp := *m
+	cp := cloneCalleeInput(m)
 	cp.Annotations = map[string]any{CallerHistoryAnnotation: true}
-	return &cp
+	return cp
 }
 
 // isCallerHistory 报 m 是不是调用方提供的前文。

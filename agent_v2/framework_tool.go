@@ -46,6 +46,7 @@ func markMinted(t tool.Tool) tool.Tool { return mintedTool{Tool: t} }
 
 func (*skillTool) isFrameworkMinted()           {}
 func (*skillActionTool) isFrameworkMinted()     {}
+func (*skillReferenceTool) isFrameworkMinted()  {}
 func (*toolSearchTool) isFrameworkMinted()      {}
 func (frameworkTool) isFrameworkMinted()        {}
 func (frameworkFinalOutput) isFrameworkMinted() {}

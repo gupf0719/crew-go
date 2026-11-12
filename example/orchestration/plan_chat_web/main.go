@@ -12,8 +12,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"path/filepath"
@@ -30,9 +28,12 @@ import (
 	"crew-go/model/deepseek"
 	"crew-go/observability"
 	"crew-go/prompt"
+	agentRedis "crew-go/redis"
 	"crew-go/schema"
 	"crew-go/skill"
 	"crew-go/tool"
+
+	goredis "github.com/redis/go-redis/v9"
 )
 
 // BasicAgent 级功能演示 flag（融入 plan_chat_web）——默认全关，不改现有 demo 行为，
@@ -53,101 +54,16 @@ func skillsDir() string {
 	return filepath.Join(filepath.Dir(file), "skills")
 }
 
-// runSlot 持有一个 HITL 会话的可中断 + 可恢复状态（ISSUE-56 / ISSUE-58）。
-//
-// 同一 session_id 可被多次 SSE 连接复用：第一次新建 → 跑到一半触发 interrupt →
-// runtime save checkpoint 到 cp[sess.RunID] → SSE 断开 → 用户点"继续/改方向/取消"再发
-// 一次 GET /api/chat?session_id=xxx&action=...&text=... → 服务端按 action 走 Resume。
-//
-// **lifecycle 模型** (run status, ISSUE-90)：
-// runs sync.Map 完成后**不删** slot, 仅 transition status → 让前端能查 history。
-// 后台 sweeper goroutine (-session-ttl-minutes) 周期清 lastActivity 超期 slot 防 OOM。
-//
-// status 字段 6 状态:
-//   - running — 当前在跑 LLM (q-only 新建 / Resume 续传后)
-//   - interrupted — InterruptError 挂起, 可 Resume
-//   - success — 自然跑完
-//   - error — 非 Interrupt 错 (LLM 报错 / ctx 超时等)
-//   - cancelled — Resume action=abort 用户主动取消
-//
-// status / lastActivity 用 mu 保护; handler / goroutine / sweeper 三方并发读写。
-//
-// resumeAction / resumeText / lastInterruptID / mode 单次串行赋值 (handler 写 →
-// goroutine 读 → 不同 Resume 之间 handler 重置), 不需 lock。
+// runSlot 保存本次 SSE 请求的执行参数。跨请求所需的状态由会话存储和 Checkpointer 持有。
 type runSlot struct {
-	sess      *agent_v2.RunSession
-	cp        *compose_v2.InMemoryCheckpointer
-	interrupt atomic.Bool
-
-	mu           sync.RWMutex
-	status       string    // 6 状态见 godoc; sweeper / handler 读, goroutine / handler 写
-	lastActivity time.Time // sweeper 按 TTL 判过期; 每次 transition + Resume handler 触发更新
-	createdAt    time.Time // history 时序展示
-
-	// ISSUE-58 HITL：每次 /api/chat 触发 resume 时由 handler 注入，goroutine 透给
-	// PlanAgent.Resume（继续/改方向/取消 + 可选文本）。
-	resumeAction agent_v2.ResumeAction
-	resumeText   string
-	// ISSUE-70 Phase 2: lastInterruptID 是 goroutine 在中断 emit 时记录的本次
-	// pending interrupt 的稳定 ID。Resume 时框架要求 caller 用 UserInputs map[id]Message
-	// 显式配对，而不是单值通道——所以下次 Resume 用此 ID 包成 map。
-	// 单 pending 场景下足够；多 pending 需扩为 map[wsID]string 等更复杂结构。
+	sess            *agent_v2.RunSession
+	cp              compose_v2.Checkpointer
+	resumeAction    agent_v2.ResumeAction
+	resumeText      string
 	lastInterruptID string
-
-	// ISSUE-71 Mode 切换：normal / plan，sticky 状态——切了就持续到下次切。
-	// chat_entry 重建时用此值装载对应 system prompt（toolkit 始终不变）。
-	mode string
+	mode            string
+	historySize     int
 }
-
-// 6 状态常量 — run status 生命周期。
-// pending 状态 plan_chat_web 不用 (q-only 立即 spawn goroutine 不存在排队期)。
-const (
-	statusRunning     = "running"
-	statusInterrupted = "interrupted"
-	statusSuccess     = "success"
-	statusError       = "error"
-	statusCancelled   = "cancelled"
-)
-
-// setStatus 原子 transition status + 刷 lastActivity (sweeper 按 lastActivity 判过期)。
-func (s *runSlot) setStatus(newStatus string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.status = newStatus
-	s.lastActivity = time.Now()
-}
-
-// getStatus 返当前 status 副本 (handler 判 410 vs Resume / sweeper 判过期用)。
-func (s *runSlot) getStatus() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.status
-}
-
-// touch 仅刷 lastActivity (Resume 续传时即使 status 不变也要重置 TTL 计时)。
-func (s *runSlot) touch() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lastActivity = time.Now()
-}
-
-// isFinished 检 status 是否进入终态 (success/error/cancelled)。interrupted 不是终态
-// (可 Resume), running 也不是。终态 slot 不可 Resume 必返 410。
-func (s *runSlot) isFinished() bool {
-	st := s.getStatus()
-	return st == statusSuccess || st == statusError || st == statusCancelled
-}
-
-// runs 是全局 session_id → *runSlot 注册表。process 重启即丢——单进程 demo 内存
-// 模式 (生产前换 Redis 见 ISSUE-90)。完成 slot 不立即 Delete 让前端能查 history,
-// 后台 sweeper 按 TTL 清防 OOM。
-var runs sync.Map
-
-// requestTimeoutSeconds 是 HTTP 请求 ctx timeout, 0 表示无 timeout (依赖 client
-// connection 控制). iter-5-N MED-4 修: 原硬编码 600s 一刀切 — scenario PlanAgent
-// 8-step plan × 真 LLM 每 step 10-30s × replan 几轮可超 10min 触超时 cp Pending
-// 被 cancel. 改可配 + 默认 0 让业务自决.
-var requestTimeoutSeconds int
 
 //go:embed index.html
 var indexHTML []byte
@@ -159,6 +75,7 @@ var indexHTML []byte
 var compactionDemoCtxWindow = 32000
 
 func main() {
+	envloader.Load()
 	addr := flag.String("addr", ":8080", "HTTP 监听地址")
 	useMock := flag.Bool("mock", false, "使用离线 mock chat model（不调用真 LLM）")
 	// iter-5-N audit follow-up: 加 -provider 跟 observability_demo 同款 + 默认 qwen
@@ -181,11 +98,13 @@ func main() {
 	ttlMinutes := flag.Int("session-ttl-minutes", 60, "已完成 session 保留时长 (分钟); 0 = 永不过期 (不启 sweeper)")
 	sweepIntervalMinutes := flag.Int("sweep-interval-minutes", 5, "TTL sweeper 周期 (分钟); 仅 -session-ttl-minutes > 0 时生效")
 	reqTimeout := flag.Int("request-timeout-seconds", 0, "HTTP 请求 ctx timeout (秒); 0 = 无 timeout (依赖 client connection 控制, 推荐 — 真 LLM Plan-Execute 长跑可超 10min)")
+	redisURL := flag.String("redis-url", os.Getenv("PLAN_WEB_REDIS_URL"), "Redis URL，空值使用进程内存")
+	secureCookie := flag.Bool("secure-cookie", false, "经 HTTPS 反向代理部署时为会话 Cookie 设置 Secure")
 	flag.Parse()
-	requestTimeoutSeconds = *reqTimeout
+	if *ttlMinutes < 0 || *reqTimeout < 0 || (*redisURL == "" && *ttlMinutes > 0 && *sweepIntervalMinutes <= 0) {
+		log.Fatal("会话 TTL、清理间隔或请求超时配置无效")
+	}
 	compactionDemoCtxWindow = *cwin
-
-	envloader.Load()
 
 	var chatModel model.ChatModel
 	if *useMock {
@@ -227,180 +146,38 @@ func main() {
 	// demo 打开内容采集，在 trace 里能看到模型 / 工具的输入输出；生产按是否含个人信息决定，配 WithRedactPatterns 脱敏。
 	obs := observability.New(observability.WithContentRecording(true))
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
+	ttl := time.Duration(*ttlMinutes) * time.Minute
+	var sessions sessionStore
+	var cp compose_v2.Checkpointer
+	if *redisURL != "" {
+		options, err := goredis.ParseURL(*redisURL)
+		if err != nil {
+			log.Fatal("Redis URL 配置无效")
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(indexHTML)
-	})
-	mux.HandleFunc("/api/chat", makeChatHandler(chatModel, obs))
-	mux.HandleFunc("/api/interrupt", interruptHandler)
-	// ISSUE-71 后 /api/scenarios 已删——chat_entry 自己路由 tool，前端不需要 dropdown
-
-	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	// 启 TTL sweeper goroutine (-session-ttl-minutes > 0 时)。
-	// 周期 Range runs.sync.Map, 删除 lastActivity 超期 + isFinished() 的 slot。
-	// running / interrupted 状态即使久未活动也不删 (业务可能挂着等 Resume)。
-	if *ttlMinutes > 0 {
-		ttl := time.Duration(*ttlMinutes) * time.Minute
-		interval := time.Duration(*sweepIntervalMinutes) * time.Minute
-		go runSweeper(ttl, interval)
-		log.Printf("[plan_chat_web] session TTL=%s, sweeper 周期=%s", ttl, interval)
+		rdb := goredis.NewClient(options)
+		defer rdb.Close()
+		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = rdb.Ping(pingCtx).Err()
+		cancel()
+		if err != nil {
+			log.Fatalf("连接 Redis: %v", err)
+		}
+		sessions = &redisSessions{client: rdb, ttl: ttl}
+		cp = agentRedis.NewCheckpointer(rdb, agentRedis.WithCheckpointerPrefix("crew-plan-web"))
 	} else {
-		log.Printf("[plan_chat_web] session TTL=0 永不过期 (sweeper 关闭, 长跑注意 OOM)")
+		memory := newMemorySessions(ttl)
+		sessions, cp = memory, compose_v2.NewInMemoryCheckpointer()
+		if ttl > 0 {
+			stop := memory.startSweeper(time.Duration(*sweepIntervalMinutes) * time.Minute)
+			defer stop()
+		}
 	}
-	log.Printf("[plan_chat_web] 启动 http://localhost%s", *addr)
+	app := &chatServer{model: chatModel, obs: obs, sessions: sessions, cp: cp,
+		requestTimeout: time.Duration(*reqTimeout) * time.Second, secureCookie: *secureCookie, durable: *redisURL != ""}
+	srv := &http.Server{Addr: *addr, Handler: app.routes(), ReadHeaderTimeout: 5 * time.Second}
+	log.Printf("[plan_chat_web] 启动 %s", *addr)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("serve: %v", err)
-	}
-}
-
-// runSweeper 后台 goroutine: 周期清 runs 中 TTL 过期且 isFinished 的 slot。
-// running / interrupted slot 即使久未活动也不删 (业务挂着等 Resume), 防误清正在
-// 用的 session。
-//
-// 生命周期跟 process 一致 (demo 单进程不需要显式 stop)。
-func runSweeper(ttl, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for range ticker.C {
-		now := time.Now()
-		cleared := 0
-		runs.Range(func(k, v any) bool {
-			slot := v.(*runSlot)
-			if !slot.isFinished() {
-				return true // 跳 running/interrupted, 业务可能挂着等 Resume
-			}
-			slot.mu.RLock()
-			expired := now.Sub(slot.lastActivity) > ttl
-			slot.mu.RUnlock()
-			if expired {
-				runs.Delete(k)
-				cleared++
-			}
-			return true
-		})
-		if cleared > 0 {
-			log.Printf("[plan_chat_web] sweeper 清 %d 过期 session", cleared)
-		}
-	}
-}
-
-// makeChatHandler 为每个请求构造独立的 sink + hooks（每次连接重建以绑定新 sink）；
-// session_id 维度复用 sess + cp + interrupt flag（runSlot），支持 HITL 中断 + 恢复。
-//
-// 入参（query string 二选一）：
-//   - q=...           新建会话，从初始 input 启动
-//   - session_id=...  恢复已挂起会话，从 checkpoint 续跑
-func makeChatHandler(chatModel model.ChatModel, obs *observability.Observability) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
-		q := strings.TrimSpace(r.URL.Query().Get("q"))
-
-		var slot *runSlot
-		isResume := false
-		switch {
-		case sessionID != "":
-			v, ok := runs.Load(sessionID)
-			if !ok {
-				// thread 不存在或已 sweeper 清掉
-				http.Error(w, "session not found", http.StatusNotFound)
-				return
-			}
-			slot = v.(*runSlot)
-			// 终态 (success/error/cancelled) 不可 Resume — 返 410 含具体 status 让前端
-			// 区分 status 字段语义。interrupted 状态可
-			// Resume 走下面正常路径。
-			if slot.isFinished() {
-				http.Error(w, "session already completed (status="+slot.getStatus()+")", http.StatusGone)
-				return
-			}
-			slot.touch()                // 刷 lastActivity 防 sweeper 在 Resume 路径误清
-			slot.interrupt.Store(false) // 清挂起标志，避免 hook 立即再次抛
-			// ISSUE-58 HITL：解析 action / text 注入到 slot，供 runOrResume 透给 Resume。
-			slot.resumeAction = parseResumeAction(strings.TrimSpace(r.URL.Query().Get("action")))
-			slot.resumeText = strings.TrimSpace(r.URL.Query().Get("text"))
-			// Mode 切换：sticky，URL 显式带 mode 时更新；否则保持 slot 当前 mode
-			if newMode := strings.TrimSpace(r.URL.Query().Get("mode")); newMode == "normal" || newMode == "plan" {
-				slot.mode = newMode
-			}
-			isResume = true
-		case q != "":
-			// ISSUE-71 接口合并后 chat_entry BasicAgent 作顶层入口。Mode 由 query 决定，
-			// 默认 normal；切 mode 不重置 session，sticky 持续到下次切。
-			mode := strings.TrimSpace(r.URL.Query().Get("mode"))
-			if mode != "plan" {
-				mode = "normal"
-			}
-			now := time.Now()
-			slot = &runSlot{
-				sess:         agent_v2.NewRunSession(),
-				cp:           compose_v2.NewInMemoryCheckpointer(),
-				mode:         mode,
-				status:       statusRunning,
-				createdAt:    now,
-				lastActivity: now,
-			}
-			runs.Store(slot.sess.RunID, slot)
-		default:
-			http.Error(w, "missing q (new session) or session_id (resume)", http.StatusBadRequest)
-			return
-		}
-
-		sink := newEventSink()
-		orchSSE := &orchAdapter{sink: sink}
-		observer := &hookAdapter{sink: sink}
-		intHook := &interruptHook{flag: &slot.interrupt}
-
-		// 业务钩子（SSE 推送 + interrupt）交给 observability 包在里面：两条都要接，漏接 OrchHooks 时节点 / 工作流
-		// span 与压缩、存档、扇出等框架指标都不记。别自己用 NewChainHooks 串——业务钩子开始一侧失败（比如
-		// interruptHook 抛中断）时，包在里面 observability 才能当场收掉刚开的 span。
-		var hooks hook.Hooks = obs.AgentHooks(observer, intHook)
-		var orch agent_v2.OrchestrationHooks = obs.OrchHooks(orchSSE)
-
-		var wg sync.WaitGroup
-		wg.Add(1)
-		// iter-5-N MED-4 修: 原硬编码 ctx 600s timeout 跟 scenario PlanAgent 长跑 (>10min)
-		// 冲突让 cp Pending silent cancel. 改 -request-timeout-seconds 可配, 默认 0 = 无
-		// timeout 依赖 client connection 控制 (业务真生产 client/CDN 自管 timeout).
-		var (
-			ctx    = r.Context()
-			cancel = func() {}
-		)
-		if requestTimeoutSeconds > 0 {
-			ctx, cancel = context.WithTimeout(r.Context(), time.Duration(requestTimeoutSeconds)*time.Second)
-		}
-		defer cancel()
-		ctx = compose_v2.WithCheckpointerCtx(ctx, slot.cp)
-
-		// 每个 HTTP 请求（Run / Resume / Abort 各一次）一个 trace：在这里开请求 span，agent 的 span 挂在
-		// 它下面；同一个任务的多次请求（Run 与续跑）靠 crew.run.id 关联（session_id 就是 RunID）。trace ID
-		// 推给前端，方便到后端里搜。没配 SDK 时 span 是 no-op、trace ID 为空，不推。
-		ctx = compose_v2.WithSessionIDCtx(ctx, slot.sess.RunID)
-		ctx, reqSpan := obs.Tracer().Start(ctx, "plan_chat_web "+r.URL.Path)
-		defer reqSpan.End()
-		if traceID := observability.TraceIDFromContext(ctx); traceID != "" {
-			sink.send("trace_started", map[string]any{
-				"session_id": slot.sess.RunID,
-				"trace_id":   traceID,
-			})
-		}
-
-		go func() {
-			defer wg.Done()
-			defer sink.close()
-			runOrResume(ctx, chatModel, slot, q, isResume, sink, orch, hooks)
-		}()
-
-		writeSSE(w, r, sink)
-		wg.Wait()
 	}
 }
 
@@ -417,33 +194,7 @@ func parseResumeAction(s string) agent_v2.ResumeAction {
 	}
 }
 
-// interruptHandler 触发指定 session 的挂起（ISSUE-56）。请求成功只代表 flag 已设；
-// 真正抛 InterruptError + save checkpoint 在下一轮 hook 触发，前端通过 SSE
-// 上的 `interrupted` 事件得到确认。
-func interruptHandler(w http.ResponseWriter, r *http.Request) {
-	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
-	if sessionID == "" {
-		http.Error(w, "missing session_id", http.StatusBadRequest)
-		return
-	}
-	v, ok := runs.Load(sessionID)
-	if !ok {
-		http.Error(w, "session not found", http.StatusNotFound)
-		return
-	}
-	slot := v.(*runSlot)
-	if slot.isFinished() {
-		http.Error(w, "session already completed (status="+slot.getStatus()+")", http.StatusGone)
-		return
-	}
-	slot.interrupt.Store(true)
-	w.WriteHeader(http.StatusOK)
-}
-
-// runOrResume 是 chat handler goroutine 主体（ISSUE-56）：每次连接重建 PlanAgent +
-// sub-agents（绑当前 sink 的 hooks），按 isResume 走 Run / Resume，识别
-// *InterruptError 推 `interrupted` 事件。完成后**不删** slot、只改 status（让前端查得到
-// history），真正的回收交给 TTL sweeper——见包头 lifecycle 那段。
+// runOrResume 执行本次请求，并在发送终态事件前交回会话记录。
 func runOrResume(
 	ctx context.Context,
 	m model.ChatModel,
@@ -453,6 +204,7 @@ func runOrResume(
 	sink *eventSink,
 	orch agent_v2.OrchestrationHooks,
 	hooks hook.Hooks,
+	settle func(status, pendingID string, historySize int) error,
 ) {
 	ag := buildChatEntryAgent(m, hooks, sink, slot.mode)
 
@@ -470,7 +222,10 @@ func runOrResume(
 		err    error
 		events []*agent_v2.AgentEvent
 	)
-	if isResume {
+	switch {
+	case isResume && slot.resumeAction == agent_v2.ResumeActionAbort:
+		// 调用方已经取得放弃许可，由 settle 清档并落终态。
+	case isResume:
 		// ISSUE-70 Phase 2: 单值 UserInput 已删，Resume 必须用 UserInputs map 按
 		// InterruptID 配对答案。slot.lastInterruptID 由上次中断时记录。
 		var userInputs map[string]*schema.Message
@@ -492,31 +247,37 @@ func runOrResume(
 			agent_v2.WithResumeUserText(slot.resumeText),
 			agent_v2.WithResumeSession(slot.sess), // ISSUE-72 cross-audit: 续传 sess 让续跑事件累积到 slot.sess
 		)
-	} else {
+	default:
 		events, err = ag.Run(ctx, slot.sess, schema.UserMessage(userInput), agent_v2.WithOrchHooks(orch))
 	}
 
+	historySize := slot.historySize + len(slot.sess.History())
+	finish := func(status, pendingID string) bool {
+		if err := settle(status, pendingID, historySize); err != nil {
+			log.Printf("[plan_chat_web] 更新会话终态: %v", err)
+			sink.send("error", map[string]any{"message": "session state unavailable", "status": statusError})
+			sink.send("done", map[string]any{"status": statusError})
+			return false
+		}
+		return true
+	}
 	if err != nil {
 		var ie *compose_v2.InterruptError
 		if errors.As(err, &ie) {
-			// 框架已经 save 了 checkpoint 到 slot.cp[slot.sess.RunID]；slot 留在 runs
-			// 里 status=interrupted 等续跑 (TTL sweeper 不清 interrupted 状态)。
-			// ISSUE-70 Phase 2: 记录本次中断 ID 让后续 Resume 按 ID 配对答案
-			//
-			// **单 query 简化**（本 example hook-based interrupt 单一 Query）：
-			// 直接读 ie.Query。**生产业务遇到 ISSUE-81 toolsFn fanout 多 tc 同时
-			// 抛 Interrupt 场景必须改 for q := range ie.AllQueries() pattern**——
-			// 见 doc/v2/hitl-resume.md §2.1 / §2.2 业务统一 accessor 协议。
-			if ie.Query != nil && ie.Query.InterruptID != "" {
-				slot.lastInterruptID = ie.Query.InterruptID
+			pendingID := ""
+			if ie.Query != nil {
+				pendingID = ie.Query.InterruptID
 			}
-			slot.setStatus(statusInterrupted)
+			checkpoint := summarizeCheckpoint(ctx, slot.cp, slot.sess.RunID)
+			if !finish(statusInterrupted, pendingID) {
+				return
+			}
 			payload := map[string]any{
 				"session_id": slot.sess.RunID,
 				"status":     statusInterrupted,
 				"reason":     ie.Reason,
 				"data":       ie.Data,
-				"checkpoint": summarizeCheckpoint(ctx, slot.cp, slot.sess.RunID),
+				"checkpoint": checkpoint,
 			}
 			if ie.Query != nil {
 				payload["query"] = ie.Query
@@ -526,25 +287,28 @@ func runOrResume(
 			return
 		}
 		// 非 Interrupt 错 → 终态 error (sweeper TTL 到清 slot)
-		slot.setStatus(statusError)
+		if !finish(statusError, "") {
+			return
+		}
 		sink.send("error", map[string]any{"message": err.Error(), "status": statusError})
 		sink.send("done", map[string]any{"status": statusError})
 		return
 	}
 
-	// ISSUE-58 HITL：Abort 路径——**所有 9 编排** (含 chat_entry 的 BasicAgent) 走
-	// `commonResumePrep::ResumeActionAbort` 共享 helper 返 (nil, nil) + 触发
-	// DeleteSubtree + EmitCpCleanupHelper (agent_v2/resume_helpers.go:62-78).
-	// 显式发 aborted 事件让前端清状态，区别于"自然跑完"。终态 cancelled (sweeper 清)。
+	// 清档成功后提交取消状态，前端收到 aborted 事件后清除暂停界面。
 	if isResume && slot.resumeAction == agent_v2.ResumeActionAbort {
-		slot.setStatus(statusCancelled)
+		if !finish(statusCancelled, "") {
+			return
+		}
 		sink.send("aborted", map[string]any{"session_id": slot.sess.RunID, "status": statusCancelled})
 		sink.send("done", map[string]any{"aborted": true, "session_id": slot.sess.RunID, "status": statusCancelled})
 		return
 	}
 
 	// 跑完了——终态 success (slot 留 runs 让前端查 history; sweeper TTL 到清)
-	slot.setStatus(statusSuccess)
+	if !finish(statusSuccess, "") {
+		return
+	}
 
 	if msg := agent_v2.FinalMessage(events); msg != nil {
 		data := map[string]any{"content": msg.Content}
@@ -554,7 +318,7 @@ func runOrResume(
 		sink.send("final", data)
 	}
 	sink.send("done", map[string]any{
-		"history_size": len(slot.sess.History()),
+		"history_size": historySize,
 		"status":       statusSuccess,
 		"session_id":   slot.sess.RunID,
 	})

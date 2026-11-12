@@ -151,12 +151,16 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		// 删失败时任务还能续，补了的话续跑执行之后真结果排在「被放弃」之后、按先到的配对被当成多余的。反过来档删了、补
 		// 结果失败只留下悬空的调用，读侧兜得住。
 		delStart := time.Now()
-		delCount, dErr := cper.DeleteSubtree(ctx, sessionID, ns)
+		cleanup := cper.DeleteSubtree
+		if rcfg.abortCleanup != nil {
+			cleanup = rcfg.abortCleanup
+		}
+		delCount, dErr := cleanup(ctx, sessionID, ns)
 		// reason="resume_abort"：业务主动弃单（WithResumeAction(Abort)）——跟引擎的
 		// "abort"（ErrRunAborted 终局失败，graph_loop Run 出口 purge）不同源，别混成一个值
 		compose_v2.EmitCpCleanupHelper(ctx, sessionID, ns, "resume_abort", delCount, time.Since(delStart).Milliseconds(), dErr)
 		if dErr != nil {
-			if errors.Is(dErr, compose_v2.ErrTaskLeaseLost) {
+			if rcfg.abortCleanup != nil || errors.Is(dErr, compose_v2.ErrTaskLeaseLost) {
 				return nil, ctx, dErr
 			}
 			slog.WarnContext(ctx, "agent resume abort: cper.DeleteSubtree failed (cp 可能未清)，悬空的 tool_call 不补",

@@ -23,7 +23,7 @@ import (
 )
 
 // RunAgentInput 是 AG-UI client（如 CopilotKit）POST 给 server 的运行请求。
-// 只解析 server 端需要的字段——state / tools / context 暂不消费。
+// context 与 state 作为临时送模数据，客户端 tools 不进入工具表。
 //
 // messages 按 AG-UI 1.0 视作这场对话的完整历史：最后一条 user 是这一轮的输入，它之前的 user / assistant 文本作为
 // 调用方提供的前文交给 agent（agent_v2.WithCallerHistoryCtx——一次运行只认一个来源：agent 配了历史层、由它拥有这场
@@ -62,7 +62,27 @@ type ResumeEntry struct {
 	// 续跑、cancelled 注入取消标记。
 	Status string `json:"status"`
 	// Payload 是用户答复（resolved 时的答案，可能是字符串或结构化对象）。
-	Payload any `json:"payload,omitempty"`
+	Payload    any `json:"payload,omitempty"`
+	payloadSet bool
+}
+
+// UnmarshalJSON 区分省略 payload 与显式 null，并保留原始 JSON 数字。
+func (e *ResumeEntry) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		InterruptID string          `json:"interruptId"`
+		Status      string          `json:"status"`
+		Payload     json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*e = ResumeEntry{InterruptID: wire.InterruptID, Status: wire.Status, payloadSet: wire.Payload != nil}
+	if !e.payloadSet {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(wire.Payload))
+	dec.UseNumber()
+	return dec.Decode(&e.Payload)
 }
 
 // AG-UI ResumeEntry.Status 取值。
@@ -152,8 +172,8 @@ type AgentFactory func(hooks hook.Hooks) agent_v2.Agent
 // Option 配置 Handler。
 type Option func(*handler)
 
-// WithCheckpointer 给 Handler 配 checkpointer——**HITL Resume 必需**（Run 中断存档、
-// 续发时按 sid 重建）。不配则中断只发 RunFinished(interrupt)、前端答复无法续跑。
+// WithCheckpointer 给默认会话表配置中断存档与续跑后端。
+// 跨实例会话用 [WithSessionStore]，由共享会话后端提供 Checkpointer。
 func WithCheckpointer(cp compose_v2.Checkpointer) Option {
 	return func(h *handler) { h.cp = cp }
 }
@@ -257,8 +277,8 @@ func WithOwnerResolver(fn compose_v2.OwnerResolver) Option {
 //	}, agui.WithCheckpointer(cp)))
 //
 // HITL 闭环：中断→前端收 RunFinished(interrupt)→用户答→带同 threadId + resume=[{interruptId,
-// status, payload}]（对齐官方 ResumeEntry）续发→server 走 Resume。session 映射 in-process
-// 持有（同 a2a/server 限制：server 重启丢挂起会话、跨进程 Resume 不支持）。
+// status, payload}]（对齐官方 ResumeEntry）续发→server 走 Resume。会话默认在进程内持有。配置
+// [WithSessionStore] 可跨实例继续，并通过 GET 查询当前挂起项。
 //
 // 并发：同一 threadId 至多一个在途 Run/Resume（busy 保护）——第二个并发请求返
 // RunError(code=busy)，避免同一挂起 sess 被两个 Resume 并发驱动 / cp 双写。
@@ -279,6 +299,9 @@ func Handler(build AgentFactory, opts ...Option) http.Handler {
 			"threadId 由客户端生成，单靠它谁猜中谁就能续别人的会话；" +
 			"单租户返一个固定值即可，" +
 			"多租户从认证中间件放进 ctx 的主体取（会话历史层的 WithHistoryOwnerFunc 是同一条规矩）")
+	}
+	if h.sessionStore != nil {
+		h.cp = h.sessionStore
 	}
 	return h
 }
@@ -307,7 +330,8 @@ type sessionEntry struct {
 	// open 是挂起的那个 run 交给前端的全部中断（InterruptID → 是不是工具审批）。续跑的 resume 列表必须恰好覆盖它们
 	// （AG-UI：不支持只答一部分，也不能答不在其中的）；审批的答复先校验再开跑，认不出的整批拒绝、这些问题保持
 	// 挂起（交给审批层的话认不出就按拒绝处理，`{"approved":true}`、`Yes.` 曾都被当成拒绝）。
-	open map[string]bool
+	open    map[string]bool
+	schemas answerSchemas
 	// prior 是 Run 时交给 agent 的调用方前文（agent_v2.WithCallerHistoryCtx），续跑时原样再推。
 	prior []*schema.Message
 	// answers 是这个任务里已经采纳过的全部答复（按 InterruptID），每次续跑都整份交给 Resume。没进工具账的提问
@@ -318,6 +342,7 @@ type sessionEntry struct {
 
 type handler struct {
 	build         AgentFactory
+	sessionStore  SessionStore
 	cp            compose_v2.Checkpointer // HITL Resume 用（nil = 不支持 Resume）
 	maxSessions   int                     // 挂起会话上限（<=0 不限）
 	sessionTTL    time.Duration           // 挂起会话最长闲置（<=0 不按时间回收），见 WithSessionTTL
@@ -334,6 +359,10 @@ type handler struct {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && h.sessionStore != nil {
+		h.servePending(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		_ = writeReject(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
@@ -393,21 +422,16 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		in.ThreadID = newThreadID()
 	}
 
-	// threadId 作会话聚类 ID push（观测跨 run 聚类，对齐 crew-go ThreadID）。
-	// **到这儿 threadID 恒非空**（上面要么铸了、要么已拒），下游不再判空。
-	ctx := compose_v2.WithThreadIDCtx(r.Context(), in.ThreadID)
-	// owner 从已认证凭据解析（认证中间件放进 r.Context() 的主体），push 给下游
-	// （HandoffAgent 持久转交等按 owner 分区的存储都读它），并织进本层会话键。
-	// threadId 是续接标识不是授权凭据——键里没有 owner 维时，任何知道 threadId 的人
-	// 都能续别人的挂起会话：读到里面的提问、替对方回答。
-	owner := h.ownerResolver(r.Context())
-	ctx = compose_v2.WithOwner(ctx, owner)
-	// 内部会话键 = (owner, threadId) 两维（见 sessionKey）。owner 为空（匿名）时全部
-	// 匿名请求落进同一个分区——那是「没有身份」的诚实语义，不是漏洞被修好了的假象。
-	key := sessionKey{owner: owner, threadID: in.ThreadID}
-	// cp 配了就 push——Run 中断存档 + Resume 重建都需要。
-	if h.cp != nil {
-		ctx = compose_v2.WithCheckpointerCtx(ctx, h.cp)
+	ctx, key := h.requestContext(r, in.ThreadID)
+	if h.sessionStore != nil {
+		var activity *compose_v2.TaskActivity
+		var err error
+		ctx, activity, err = h.openSharedSession(ctx, key)
+		if err != nil {
+			rejectSharedSession(ctx, sse, err)
+			return
+		}
+		defer activity.Release()
 	}
 	ctx = withClientModelData(ctx, &in)
 
@@ -416,6 +440,16 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.serveRun(ctx, sse, &in, key)
+}
+
+func (h *handler) requestContext(r *http.Request, threadID string) (context.Context, sessionKey) {
+	ctx := compose_v2.WithThreadIDCtx(r.Context(), threadID)
+	owner := h.ownerResolver(r.Context())
+	ctx = compose_v2.WithOwner(ctx, owner)
+	if h.cp != nil {
+		ctx = compose_v2.WithCheckpointerCtx(ctx, h.cp)
+	}
+	return ctx, sessionKey{owner: owner, threadID: threadID}
 }
 
 // serveRun 处理新一轮运行。
@@ -433,39 +467,51 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	h.warnClientMessages(ctx, rep)
 	ctx = agent_v2.WithCallerHistoryCtx(ctx, prior)
 
-	// 占用 threadId（并发保护 + 处理已有挂起会话）。**threadId 到这儿恒非空**——
-	// ServeHTTP 没给就铸一个，见那里的说明。
-	// key 含 owner 维——map 键一律用它，wire 事件仍用裸 ThreadID（前端只认自己给的那个）。
-	stale, evicted, ok := h.acquireForRun(key)
-	if ok {
-		defer h.releaseBusy(key)
-	}
-	// 目标键忙时也要清理已回收条目的存档，并释放回收许可。
-	h.cleanupEvicted(ctx, evicted)
-	if !ok {
-		_ = sse.Reject(http.StatusConflict, "busy", "run already in progress for this thread")
-		return
-	}
+	shared := sharedSessionFrom(ctx)
+	var stale *sessionEntry
 	started, replacing := false, false
-	defer func() {
-		if started {
+	if shared != nil {
+		if shared.record != nil {
+			stale = &sessionEntry{sess: shared.session()}
+		}
+	} else {
+		var evicted []evictedTask
+		var ok bool
+		stale, evicted, ok = h.acquireForRun(key)
+		if ok {
+			defer h.releaseBusy(key)
+		}
+		// 目标键忙时也要清理已回收条目的存档，并释放回收许可。
+		h.cleanupEvicted(ctx, evicted)
+		if !ok {
+			_ = sse.Reject(http.StatusConflict, "busy", "run already in progress for this thread")
 			return
 		}
-		if stale != nil && (!replacing || h.hasTaskCheckpoint(ctx, stale.sess.RunID)) {
-			h.restoreEntry(key, stale)
-		} else {
-			h.removeEntry(key)
-		}
-	}()
+		defer func() {
+			if started {
+				return
+			}
+			if stale != nil && (!replacing || h.hasTaskCheckpoint(ctx, stale.sess.RunID)) {
+				h.restoreEntry(key, stale)
+			} else {
+				h.removeEntry(key)
+			}
+		}()
+	}
 
 	// 先占旧任务的放弃许可，在开始事件成功送达后才删档。客户端断开或启动失败时恢复原入口。
 	var abandonOpts []agent_v2.RunOption
 	var staleMayBeResumable bool
 	var dropCtx context.Context
 	var dropActivity *compose_v2.TaskActivity
+	var oldTask string
 	if stale != nil && stale.sess != nil {
+		oldTask = stale.sess.RunID
+		abandonOpts = append(abandonOpts, agent_v2.WithAbandonedTasks(oldTask))
+	}
+	if oldTask != "" && shared == nil {
 		var dropErr error
-		dropCtx, dropActivity, dropErr = h.beginDropCP(ctx, stale.sess.RunID)
+		dropCtx, dropActivity, dropErr = h.beginDropCP(ctx, oldTask)
 		if errors.Is(dropErr, compose_v2.ErrTaskBusy) {
 			_ = sse.Reject(http.StatusConflict, "busy", "an operation on the previous task is in progress")
 			return
@@ -474,7 +520,6 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		if dropActivity != nil {
 			defer dropActivity.Release()
 		}
-		abandonOpts = append(abandonOpts, agent_v2.WithAbandonedTasks(stale.sess.RunID))
 	}
 
 	adapter := newSSEAdapter(sse, in.RunID, in.Messages)
@@ -499,7 +544,25 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	if err := sse.WriteEvent(NewRunStarted(in.ThreadID, runID)); err != nil {
 		return
 	}
-	if dropActivity != nil {
+	if shared != nil {
+		var abandoned []string
+		if oldTask != "" {
+			abandoned = []string{oldTask}
+		}
+		taskCtx, activity, err := compose_v2.BeginTaskActivity(ctx, sess.RunID, abandoned)
+		if err != nil {
+			rejectSharedSession(ctx, sse, err)
+			return
+		}
+		defer activity.Release()
+		ctx = taskCtx
+		record := &SessionRecord{TaskID: sess.RunID, Prior: prior, ModelData: clientModelData(in)}
+		if err := shared.save(ctx, record, oldTask); err != nil {
+			rejectSharedSession(ctx, sse, err)
+			return
+		}
+		activity.FinishAbandon()
+	} else if dropActivity != nil {
 		replacing = true
 		staleMayBeResumable = h.deleteCP(dropCtx, stale.sess.RunID) != nil
 		dropActivity.Release()
@@ -530,8 +593,12 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		// 走到这儿 = ag.Run 没正常返回（Goexit）。补一个终态事件让前端的生命周期闭合，
 		// 并清掉空壳 entry + 它的 cp（那份档谁也够不着：Status=failed 列不出来、
 		// sess==nil 让 LRU 也清不了）。
-		h.dropCP(ctx, sess.RunID)
-		h.removeEntry(key)
+		if shared == nil {
+			h.dropCP(ctx, sess.RunID)
+		}
+		if err := h.completeSession(ctx, key); err != nil {
+			slog.WarnContext(ctx, "agui: 异常退出后会话记录清理失败", "err", err)
+		}
 		adapter.finish() // 收尾在途的流式消息、发出攒着的撤回快照
 		_ = sse.WriteEvent(NewRunError("run terminated abnormally (goroutine exited without returning)", "agent_error"))
 	}()
@@ -541,11 +608,15 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	adapter.finish()
 	if errors.Is(err, compose_v2.ErrTaskBusy) {
 		// 内层任务也可能返回 busy，父图此时可能已给本次新任务写档。
-		h.dropCP(ctx, sess.RunID)
-		if staleMayBeResumable {
-			h.restoreEntry(key, stale)
-		} else {
-			h.removeEntry(key)
+		if shared == nil {
+			h.dropCP(ctx, sess.RunID)
+			if staleMayBeResumable {
+				h.restoreEntry(key, stale)
+			} else {
+				h.removeEntry(key)
+			}
+		} else if !h.finishSession(ctx, sse, key) {
+			return
 		}
 		_ = sse.Reject(http.StatusConflict, "busy", "an operation on this or the previous task is in progress")
 		return
@@ -564,6 +635,7 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 	// 校验 resume entry 合法性（对齐官方 ResumeEntry：status 是 resolved/cancelled 枚举、
 	// interruptId 非空）——非法值 fail-fast 发 RunError，不静默当 resolved（官方 wire 层是
 	// enum 拒非法；内联协议层显式拒暴露客户端 bug，而非把未知状态当有效答案注入续跑）。
+	allCancelled := true
 	for _, e := range in.Resume {
 		if e.Status != ResumeStatusResolved && e.Status != ResumeStatusCancelled {
 			_ = sse.Reject(http.StatusBadRequest, "invalid_resume", fmt.Sprintf("invalid resume status %q (want %q or %q)", e.Status, ResumeStatusResolved, ResumeStatusCancelled))
@@ -573,22 +645,51 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 			_ = sse.Reject(http.StatusBadRequest, "invalid_resume", "resume entry missing interruptId")
 			return
 		}
+		allCancelled = allCancelled && e.Status == ResumeStatusCancelled
 	}
 
-	// 占用挂起会话（并发保护：已 busy = 另一 Resume/Run 在途，拒；不存在 = 会话已结束/过期）。
-	sess, open, prior, ok, busy := h.acquireForResume(key)
-	if busy {
-		_ = sse.Reject(http.StatusConflict, "busy", "resume already in progress for this thread")
-		return
+	shared := sharedSessionFrom(ctx)
+	var entry *sessionEntry
+	var pendingEpoch string
+	if shared != nil {
+		if shared.record != nil {
+			// 在实际任务的租约内核对挂起问题，并复用租约执行 Resume。全取消走 Agent 的放弃许可。
+			if !allCancelled {
+				taskCtx, activity, err := compose_v2.BeginTaskActivity(ctx, shared.record.TaskID, nil)
+				if err != nil {
+					rejectSharedSession(ctx, sse, err)
+					return
+				}
+				defer activity.Release()
+				ctx = taskCtx
+			}
+			batch, err := shared.pending(ctx)
+			if err != nil {
+				rejectSharedSession(ctx, sse, err)
+				return
+			}
+			pendingEpoch = batch.epoch
+			if len(batch.open) > 0 {
+				entry = &sessionEntry{sess: shared.session(), open: batch.open, schemas: batch.schemas, prior: shared.record.Prior}
+			}
+			ctx = agent_v2.WithModelUserContext(ctx, shared.record.ModelData)
+		}
+	} else {
+		var busy bool
+		entry, busy = h.acquireForResume(key)
+		if busy {
+			_ = sse.Reject(http.StatusConflict, "busy", "resume already in progress for this thread")
+			return
+		}
+		if entry != nil {
+			defer h.releaseBusy(key)
+		}
 	}
-	if !ok {
+	if entry == nil {
 		_ = sse.Reject(http.StatusNotFound, "no_session", "no suspended session for thread (interrupt expired or wrong threadId)")
 		return
 	}
-	defer h.releaseBusy(key) // 确保 busy 清（含 panic 路径）
-	// 续跑里才开始跑的成员（Sequential 的后一步之类）同样要看到前文，而且是 Run 时那一份：跟同一个任务里先跑的成员看到
-	// 的一样。不按续跑请求的 messages 重算——前端可能把这一问的答复当成一条 user 追加进去，那样 Run 时的输入会被算进
-	// 前文、续跑才跑的成员看到它两遍。
+	sess, open, prior := entry.sess, entry.open, entry.prior
 	ctx = agent_v2.WithCallerHistoryCtx(ctx, prior)
 
 	// **resume 列表恰好覆盖挂起的那些中断**（AG-UI：每一条答一个挂起的中断，全部都要答到或者明确放弃，不支持只答
@@ -603,8 +704,28 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 	// `{"approved":true}` 或 `Yes.`，工具就被当成用户拒绝、一次都不执行（实测）。认不出就报错，这一问
 	// 保持挂起（会话、存档原样），前端可以重答；一批里只要有一条认不出，整批都不采纳。
 	approvalAnswers := make(map[string]string, len(open))
+	reused := make(map[string]*schema.Message)
 	for _, e := range in.Resume {
-		if e.Status != ResumeStatusResolved || !open[e.InterruptID] {
+		if e.Status != ResumeStatusResolved {
+			continue
+		}
+		if shared != nil && !e.payloadSet {
+			if prior := shared.record.Answers[e.InterruptID]; prior != nil {
+				reused[e.InterruptID] = prior
+				continue
+			}
+		}
+		if spec := entry.schemas[e.InterruptID]; spec != nil {
+			if !e.payloadSet {
+				_ = sse.Reject(http.StatusBadRequest, "invalid_resume_payload", fmt.Sprintf("interrupt %q requires a payload", e.InterruptID))
+				return
+			}
+			if err := spec.Validate(e.Payload); err != nil {
+				_ = sse.Reject(http.StatusBadRequest, "invalid_resume_payload", fmt.Sprintf("interrupt %q: %v", e.InterruptID, err))
+				return
+			}
+		}
+		if !open[e.InterruptID] {
 			continue
 		}
 		option, ok := approvalAnswerFromPayload(e.Payload)
@@ -647,18 +768,24 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 
 	// 分类 resume entry：resolved 收集答案（按 InterruptID 配对），cancelled 记账。
 	answers := make(map[string]*schema.Message, len(in.Resume))
-	hasResolved, hasCancelled := false, false
 	for _, e := range in.Resume {
 		if e.Status == ResumeStatusCancelled {
-			hasCancelled = true
+			answers[e.InterruptID] = schema.UserMessage("[用户取消了此项]")
 			continue
 		}
-		hasResolved = true
+		if prior := reused[e.InterruptID]; prior != nil {
+			answers[e.InterruptID] = prior
+			continue
+		}
 		if option, isApproval := approvalAnswers[e.InterruptID]; isApproval {
 			answers[e.InterruptID] = schema.UserMessage(option)
 			continue
 		}
-		answers[e.InterruptID] = schema.UserMessage(payloadToString(e.Payload))
+		text := payloadToString(e.Payload)
+		if e.Payload == nil && entry.schemas[e.InterruptID] != nil {
+			text = "null" // 通过显式 schema 校验的 JSON null。
+		}
+		answers[e.InterruptID] = schema.UserMessage(text)
 	}
 
 	// RunStarted 写失败 = client 已断开——短路不跑 Resume。
@@ -680,17 +807,42 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 
 	// 全 cancelled（用户放弃、无任何有效答复）→ 终止整个 run，对齐官方 AG-UI cancelled
 	// 语义 "user abandoned"。ResumeActionAbort 清 cp 后退出。
-	if hasCancelled && !hasResolved {
-		_, err := ag.Resume(ctx, sess.RunID,
-			agent_v2.WithResumeSession(sess),
-			agent_v2.WithResumeAction(agent_v2.ResumeActionAbort))
+	if allCancelled {
+		opts := []agent_v2.ResumeOption{
+			agent_v2.WithResumeSession(sess), agent_v2.WithResumeAction(agent_v2.ResumeActionAbort),
+		}
+		if shared != nil {
+			opts = append(opts, agent_v2.WithResumeAbortCleanup(func(cleanupCtx context.Context, sid, ns string) (int32, error) {
+				if sid != shared.record.TaskID || ns != "" {
+					return 0, errors.New("agui: shared abort requires the root of the current task")
+				}
+				batch, err := shared.pending(cleanupCtx)
+				if err != nil {
+					return 0, err
+				}
+				if pendingEpoch != batch.epoch || coverageProblem(in.Resume, batch.open) != "" {
+					return 0, errPendingChanged
+				}
+				return shared.write(cleanupCtx, nil, sid)
+			}))
+		}
+		_, err := ag.Resume(ctx, sess.RunID, opts...)
 		settled = true
 		adapter.finish()
 		if errors.Is(err, compose_v2.ErrTaskBusy) {
 			_ = sse.Reject(http.StatusConflict, "busy", "an operation on this task is in progress")
 			return
 		}
-		h.removeEntry(key) // run 终止，清挂起 entry
+		if errors.Is(err, errPendingChanged) {
+			_ = sse.Reject(http.StatusConflict, "invalid_resume", errPendingChanged.Error())
+			return
+		}
+		if shared != nil && err == nil && shared.record != nil {
+			err = errors.New("the agent did not run the shared checkpoint cleanup")
+		}
+		if shared == nil {
+			h.removeEntry(key)
+		}
 		if err != nil {
 			_ = sse.WriteEvent(NewRunError(err.Error(), "abort_failed"))
 			return
@@ -702,16 +854,29 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 		return
 	}
 
-	// 有 resolved（可能混合 cancelled）→ 续跑。混合时 cancelled 的 interrupt 仍需答案
-	// 才能推进，注入明确取消标记（非模糊 [cancelled]）让业务工具 / LLM 感知用户取消了该项。
-	for _, e := range in.Resume {
-		if e.Status == ResumeStatusCancelled {
-			answers[e.InterruptID] = schema.UserMessage("[用户取消了此项]")
+	var all map[string]*schema.Message
+	if shared != nil {
+		var err error
+		all, err = shared.accept(ctx, answers)
+		if err != nil {
+			rejectSharedSession(ctx, sse, err)
+			settled = true
+			return
+		}
+	} else {
+		all = h.recordAnswers(key, answers)
+	}
+	// 历史答复仍参与节点重放，诊断只把本次提交视作新答复。
+	replayed := make([]string, 0, len(all)-len(answers))
+	for id := range all {
+		if _, isNew := answers[id]; !isNew {
+			replayed = append(replayed, id)
 		}
 	}
+	ctx = compose_v2.WithReplayedResumeAnswersCtx(ctx, replayed)
 	_, err := ag.Resume(ctx, sess.RunID,
 		agent_v2.WithResumeSession(sess),
-		agent_v2.WithResumeUserInputs(h.recordAnswers(key, answers)))
+		agent_v2.WithResumeUserInputs(all))
 	settled = true
 	adapter.finish()
 	if errors.Is(err, compose_v2.ErrTaskBusy) {
@@ -727,6 +892,7 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 // ⚠️ **发回前端的只能是 key.threadID 那一维**——owner 是服务端解析出来的身份，前端只认
 // 它自己给的那个 threadId，把整个键的内容发出去它就认不出来了（顺带把身份泄给了浏览器）。
 func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key sessionKey, runID string, sess *agent_v2.RunSession, prior []*schema.Message, err error) {
+	shared := sharedSessionFrom(ctx)
 	// **陈旧写回**（`WithStaleWriteGuard` 开启时才可能出现）：这次的结果没落盘，槽里是另一个执行者
 	// 的状态，留 entry 等续发是徒劳——前端答完发回来，框架载入的是别人的状态，于是重新问一遍已经
 	// 答过的问题，来回不收敛（实测：问 q1 → 答 → 问 q2 → 答 → 又问 q1）。引擎出口写档撞上它时返
@@ -764,14 +930,18 @@ func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key session
 		//
 		// ⚠️ 前端照 code 再发一次**回答**会拿到同样的错——那是对的：确定性的错就该确定性地
 		// 报，而不是换一种说法。文案里点明另一条出路。
-		h.keepSuspended(key, sess) // 挂起的还是之前那几问：记下的中断与答复都留着
+		if shared == nil {
+			h.keepSuspended(key, sess)
+		}
 		_ = sse.WriteEvent(NewRunError("the saved state for this session is inconsistent and cannot be resumed; "+
 			"send all interrupts as cancelled to discard it, or start a new session",
 			"checkpoint_not_resumable"))
 		return
 	}
-	if errors.Is(err, compose_v2.ErrCheckpointStale) {
-		h.removeEntry(key)
+	if errors.Is(err, compose_v2.ErrCheckpointStale) || errors.Is(err, compose_v2.ErrTaskLeaseLost) {
+		if shared == nil {
+			h.removeEntry(key)
+		}
 		// 不回传 err.Error()——里面有 session id / ns / epoch token 等内部信息
 		_ = sse.WriteEvent(NewRunError("this session was concurrently advanced by another run; result was not persisted",
 			"checkpoint_stale"))
@@ -781,7 +951,9 @@ func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key session
 	// 跟上面两条同理要专属 code：它重跑必然撞同一个槽（框架在 IsRetryable 里排掉了它），落进通用兜底
 	// 的 `agent_error` 会让前端原样重来。文案不回传 err.Error()——里面有 sid / ns / 两张图的 GraphID。
 	if errors.Is(err, compose_v2.ErrGraphIDConflict) {
-		h.removeEntry(key)
+		if shared == nil {
+			h.removeEntry(key)
+		}
 		_ = sse.WriteEvent(NewRunError("this session's saved state belongs to a different agent; start a new session",
 			"graph_id_conflict"))
 		return
@@ -790,39 +962,49 @@ func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key session
 	// 的话前端续发要么找不到档，要么续进旧档（重问已经答过的问题）。文案不回传 err.Error()——里面有
 	// 后端的错误原文与 sid。
 	if errors.Is(err, compose_v2.ErrCheckpointNotPersisted) {
-		h.removeEntry(key)
+		if !h.finishSession(ctx, sse, key) {
+			return
+		}
 		_ = sse.WriteEvent(NewRunError("this run's state could not be saved, so it cannot be resumed; start a new session",
 			"checkpoint_save_failed"))
 		return
 	}
 	if ie, isInterrupt := compose_v2.IsInterrupt(err); isInterrupt {
-		queries := ie.AllQueries()
-		interrupts := make([]RunInterrupt, 0, len(queries))
-		open := make(map[string]bool, len(queries))
-		for _, q := range queries {
-			// 取每条自己的 reason：同批多个中断经 MergeInterrupts 合成一个时，ie.Reason 是一句合并说明，各自的原因
-			// （如 tool_approval）在 q.Reason 上。单个中断原样透出时 q.Reason 可能没填，回落 ie.Reason。
-			reason := q.Reason
-			if reason == "" {
-				reason = ie.Reason
+		var batch interruptBatch
+		var projectErr error
+		if shared != nil {
+			batch, projectErr = shared.pending(ctx)
+			if projectErr == nil && len(batch.open) == 0 {
+				projectErr = fmt.Errorf("%w: no pending questions in the root checkpoint", errInvalidPending)
 			}
-			if reason == agent_v2.ApprovalInterruptReason {
-				open[q.InterruptID] = true
-				interrupts = append(interrupts, approvalInterrupt(q))
-				continue
-			}
-			open[q.InterruptID] = false
-			interrupts = append(interrupts, questionInterrupt(q, reason))
+		} else {
+			batch, projectErr = projectInterrupts(ie.AllQueries(), ie.Reason)
 		}
-		h.storeInterrupt(key, sess, open, prior)
-		_ = sse.WriteEvent(NewRunInterrupted(key.threadID, runID, interrupts))
+		if projectErr != nil {
+			if errors.Is(projectErr, errInvalidPending) {
+				if shared == nil {
+					h.dropCP(ctx, sess.RunID)
+				}
+				if !h.finishSession(ctx, sse, key) {
+					return
+				}
+				slog.WarnContext(ctx, "agui: 无法投影挂起问题", "err", projectErr)
+				_ = sse.WriteEvent(NewRunError("the run has an invalid pending interrupt", "invalid_interrupt"))
+			} else {
+				rejectSharedSession(ctx, sse, projectErr)
+			}
+			return
+		}
+		if shared == nil {
+			h.storeInterrupt(key, sess, batch, prior)
+		}
+		_ = sse.WriteEvent(NewRunInterrupted(key.threadID, runID, batch.events))
 		return
 	}
-	h.removeEntry(key)
-	// **句柄丢了，档一起清**：这次退出留下的档（调用方取消导致的退出、业务报错留下的失败现场）在 agui 这边
-	// 没有续跑入口——放弃得到 no_session，LRU、TTL 都够不着它——留着只会在持久后端上越积越多、一直挂在
-	// ListPending 里（审计实测：浏览器断开之后留下一份 pending 档）。
-	if sess != nil && compose_v2.LeavesResumableCheckpoint(err) {
+	if !h.finishSession(ctx, sse, key) {
+		return
+	}
+	if shared == nil && sess != nil && compose_v2.LeavesResumableCheckpoint(err) {
 		h.dropCP(ctx, sess.RunID)
 	}
 	if err != nil {
@@ -836,6 +1018,14 @@ func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key session
 		return
 	}
 	_ = sse.WriteEvent(NewRunFinished(key.threadID, runID))
+}
+
+func (h *handler) finishSession(ctx context.Context, sse *SSEWriter, key sessionKey) bool {
+	if err := h.completeSession(ctx, key); err != nil {
+		rejectSharedSession(ctx, sse, err)
+		return false
+	}
+	return true
 }
 
 // ── sessions map 并发 + 生命周期 helpers ──
@@ -891,32 +1081,23 @@ func (h *handler) sweepExpiredLocked(target sessionKey) []evictedTask {
 	return tasks
 }
 
-// acquireForResume 为 serveResume 占用挂起会话（标 busy），返回挂起的中断（InterruptID → 是不是工具审批）与 Run 时的
-// 前文。不存在（含 busy 壳无 sess）返 ok=false；已 busy 返 busy=true。
-func (h *handler) acquireForResume(key sessionKey) (sess *agent_v2.RunSession, open map[string]bool, prior []*schema.Message, ok bool, busy bool) {
+// acquireForResume 占用挂起条目。持有 busy 时，其会话与挂起问题归当前请求使用。
+func (h *handler) acquireForResume(key sessionKey) (*sessionEntry, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	e := h.sessions[key]
 	if e == nil || e.sess == nil {
-		return nil, nil, nil, false, false
+		return nil, false
 	}
 	if e.busy {
-		return nil, nil, nil, false, true
+		return nil, true
 	}
-	// **过期即不可用**，跟惰性回收什么时候真跑无关——见 WithSessionTTL 的两段语义。
-	// 不在这儿判的话，回收延迟就变成语义延迟：一条早该过期的会话在下次扫描之前仍然续
-	// 得起来，而低流量部署下「下次扫描」可能是几天以后。
 	if h.expiredLocked(e) {
-		return nil, nil, nil, false, false
+		return nil, false
 	}
 	e.busy = true
 	e.touchedAt = time.Now().UnixNano()
-	// 交出去的是拷贝：锁外读，store 在别的请求里可能换掉它
-	open = make(map[string]bool, len(e.open))
-	for id, approval := range e.open {
-		open[id] = approval
-	}
-	return e.sess, open, e.prior, true, false
+	return e, false
 }
 
 // recordAnswers 把这一轮采纳的答复并进这个任务累积的答复，返回整份（拷贝）交给 Resume。entry 不在了（被淘汰）时
@@ -953,7 +1134,7 @@ func (h *handler) releaseBusy(key sessionKey) {
 
 // storeInterrupt 中断挂起时把 sess、这次交给前端的中断（InterruptID → 是不是工具审批）与 Run 时的前文存入 entry，换掉
 // 之前记下的中断；累积的答复留着（busy 保持——releaseBusy defer 会清）。
-func (h *handler) storeInterrupt(key sessionKey, sess *agent_v2.RunSession, open map[string]bool, prior []*schema.Message) {
+func (h *handler) storeInterrupt(key sessionKey, sess *agent_v2.RunSession, batch interruptBatch, prior []*schema.Message) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	e := h.sessions[key]
@@ -962,7 +1143,8 @@ func (h *handler) storeInterrupt(key sessionKey, sess *agent_v2.RunSession, open
 		h.sessions[key] = e
 	}
 	e.sess = sess
-	e.open = open
+	e.open = batch.open
+	e.schemas = batch.schemas
 	e.prior = prior
 	e.touchedAt = time.Now().UnixNano()
 }

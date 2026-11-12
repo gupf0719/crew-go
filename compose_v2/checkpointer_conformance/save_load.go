@@ -175,7 +175,8 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 				// 是两回事，业务 backend 把空串写成 NULL 再读回非空就串档了。
 				{InterruptID: "q1", Question: "Q1?", Reason: "因为用户操作",
 					ToolCallID: "tc_abc", ToolName: "transfer"},
-				{InterruptID: "q2", Question: "Q2?", Options: []string{"yes", "no"}, Reason: "需要确认"},
+				{InterruptID: "q2", Question: "Q2?", Options: []string{"yes", "no"}, Reason: "需要确认",
+					ResponseSchema: json.RawMessage(`{"type":"object","required":["decision"]}`)},
 				// 声明式断点停下的挂起：Breakpoint 漏序列化不报错，但引擎靠它判「上次是不是停在断点上」——
 				// 漏了的话，停在 before 断点上的档每次续跑都被重判、在同一个边界再停，图永远过不去（after 断点
 				// 那种续跑照常放行）；调用方也从存档里分不出「这是断点、续跑即放行」与「节点在等答案」。
@@ -462,6 +463,18 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 		if loaded.PendingInterrupts[1].ToolCallID != "" || loaded.PendingInterrupts[1].ToolName != "" {
 			t.Errorf("PendingInterrupts[1] 工具身份应为空（问答型挂起不指向动作），got (%q, %q)",
 				loaded.PendingInterrupts[1].ToolCallID, loaded.PendingInterrupts[1].ToolName)
+		}
+
+		var responseSchema struct {
+			Type     string
+			Required []string
+		}
+		if err := json.Unmarshal(loaded.PendingInterrupts[1].ResponseSchema, &responseSchema); err != nil ||
+			responseSchema.Type != "object" || !slices.Equal(responseSchema.Required, []string{"decision"}) {
+			t.Errorf("q2 response schema lost or changed: %s (%v)", loaded.PendingInterrupts[1].ResponseSchema, err)
+		}
+		if len(loaded.PendingInterrupts[0].ResponseSchema) != 0 {
+			t.Error("q1 should have no response schema")
 		}
 
 		// q2: InterruptID + Question + Options 顺序值 + Reason

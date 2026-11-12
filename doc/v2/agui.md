@@ -33,7 +33,8 @@ h := agui.Handler(func(hooks hook.Hooks) agent_v2.Agent {
         agent_v2.WithToolkit(tk),
         agent_v2.WithHooks(hooks), // ← adapter 必须注入 agent，否则只剩纯文本
     )
-}, agui.WithCheckpointer(cp))
+}, agui.WithCheckpointer(cp),
+   agui.WithOwnerResolver(func(context.Context) string { return "demo" }))
 http.Handle("/agui", h)
 ```
 
@@ -64,7 +65,7 @@ adapter（`agui/adapter.go`）一个 struct 同时实现 `hook.Hooks` + `agent_v
 | `OnToolStart`（`CallId`/`Name`/`ArgumentsJSON`） | `ToolCallStart` + `ToolCallArgs` + `ToolCallEnd`（参数非流式，一次性发） |
 | `OnToolEnd`（`Result`） | `ToolCallResult`（`CallId` 作 `toolCallId` 配对锚点） |
 | Run 开始 / 结束 / 出错 | `RunStarted` / `RunFinished` / `RunError` |
-| `InterruptError` | `RunFinished(outcome=interrupt, interrupts=[{id, reason, message, …}])`：工具审批 reason=`tool_call`（带 `toolCallId`、`responseSchema` 与 `metadata.options`），没有工具调用 ID 时 `confirmation`；普通提问使用 `input_required` 和字符串响应 schema，框架断点使用 `crew-go:breakpoint` |
+| `InterruptError` | `RunFinished(outcome=interrupt, interrupts=[{id, reason, message, …}])`：工具审批 reason=`tool_call`（带 `toolCallId`、`responseSchema` 与 `metadata.options`），没有工具调用 ID 时 `confirmation`；普通提问默认使用 `input_required` 和字符串响应 schema，可用 `compose_v2.AskQuery.ResponseSchema` 覆盖 schema。框架断点使用 `crew-go:breakpoint` |
 | `EventSink.Send("state_snapshot")` | `StateSnapshot`（业务 opt-in，见 §6） |
 | `EventSink.Send("reset_stream")` | 收尾那条消息；作废时连同这次模型调用的工具调用与结果一起作废（按框架标在工具钩子 `Extra` 上的 `agent_v2.ToolModelRunIDExtraKey` 认），带 `replacement`（`OnModelEnd` 钩子改写了答复）时换成新正文；再发 AG-UI 标准的 `MessagesSnapshot`（请求带来的消息原样 + 这个 run 发出、没作废的消息）纠正前端——连着来的几个撤回与改写攒成一份，在适配层下一次往外写别的事件、或 run 收尾时发，有在途的流式消息时等它们都收尾（落在一条流中间时官方客户端的事件压缩回放把快照排到那条流之后，那条消息回放出来只剩半截），另立即发 `Custom(crew.reset_stream)` 给按 run_id 自管缓冲的前端。**请求没带 messages 时不发快照**（快照之外的消息会被前端丢掉，而适配层不知道它手上有什么），标准前端那时留着旧内容 |
 | `OnError` | `Custom`（前端可处理，标准组件忽略） |
@@ -74,7 +75,7 @@ adapter（`agui/adapter.go`）一个 struct 同时实现 `hook.Hooks` + `agent_v
 
 ---
 
-`context` 的描述和值以及非空 `state` 会以 JSON 补到本次送模的用户消息。BasicAgent 和 LLMPlanner 使用这份临时数据，历史和存档保留原对话。Resume 请求可提供新的本轮数据。客户端的 system / developer 消息仍按前文规则过滤。[AG-UI 输入类型](https://docs.ag-ui.com/sdk/js/core/types) · [中断原因](https://docs.ag-ui.com/concepts/interrupts#reason-taxonomy)
+`context` 的描述和值以及非空 `state` 会以 JSON 补到本次送模的用户消息。BasicAgent 和 LLMPlanner 使用这份临时数据，历史和存档保留原对话。默认会话的 Resume 请求可提供新的本轮数据。共享会话续跑时沿用 Run 时的这份数据。客户端的 system / developer 消息仍按前文规则过滤。[AG-UI 输入类型](https://docs.ag-ui.com/sdk/js/core/types) · [中断原因](https://docs.ag-ui.com/concepts/interrupts#reason-taxonomy)
 
 ## 5. HITL 闭环（Resume）
 
@@ -88,29 +89,26 @@ Run → 中断 → RunFinished(outcome=interrupt, interrupts=[{id, reason, messa
   `interrupt.id`）+ `status`（`resolved` 已答 / `cancelled` 用户放弃）+ `payload`（答案）
   ——CopilotKit 等标准前端按此格式发。
 - **resume 列表恰好覆盖挂起的中断**（AG-UI 1.0：每个挂起的中断都要答到或明确放弃，不支持只答
-  一部分）：有不是挂起中断的 ID、同一个 ID 出现两次、漏了某个挂起的中断，都发
-  `RunError(code=invalid_resume)`，什么都不执行、会话保持挂起，前端改好重发。规范把这条交给前端
+  一部分）：有不是挂起中断的 ID、同一个 ID 出现两次、漏了某个挂起的中断，都返回
+  HTTP 400 `invalid_resume`，会话保持挂起，前端改好重发。规范把这条交给前端
   检查，handler 仍然查：同一个 ID 两条时后一条曾覆盖前一条，审批的批准与拒绝取决于数组顺序。
 - **payload**：工具审批只认 `true` / `false`、`{"approved": bool}`（对象只能有这一个字段——
   不支持带修改的批准，带 `editedArgs` 的答复不会按原参数执行）与四个选项字符串（词表见
-  `agent_v2.NormalizeApprovalAnswer`）；认不出发 `RunError(code=invalid_resume_payload)`，
-  一批里有一条认不出整批不采纳、这些问题保持挂起。其余提问的 payload 是字符串原样注入，结构化
-  对象 JSON 序列化后注入。
+  `agent_v2.NormalizeApprovalAnswer`）；认不出返回 HTTP 400 `invalid_resume_payload`，保留整批挂起项。
+  其余提问的字符串原样传给节点，结构化值经 JSON 序列化后传入。
 - **答复按任务累积**：同一个任务里采纳过的答复都记着，每次续跑整份交给 Resume。没进工具账的
   提问（`ask_user`、节点里直接 `compose_v2.Ask` 的）续跑时会重问，框架要 Resume 的调用方把答过的
   答案带上；只交这一轮的话，一个节点先后问两问会来回重问、永远答不完。新开任务（同 threadId
   不带 resume 再发）时清空。
-- **cancelled 语义**（对齐官方 "user abandoned"）：全部 entry 都 cancelled → 终止整个
-  run（`ResumeActionAbort` 清 cp 退出，发 `Custom("cancelled")` + `RunFinished(outcome=cancelled)`
-  ——1.0 定稿后有这个分支；缺省 outcome 在 1.0 里意味着成功，不能用来表示取消）；混合
-  resolved/cancelled → resolved 续跑、cancelled 注入取消标记让业务工具感知该项被取消。
-- `WithCheckpointer(cp)` **必需**——中断存档 + 续发重建；不配则中断只发
-  `RunFinished(interrupt)`、前端答复无法续跑（发 `RunError`）。
-- session 映射 **in-process 持有**（`(owner, threadId) → sess`）：中断留 sess 待续发、成功 / 错误
-  清 sess。**多轮 HITL 天然支持**（qwen 可能多轮追问，每轮 Resume 续用同一 sess）。
-- **并发保护**：同 threadId 至多一个在途 Run/Resume（`busy` 标记）——第二个并发请求返
-  `RunError(code=busy)`，避免同一挂起 sess 被两个 Resume 并发驱动 / cp 双写。serveRun
-  遇已有挂起会话（用户开新对话）先清旧 cp 防孤儿泄漏。
+- 节点可在 `compose_v2.AskQuery.ResponseSchema` 声明 JSON Schema 对象。它随存档往返，
+  由 AG-UI 投影到 `responseSchema`。Handler 在续跑前校验 `resolved` 的 payload。
+  字段缺失或类型不符时返回 `invalid_resume_payload`，保留原挂起项。
+  允许文档内引用，外部引用报配置错误。工具审批沿用其固定答复格式。
+- 全部 `cancelled` 时走 `agent_v2.ResumeActionAbort`，清档后发 `RunFinished(outcome=cancelled)`。
+  混合答复中，取消项以 `[用户取消了此项]` 传给节点。
+- 默认进程内会话配 `agui.WithCheckpointer` 后支持多轮续跑。同一 `(owner, threadId)`
+  在途时第二个请求收到 `busy`。新 Run 替换旧挂起会话时清理旧存档。
+
 - **上限防 OOM**：挂起会话超 `WithMaxSessions`（默认 10000）时淘汰一个空闲会话 + 清其
   cp——防前端放弃中断（关页面 / 断网）导致 sessions map 长跑 OOM。**淘汰按 owner 分摊**：
   份额最大的那个 owner 出账，且**到达者不赢平局**（平局时由发起这次请求的 owner 自己出，
@@ -119,8 +117,52 @@ Run → 中断 → RunFinished(outcome=interrupt, interrupts=[{id, reason, messa
   那种份额恒为 1 的请求也挤不动。代价是**上限变软**——实测约 `max(maxSessions, 有挂起
   会话的租户数) + 在途请求数`，而增量挂在**身份数**上（一个身份恰好多占一格，跟它发多少
   请求无关）。详见 `WithMaxSessions` 的 godoc。
-- **限制**（同 `a2a/server`）：**server 重启丢挂起会话、跨进程 Resume 不支持**——sess
-  和 cp 都 in-process。业务要跨进程 / HA 需自实现 sess 持久化。
+
+### 共享会话
+
+每个实例用同一 SQL 数据库、存档表和相同的 Agent 图定义。`sql.AGUISessionStore.Setup` 建立
+会话表、存档表和租约表，`agui.WithSessionStore` 同时给 Handler 提供会话与 Checkpointer。
+
+```go
+cp := crewsql.NewCheckpointer(db, crewsql.Postgres{})
+sessions := crewsql.NewAGUISessionStore(cp)
+if err := sessions.Setup(ctx); err != nil {
+    return err
+}
+mux.Handle("/agui", agui.Handler(build,
+    agui.WithOwnerResolver(resolveAuthenticatedOwner),
+    agui.WithSessionStore(sessions),
+))
+```
+
+会话记录由 Handler 在启动 Run 前写入，保存任务 ID、Run 时的调用方前文、临时送模数据和已采纳答复。
+框架按任务 ID 写图存档。挂起集合以根存档为准，SSE 和查询接口都从根存档投影。
+同一 `(owner, threadId)` 的请求先取得共享会话租约，续跑在任务租约内校验当前中断 ID。
+取消还会在放弃许可内复核存档写代。替换或取消时，SQL 后端在一个事务内核对租约、更新会话并清理旧存档。
+
+```mermaid
+sequenceDiagram
+    participant A as 实例 A
+    participant DB as 共享数据库
+    participant B as 实例 B
+    A->>DB: 保存会话与任务 ID
+    A->>DB: 图挂起时写入根存档
+    B->>DB: 取得会话和任务租约
+    B->>DB: 读取当前问题与已采纳答复
+    B->>DB: 校验后保存本次答复
+    B->>DB: 续跑并写入下一问或清理已完成任务
+```
+
+重连时调用 `GET /agui?threadId=<id>`，仍通过配置的 owner 解析器确定归属。返回
+`{"threadId":"...","interrupts":[...]}`，暂无待答问题时 `interrupts` 为空数组。
+如果某条当前问题的答复已保存且图还停在该处，响应会带 `acceptedInterruptIds`。
+这时可发送同一个 ID、`status:"resolved"` 并省略 `payload`，由服务端重放已采纳的答复。
+线程正被驱动时返回 HTTP 409 `busy`。图已进入下一问时，迟到的旧 ID 返回 `invalid_resume`。
+
+共享路径重建 `agent_v2.RunSession`。已准入工具依赖图存档中的调用状态，新调用按当前工具审批规则判定。
+挂起上限和 TTL 适用于进程内会话。共享会话写入终态标记后，后续同线程请求会补偿未完成的清理。
+如果终态标记本身未能写入，可以在数据库恢复后重新发起 Run 清理上一任务。
+进程在形成根存档前退出时，可以用同一线程重新发起 Run 并清理上一任务。
 
 ---
 
@@ -155,7 +197,7 @@ agui.Handler(func(hooks hook.Hooks) agent_v2.Agent {
     }
     return agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("seq")).
         AddStep("s1", mkStep("step1")).AddStep("s2", mkStep("step2"))
-})
+}, agui.WithOwnerResolver(func(context.Context) string { return "demo" }))
 ```
 
 - chunk 走 `OrchHooks` **嵌套继承**：handler 用 `WithCtxOrchHooks(ctx, adapter)` push，
@@ -168,10 +210,6 @@ agui.Handler(func(hooks hook.Hooks) agent_v2.Agent {
 
 ## 8. 限制
 
-- **session store in-process**：server 重启丢挂起会话、跨进程 Resume 不支持（同 a2a）。
-  单进程内有 `busy` 并发保护（同 threadId 拒并发 Run/Resume）+ 按 owner 分摊的淘汰上限
-  （`WithMaxSessions` 默认 10000，**软上限**见 §5）+ handler panic recover 兜底（发 RunError
-  不留半截流），但跨进程 / HA 仍需自实现。
 - **client 断开**：agent 跑期间 client 断开 → `r.Context()` canceled → 框架超步边界停 +
   清 sess（省 LLM/工具开销）；RunStarted 前断开 → 短路不跑 agent。（单个长超步 / LLM 调用
   期间断开需该请求响应 ctx 取消才立即停。）
@@ -187,7 +225,9 @@ agui.Handler(func(hooks hook.Hooks) agent_v2.Agent {
 
 - 单测 [`agui/agui_test.go`](../../agui/agui_test.go)：SSE wire 格式 / streaming 端到端
   （chunk delta 拼回）/ HITL Run→中断→Resume→完成 / 无 cp resume 报错 / 非 BasicAgent
-  （SequentialAgent）；`go test -race` 通过。
+  （SequentialAgent）。
+- [共享审批回归](../../sql/agui_session_test.go)覆盖独立连接接手、断流重连、迟到答复、旧取消与租约失效。
+- [SOP 示例](../../example/orchestration/sop_demo/main.go)演示结构化审批、校验回退、拒绝及批准后执行。
 - 真 qwen 冒烟 [`example/agui/agui_smoke`](../../example/agui/agui_smoke)：① tool + streaming
   ② 多轮 HITL Resume（qwen 调 ask_user 追问 → 中断 → 多轮续发续跑）。
 

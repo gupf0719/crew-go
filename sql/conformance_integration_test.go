@@ -51,6 +51,15 @@ func TestPostgresIntegration(t *testing.T) {
 	t.Run("SharedApproval", func(t *testing.T) {
 		runSQLSharedApproval(t, "pgx", dsn)
 	})
+	t.Run("AGUISharedSessions", func(t *testing.T) {
+		runAGUISessionScenarios(t, crewsql.Postgres{}, func() *sql.DB {
+			db, err := sql.Open("pgx", dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return db
+		})
+	})
 }
 
 func TestMySQLIntegration(t *testing.T) {
@@ -79,6 +88,15 @@ func TestMySQLIntegration(t *testing.T) {
 	}
 	t.Run("SharedApproval", func(t *testing.T) {
 		runSQLSharedApproval(t, "mysql", config.FormatDSN())
+	})
+	t.Run("AGUISharedSessions", func(t *testing.T) {
+		runAGUISessionScenarios(t, crewsql.MySQL{}, func() *sql.DB {
+			db, err := sql.Open("mysql", config.FormatDSN())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return db
+		})
 	})
 }
 

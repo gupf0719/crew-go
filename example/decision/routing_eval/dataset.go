@@ -6,6 +6,8 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 )
 
@@ -27,6 +29,12 @@ var tiers = []tier{
 	{ID: "real", Title: "真实会话集", File: "cases_real.jsonl", Note: "带会话元数据与多轮历史，含话题切换、语音转写、提示词注入与超范围请求，只有中文"},
 }
 
+const externalTierID = "external"
+
+var externalTier = tier{
+	ID: externalTierID, Title: "外部业务集", Note: "由业务方提供并按分支职责人工标注",
+}
+
 func tierByID(id string) (tier, bool) {
 	for _, t := range tiers {
 		if t.ID == id {
@@ -39,16 +47,16 @@ func tierByID(id string) (tier, bool) {
 // route 是一个路由目标分支。Name 是 RoutingAgent 的分支名，两种语言的职责描述分别
 // 喂给中文 / 英文条件下的 classifier 与 Jev。
 type route struct {
-	Name   string
-	DescZH string
-	DescEN string
+	Name   string `json:"name"`
+	DescZH string `json:"desc_zh"`
+	DescEN string `json:"desc_en,omitempty"`
 }
 
 // scenario 是一套路由目标。三套覆盖不同的业务面，避免结论只对一套标签成立。
 type scenario struct {
-	ID     string
-	Title  string
-	Routes []route
+	ID     string  `json:"id"`
+	Title  string  `json:"title"`
+	Routes []route `json:"routes"`
 }
 
 // scenarios 的分支描述按业务方写 WithRoutingDescriptions 的口吻写，互不重叠。
@@ -182,7 +190,8 @@ type evalCase struct {
 	ZH       string   `json:"zh"`
 	EN       string   `json:"en"`
 	// Tier 由样本所在的文件决定，不在 JSON 里。
-	Tier string `json:"-"`
+	Tier     string `json:"-"`
+	scenario scenario
 }
 
 // text 按语言取样本原文。
@@ -191,16 +200,6 @@ func (c evalCase) text(lang string) string {
 		return c.EN
 	}
 	return c.ZH
-}
-
-// scenarioByID 按 ID 取场景；不存在返回 false。
-func scenarioByID(id string) (scenario, bool) {
-	for _, sc := range scenarios {
-		if sc.ID == id {
-			return sc, true
-		}
-	}
-	return scenario{}, false
 }
 
 // hasRoute 判断场景里是否有这个分支。
@@ -213,43 +212,105 @@ func (sc scenario) hasRoute(name string) bool {
 	return false
 }
 
-// loadCases 解析三个内嵌样本文件并逐条校验：ID 全局唯一、场景存在、gold 是该场景
-// 的分支、中文不为空、标签都在 knownTags 里。真实会话集只有中文，其余两个子集的
-// 英文也必须有。
-func loadCases() ([]evalCase, error) {
+// loadCases 按内嵌子集或外部文件加载样本，使用同一套标注校验。
+func loadCases(casePath, scenarioPath string) ([]evalCase, error) {
+	defs := scenarios
+	if scenarioPath != "" {
+		if casePath == "" {
+			return nil, fmt.Errorf("-scenarios requires -cases")
+		}
+		var err error
+		defs, err = loadScenarios(scenarioPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	byID := make(map[string]scenario, len(defs))
+	for _, sc := range defs {
+		byID[sc.ID] = sc
+	}
+	seen := make(map[string]bool)
+	if casePath != "" {
+		f, err := os.Open(casePath)
+		if err != nil {
+			return nil, fmt.Errorf("open cases: %w", err)
+		}
+		defer func() { _ = f.Close() }() // 只读文件已读完，关闭失败不改变校验结果。
+		return scanCases(f, casePath, externalTierID, byID, seen)
+	}
+
 	cases := make([]evalCase, 0, 512)
-	seen := make(map[string]bool, 512)
 	for _, t := range tiers {
 		raw, err := caseFiles.ReadFile(t.File)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", t.File, err)
 		}
-		sc := bufio.NewScanner(bytes.NewReader(raw))
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		line := 0
-		for sc.Scan() {
-			line++
-			text := strings.TrimSpace(sc.Text())
-			if text == "" {
-				continue
-			}
-			var c evalCase
-			if err := json.Unmarshal([]byte(text), &c); err != nil {
-				return nil, fmt.Errorf("%s line %d: %w", t.File, line, err)
-			}
-			c.Tier = t.ID
-			if err := validateCase(c, seen); err != nil {
-				return nil, fmt.Errorf("%s line %d: %w", t.File, line, err)
-			}
-			seen[c.ID] = true
-			cases = append(cases, c)
+		sub, err := scanCases(bytes.NewReader(raw), t.File, t.ID, byID, seen)
+		if err != nil {
+			return nil, err
 		}
-		if err := sc.Err(); err != nil {
-			return nil, fmt.Errorf("scan %s: %w", t.File, err)
+		cases = append(cases, sub...)
+	}
+	return cases, nil
+}
+
+func loadScenarios(path string) ([]scenario, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read scenarios: %w", err)
+	}
+	var defs []scenario
+	if err := json.Unmarshal(raw, &defs); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if len(defs) == 0 {
+		return nil, fmt.Errorf("%s: no scenarios found", path)
+	}
+	ids := make(map[string]bool, len(defs))
+	for _, sc := range defs {
+		if strings.TrimSpace(sc.ID) == "" || ids[sc.ID] || strings.TrimSpace(sc.Title) == "" || len(sc.Routes) < 2 {
+			return nil, fmt.Errorf("%s: scenario %q requires a unique id, a title and at least two routes", path, sc.ID)
+		}
+		ids[sc.ID] = true
+		names := make(map[string]bool, len(sc.Routes))
+		for _, r := range sc.Routes {
+			if strings.TrimSpace(r.Name) == "" || names[r.Name] || strings.TrimSpace(r.DescZH) == "" {
+				return nil, fmt.Errorf("%s: scenario %q requires unique route names and desc_zh (route %q)", path, sc.ID, r.Name)
+			}
+			names[r.Name] = true
 		}
 	}
+	return defs, nil
+}
+
+func scanCases(r io.Reader, source, tierID string, defs map[string]scenario, seen map[string]bool) ([]evalCase, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var cases []evalCase
+	line := 0
+	for sc.Scan() {
+		line++
+		raw := bytes.TrimSpace(sc.Bytes())
+		if len(raw) == 0 {
+			continue
+		}
+		var c evalCase
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return nil, fmt.Errorf("%s line %d: %w", source, line, err)
+		}
+		c.Tier = tierID
+		c.scenario = defs[c.Scenario]
+		if err := validateCase(c, seen); err != nil {
+			return nil, fmt.Errorf("%s line %d: %w", source, line, err)
+		}
+		seen[c.ID] = true
+		cases = append(cases, c)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("scan %s line %d: %w", source, line+1, err)
+	}
 	if len(cases) == 0 {
-		return nil, fmt.Errorf("no cases found")
+		return nil, fmt.Errorf("%s: no cases found", source)
 	}
 	return cases, nil
 }
@@ -259,8 +320,8 @@ func validateCase(c evalCase, seen map[string]bool) error {
 	if c.ID == "" || seen[c.ID] {
 		return fmt.Errorf("empty or duplicate id %q", c.ID)
 	}
-	s, ok := scenarioByID(c.Scenario)
-	if !ok {
+	s := c.scenario
+	if s.ID == "" {
 		return fmt.Errorf("case %s: unknown scenario %q", c.ID, c.Scenario)
 	}
 	if !s.hasRoute(c.Gold) {
@@ -269,8 +330,18 @@ func validateCase(c evalCase, seen map[string]bool) error {
 	if strings.TrimSpace(c.ZH) == "" {
 		return fmt.Errorf("case %s: zh must be non-empty", c.ID)
 	}
-	if c.Tier != "real" && strings.TrimSpace(c.EN) == "" {
+	if (c.Tier == "standard" || c.Tier == "hard") && strings.TrimSpace(c.EN) == "" {
 		return fmt.Errorf("case %s: en must be non-empty outside the real tier", c.ID)
+	}
+	if c.Tier == externalTierID {
+		if strings.TrimSpace(c.EN) != "" {
+			for _, r := range s.Routes {
+				if strings.TrimSpace(r.DescEN) == "" {
+					return fmt.Errorf("case %s: route %q needs desc_en when en is set", c.ID, r.Name)
+				}
+			}
+		}
+		return nil
 	}
 	if len(c.Tags) == 0 {
 		return fmt.Errorf("case %s: at least one tag is required", c.ID)

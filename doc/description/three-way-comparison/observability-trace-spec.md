@@ -26,6 +26,20 @@
   迁移到新约定会影响按名称查 workflow 的仪表盘、告警和 exporter 规则。对照 11 月快照时以下文为
   已实现行为、以上游合并记录为新约定。[本仓属性与指标](../../../observability/semconv.go) · [11 月行业调查](industry-survey-2026q4.md)
 
+### 工作流指标迁移前核对
+
+仓内对 `gen_ai.invoke_workflow.duration` 和 `gen_ai.workflow.name` 的使用集中在 SDK 实现、测试和文档。
+仓内回归用 SDK 的手动采集器检查 GraphAgent 和其同层图合计只产生一个工作流时长样本，
+普通 Agent 仍通过 `gen_ai.invoke_agent.duration` 计时。
+[工作流与 Agent 指标回归](../../../observability/observability_test.go)
+
+部署侧迁移时一起核对仪表盘、告警和采集重写规则。除了 OTel 点号名称，还要查导出器归一化后的
+`gen_ai_invoke_workflow_duration` 和 `gen_ai_workflow_name`。采用 11 月约定后，按
+`gen_ai.operation.name=invoke_workflow` 查询 `gen_ai.invoke_agent.duration`，
+名称维度改取 `gen_ai.agent.name`，用同一批运行对齐时长序列的样本数。
+当前保留已发布的指标命名，现网规则的影响待部署配置核对。
+[上游工作流指标变更](https://github.com/open-telemetry/semantic-conventions-genai/pull/571)
+
 ## 2026-10-07 对照基线
 
 - span 形状（名字、kind、`gen_ai.operation.name`）按约定：`chat` / `invoke_agent`（INTERNAL 与 CLIENT）/

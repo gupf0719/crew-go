@@ -29,7 +29,7 @@
 |---|---|---|---|
 | **Interrupt 数据结构** | 平铺 `*InterruptError{Reason, Query, Queries, Data}`——Query (单) / Queries (多, ISSUE-81) 互斥 | 平铺 `Interrupt{value, id, response_schema}`，schema 可选 | 树 `InterruptSignal{ID, Address, State, Subs[]}` |
 | **多 query 协议** | `Queries []*AskQuery` + `AllQueries()` + `MergeInterrupts()` helper (fanout 聚合) | 多 pending 全平铺 `tuple[Interrupt, ...]` | `Subs []*InterruptSignal` 树 |
-| **fan-out 多分支同时中断时返给 caller 几个** | **全部**（`MergeInterrupts(res.AllInterrupts)`，2026-07-27 `4bf9568` 补齐——此前只返 FirstErr、cp 侧却记全，业务照 AllQueries() 建答案 map 系统性少答）| **全部**（`_runner.py:688-690` `# raise combined interrupts` → `GraphInterrupt(tuple(i for exc in interrupts for i in exc.args[0]))` 双层展开；与普通异常明确分开处理——普通异常 `raise exc` 直接抛第一个，中断先 `# collect interrupts` 攒起来）| **全部**（`internal/core/interrupt.go:196` `FromInterruptContexts` 收 `[]*InterruptCtx` 列表，合并公共祖先建成一棵树，注释明写 "reconstructs a single InterruptSignal tree from a **list**"）|
+| **fan-out 多分支同时中断时返给 caller 几个** | **全部**（`MergeInterrupts(res.AllInterrupts)`，2026-07-27 `4bf9568` 补齐——此前只返 FirstErr、cp 侧却记全，业务照 AllQueries() 建答案 map 系统性少答）| **全部**（`_runner.py:688-690` `# raise combined interrupts` → `GraphInterrupt(tuple(i for exc in interrupts for i in exc.args[0]))` 双层展开；与普通异常明确分开处理——普通异常 `raise exc` 直接抛第一个，中断先 `# collect interrupts` 攒起来）| **全部**（[`FromInterruptContexts`](https://github.com/cloudwego/eino/blob/4a4b7186693d9805539c7f0c36db7d03a3485c6a/internal/core/interrupt.go#L202) 收 `[]*InterruptCtx` 列表，合并公共祖先建成一棵树，注释明写 "reconstructs a single InterruptSignal tree from a **list**"）|
 | **InterruptID 生成** | `InterruptSite.InterruptID()` 用 FNV-1a 64 位（16 个十六进制字符），按任务、执行位置和重做代际等维度派生。[实现](../../../compose_v2/interrupt.go) | 1.2.20 用 xxHash 128 位（32 个十六进制字符）。第一个回答槽沿用 namespace 哈希，后续把已采纳答案数编入 ID。[源码改动](https://github.com/langchain-ai/langgraph/commit/6ea1751a9) | runtime 生成 + Address 关联 |
 | **嵌套表达** | graphNS 编入 InterruptID + 每层 cp 物理分离 (parentSID, parentNS/childName) | `checkpoint_ns` 链 + hash 自然命中 | `InterruptSignal.Subs` 树 |
 | **cond fn 协议** | **cond = 纯判断**（读 channel → 返目标，不产 writes/不改 state），由此两条: ① **禁止 interrupt**——中断的本质是要新输入；cond 要新输入才能判断 = 判断所需信息没备齐 = **上游 node 没尽责**（且 cond 是纯函数、Resume 后重新执行，答案仍得从 channel 读——绕一圈还是得让上游备好）。抛任何 InterruptError 转**非-interrupt** error 拒绝，HITL 归 node（RoutingAgent 的 Router/classifier 已在 classify node 内跑原生支持）。② **报错的 Resume 语义业务声明**（`WithCondFailPolicy`）——纯判断报错只可能是「上游数据缺失/非法」，该重试还是放弃取决于上游是否确定性（纯计算重跑必拿同样坏数据；LLM 上游重跑很可能就好），只有业务知道: `CondFailAbort`(默认，终局失败——wrap `ErrRunAborted` → Run 出口**主动 DeleteSubtree 清子树**，子图终局性经错误链自动向上传播) / `CondFailRerunFrom`(存 Pending cp、Resume 重跑 from，业务须保其 writes 幂等) | path **机械上能** interrupt，但**是实现副作用非契约**(靠 path 被 coerce 成 `trace=True` 重设 config context；官方 25 个 path 测试 0 个用、`interrupt()` docstring 明写 "from within a **node**"); **它同样做 matched-writes-skip**，但 branch 在 task **内** → interrupt 时节点 writes 压根没 commit → 恒整 task 重跑(连 LLM)，**无"已 commit 却重跑"的违约** | branch.invoke 抛 err 直接**整图 fail** (`newGraphRunError` 不做 interrupt 特判), 不支持 branch HITL |
@@ -230,7 +230,7 @@ def interrupt(value: Any) -> Any:                  # types.py:403
 
 ### Interrupt 数据结构
 
-`internal/core/interrupt.go:32-38`（**3 个嵌入字段**，非命名字段/指针）：
+`InterruptSignal` 包含三个嵌入字段。
 ```go
 type InterruptSignal struct {
     ID string
@@ -242,31 +242,33 @@ type InterruptSignal struct {
 ```
 
 **树结构**——`Subs` 表达"父 graph → 子 graph → tool"嵌套链。落盘时 `SignalToPersistenceMaps`
-拍平为 `id → Address` + `id → InterruptState` 双 map。
+拍平为 `id → Address` + `id → InterruptState` 双 map。[eino InterruptSignal](https://github.com/cloudwego/eino/blob/4a4b7186693d9805539c7f0c36db7d03a3485c6a/internal/core/interrupt.go#L47)
 
 ### Resume 答案 API
 
-`internal/core/address.go:249-273`：
+`BatchResumeWithData` 将各提问的答案写进 ctx。
 ```go
 func BatchResumeWithData(ctx context.Context, dataByID map[string]any) context.Context {
     // 注入全局 id2ResumeData map 到 ctx
 }
 ```
 
+[eino BatchResumeWithData](https://github.com/cloudwego/eino/blob/4a4b7186693d9805539c7f0c36db7d03a3485c6a/internal/core/address.go#L245)
+
 ### 节点取答案（typed）
 
-`compose/resume.go:77`（转发 `internal/core/resume.go:86`）——**3 个裸返回值，无包装 struct**：
+`GetResumeContext` 返回续跑状态、答案存在标志与类型化答案。
 ```go
 func GetResumeContext[T any](ctx context.Context) (isResumeFlow bool, hasData bool, data T)
 ```
 
 节点范式：`isResumeFlow, hasData, data := compose.GetResumeContext[MyT](ctx)`。`isResumeFlow`
 标识本组件是否 resume 目标（自定向 / 作为子流程导管两种角色，见 godoc）；`hasData` 区分
-"恢复但无数据"（`Resume(ctx, ids...)`）vs"恢复且带数据"（`ResumeWithData`）。
+"恢复但无数据"（`Resume(ctx, ids...)`）vs"恢复且带数据"（`ResumeWithData`）。[eino GetResumeContext](https://github.com/cloudwego/eino/blob/4a4b7186693d9805539c7f0c36db7d03a3485c6a/internal/core/resume.go#L86)
 
 ### InterruptCtx 三态
 
-`internal/core/interrupt.go:113-127`：跨包 user-facing 视图：
+`InterruptCtx` 提供跨包的中断视图。
 ```go
 type InterruptCtx struct {
     ID          string         // 全限定地址（join Address 段，如 "agent:A;node:graph_a;tool:..."）
@@ -276,6 +278,8 @@ type InterruptCtx struct {
     Parent      *InterruptCtx  // 父链表，top-level 为 nil
 }
 ```
+
+[eino InterruptCtx](https://github.com/cloudwego/eino/blob/4a4b7186693d9805539c7f0c36db7d03a3485c6a/internal/core/interrupt.go#L128)
 
 **注意**：这不是"执行/中断/恢复运行时三态分离"，而是"内部 InterruptSignal 树 vs 外部公开扁平视图"双形态。eino 用 `InterruptCtx` 让 adk → compose 跨包传递 + 按 `allowedSegmentTypes` 过滤地址段（隐藏中间层 nodeID）。
 
@@ -394,6 +398,7 @@ crew-go v2 把 graphNS 编进 ID 的 hash 表达嵌套——`cp.PendingInterrupt
 | **R33 Reflect 拆图 (2026-06-11, commit 5cd19b2)** | **ReflectAgent eval 单节点拆 actor→evaluate→cond→[End\|feedback]：verdict/critique 进 channel superstep commit，feedback（reflectorAgent）中断 Resume 不重评 evaluator；budget 判定在 feedback 之前** | LangGraph reflection 教程 generate/reflect 双节点 + should_continue 挂 generate 后 reflect 前（耗尽轮 critique 不白跑）+ role-flip 保留 messages[0]；eino executor/replanner 平级 sub-agent + Resume 按 SubAgentIndex 只续被中断者 | 原单节点：reflectorAgent 中断 → Resume 重跑整节点 → evaluator 重评（LLM 非确定）→ verdict 翻面时用户答案静默丢 + pending 孤儿。Reflector 签名扩 goal + 输入 user-role 合成（两方都不让评估器收 assistant-role、都显式带目标、都保留批评全文——我们三条全违已修齐）。测试: TestR33_ReflectSplit_* ×4 + r34 Resume 矩阵 |
 | **2026-05 audit (#5 三方对照)** | (1) `InterruptError.Data` godoc 改 — 谎报"cp 持久化按 JSON-friendly 序列化"实际从未实现 (cp 只存 AskQuery 4 字段（Question/Options/InterruptID/Reason）不含 InterruptError.Data) → 明示"仅同进程, Resume 后丢失" + 业务跨 Resume / 跨进程持久化走 (a) AskQuery.Question/Options 自序列化 (b) `store.Store` 后端 (Redis/PG) 关联 AskQuery.InterruptID; (2) graph_loop.go auto-fill InterruptID 路径加 slog.LogAttrs (类型化 Attr, 非 variadic any) 输出 5 维, 业务开 DEBUG 反查 hex 对应位置 | eino `InterruptState.LayerSpecificPayload` 落盘 + Resume 重建 / eino `Address.String()` 直接读 vs LangGraph hash 单向 | **不抄 eino typed Data 落盘**: Go 无变长泛型 method + 业务 map[string]any 已能 work + 跨 thread 走 store.Store 替代. **借鉴 eino Address 可观测但只加日志不加字段**: 加 5 维 slog 让业务调试时可见, 不引入业务侧 Address struct (协议复杂度). **audit follow-up #5 #2**: 第一版 godoc 又错推荐 `sess.SetValue` 跨 Resume (sess.values 同样不走 cp), 改为 store.Store 跨进程持久化; 第一版 slog.DebugContext 用 variadic any 在 caller 站点 boxing alloc, 改 slog.LogAttrs 几乎零 alloc |
 | **a2a human gate 的答复绑定与提问位置（2026-10-16，`fix/a2a-gate-task-binding`）** | 等人答复的那一问按调用位置记进宿主存档，身份 = 调用位置 + 远端 taskID + 第几问；远端任务给了结局就清记录、再跑发原始请求。引擎钩子与条件边里不续任何远端任务，远端要人时报终局错误；**不支持**「钩子里接住 gate 的中断、换成业务 ID 再抛、续跑时自己取答复带原 session 再调」的写法 | ADK `RemoteA2aAgent`（答复按合成调用 ID 找回那一问所在的任务）+ MAF `A2AAgent`（请求 ID = agent + 远端任务 + 第几问，任务句柄归节点、随工作流存档）+ A2A 规范（同一个 taskId 续 input-required，终态任务不收消息） | 五家没有一家让只做观测的钩子挂起提问；能由业务指定、又真能分发答复的 ID 只出现在节点里、给节点自己的提问（MAF），不是在钩子里给别的组件抛出的提问换 ID。那种写法以前能跑通靠的是会话级任务句柄，它会让一次调用续上别的调用挂着的任务（实测），已撤。调用方知道自己在哪儿调，出路是挪到节点体 / 工具 / 编排成员里。详见下文「远端 agent 要人」一节 |
+| **2026-11-12 结构化审批与跨实例续跑** | `compose_v2.AskQuery.ResponseSchema` 随问题落盘。AG-UI 在任务租约内校验答复，SQL 共享会话记录与任务租约在同一后端。 | LangGraph `response_schema` 和逐问恢复 | 问题集合由根存档提供。会话保存任务索引、原请求前文和已采纳答复，旧取消需在放弃许可内复核存档写代。见 [AG-UI 共享会话](../../v2/agui.md#共享会话)。 |
 
 ## 开放问题
 

@@ -405,11 +405,12 @@ func extractOrchHooksOrCtx(ctx context.Context, optsHooks OrchestrationHooks) co
 type ResumeOption func(*resumeConfig)
 
 type resumeConfig struct {
-	action     ResumeAction
-	userInputs map[string]*schema.Message // by InterruptID
-	userText   string                     // 非寻址型「用户这轮说了什么」
-	orchHooks  OrchestrationHooks
-	session    *RunSession // 续传给 framework 让事件累积到同一对象
+	action       ResumeAction
+	abortCleanup func(context.Context, string, string) (int32, error)
+	userInputs   map[string]*schema.Message // by InterruptID
+	userText     string                     // 非寻址型「用户这轮说了什么」
+	orchHooks    OrchestrationHooks
+	session      *RunSession // 续传给 framework 让事件累积到同一对象
 
 	// per-call 覆盖（对齐 eino/langgraph：resume 本身是一次正常调用，能重传 per-call；
 	// 仅本次 Resume 生效、不进 cp）。无则回退构造期默认（不继承上次 Run 的覆盖）。
@@ -433,6 +434,13 @@ func WithResumeAction(a ResumeAction) ResumeOption {
 	return func(c *resumeConfig) {
 		c.action = a
 	}
+}
+
+// WithResumeAbortCleanup 让宿主在同一原子操作中清理存档和外部任务记录。
+// Abort 取得任务的放弃许可后，调用 cleanup(ctx, sessionID, namespace) 代替 Checkpointer.DeleteSubtree。
+// cleanup 返回已删除的存档数量。失败时返回错误并保留历史，成功后仍走正常的历史与钩子收尾。
+func WithResumeAbortCleanup(cleanup func(ctx context.Context, sessionID, namespace string) (int32, error)) ResumeOption {
+	return func(c *resumeConfig) { c.abortCleanup = cleanup }
 }
 
 // WithResumeUserInputs 用 map[InterruptID]Message 答多 pending interrupts。

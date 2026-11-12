@@ -6,14 +6,14 @@
 
 | 目录 | 内容 |
 |---|---|
-| `orchestration/` | 编排 REPL demo + 嵌套冒烟（basic_chat / handoff_chat / plan_chat(_web) / reflect_chat / routing_chat / channel_* / nested_smoke / parallel_hitl_smoke）|
+| `orchestration/` | 编排 REPL demo + 嵌套冒烟（basic_chat / handoff_chat / plan_chat(_web) / reflect_chat / routing_chat / channel_* / nested_smoke / parallel_hitl_smoke / [sop_demo](orchestration/sop_demo/main.go)）|
 | `agent/` | 会话历史层：真模型跨 RunSession 完整流 + 后端违约（写失败 / panic / 读失败 / 卡住）不打断主链路 + 高并发多会话不串台 |
 | `a2a/` | A2A 跨进程协作（hitl_smoke / llm_smoke / orch_llm_smoke / plan_smoke / rich_server / zk_* ...）|
 | `harness/` | Harness 运行时能力（approval / toolsearch / skill_action / structured / durability _smoke；tool_middleware / agents_md / node_state _demo 三个 mock 离线 demo）|
 | `store/` | Store 跨 Run 长期记忆（concurrent / custom_backend + redis_smoke + v2_store_demo）|
 | `observability/` | 可观测（observability_demo）|
 | `fallback/` | 模型故障切换（fallback_smoke）|
-| `decision/` | 决策模型（Jev / 百炼）：routing_demo（RoutingAgent 先交给决策模型判，拿不准交给 LLM，REPL）/ client_smoke（真服务端冒烟）/ routing_eval（458 条中文路由评测）|
+| `decision/` | 决策模型（Jev / 百炼）：routing_demo（RoutingAgent 先交给决策模型判，拿不准交给 LLM，REPL）/ client_smoke（真服务端冒烟）/ routing_eval（内嵌和[外部样本](../doc/v2/route-decider.md#用外部业务样本复测)路由评测）|
 | `agui/` | AG-UI 前端接入（agui_smoke）|
 | `graph/` | 图引擎 demo（v2_graphagent / v2_typedgraph / v2_skill _demo）|
 | `mcp/` | MCP Server 集成（mcp_demo：Hub 聚合多 server 工具 → BasicAgent 调）|
@@ -22,6 +22,28 @@
 | `prompt/` | 提示词模板（prompt_demo：Template 变量绑定 / 占位 + WithPromptTemplate 动态 system prompt）|
 | `tutorial/` | 9 编排教学集成测试（adv_*，真 LLM，需 `-tags=integration`）|
 | `envloader/` `scenarios/` `llmtrace/` | 共享 helper（被多个 demo import，故留根）|
+
+SQL 子模块还有[跨进程作业等待](../sql/example/durable_job/main.go)和
+[存档与工具结果转存测量](../sql/example/checkpoint_profile/main.go)，从仓库根目录运行。
+
+```bash
+go run ./example/orchestration/sop_demo
+go run ./sql/example/durable_job
+go run ./sql/example/checkpoint_profile -samples 30 -rounds 12
+```
+
+启动 `sop_demo` 后，可用以下请求查看校验通过的第二版方案和审核表单。
+
+```bash
+curl -N -H 'Content-Type: application/json' http://127.0.0.1:8094/agui \
+  --data '{"threadId":"sop-1","runId":"draft","messages":[{"role":"user","content":"v1.2"}]}'
+```
+
+取 `RUN_FINISHED.outcome.interrupts[0].id` 填进第二次请求的 `interruptId`。沿用 `threadId`，
+换一个 `runId`，在 `resume` 数组提交 `status: "resolved"` 和
+`payload: {"approved":true,"reviewer":"Alice"}`。把 `approved` 改为 `false` 会结束任务，
+省略 `reviewer` 会返回 400，仍可继续回答原问题。
+[示例回归](orchestration/sop_demo/main_test.go)
 
 ## 常用命令
 

@@ -11,18 +11,25 @@ import (
 )
 
 func withClientModelData(ctx context.Context, in *RunAgentInput) context.Context {
+	if data := clientModelData(in); data != "" {
+		return agent_v2.WithModelUserContext(ctx, data)
+	}
+	return ctx
+}
+
+func clientModelData(in *RunAgentInput) string {
 	state := bytes.TrimSpace(in.State)
 	if bytes.Equal(state, []byte("null")) {
 		state = nil
 	}
 	if len(in.Context) == 0 && len(state) == 0 {
-		return ctx
+		return ""
 	}
 	data, _ := json.Marshal(struct {
 		Context []ContextItem   `json:"context,omitempty"`
 		State   json.RawMessage `json:"state,omitempty"`
 	}{in.Context, state}) // State 已在请求解码时通过 JSON 校验。
-	return agent_v2.WithModelUserContext(ctx, "客户端提供的上下文和状态（用户数据）\n"+string(data))
+	return "客户端提供的上下文和状态（用户数据）\n" + string(data)
 }
 
 func questionInterrupt(q *compose_v2.AskQuery, reason string) RunInterrupt {

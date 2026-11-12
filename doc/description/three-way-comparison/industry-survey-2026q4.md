@@ -121,8 +121,8 @@ crew-go 可以用脱敏的真实样本扩充路由评测的用例覆盖，复用
   配置的消费情况。
   [工作流合并](https://github.com/open-telemetry/semantic-conventions-genai/pull/571) · [agent transfer](https://github.com/open-telemetry/semantic-conventions-genai/pull/447) · [本仓对照](observability-trace-spec.md)
 
-crew-go 的取消终态与 Resume wire `runId` 两处 Q3 问题已有对应回归。AG-UI HTTP handler 用进程内会话映射
-维护挂起项。若需要服务重启后从另一实例续跑，还要恢复挂起集合、已采纳的答案和任务归属。
+crew-go 的取消终态与 Resume wire `runId` 两处 Q3 问题已有对应回归。调研基线的 AG-UI HTTP Handler 用进程内会话映射维护挂起项。
+共享会话的实现和验收见[本轮落地](#九本轮落地)。
 [Q3 回查](industry-survey-2026q3.md) · [本仓协议测试](../../../agui/agui_test.go) · [会话映射](../../../agui/handler.go)
 
 复用上游经验时，可以把问题写成可复现的用例。用同一节点的两次提问验证旧答案重发，用同批工具的成功和失败验证已完成结果的重放，用审批挂起时收到后台结果的场景验证通知交付。独立后台子 agent 的设计再根据业务用例确定任务句柄、审批归属、完成通知和退出清理。
@@ -189,7 +189,7 @@ AgentScope SOP 的逐步验收可与 crew-go 通过 GraphAgent 拼接执行和�
 
 ### 1. 用真实样本决定路由门槛
 
-`routing_eval` 已有升级链、重复运行、标注分歧复核和输入指纹缓存，样本入口目前读内嵌 JSONL。增加外部 JSONL
+`routing_eval` 已有升级链、重复运行、标注分歧复核和输入指纹缓存，调研基线的样本入口读内嵌 JSONL。增加外部 JSONL
 输入后，先选一套现有业务分支，用脱敏的请求和上下文按分支人工标注，比较同一批样本上的升级率、自动承接比例、
 自动承接中的错路由率及 P95 路由延迟。线上有流量时，可用同步的 `WithShadow` 按请求抽样并设短超时，
 收集决策分歧供复核。影子结果和线上实际分支都可以作为复核线索，业务标注作为对照答案。
@@ -198,7 +198,7 @@ AgentScope SOP 的逐步验收可与 crew-go 通过 GraphAgent 拼接执行和�
 ### 2. 让同一条挂起审批跨实例续跑
 
 用两个 AG-UI Handler 共用一个内存 Checkpointer 做了对照。A 发起 Run、回答第一问并停在第二问，第二问交给新建的 B
-返回 `404/no_session`。同一份答复交回 A 返回成功，节点拿到 `one+two`，两问各发出一次。当前通用 Handler
+返回 `404/no_session`。同一份答复交回 A 返回成功，节点拿到 `one+two`，两问各发出一次。调研基线的通用 Handler
 在进程内保存从 `(owner, threadId)` 到挂起任务的映射、原请求前文和已采纳答复。
 [Handler 状态](../../../agui/handler.go) · [两问测试基线](../../../agui/resume_coverage_test.go)
 
@@ -245,3 +245,45 @@ agent 实例。首期沿用已准入调用的结论，新调用按当前规则�
 先测 `WithToolResultSpill` 带来的变化。若全量快照仍是瓶颈，再比较增量方案的写入节省、恢复读放大，以及回收之后能否
 正确恢复旧任务。
 [工具结果转存](../../../agent_v2/tool_spill.go) · [存档取舍](checkpoint-storage.md)
+
+## 九、本轮落地
+
+- **路由复测**支持业务 JSONL 和分支定义。报告增加实际升级率、自动承接率、自动承接错路由率与 P95。
+  本地决策服务验证了请求内容、标签更新与缓存复用。用脱敏业务样本决定实际接管门槛仍待标注数据和模型凭据。
+  [评测用法](../../v2/route-decider.md#用外部业务样本复测)
+- **共享审批**在 SQL 持久化任务索引、前文和已采纳答复，由根存档提供挂起集合。
+  测试分别覆盖 SSE 中断帧丢失后的接手和宿主进程退出后的接手。并发续跑、旧 ID、异租户、
+  答复提交响应丢失和任务替换失败也有回归。
+  [接入和重连](../../v2/agui.md#共享会话) · [SQL 回归](../../../sql/agui_session_test.go)
+- **逐步验收**有可运行的 GraphAgent 示例。第一版方案缺少验收项会退回生成，第二版挂起审核。
+  缺字段或类型错误保留挂起问题。批准后执行一次，拒绝结束。
+  [SOP 示例](../../../example/orchestration/sop_demo/main.go)
+- **外部作业等待**用独立的构建服务数据库模拟外部 API，宿主和回调通过持久任务键及任务租约协调。
+  提交后未保存句柄可用原幂等键恢复。回调可早于存档，回调与挂起落档都会尝试交付，
+  周期恢复扫描补偿在途竞争、宿主退出及丢失的回调。扫描先查询作业结果，再判断是否到期。
+  完成、取消和超时竞争同一终态，交付状态先落库再清存档。
+  [作业示例](../../../sql/example/durable_job/main.go) · [回归场景](../../../sql/example/durable_job/workflow_test.go)
+- **指标核对**查过仓内采集和示例配置，工作流时长和普通 Agent 时长有各自的序列。用 GraphAgent 回归确认
+  一次工作流只记一个样本。沿用现有导出名，等部署侧看板、告警和采集规则一起核对后决定迁移。
+  [指标和迁移约定](observability-trace-spec.md)
+
+### 存档测量
+
+```bash
+go run ./sql/example/checkpoint_profile -samples 30 -rounds 12
+```
+
+每种模式 30 个模拟任务，每个任务 12 轮、每轮 65,536 字节工具输出。每个任务在最后一批工具等待人答，
+然后由新建的 BasicAgent 从存档续跑。`cp_bytes_p95` 取序列化存档的字节数，保存耗时覆盖 SQL 写入，
+挂起和续跑耗时取各自完整调用。设置 `CREW_SQL_POSTGRES_DSN` 可切到 PostgreSQL 测试库。
+
+| 后端 | 模式 | P95 存档字节 | 保存 P95 ms | 挂起 P95 ms | 续跑 P95 ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 文件 SQLite | 全量 | 1,579,015 | 9.860 | 23.566 | 27.727 |
+| 文件 SQLite | 工具结果转存 | 190,142 | 1.964 | 20.465 | 7.008 |
+| 本地 PostgreSQL 16.9 | 全量 | 1,579,015 | 49.967 | 72.601 | 44.089 |
+| 本地 PostgreSQL 16.9 | 工具结果转存 | 190,142 | 7.308 | 31.668 | 14.100 |
+
+本组负载转存后存档字节约少 88%。挂起耗时已计入转存写入，表中存档字节只计 checkpoint。
+下一步用业务会话测同一组指标，依实际剩余瓶颈决定是否引入增量存档。
+[测量入口](../../../sql/example/checkpoint_profile/main.go) · [存档取舍](checkpoint-storage.md)

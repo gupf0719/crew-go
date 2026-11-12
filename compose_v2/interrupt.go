@@ -2,6 +2,7 @@ package compose_v2
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -23,6 +24,8 @@ type AskQuery struct {
 	Question string `json:"question"`
 	// Options 可选项；nil = 自由文本
 	Options []string `json:"options,omitempty"`
+	// ResponseSchema 是期望答复的 JSON Schema 对象，供协议入口展示和校验。
+	ResponseSchema json.RawMessage `json:"response_schema,omitempty"`
 	// InterruptID 这条挂起的稳定身份——调用方拿它配答案，跨 Resume 必须重现得出同一个值。
 	//
 	// **必填。框架不替你补**：空 ID 会被当场拒（`ErrRunAborted`，不可重试、存档不留）。
@@ -86,6 +89,7 @@ func (q *AskQuery) clone() *AskQuery {
 	if q.Options != nil {
 		c.Options = append([]string(nil), q.Options...)
 	}
+	c.ResponseSchema = append(json.RawMessage(nil), q.ResponseSchema...)
 	c.Breakpoint = q.Breakpoint.clone()
 	return &c
 }
@@ -1388,6 +1392,20 @@ func GetResumeUserText(ctx context.Context) (string, bool) {
 }
 
 // ── RunOption 集成 ──
+
+type replayedResumeAnswersKey struct{}
+
+func (replayedResumeAnswersKey) ExecutionState() {}
+
+// WithReplayedResumeAnswersCtx 标记已采纳、为节点重放而再次传入的答复 ID。
+// 只影响 unmatched 诊断，答案仍经 [WithResumeAnswers] 传入。
+func WithReplayedResumeAnswersCtx(ctx context.Context, ids []string) context.Context {
+	replayed := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		replayed[id] = true
+	}
+	return context.WithValue(ctx, replayedResumeAnswersKey{}, replayed)
+}
 
 // WithResumeAnswers 配置 Resume 时的用户答案 map。
 //

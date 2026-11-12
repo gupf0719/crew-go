@@ -10,6 +10,8 @@ import (
 	"crew-go/schema"
 )
 
+const pauseInterruptID = "pause"
+
 // interruptHook 在可落档的位置检查会话的暂停请求。顶层 OnAgentStart 跳过检查，
 // 子 agent 启动和模型调用结束时可以中断，交给引擎保存存档。
 type interruptHook struct {
@@ -45,7 +47,7 @@ func (h *interruptHook) maybeInterrupt(ctx context.Context, info *hook.AgentInfo
 				// 暂停钮这种形态不走 `compose_v2.Ask`——它不在节点里（hook 跑在 agent 层），
 				// 而且抛完**不回查**（ID 只当 SSE payload 外带给前端，续跑走
 				// `WithResumeUserText`）。这类「不指向具体提问」的挂起自填一个常量即可。
-				InterruptID: "pause",
+				InterruptID: pauseInterruptID,
 				Question:    "已挂起，请点继续或换方向。",
 			},
 			Data: map[string]any{

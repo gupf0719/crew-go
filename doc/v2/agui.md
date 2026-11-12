@@ -107,7 +107,8 @@ Run → 中断 → RunFinished(outcome=interrupt, interrupts=[{id, reason, messa
 - 全部 `cancelled` 时走 `agent_v2.ResumeActionAbort`，清档后发 `RunFinished(outcome=cancelled)`。
   混合答复中，取消项以 `[用户取消了此项]` 传给节点。
 - 默认进程内会话配 `agui.WithCheckpointer` 后支持多轮续跑。同一 `(owner, threadId)`
-  在途时第二个请求收到 `busy`。新 Run 替换旧挂起会话时清理旧存档。
+  在途时第二个请求收到 `busy`。新 Run 替换旧挂起会话时，确认旧档删除后才运行。
+  开流前放弃许可存储故障时返回 HTTP 503。开流后清档失败时发 `RUN_ERROR`，两种情况都保留旧会话的续跑入口。
 
 - **上限防 OOM**：挂起会话超 `WithMaxSessions`（默认 10000）时淘汰一个空闲会话 + 清其
   cp——防前端放弃中断（关页面 / 断网）导致 sessions map 长跑 OOM。**淘汰按 owner 分摊**：

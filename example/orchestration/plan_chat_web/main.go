@@ -709,24 +709,45 @@ func extractAgentMetas(subAgents map[string]agent_v2.Agent) []agentMeta {
 	return metas
 }
 
-// newWebPlanner 与 plan_chat/main.go 的 newJSONPlanner 逻辑等价，仅把打印改为
-// sink.send。prevRemaining 由闭包捕获，用于计算 replan diff。
+const webPlannerCallStep = "web-planner-call"
+
+// webPlannerCall 保存一次 plan 节点执行中的规划器输入和暂停状态。
+type webPlannerCall struct {
+	Prompt string
+	Paused bool
+}
+
+func init() {
+	compose_v2.RegisterValueType[webPlannerCall]("plan_chat_web.PlannerCall")
+}
+
+// newWebPlanner 调用场景规划器并向浏览器发送计划变化。
 //
 // ISSUE-72 R7：subAgents map 透传进来抽 Description() 注入 prompt，让 planner
 // 看到"可选 agent 列表"——加 / 删专家时只动 scenario builder，无需改 PlannerPrompt。
 func newWebPlanner(plannerAgent agent_v2.Agent, sink *eventSink, subAgents map[string]agent_v2.Agent) agent_v2.Planner {
 	metas := extractAgentMetas(subAgents)
 	var prevRemaining []agent_v2.PlanStep
-	return func(ctx context.Context, sess *agent_v2.RunSession, input string, executed []agent_v2.ExecutedStep) ([]agent_v2.PlanStep, string, error) {
-		// ISSUE-58 HITL: Resume 注入的 user 插话喂回 Planner prompt。
-		// 走**非寻址通道**：planner 不在节点里、没有自己的 InterruptID，它要的是「用户这轮说了什么」。
-		var resumeUserMsg string
-		if text, ok := compose_v2.GetResumeUserText(ctx); ok {
-			resumeUserMsg = text
+	return func(ctx context.Context, _ *agent_v2.RunSession, input string, executed []agent_v2.ExecutedStep) ([]agent_v2.PlanStep, string, error) {
+		resumeText, _ := compose_v2.GetResumeUserText(ctx)
+		call, saved := compose_v2.GetStepResult[webPlannerCall](ctx, webPlannerCallStep)
+		// 同一次规划沿用原输入，使寻址答案能回到原子档。用户主动暂停并补充方向时更新输入。
+		if !saved || (call.Paused && resumeText != "") {
+			call.Prompt = buildReplanPrompt(input, executed, metas, resumeText)
 		}
-		prompt := buildReplanPrompt(input, executed, metas, resumeUserMsg)
-		events, err := plannerAgent.Run(ctx, sess, schema.UserMessage(prompt))
+		call.Paused = false
+		if err := compose_v2.SaveStepResult(ctx, webPlannerCallStep, call); err != nil {
+			return nil, "", fmt.Errorf("planner: save call: %w", err)
+		}
+		// 规划器在 plan 节点内执行，由框架为子 Agent 分配独立存档槽。
+		events, err := agent_v2.RunSubAgent(ctx, "planner", plannerAgent, schema.UserMessage(call.Prompt))
 		if err != nil {
+			if ie, ok := compose_v2.IsInterrupt(err); ok && ie.Query != nil && ie.Query.InterruptID == pauseInterruptID {
+				call.Paused = true
+				if saveErr := compose_v2.SaveStepResult(ctx, webPlannerCallStep, call); saveErr != nil {
+					return nil, "", fmt.Errorf("planner: save pause: %w", saveErr)
+				}
+			}
 			return nil, "", fmt.Errorf("planner: %w", err)
 		}
 		out := agent_v2.FinalMessage(events)

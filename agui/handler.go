@@ -507,8 +507,8 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	}
 
 	// 先占旧任务的放弃许可，在开始事件成功送达后才删档。客户端断开或启动失败时恢复原入口。
+	const replacementCleanupError = "the previous suspended task could not be discarded"
 	var abandonOpts []agent_v2.RunOption
-	var staleMayBeResumable bool
 	var dropCtx context.Context
 	var dropActivity *compose_v2.TaskActivity
 	var oldTask string
@@ -519,11 +519,14 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	if oldTask != "" && shared == nil {
 		var dropErr error
 		dropCtx, dropActivity, dropErr = h.beginDropCP(ctx, oldTask)
-		if errors.Is(dropErr, compose_v2.ErrTaskBusy) {
-			_ = sse.Reject(http.StatusConflict, "busy", "an operation on the previous task is in progress")
+		if dropErr != nil {
+			if errors.Is(dropErr, compose_v2.ErrTaskBusy) {
+				_ = sse.Reject(http.StatusConflict, "busy", "an operation on the previous task is in progress")
+			} else {
+				_ = sse.Reject(http.StatusServiceUnavailable, "agent_error", replacementCleanupError)
+			}
 			return
 		}
-		staleMayBeResumable = dropErr != nil
 		if dropActivity != nil {
 			defer dropActivity.Release()
 		}
@@ -571,7 +574,12 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		activity.FinishAbandon()
 	} else if dropActivity != nil {
 		replacing = true
-		staleMayBeResumable = h.deleteCP(dropCtx, stale.sess.RunID) != nil
+		if err := h.deleteCP(dropCtx, oldTask); err != nil {
+			// 前置清档失败时由 defer 恢复原续跑入口，等待存储恢复。
+			replacing = false
+			_ = sse.Reject(http.StatusServiceUnavailable, "agent_error", replacementCleanupError)
+			return
+		}
 		dropActivity.Release()
 	}
 	started = true
@@ -617,11 +625,7 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		// 内层任务也可能返回 busy，父图此时可能已给本次新任务写档。
 		if shared == nil {
 			h.dropCP(ctx, sess.RunID)
-			if staleMayBeResumable {
-				h.restoreEntry(key, stale)
-			} else {
-				h.removeEntry(key)
-			}
+			h.removeEntry(key)
 		} else if !h.finishSession(ctx, sse, key) {
 			return
 		}
@@ -1428,7 +1432,7 @@ func (h *handler) deleteCP(ctx context.Context, sid string) error {
 	// detached ctx——cp 清理不受 request ctx 取消影响（client 断开时仍要清孤儿 cp；honor-ctx
 	// 的 backend 如 PG/Redis 尤其需要，否则 ctx 取消让 DeleteSubtree 失败反而漏清）。对齐
 	// a2a executor 的 context.WithoutCancel。另加上限：后端挂住时 handler 不一直卡着（同引擎出口的宽限期）。
-	// best-effort：失败不阻断主流程（cp 泄漏优于崩）。
+	// 调用方根据操作是否以清档为前置条件处理返回的错误。
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropCPTimeout)
 	defer cancel()
 	_, err := h.cp.DeleteSubtree(dctx, sid, "")

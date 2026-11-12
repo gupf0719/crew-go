@@ -530,8 +530,9 @@ func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, arg
 			Reason: ApprovalInterruptReason,
 			// 指向这次审批卡住的那个工具调用，给调用方 / 前端定位用：InterruptID 是哈希，反查不出是哪一个调用。
 			// 框架自己不读它（放弃时按会话历史补结果，见 closeUnansweredToolCallsOnAbort）。
-			ToolCallID: tc.ID,
-			ToolName:   name,
+			ToolCallID:         tc.ID,
+			ToolCallInstanceID: toolBatchFrom(ctx).callInstanceID(compose_v2.GetCurrentToolCallIndex(ctx)),
+			ToolName:           name,
 		},
 	}}
 }

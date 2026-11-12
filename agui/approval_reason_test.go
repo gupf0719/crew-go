@@ -48,7 +48,12 @@ func TestHandler_MergedApprovals_EachKeepsItsReason(t *testing.T) {
 	}, agui.WithCheckpointer(compose_v2.NewInMemoryCheckpointer()))
 	events := parseSSE(postAGUI(h, `{"threadId":"t1","runId":"r1","messages":[{"role":"user","content":"退款并通知"}]}`).Body.String())
 	var its []map[string]any
+	calls := map[string]string{}
 	for _, ev := range events {
+		if ev["type"] == "TOOL_CALL_START" {
+			name, _ := ev["toolCallName"].(string)
+			calls[name], _ = ev["toolCallId"].(string)
+		}
 		if ev["type"] != "RUN_FINISHED" {
 			continue
 		}
@@ -62,9 +67,9 @@ func TestHandler_MergedApprovals_EachKeepsItsReason(t *testing.T) {
 	if len(its) != 2 {
 		t.Fatalf("应有两条审批中断，实际 %d 条（事件 %v）", len(its), eventTypes(events))
 	}
-	for i, wantCall := range []string{"c1", "c2"} {
+	for i, name := range []string{"refund", "notify"} {
 		m := its[i]
-		if m["reason"] != "tool_call" || m["toolCallId"] != wantCall {
+		if wantCall := calls[name]; wantCall == "" || m["reason"] != "tool_call" || m["toolCallId"] != wantCall {
 			t.Errorf("第 %d 条应是 reason=tool_call、toolCallId=%s，实际 reason=%v toolCallId=%v", i+1, wantCall, m["reason"], m["toolCallId"])
 		}
 		schema, _ := m["responseSchema"].(map[string]any)

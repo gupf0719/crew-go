@@ -658,7 +658,7 @@ func (m *MyMem0) Put(ctx context.Context, ns store.Namespace, key string, value 
 }
 ```
 
-agent_v2 调用别的 agent 的每一处都自动 push `WithSubAgentStoreScope(ctx, true)`（详 `store.md` §10.5 #4 producer/consumer 协议节）。**框架自己不读这个 flag**——它曾经守在 `commitFinal` 的 `store.Put` 前面，那道闸让成员的 `WithStoreMemory` 完全失效，已删。**push 点收敛在 4 处**——`runMember`（**6 个**编排调自己的成员，不含 Handoff）/ `runDecisionAgent`（分类器 / 评估器 / 反馈教练）/ `runNestedCall`（嵌套调用的执行器：`RunSubAgent` + `AgentAsTool` + SkillTool fork）/ Handoff 铸造。
+agent_v2 调用别的 agent 时自动设置 `WithSubAgentStoreScope(ctx, true)`（详 `store.md` §10.5 #4）。`WithStoreMemory` 按写入者选择 namespace，MicroCompact 的转存去重区分顶层与成员。**push 点收敛在 4 处**——`runMember`（**6 个**编排调自己的成员，不含 Handoff）/ `runDecisionAgent`（分类器 / 评估器 / 反馈教练）/ `runNestedCall`（嵌套调用的执行器：`RunSubAgent` + `AgentAsTool` + SkillTool fork）/ Handoff 铸造。
 
 **业务 store.Search 看父对话历史**（`sess.RootSession()` + `HistoryFor(...)` 范式）：
 

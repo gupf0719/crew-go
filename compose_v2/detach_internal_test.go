@@ -23,7 +23,7 @@ var executionCtxKeys = []any{
 	graphNSKey{}, nodeIDKey{}, nodeVisitKey{}, nodeInstanceIDKey{}, nodeInterruptCounterKey{},
 	checkpointingDisabledKey{},
 	taskCommitBarrierKey{}, taskCommitContextKey{}, replayedResumeAnswersKey{},
-	toolCallIdxKey{}, currentToolCallIDKey{}, inToolCallKey{}, withinNodeScopeKey{},
+	toolCallIdxKey{}, currentToolCallIDKey{}, toolCallInstanceKey{}, inToolCallKey{}, withinNodeScopeKey{},
 	nodeStateAccessorKey{}, subCallCounterKey{}, subCallScopeKey{}, abnormalNodeExitKey{},
 	componentKindKey{}, eventSinkKey{}, sendSinkKey{}, toolCategoryLookupKey{}, outerRerunGensKey{}, outerRegensKey{},
 	threadIDKey{}, softCancelCtxKey{}, detachedKey{}, detachedFromKey{}, runAliveKey{}, signalScopeKey{}, taskRecipientKeyCtxKey{}, hookCallKey{}, exitGraceKey{}, streamRecordKey{}, runningSlotKey{}, checkpointTaskLeaseKey{},

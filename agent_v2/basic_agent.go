@@ -20,6 +20,7 @@ import (
 	"crew-go/compose_v2"
 	"crew-go/hook"
 	"crew-go/internal/panicerr"
+	"crew-go/internal/streamdelta"
 	"crew-go/model"
 	specModel "crew-go/modules/model"
 	"crew-go/schema"
@@ -1383,9 +1384,10 @@ func historyToolKey(m *schema.Message, id string) historyToolCallKey {
 }
 
 type historyToolPair struct {
-	id         string
+	call       schema.ToolCall
 	declaredAt int
 	resultAt   int
+	resultPart int
 	result     *schema.Message
 }
 
@@ -1416,11 +1418,12 @@ func pairToolResults(msgs []*schema.Message) []historyToolPair {
 			continue
 		}
 		if m.Role == schema.RoleTool {
-			for _, piece := range splitToolResultBlocks(m) {
+			for part, piece := range splitToolResultBlocks(m) {
 				key := historyToolKey(piece, schema.GetToolResultID(piece))
 				if queue := waiting[key]; len(queue) > 0 {
 					pairs[queue[0]].result = piece
 					pairs[queue[0]].resultAt = i
+					pairs[queue[0]].resultPart = part
 					waiting[key] = queue[1:]
 				}
 			}
@@ -1429,7 +1432,7 @@ func pairToolResults(msgs []*schema.Message) []historyToolPair {
 		for _, tc := range schema.GetToolCalls(m) {
 			key := historyToolKey(m, tc.ID)
 			waiting[key] = append(waiting[key], len(pairs))
-			pairs = append(pairs, historyToolPair{id: tc.ID, declaredAt: i})
+			pairs = append(pairs, historyToolPair{call: tc, declaredAt: i})
 		}
 	}
 	return pairs
@@ -1471,7 +1474,7 @@ func danglingToolCalls(msgs []*schema.Message) []unansweredHistoryCall {
 	var out []unansweredHistoryCall
 	for _, p := range pairToolResults(msgs) {
 		if p.result == nil {
-			out = append(out, unansweredHistoryCall{ID: p.id, declaration: msgs[p.declaredAt]})
+			out = append(out, unansweredHistoryCall{ID: p.call.ID, declaration: msgs[p.declaredAt]})
 		}
 	}
 	return out
@@ -1568,8 +1571,8 @@ func dropDanglingToolCalls(msgs []*schema.Message) []*schema.Message {
 				continue
 			}
 			// 这个 id 的结果用完了（或压根没有）→ 补占位，保证这一块自洽
-			placeholder := schema.ToolResultMessage(p.id, unfinishedToolResultText)
-			key := historyToolKey(m, p.id)
+			placeholder := schema.ToolResultMessage(p.call.ID, unfinishedToolResultText)
+			key := historyToolKey(m, p.call.ID)
 			if key.task != "" {
 				placeholder.Annotations = map[string]any{HistoryTaskAnnotation: key.task, HistoryAgentAnnotation: key.agent}
 			}
@@ -3819,6 +3822,8 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 		// 调用期间做出的决定已经收全。记账里记的也是这一份原始的：这一批没处理完就停下、续跑命中时钩子
 		// 照样 fire、按同一套规则重判；处理完之后定下的不再交给钩子（见 fixedToolResults）。
 		runCall := func(callCtx context.Context, tc schema.ToolCall, idx int) outcome {
+			batch := toolBatchFrom(ctx)
+			callCtx = compose_v2.WithToolCallInstanceID(callCtx, tc.ID, batch.callInstanceID(idx))
 			var oc outcome
 			sigs, _ := compose_v2.CaptureSignals(callCtx, func(c context.Context) error {
 				oc = runOne(c, tc, idx)
@@ -4107,11 +4112,7 @@ func streamOrGenerate(ctx context.Context, llm model.ChatModel, in []*schema.Mes
 		finalReasoning strings.Builder // thinking 模型流式 reasoning_content 聚合（ISSUE-89）
 		finalRefusal   strings.Builder // 拒答增量（openai 客户端逐片段交出 delta.refusal）
 		finalRole      schema.MessageRole
-		// tool_call ContentBlocks 增量聚合
-		// OpenAI 流式 tool_call 是 incremental——每 chunk delta 含 partial JSON arguments，
-		// 按 tool_call.Id 配对累加（按 id concat 增量拼接）。
-		toolCallByID = make(map[string]*schema.ContentBlock)
-		toolCallIDs  []string // 保插入顺序避免 map 迭代乱序
+		toolCalls      streamedToolCalls
 		// 业务 chunk 的 Annotations 也要 merge 到最终 message——
 		// 业务把信号写在 annotation 里时（RoutingAgent 分类器的 route_target、自定义 key）
 		// 上层编排能看到。merge 策略 last-write-wins 让最后一 chunk
@@ -4207,52 +4208,15 @@ func streamOrGenerate(ctx context.Context, llm model.ChatModel, in []*schema.Mes
 		// 注释解释。注：framework 自管 keys（run_id）会在 final 末段 stamp，业务 keys
 		// （route_target / 自定义）由此处 merge 保留。
 		for k, v := range chunk.Annotations {
+			if k == streamdelta.ToolCallIndices {
+				continue // 索引只描述当前片段中的位置。
+			}
 			if mergedAnnotations == nil {
 				mergedAnnotations = make(map[string]any)
 			}
 			mergedAnnotations[k] = v
 		}
-		// 增量聚合 tool_call ContentBlocks（按 ID 配对累加 args）
-		//
-		// empty tool_call ID 时按出现顺序生成
-		// 隐式 key 防止 N 个不同 tool_call 串台合并成 1 个 args 乱码。OpenAI
-		// SDK spec 要求首 chunk 必带 id（model/openai/client.go indexMap 已兜底），
-		// 但第三方 SDK 直接产 schema.Message stream 时若不回填 id 会触发本路径。
-		//
-		// 协议（业务接入新 SDK 必读）：
-		//   - 首选：producer 保证 tool_call.Id 非空（OpenAI delta 模式首 chunk 必填）
-		//   - 兜底：empty id chunks 按"位置"作 key（无法跨 chunk 配对，需 producer
-		//     单 chunk 内自包含全 args）
-		for _, cb := range chunk.ContentBlocks {
-			if cb == nil || cb.Toolcall == nil {
-				continue
-			}
-			id := cb.Toolcall.Id
-			if id == "" {
-				// 防御 fallback：按当前 toolCallIDs 长度作隐式位置 key
-				// 注：此路径下 chunk 间无法配对累加 args——producer 必须单 chunk 内自包含
-				id = fmt.Sprintf("__pos_%d__", len(toolCallIDs))
-			}
-			if existing, ok := toolCallByID[id]; ok {
-				// 增量合并：args 拼接（OpenAI delta 模式），name 取最新非空
-				if cb.Toolcall.Name != "" {
-					existing.Toolcall.Name = cb.Toolcall.Name
-				}
-				existing.Toolcall.Arguments += cb.Toolcall.Arguments
-			} else {
-				// 首次见此 ID——深拷贝避免后续 mutation 串到 chunk
-				cloned := &schema.ContentBlock{
-					Type: cb.Type,
-					Toolcall: &schema.ToolcallContentBlock{
-						Id:        cb.Toolcall.Id,
-						Name:      cb.Toolcall.Name,
-						Arguments: cb.Toolcall.Arguments,
-					},
-				}
-				toolCallByID[id] = cloned
-				toolCallIDs = append(toolCallIDs, id)
-			}
-		}
+		toolCalls.add(chunk)
 		// 投递 chunk 给前端实时渲染
 		if sink != nil && chunk.Content != "" {
 			sink.Send(compose_v2.Event{
@@ -4268,12 +4232,10 @@ func streamOrGenerate(ctx context.Context, llm model.ChatModel, in []*schema.Mes
 	}
 
 	// 只有一个片段时它就是整条消息，整条采用。增量拼接是给多个片段用的：只拼内容、推理、拒答、工具调用、
-	// 标注与用量，其余字段（消息 ID、非工具调用的内容块、结束原因……）拼不了就丢，同一个 ID
-	// 的两个工具调用还会被并成一个。不支持流式的候选经 fallback 包成一个片段交过来时正是这种情况，
-	// 走拼接的话拿到的跟直接调 Generate 不一样（实测两个 ID 都是 call_0 的工具调用并成了一个、
-	// 参数首尾相接）。
+	// 标注与用量。保留单片段的消息 ID、非工具内容块和结束原因，使 fallback 包装的 Generate 答复完整往返。
 	if chunkCount == 1 {
 		out := withRunID(onlyChunk, runID)
+		delete(out.Annotations, streamdelta.ToolCallIndices)
 		if out.Role == "" {
 			out.Role = schema.RoleAssistant
 		}
@@ -4287,10 +4249,7 @@ func streamOrGenerate(ctx context.Context, llm model.ChatModel, in []*schema.Mes
 		Content:          finalContent.String(),
 		ReasoningContent: finalReasoning.String(), // thinking 模型多轮回传需要（ISSUE-89）
 		Refusal:          finalRefusal.String(),
-	}
-	// 按插入顺序拼 ContentBlocks（保 LLM 看到的 tool_call 列表顺序确定）
-	for _, id := range toolCallIDs {
-		out.ContentBlocks = append(out.ContentBlocks, toolCallByID[id])
+		ContentBlocks:    toolCalls.blocks,
 	}
 	// 给最终消息打 run_id annotation——hook OnModelEnd 能取到，前端按 run_id 区分流批
 	if out.Annotations == nil {

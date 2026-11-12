@@ -42,16 +42,17 @@ func (m sharedApprovalModel) WithTools([]*schema.ToolInfo) (model.ChatModel, err
 	return m, nil
 }
 
-func sharedApprovalAgent(history agent_v2.HistoryStore, executed func()) *agent_v2.BasicAgent {
+func sharedApprovalAgent(history agent_v2.HistoryStore, executed func(), opts ...agent_v2.Option) *agent_v2.BasicAgent {
 	tools := tool.NewToolkit()
 	tools.Register(tool.NewFuncTool("transfer", "转账", map[string]any{"type": "object"},
 		func(context.Context, map[string]any) (*tool.Result, error) {
 			executed()
 			return tool.Success("已转账"), nil
 		}))
-	return agent_v2.NewBasicAgent(agent_v2.WithName("shared-teller"), agent_v2.WithModel(sharedApprovalModel{}),
+	defaults := []agent_v2.Option{agent_v2.WithName("shared-teller"), agent_v2.WithModel(sharedApprovalModel{}),
 		agent_v2.WithToolkit(tools), agent_v2.WithApprovalMode(agent_v2.ApprovalAsk),
-		agent_v2.WithHistory(history, "tenant"))
+		agent_v2.WithHistory(history, "tenant")}
+	return agent_v2.NewBasicAgent(append(defaults, opts...)...)
 }
 
 type pauseSharedResume struct {

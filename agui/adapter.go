@@ -140,8 +140,7 @@ func newSSEAdapter(w *SSEWriter, runID string, input []AGUIMessage) *sseAdapter 
 }
 
 // recordLocked 记下这个 run 发出的一条消息。文本消息与工具结果按 id 认（同 id 已记过、没作废时返回已有的那条——流式片段
-// 接在同一条后面）；工具调用每次发出单独记一条：provider 会复用 tool_call ID，它们出自不同的模型调用、各自作废（快照里
-// 同一个 id 只重述一份，见 voidLocked）。调用方须持 a.mu。
+// 接在同一条后面）。工具调用按实例记录，随产出它的模型调用撤回。调用方须持 a.mu。
 func (a *sseAdapter) recordLocked(m *emittedMessage) *emittedMessage {
 	if !m.isToolCall {
 		if old, ok := a.byID[m.id]; ok && !old.voided {
@@ -157,6 +156,13 @@ func (a *sseAdapter) recordLocked(m *emittedMessage) *emittedMessage {
 func producerOf(extra map[string]any) string {
 	id, _ := extra[agent_v2.ToolModelRunIDExtraKey].(string)
 	return id
+}
+
+func wireToolCallID(extra map[string]any, callID string) (string, bool) {
+	if id, _ := extra[agent_v2.ToolCallInstanceIDExtraKey].(string); id != "" {
+		return id, true
+	}
+	return callID, false
 }
 
 // voidLocked 撤回这个 run 里一次模型调用（run_id）发出的消息——它的文本，连同它产出的工具调用与这些调用的结果：发
@@ -263,8 +269,8 @@ func (a *sseAdapter) snapshotLocked() { a.snapshotPending = true }
 // writeLocked 往外写一个事件。攒着的快照由各入口在改状态之前发（见 flushSnapshotLocked 的调用处），这里不发：入口多是先把
 // 要发的消息记进状态再写事件，在这里发的话快照里已经有这个事件，增量又发一遍（审计实测前端出现 "FINALFINAL"、工具参数
 // 拼成两份）。调用方须持 a.mu。
-func (a *sseAdapter) writeLocked(ev Event) {
-	_ = a.w.WriteEvent(ev)
+func (a *sseAdapter) writeLocked(ev Event) error {
+	return a.w.WriteEvent(ev)
 }
 
 // flushSnapshotLocked 发攒着的 MESSAGES_SNAPSHOT：请求带来的消息原样加上这个 run 发出、没作废的消息。请求没带消息时不发——
@@ -279,7 +285,7 @@ func (a *sseAdapter) flushSnapshotLocked() {
 	}
 	msgs := make([]json.RawMessage, 0, len(a.input)+len(a.emitted))
 	msgs = append(msgs, a.input...)
-	// 同一个 tool_call ID 只重述一份：官方客户端的 TOOL_CALL_START 是幂等的，几次复用同一个 ID 的调用在它手上是一条消息
+	// 按线上 ID 重述工具调用。自研 Agent 重复发相同 ID 时客户端会合并为一条。
 	calls := map[string]bool{}
 	for _, e := range a.emitted {
 		if e.voided || (e.isToolCall && calls[e.id]) {
@@ -346,39 +352,53 @@ func (a *sseAdapter) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, output *
 
 // OnToolStart 把一次工具调用映射为 ToolCallStart + Args + End。crew-go 的工具参数
 // 非流式（OnToolStart 一次拿到完整 ArgumentsJSON），故 Args 一次性发完整参数。
-// in.CallId 是 tool_call↔tool_result 配对锚点，直接当 AG-UI toolCallId。
+// 框架工具调用和审批共享实例 ID。自研 Agent 可通过 CallId 提供自己的线上标识。
 //
 // 不在此收尾流式 message：每轮 message 已由 OnModelEnd 按自己的 run_id 收尾（modelNode
 // 先于 toolsNode）；并发编排下 OnToolStart 无 run_id 上下文，若在此 close 会误伤其它
 // sub-agent 在途的 message。
 func (a *sseAdapter) OnToolStart(ctx context.Context, _ *hook.AgentInfo, in *schema.ToolInput) (context.Context, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.flushSnapshotLocked() // 在这次要改的状态记进去之前：快照里不能已经有这个入口接着要发的事件
-	// 续跑时同一批调用的再次派发（框架标 agent_v2.ToolRedispatchedExtraKey）：上一个 run 已经发过它们的 START / ARGS / END，
-	// 再发就是重开同一个调用、参数追加，前端的参数文本变成两份。结果照常在执行的那一次发（见 OnToolEnd）。按 toolCallId
-	// 记「发过没有」不行：provider 在不同轮次复用同一个 ID 时，后一个调用的 START 会被吞掉、结果挂到前一个头上（审计实测）。
-	if again, _ := in.Extra[agent_v2.ToolRedispatchedExtraKey].(bool); again {
+	callID, hasInstance := wireToolCallID(in.Extra, in.CallId)
+	// 无实例标识的旧档沿用批次重派标记。框架实例按已写出的事件去重。
+	if again, _ := in.Extra[agent_v2.ToolRedispatchedExtraKey].(bool); again && !hasInstance {
 		return ctx, nil
 	}
-	// provider 跨轮复用 tool_call ID 时：同一个 ID 已经在请求带来的消息里（以前的 run 发出的，或外来历史里装在别的 id 的
-	// 消息下——带 parentMessageId 的），客户端把这次的调用并进它手上那条（官方客户端的 TOOL_CALL_START 在所有消息的工具
-	// 调用里找同一个 id），快照照原样重述那条、这里不另记；曾经只认消息 id 等于 toolCallId 的那种，外来历史下快照里同一个
-	// 工具调用出现两份。这个 run 里复用的每次单独记一条（各自作废），快照里同一个 ID 只重述一份
-	if !a.inputIDs[in.CallId] && !a.inputCallIDs[in.CallId] {
-		a.recordLocked(&emittedMessage{id: in.CallId, producer: producerOf(in.Extra), role: "assistant", isToolCall: true,
-			toolCallID: in.CallId, toolName: in.Name, toolArgs: in.ArgumentsJSON})
+	// 后续开始钩子可能在整批派发前挂起。工具钩子自己的存档记录已经写出的调用。
+	const startedStep = "agui.tool_call_started"
+	if sent, ok := compose_v2.GetStepResult[string](ctx, startedStep); ok && sent == callID {
+		return ctx, nil
 	}
-	a.writeLocked(NewToolCallStart(in.CallId, in.Name))
-	if in.ArgumentsJSON != "" {
-		a.writeLocked(NewToolCallArgs(in.CallId, in.ArgumentsJSON))
+	if !a.emitToolCall(in, callID) {
+		return ctx, nil // SSE 连接失败时由请求取消收尾。
 	}
-	a.writeLocked(NewToolCallEnd(in.CallId))
-	return ctx, nil
+	// 模型文本流由产出它的模型节点登记。
+	return ctx, compose_v2.SaveStepResult(ctx, startedStep, callID, compose_v2.WithStreams(nil))
 }
 
-// OnToolEnd 把工具执行结果映射为 ToolCallResult。out.CallId 与 OnToolStart 的
-// in.CallId 配对。失败时 content 取错误码（前端看得到工具失败）。
+func (a *sseAdapter) emitToolCall(in *schema.ToolInput, callID string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.flushSnapshotLocked() // 在记录本次调用之前发出已攒的快照。
+	if err := a.writeLocked(NewToolCallStart(callID, in.Name)); err != nil {
+		return false
+	}
+	if in.ArgumentsJSON != "" {
+		if err := a.writeLocked(NewToolCallArgs(callID, in.ArgumentsJSON)); err != nil {
+			return false
+		}
+	}
+	if err := a.writeLocked(NewToolCallEnd(callID)); err != nil {
+		return false
+	}
+	// 请求里已有该线上 ID 时，快照沿用请求原文中的消息。
+	if !a.inputIDs[callID] && !a.inputCallIDs[callID] {
+		a.recordLocked(&emittedMessage{id: callID, producer: producerOf(in.Extra), role: "assistant", isToolCall: true,
+			toolCallID: callID, toolName: in.Name, toolArgs: in.ArgumentsJSON})
+	}
+	return true
+}
+
+// OnToolEnd 把工具执行结果映射为 ToolCallResult，沿用 OnToolStart 的线上 ID。失败时正文取错误码。
 //
 // 这一批 tool_call 没整体成功时（有调用挂起等人回答、或者硬失败）框架照样给已经有结局的调用触发 OnToolEnd，带
 // agent_v2.ToolBatchFailedExtraKey：那个结果不进历史，续跑时这个调用从工具账重放或重新执行，那一次才发——这里发的话
@@ -415,16 +435,14 @@ func (a *sseAdapter) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, out *sche
 	// （「Re-streaming a message the consumer already has appends to it」）。
 	// 这里曾无条件用 a.runID，于是一个 run 里 N 个工具结果全撞在一起。
 	//
-	// 用 `<runID>/<callID>` 派生：runID 每个 run 唯一（见 handler 的 wireRunID），
-	// callID 在一个 run 内唯一，合起来即 thread 内唯一，且**可读、可由两端各自推导**。
-	// provider 在一个 run 里复用 tool_call ID 时 `<runID>/<callID>` 会撞：加序号保 thread 内唯一。撞了的话消费方把后一条
-	// 当成同一条消息（规范：重发已有的消息是追加），快照里也会把两次结果拼成一条（审计实测 "RaRb"）
-	resultID := a.runID + "/" + out.CallId
+	// 结果消息 ID 由本次 AG-UI runId 与调用 ID 派生。自研 Agent 复用调用 ID 时用后缀区分结果消息。
+	callID, _ := wireToolCallID(out.Extra, out.CallId)
+	resultID := a.runID + "/" + callID
 	for n := 2; a.byID[resultID] != nil || a.inputIDs[resultID]; n++ {
-		resultID = a.runID + "/" + out.CallId + "#" + strconv.Itoa(n)
+		resultID = a.runID + "/" + callID + "#" + strconv.Itoa(n)
 	}
-	a.recordLocked(&emittedMessage{id: resultID, producer: producerOf(out.Extra), role: "tool", toolCallID: out.CallId}).content.WriteString(content)
-	a.writeLocked(NewToolCallResult(resultID, out.CallId, content))
+	a.recordLocked(&emittedMessage{id: resultID, producer: producerOf(out.Extra), role: "tool", toolCallID: callID}).content.WriteString(content)
+	a.writeLocked(NewToolCallResult(resultID, callID, content))
 	return ctx, nil
 }
 

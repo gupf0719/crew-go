@@ -24,6 +24,7 @@ type crModel struct {
 	calls   int
 	tool    string
 	pathArg bool
+	reuseID bool
 	inputs  [][]*schema.Message
 	orphans []string
 }
@@ -52,7 +53,11 @@ func (m *crModel) Generate(_ context.Context, msgs []*schema.Message, _ ...model
 	if m.pathArg {
 		args = fmt.Sprintf(`{"path":"f%02d"}`, m.calls)
 	}
-	return schema.AssistantToolCallMessage([]schema.ToolCall{{ID: fmt.Sprintf("c%d", m.calls), Type: "function",
+	id := fmt.Sprintf("c%d", m.calls)
+	if m.reuseID {
+		id = "shared"
+	}
+	return schema.AssistantToolCallMessage([]schema.ToolCall{{ID: id, Type: "function",
 		Function: schema.FunctionCall{Name: m.tool, Arguments: args}}}), nil
 }
 func (m *crModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
@@ -135,6 +140,42 @@ func TestAutoCompact_ReinjectSkipsWhatMicroCompactClears(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("fixture 没搭对：一次重注入都没发生")
+	}
+}
+
+func TestAutoCompact_ReinjectKeepsRecentReadsWhenIDsRepeat(t *testing.T) {
+	const keep = 3
+	m := &crModel{rounds: 20, tool: "Read", pathArg: true, reuseID: true}
+	cfg := smallWindow(&countingSummarizer{})
+	cfg.ReinjectRecentFiles = true
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("coder"), agent_v2.WithModel(m),
+		agent_v2.WithToolkit(readToolkit(func(path string) string { return "BODY-" + path + "\n" + strings.Repeat("x", 12000) })),
+		agent_v2.WithMaxRounds(25), agent_v2.WithAutoCompact(cfg),
+		agent_v2.WithMicroCompact(&agent_v2.MicroCompactConfig{Enabled: true, KeepRecent: keep}))
+	if _, err := ag.Run(t.Context(), agent_v2.NewRunSession(), schema.UserMessage("检查文件")); err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for i, input := range m.inputs {
+		if i <= keep {
+			continue // 先等到已有 Read 结果需要清理。
+		}
+		for _, msg := range input {
+			if !strings.HasPrefix(msg.Content, "# Recently Read Files") {
+				continue
+			}
+			for _, match := range crPathRe.FindAllStringSubmatch(msg.Content, -1) {
+				checked++
+				var n int
+				if _, err := fmt.Sscanf(match[1], "f%02d", &n); err != nil || n < i+1-keep ||
+					!strings.Contains(msg.Content, "## "+match[1]+"\n```\nBODY-"+match[1]+"\n") {
+					t.Fatalf("第 %d 轮应重注入近期文件及其自己的正文，实际 %.300s", i+1, msg.Content)
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("重复 ID 的近期 Read 应至少触发一次文件重注入")
 	}
 }
 

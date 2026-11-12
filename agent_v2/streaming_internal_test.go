@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"crew-go/internal/streamdelta"
 	"crew-go/model"
 	"crew-go/schema"
 )
@@ -12,7 +13,7 @@ import (
 // （后者需要 toolkit 等 setup，dot test 太多 noise）
 
 // TestRepro_R7_Bug5_EmptyToolCallIDDoesNotMerge_Internal 验证 audit Round 7 Bug 5：
-// streamOrGenerate 用 cb.Toolcall.Id 直接作 toolCallByID map key，empty ID 时
+// streamOrGenerate 直接按 cb.Toolcall.Id 聚合时，空 ID 会导致
 // 多个不同 tool_call 串台合并成 1 个 args 乱码。
 //
 // 内部测试：直接调 streamOrGenerate（agent_v2 包内私有函数）。
@@ -52,10 +53,29 @@ func TestRepro_R7_Bug5_EmptyToolCallIDDoesNotMerge_Internal(t *testing.T) {
 		for i, c := range calls {
 			argsList[i] = c.Function.Arguments
 		}
-		t.Fatalf("Bug 5 reproduced: 2 个 empty-ID tool_call 合并成 1 个\n"+
-			"期望 2 个独立 tool_call，实际 %d 个 (args=%v)\n"+
-			"修复方向：empty id chunk 用 fmt.Sprintf(\"__pos_%%d__\", len(toolCallIDs)) 隐式 key",
-			len(calls), argsList)
+		t.Fatalf("期望 2 个独立 tool_call，实际 %d 个 (args=%v)", len(calls), argsList)
+	}
+}
+
+func TestStreamOrGenerate_IndexArrivesAfterCallID(t *testing.T) {
+	chunk := func(id, name, args string) *schema.Message {
+		return schema.AssistantToolCallMessage([]schema.ToolCall{{ID: id, Function: schema.FunctionCall{Name: name, Arguments: args}}})
+	}
+	first := chunk("shared", "lookup", `{"q":`)
+	second := chunk("shared", "", `"value"`)
+	second.Annotations = map[string]any{streamdelta.ToolCallIndices: map[int]int{0: 0}}
+	third := chunk("", "", `}`)
+	third.Annotations = second.Annotations
+	out, err := streamOrGenerate(t.Context(), &incrModel{chunks: []*schema.Message{first, second, third}}, nil, "test", "run", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := schema.GetToolCalls(out)
+	if len(calls) != 1 || calls[0].ID != "shared" || calls[0].Function.Name != "lookup" || calls[0].Function.Arguments != `{"q":"value"}` {
+		t.Fatalf("后续出现的索引应续接已有调用，实际 %+v", calls)
+	}
+	if _, ok := out.Annotations[streamdelta.ToolCallIndices]; ok {
+		t.Fatal("增量索引不应进入最终模型消息")
 	}
 }
 

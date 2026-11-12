@@ -80,21 +80,28 @@ func TestSQLiteAGUISessions(t *testing.T) {
 func TestSQLiteAGUIApprovalSurvivesProcessExit(t *testing.T) {
 	dsn := (&url.URL{Scheme: "file", Path: filepath.Join(t.TempDir(), "agui-process.db"),
 		RawQuery: "_pragma=busy_timeout(5000)&_txlock=immediate"}).String()
-	run := func(step string) string {
+	run := func(step, callID string) string {
 		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAGUIApprovalProcessWorker$")
-		cmd.Env = append(os.Environ(), "CREW_TEST_AGUI_DSN="+dsn, "CREW_TEST_AGUI_STEP="+step)
+		cmd.Env = append(os.Environ(), "CREW_TEST_AGUI_DSN="+dsn, "CREW_TEST_AGUI_STEP="+step, "CREW_TEST_AGUI_CALL_ID="+callID)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("%s worker: %v\n%s", step, err, out)
 		}
 		return string(out)
 	}
-	if out := run("start"); !strings.Contains(out, "approval-persisted") || strings.Contains(out, "transfer-executed") {
-		t.Fatalf("start worker did not suspend before execution: %s", out)
+	started := run("start", "")
+	var callID string
+	for _, line := range strings.Split(started, "\n") {
+		if id, ok := strings.CutPrefix(line, "approval-persisted "); ok {
+			callID = id
+		}
 	}
-	if out := run("resume"); strings.Count(out, "transfer-executed") != 1 {
+	if callID == "" || strings.Contains(started, "transfer-executed") {
+		t.Fatalf("start worker did not suspend before execution: %s", started)
+	}
+	if out := run("resume", callID); strings.Count(out, "transfer-executed") != 1 {
 		t.Fatalf("replacement worker must execute the approved tool once: %s", out)
 	}
 }
@@ -113,8 +120,8 @@ func TestAGUIApprovalProcessWorker(t *testing.T) {
 	if err := history.Setup(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	h := sharedHandler(func(hook.Hooks) agent_v2.Agent {
-		return sharedApprovalAgent(history, func() { fmt.Println("transfer-executed") })
+	h := sharedHandler(func(hooks hook.Hooks) agent_v2.Agent {
+		return sharedApprovalAgent(history, func() { fmt.Println("transfer-executed") }, agent_v2.WithHooks(hooks))
 	}, st)
 	switch os.Getenv("CREW_TEST_AGUI_STEP") {
 	case "start":
@@ -123,15 +130,25 @@ func TestAGUIApprovalProcessWorker(t *testing.T) {
 		if !strings.Contains(r.Body.String(), `"type":"interrupt"`) {
 			t.Fatalf("start failed to reach tool approval: %s", r.Body)
 		}
-		fmt.Println("approval-persisted")
+		starts := aguiToolEventIDs(t, r.Body.String())[agui.EventTypeToolCallStart]
+		if len(starts) != 1 || starts[0] == "" || starts[0] == "transfer" {
+			t.Fatalf("start should expose one framework call ID: %v", starts)
+		}
+		fmt.Println("approval-persisted", starts[0])
 	case "resume":
+		callID := os.Getenv("CREW_TEST_AGUI_CALL_ID")
 		p := aguiPending(t, h, "tenant")
-		if len(p.Interrupts) != 1 || p.Interrupts[0].ToolCallID != "transfer" {
+		if callID == "" || len(p.Interrupts) != 1 || p.Interrupts[0].ToolCallID != callID {
 			t.Fatalf("tool approval was lost: %+v", p)
 		}
 		answer := aguiAnswer(p.Interrupts[0].ID, "resolved", true)
-		if r := aguiPost(t, h, "tenant", answer); !strings.Contains(r.Body.String(), `"type":"success"`) {
+		r := aguiPost(t, h, "tenant", answer)
+		if !strings.Contains(r.Body.String(), `"type":"success"`) {
 			t.Fatalf("resume failed: %s", r.Body)
+		}
+		calls := aguiToolEventIDs(t, r.Body.String())
+		if results := calls[agui.EventTypeToolCallResult]; len(calls[agui.EventTypeToolCallStart]) != 0 || len(results) != 1 || results[0] != callID {
+			t.Fatalf("resume should report one result for the original call: %v", calls)
 		}
 		if r := aguiPost(t, h, "tenant", answer); r.Code != http.StatusNotFound {
 			t.Fatalf("approval replayed after completion: %d %s", r.Code, r.Body)
@@ -139,6 +156,28 @@ func TestAGUIApprovalProcessWorker(t *testing.T) {
 	default:
 		t.Fatal("unknown worker step")
 	}
+}
+
+func aguiToolEventIDs(t *testing.T, body string) map[agui.EventType][]string {
+	t.Helper()
+	ids := make(map[agui.EventType][]string)
+	for _, line := range strings.Split(body, "\n") {
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		var event struct {
+			Type       agui.EventType `json:"type"`
+			ToolCallID string         `json:"toolCallId"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == agui.EventTypeToolCallStart || event.Type == agui.EventTypeToolCallResult {
+			ids[event.Type] = append(ids[event.Type], event.ToolCallID)
+		}
+	}
+	return ids
 }
 
 type viewModel struct {

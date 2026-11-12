@@ -32,8 +32,7 @@ import (
 //     不同了——算进来的话同一次调用每次重跑都成了一次新调用。
 //   - `Metadata`：模型响应的元数据（时间戳 / 用量 / 结束原因），描述的是那次响应怎么来的，
 //     不是这次调用的输入。
-//   - `run_id` 标注（compose_v2.RunIDAnnotationKey）：每次调模型都铸一个新的。把上游模型的
-//     产出原样交给嵌套调用时，内容一字不差也会被它弄得不同。
+//   - 模型答复的 `run_id` 和工具批次 ID：框架每次生成答复都会铸造新值，供事件关联使用。
 //
 // ⚠️ 其余标注都算输入。**业务往输入里放每次都变的东西（请求号、时间戳）时，这次调用每次重跑
 // 都是一次新调用**——要么别放，要么给调用一个 call key（[WithCallKey]）。
@@ -178,7 +177,7 @@ func (w digestWriter) block(b *schema.ContentBlock) {
 	}
 }
 
-// annotations 写入去掉 run_id（每次调模型都新铸）之后的整张标注表，**整张一起**按存档的
+// annotations 去掉框架每次调模型铸造的运行和工具批次 ID，再将标注表**整张一起**按存档的
 // JSON 往返归一化（见 digestValue）。
 //
 // 不逐键写：键里若有非法 UTF-8，JSON 往返会把它换成 U+FFFD——两个键换完之后相对顺序可能
@@ -188,7 +187,7 @@ func (w digestWriter) block(b *schema.ContentBlock) {
 func (w digestWriter) annotations(ann map[string]any) {
 	filtered := make(map[string]any, len(ann))
 	for k, v := range ann {
-		if k == compose_v2.RunIDAnnotationKey {
+		if k == compose_v2.RunIDAnnotationKey || k == toolCallBatchIDAnnotation {
 			continue
 		}
 		filtered[k] = v

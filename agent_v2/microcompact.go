@@ -2,10 +2,13 @@ package agent_v2
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
+	"reflect"
+	"slices"
 	"sync"
 	"time"
 
@@ -74,7 +77,7 @@ type MicroCompactConfig struct {
 	//   - 默认 NS **按 sid 派生**：store.NS("_micro_offload", sid)；无 sid 才回落裸
 	//     store.NS("_micro_offload")。业务可用 OffloadNS 覆盖。⚠️ 取回一律走
 	//     OffloadNamespace(ctx)，别直接用裸 cfg.OffloadNS（见下方 audit 注释）
-	//   - key = tool_use_id (按 schema.GetToolResultID 取)
+	//   - key 由存储的消息内容派生，读取时使用 MicroCompactOffloadKeyAnnotation
 	//   - value = 卸载那一刻的 *schema.Message (含 Content + ContentBlocks; 开了
 	//     ToolResultMaxBytes 时它已是截断版)
 	//   - store.Put 失败 → slog.Warn + 退化为纯占位符 (不阻断主链路)
@@ -105,7 +108,7 @@ type MicroCompactConfig struct {
 const MicroCompactOffloadedAnnotation = "microcompact_offloaded"
 
 // MicroCompactOffloadKeyAnnotation 存 offload store key. 业务读 placeholder message
-// Annotations 拿 key 后 store.Get(ctx, cfg.OffloadNamespace(ctx), key) 取回。
+// Annotations 拿不透明的 key 后 store.Get(ctx, cfg.OffloadNamespace(ctx), key) 取回。
 // ⚠️ **取回的不是 `*schema.Message`**：store 按值的 JSON 形状存（见 store.Item），每个后端读回都是
 // `map[string]any`，要消息就 json.Marshal 再 json.Unmarshal 进 schema.Message。
 // **用 cfg.OffloadNamespace(ctx) 拿 NS，别用裸 cfg.OffloadNS**——默认档 cfg.OffloadNS 空 ≠
@@ -167,10 +170,8 @@ const defaultMicroCompactPlaceholder = "[Old tool result content cleared by micr
 // 用 annotation 而非字符串匹配，保证用户自定义 Placeholder 时识别仍可靠。
 const MicroCompactClearedAnnotation = "microcompact_cleared"
 
-// microCompactToClear 是 MicroCompact 要清的那些 tool_result（按 tool_use_id）：白名单里的每个工具保留最近 KeepRecent
-// 个，更早的都清。纯计算——MicroCompactRun 按它清，AutoCompact 的文件重注入按它跳过（在原始消息流上挑文件时，
-// MicroCompact 会清掉的那些不再注回原文，见 autocompact.go）。同一个判据只有这一份。
-func microCompactToClear(messages []*schema.Message, cfg *MicroCompactConfig) map[string]bool {
+// microCompactToClear 按配对结果的位置选择可压缩消息，MicroCompact 和文件重注入共用判定。
+func microCompactToClear(messages []*schema.Message, cfg *MicroCompactConfig) map[int]bool {
 	keep := cfg.KeepRecent
 	if keep <= 0 {
 		keep = 5
@@ -184,26 +185,33 @@ func microCompactToClear(messages []*schema.Message, cfg *MicroCompactConfig) ma
 			whitelist[t] = true
 		}
 	}
-	// 收集白名单 tool 的 tool_use_id（按 tool name 分组，按出现顺序）
-	perToolIDs := map[string][]string{}
-	for _, m := range messages {
-		if m == nil {
+	recent := make(map[string]int, len(whitelist))
+	eligible := map[int]int{}
+	for _, pair := range slices.Backward(pairToolResults(messages)) {
+		name := pair.call.Function.Name
+		if !whitelist[name] {
 			continue
 		}
-		for _, tc := range schema.GetToolCalls(m) {
-			if whitelist[tc.Function.Name] {
-				perToolIDs[tc.Function.Name] = append(perToolIDs[tc.Function.Name], tc.ID)
-			}
+		if recent[name] < keep {
+			recent[name]++
+			continue
+		}
+		if pair.result != nil {
+			eligible[pair.resultAt]++
 		}
 	}
-	// 每个 tool 保留最近 keep 个
-	toClear := map[string]bool{}
-	for _, ids := range perToolIDs {
-		if len(ids) <= keep {
+	toClear := make(map[int]bool, len(eligible))
+	for i, count := range eligible {
+		m := messages[i]
+		// 合并结果共享正文和标注，全部结果块都符合时才压缩。
+		if count != len(toolResultIDs(m)) {
 			continue
 		}
-		for _, id := range ids[:len(ids)-keep] {
-			toClear[id] = true
+		cleared, _ := m.Annotations[MicroCompactClearedAnnotation].(bool)
+		offloaded, _ := m.Annotations[MicroCompactOffloadedAnnotation].(bool)
+		skillBody, _ := m.Annotations[SkillBodyAnnotation].(bool)
+		if !cleared && !offloaded && !skillBody {
+			toClear[i] = true
 		}
 	}
 	return toClear
@@ -218,10 +226,9 @@ func microCompactToClear(messages []*schema.Message, cfg *MicroCompactConfig) ma
 //   - 不在 CompactableTools 白名单的 tool 完全跳过
 //
 // 算法：
-//  1. 遍历 messages，收集白名单 tool 的所有 tool_use_id（按出现顺序按 tool name 分组）
-//  2. 对每个 tool name，保留最近 KeepRecent 个 id；早于第 N 个的对应 tool_result
-//     入"待清除"集合
-//  3. 重新构造消息切片：role=tool 且 tool_use_id 在待清除集合的，clone 后改 Content
+//  1. 按出现顺序配对工具声明与结果。
+//  2. 每个白名单工具保留最近 KeepRecent 次调用，按结果位置选择更早的配对结果。
+//  3. 复制选中的结果并替换正文，合并消息在所有结果块可压缩时整体替换。
 //
 // **HIGH-1 改动 (audit⁵)**: 加 ctx 参数对齐 AutoCompactRun / ReactiveCompactRun 签名,
 // 让 ctx 挂 EventSink (业务接 observability) 时 EmitCompactionEvent fire Before/After event.
@@ -233,10 +240,7 @@ func MicroCompactRun(ctx context.Context, messages []*schema.Message, cfg *Micro
 	}
 	// Sub-5d audit fix: 测 duration 让 After event 自带 DurationMs (OTel self-contained).
 	startNanos := time.Now().UnixNano()
-	// event fire 门:sink 在才构造 + 投递 event(取代已删的 cfg.EmitEvents 开关)。
-	// 经 BasicAgent graph 时 framework 恒 push sink 故恒发;直接调用本函数不经 graph
-	// 且无 sink 时连 event payload 都不构造(含下面 offload 时算 value_size 的
-	// json.Marshal——offload 的 store.Put 本身在门外恒执行,是压缩副作用不是观测)。
+	// 有 sink 才构造事件。转存独立执行，编码结果用于派生 key 和统计写入大小。
 	hasSink := hasEventSink(ctx)
 	// emit Before event. MicroCompact 不计 token, InputTokens=0.
 	// Trigger 字段空——MicroCompact 总跑无显式触发条件.
@@ -253,7 +257,7 @@ func MicroCompactRun(ctx context.Context, messages []*schema.Message, cfg *Micro
 	if placeholder == "" {
 		placeholder = defaultMicroCompactPlaceholder
 	}
-	// Step 1 + 2：挑出要清的 tool_use_id（见 microCompactToClear）
+	// 按配对结果的位置选择待压缩消息。
 	toClear := microCompactToClear(messages, cfg)
 	if len(toClear) == 0 {
 		// 无 tool_result 待清——后处理 noop, After event Dropped=0/Kept=len(messages)
@@ -272,124 +276,37 @@ func MicroCompactRun(ctx context.Context, messages []*schema.Message, cfg *Micro
 		return messages
 	}
 
-	// HIGH-2: offload 模式准备 — 先在 store ctx 取 store, 失败则降级为纯替占位符.
-	// 机制是"卸到 backend + 替占位符", backend 用 crew-go store.Store.
 	var offloadStore store.Store
-	// offload 写入与业务恢复共用 OffloadNamespace 单点（消除默认档 NS 派生 drift，audit MED）：
-	// cfg.OffloadNS 非空用它，否则按 ctx sid per-sid 隔离防跨 sess 撞 key（业务 deterministic
-	// callID 测试场景会撞），无 sid fallback 全局 NS（调试 / 不挂 cper 时仍 work）。
 	offloadNS := cfg.OffloadNamespace(ctx)
 	if cfg.OffloadEnabled {
 		offloadStore = store.FromContext(ctx)
-		if offloadStore == nil {
-			// 业务 opt-in OffloadEnabled 但忘了挂 store — slog.Warn 让业务可观测,
-			// 降级为纯替占位符 (不阻断主链路).
-			slog.WarnContext(ctx, "microcompact: OffloadEnabled=true but no store in ctx, falling back to placeholder-only",
-				"hint", "use store.WithContext(ctx, st) to inject store")
+		if isFrameworkNil(offloadStore) {
+			offloadStore = nil
+			slog.WarnContext(ctx, "microcompact: offload enabled without a store, falling back to placeholder-only")
 		}
 	}
 
-	// Step 3：替换对应 tool_result 的 Content（clone 不动原 message 指针）
-	out := make([]*schema.Message, len(messages))
+	out := slices.Clone(messages)
 	for i, m := range messages {
-		if m == nil {
+		if !toClear[i] {
 			continue
 		}
-		if m.Role == schema.RoleTool {
-			id := schema.GetToolResultID(m)
-			if toClear[id] {
-				// Bug Y：已带 cleared marker 的不重 clone（节省分配 +
-				// 避免 Annotations map 被反复重建覆盖其它 key）
-				if m.Annotations != nil {
-					if v, ok := m.Annotations[MicroCompactClearedAnnotation].(bool); ok && v {
-						out[i] = m
-						continue
-					}
-					// ⚠️ 这个短路**在 BasicAgent 图路径下永不命中**，别指望它做跨轮去重：
-					// 它读的是入参 message 上的 marker，而 marker 只设在 clone 上、
-					// clone 不写回 channel ⟹ 下一轮读出的原消息永远没有它。
-					// 跨轮去重走 offloadDedup（见文件末尾），本短路只在业务直接把带
-					// marker 的消息喂进来时起作用。
-					if v, ok := m.Annotations[MicroCompactOffloadedAnnotation].(bool); ok && v {
-						out[i] = m
-						continue
-					}
-				}
-				// **R17 audit MED-2 fix**：跨层 marker 一致防护——若 tool_result 带
-				// SkillBodyAnnotation marker（业务把 activate_skill 加进 CompactableTools
-				// 白名单时会命中），不能清内容否则跨层契约破裂：marker 残留 →
-				// AutoCompact groupContainsProtectedMarker 仍认为该组含 body 整组保留无意义
-				// 占位符 → LLM 看到 N 个 placeholder 但找不到真 body。
-				if m.Annotations != nil {
-					if v, ok := m.Annotations[SkillBodyAnnotation].(bool); ok && v {
-						out[i] = m
-						continue
-					}
-				}
-				// 产生时就转存过的（见 tool_spill.go）：全文已在 store 里，这里只清掉预览、留下取回方式——
-				// 再卸载一次就是把「转存说明」本身又存一份，模型得先读回说明才能拿到 id（两跳）。
-				if sid, ok := m.Annotations[ToolResultSpillAnnotation].(string); ok && sid != "" {
-					out[i] = cloneToolResultWithPlaceholder(m, fmt.Sprintf(
-						"[较早的工具输出已清理；全文仍可用 %s 取回，id=%q]", ReadToolOutputToolName, sid))
-					continue
-				}
-				// HIGH-2: offload path — store.Put 成功后用 offloaded 占位符 +
-				// MicroCompactOffloadedAnnotation marker; 失败 / 未启用 / 无 store →
-				// 走旧 cloneToolResultWithPlaceholder 路径 (向后行为兼容).
-				if offloadStore != nil && id != "" {
-					// **跨轮去重**：每轮重扫历史会把同一条旧 tool_result 反复挑出来，
-					// 而消息上的 marker 活不到下一轮（clone 不写回 channel）⟹ 不拦的话
-					// `store.Put` 次数随轮数平方增长。查+记一次完成，键带 NS（去重范围
-					// 必须等于 key 范围，见文件末尾 offloadDedup 那段）。
-					// 没挂集合时恒返 false ⟹ 退化成每轮都写 = 引入前行为。
-					if offloadDedupFrom(ctx).markOffloaded(offloadNS, id) {
-						// 本 Run 内已卸载过同一 (ns, key)——跳过远程写，仍走下面的
-						// 占位符替换（占位符是每轮都要重新产出的，它在 clone 上）
-						out[i] = cloneToolResultWithOffloadRef(m, id, microCompactPreviewBytes, cfg.OffloadReadToolName)
-						continue
-					}
-					// Phase 2 Sub-1 audit HIGH-1 fix: 跨 framework store callsite fire 一致性 —
-					// 跟 basic_agent.go preamble Search + commitFinal Put 一样对 store.Put 调用
-					// fire StoreOperationPut event. 业务订阅 observability 时拿到所有 framework
-					// store 操作流量 (microcompact offload 是热路径每次 compact 都触发).
-					// sink-gated 一并控制 (接了 observability 就全收 micro 相关 event 含 store.put).
-					putStart := time.Now()
-					perr := offloadStore.Put(ctx, offloadNS, id, m)
-					if hasSink {
-						// value_size_bytes 用 json.Marshal 跟业务后端实际字节量级一致 (audit MED-2)
-						valueSize := 0
-						if m != nil {
-							if data, jerr := json.Marshal(m); jerr == nil {
-								valueSize = len(data)
-							} else {
-								valueSize = len(m.Content)
-							}
-						}
-						putAction := &StorePutAction{
-							NS:             offloadNS.String(),
-							Key:            id,
-							ValueSizeBytes: valueSize,
-							DurationMs:     time.Since(putStart).Milliseconds(),
-							Ok:             perr == nil,
-						}
-						if perr != nil {
-							putAction.Err = perr.Error()
-						}
-						EmitStoreEvent(ctx, &StoreAction{Type: StoreOperationPut, Put: putAction})
-					}
-					if perr == nil {
-						out[i] = cloneToolResultWithOffloadRef(m, id, microCompactPreviewBytes, cfg.OffloadReadToolName)
-						continue
-					} else {
-						slog.WarnContext(ctx, "microcompact: store.Put failed, falling back to placeholder-only",
-							"key", id, "ns", offloadNS.String(), "err", perr)
-					}
-				}
-				out[i] = cloneToolResultWithPlaceholder(m, placeholder)
+		// 产生时已转存的结果只清预览，保留原取回入口。
+		if sid, _ := m.Annotations[ToolResultSpillAnnotation].(string); sid != "" {
+			out[i] = cloneToolResultWithPlaceholder(m, fmt.Sprintf(
+				"[较早的工具输出已清理；全文仍可用 %s 取回，id=%q]", ReadToolOutputToolName, sid))
+			continue
+		}
+		if offloadStore != nil {
+			key, err := putMicroCompactOffload(ctx, offloadStore, offloadNS, m, hasSink)
+			if err == nil {
+				out[i] = cloneToolResultWithOffloadRef(m, key, microCompactPreviewBytes, cfg.OffloadReadToolName)
 				continue
 			}
+			slog.WarnContext(ctx, "microcompact: offload failed, falling back to placeholder-only",
+				"key", key, "ns", offloadNS.String(), "err", err)
 		}
-		out[i] = m
+		out[i] = cloneToolResultWithPlaceholder(m, placeholder)
 	}
 	// emit After event (opt-in). Dropped = len(toClear), Kept = len(messages) - len(toClear).
 	// (注: 这里 Dropped 是"被清的 tool_result 数", 不是真删 message 数.)
@@ -493,69 +410,95 @@ func cloneToolResultWithOffloadRef(m *schema.Message, key string, previewBytes i
 	return &cloned
 }
 
-// ── offload 去重（跨轮） ───────────────────────────────────────────────────
-//
-// MicroCompact 是「**每轮重扫历史**挑旧的清」的形态——判据 `KeepRecent` 是「按新旧
-// 淘汰」，而「旧」相对全局位置定义、产生时不可知，所以只能重扫。重扫本身免费（纯本地
-// clone），但 `OffloadEnabled` 给这条免费路径挂上了**远程写**副作用。
-//
-// 而那个「已 offload 就跳过」的短路读的是**入参** message 上的 marker，marker 只设在
-// 压缩产出的 clone 上，clone **不写回 channel**（那条不变量是 tool memo 正确性的前提）
-// ⟹ 下一轮从 channel 读出的原消息永远没有 marker ⟹ **短路永不命中**。实测 5 轮里该
-// offload 的 4 条 `store.Put` 了 10 次（`[o1 | o1 o2 | o1 o2 o3 | o1 o2 o3 o4]`），
-// 随轮数平方增长。
-//
-// 修法是把去重游标放在**数据旁边**而不是数据里：一张 per-Run 的已卸载集合，随 ctx 传，
-// 进程本地、重启即失、失效后果仅是多写一次同内容（良性）。
-//
-// ⚠️ **唯一的正确性约束：去重范围必须等于 key 范围。**
-// offload 的 key 是 `schema.GetToolResultID(m)`，而 tool_call ID **不保证唯一**
-// （框架别处已按这个前提设计，见 basic_agent.go 的 memoKey）。所以：
-//   - **绝不能挂在 `MicroCompactConfig` 上**——它在 agent 构造期建一次、跨所有 Run
-//     复用，另一个 Run 里撞了 ID 的消息会被**错误跳过卸载**，那是真数据丢失；
-//   - 集合的键必须带上 `OffloadNamespace(ctx)` 的实际返回值——它有三档（业务自定 /
-//     按 sid 隔离 / 全局默认），只按 sid 分桶在业务自定 NS 那档会错。
+// putMicroCompactOffload 按实际写入的内容派生 key，只为真实写入记录 Store 事件。
+func putMicroCompactOffload(ctx context.Context, st store.Store, ns store.Namespace, m *schema.Message, hasSink bool) (string, error) {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return "", fmt.Errorf("encode tool result: %w", err)
+	}
+	key := fmt.Sprintf("mco-%x", sha256.Sum256(data))
+	start := time.Now()
+	attempted, err := offloadDedupFrom(ctx).put(ctx, st, ns, key, m)
+	if hasSink && attempted {
+		action := &StorePutAction{
+			NS:             ns.String(),
+			Key:            key,
+			ValueSizeBytes: len(data),
+			DurationMs:     time.Since(start).Milliseconds(),
+			Ok:             err == nil,
+		}
+		if err != nil {
+			action.Err = err.Error()
+		}
+		EmitStoreEvent(ctx, &StoreAction{Type: StoreOperationPut, Put: action})
+	}
+	return key, err
+}
 
 type offloadDedupKey struct{}
 
-// offloadDedup 是一次 Run 内「已卸载过的 (namespace, key)」集合。
+// offloadDedup 保存本次运行的写入结论。并行调用等待相同地址的写入完成，失败后下一轮可重试。
 type offloadDedup struct {
-	mu   sync.Mutex
-	done map[string]bool
+	mu     sync.Mutex
+	writes map[offloadAddress]*offloadWrite
 }
 
-// markOffloaded 记下「这个 (ns, key) 已卸载」，返回**之前是否已经卸载过**。
-// 一次调用同时完成查与记，避免并发下两个 goroutine 都判「没卸载过」。
-func (d *offloadDedup) markOffloaded(ns store.Namespace, key string) (already bool) {
-	if d == nil || key == "" {
-		return false
+type offloadAddress struct {
+	store     store.Store
+	namespace string
+	key       string
+	owner     string
+	member    bool
+}
+
+type offloadWrite struct {
+	done chan struct{}
+	err  error
+}
+
+var errOffloadIncomplete = errors.New("offload write did not complete")
+
+func (d *offloadDedup) put(ctx context.Context, st store.Store, ns store.Namespace, key string, value *schema.Message) (bool, error) {
+	if d == nil || !reflect.ValueOf(st).Comparable() || ns.Validate() != nil {
+		return true, st.Put(ctx, ns, key, value)
 	}
-	full := strings.Join(append(append([]string{}, ns...), key), "\x00")
+	addr := offloadAddress{store: st, namespace: ns.String(), key: key,
+		owner: compose_v2.GetOwner(ctx), member: IsSubAgentStoreScope(ctx)}
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.done[full] {
-		return true
+	if previous := d.writes[addr]; previous != nil {
+		d.mu.Unlock()
+		select {
+		case <-previous.done:
+			return false, previous.err
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
 	}
-	if d.done == nil {
-		d.done = map[string]bool{}
-	}
-	d.done[full] = true
-	return false
+
+	// Put 发生 panic 或 Goexit 时也要释放等待者，后续调用可以重试。
+	current := &offloadWrite{done: make(chan struct{}), err: errOffloadIncomplete}
+	d.writes[addr] = current
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if current.err != nil {
+			delete(d.writes, addr)
+		}
+		close(current.done)
+	}()
+	current.err = st.Put(ctx, ns, key, value)
+	return true, current.err
 }
 
-// withOffloadDedup 在 Run / Resume 入口挂一张空的已卸载集合。
-//
-// **每次 Run 挂新的**——生命周期正好是一次 Run，跨轮存活（同一条 ctx 链）、不跨 Run。
-// 已挂过就原样返回（嵌套 sub-agent 沿用父的，同一次 Run 内不重复建）。
+// withOffloadDedup 在 Run / Resume 入口挂一张空的写入记录，嵌套执行共享同一张。
 func withOffloadDedup(ctx context.Context) context.Context {
 	if ctx.Value(offloadDedupKey{}) != nil {
 		return ctx
 	}
-	return context.WithValue(ctx, offloadDedupKey{}, &offloadDedup{done: map[string]bool{}})
+	return context.WithValue(ctx, offloadDedupKey{}, &offloadDedup{writes: make(map[offloadAddress]*offloadWrite)})
 }
 
-// offloadDedupFrom 取集合；没挂时返 nil，`markOffloaded` 对 nil 恒返 false
-// ⟹ 退化成「每轮都写」= 引入本机制前的行为，安全侧。
 func offloadDedupFrom(ctx context.Context) *offloadDedup {
 	d, _ := ctx.Value(offloadDedupKey{}).(*offloadDedup)
 	return d

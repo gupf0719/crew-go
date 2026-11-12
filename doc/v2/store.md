@@ -515,7 +515,7 @@ events, err := topAgent.Run(ctx, sess, input)  // 所有嵌套 sub-agent 都能 
 | 现有 Memory 接口能力 | WithStoreMemory 处理 |
 |---|---|
 | `Memory.Read` 可抛 `InterruptError` 做业务级 HITL gate（旧 `memory.go:80-82` ISSUE-74 修后）| ✅ 保留——helper 注入逻辑作为 `buildInitialMessages` 子步执行（见 §13 议题 1 方向 A 落地），InterruptError 透传到 preamble 节点，框架自动 SaveNS cp 让 Resume 时重跑 |
-| `WithSubAgentMemoryScope` / `IsSubAgentMemoryScope` ctx 协议（旧 `memory.go:12-50`）—— 防双重持久化 | ⚠️ 已改名 `WithSubAgentStoreScope` / `IsSubAgentStoreScope`，4 处派发点无条件 push（grep 看当前 push 点）。**但框架自己不再读它**——防重复写这件事改由「写入者维进 ns」解决（顶层写基准 ns、成员写 `ns/位置`，本来就不重复），那道「sub-agent 直接跳过」的闸让成员的 `WithStoreMemory` 完全失效，已删。flag 仍可供业务读，别拿它整个 skip |
+| `WithSubAgentMemoryScope` / `IsSubAgentMemoryScope` ctx 协议（旧 `memory.go:12-50`） | 已改名 `WithSubAgentStoreScope` / `IsSubAgentStoreScope`，4 处派发点设置标记。`WithStoreMemory` 按写入者选择 namespace。业务 Store 可据标记选后端或 TTL，MicroCompact 据此区分写入去重范围 |
 | `MemoryInjectedAnnotation` 跨层 marker（旧 `basic_agent.go` buildInitialMessages 内设置 + `autocompact.go` 多处消费）—— AutoCompact / ReactiveCompact / emergencyDrop 跳过保护 | ✅ 保留并改名 `StoreInjectedAnnotation`；helper preamble 注入消息时打此 marker；autocompact.go 3 处消费同步改名 |
 | `MemoryConfig.MaxReadMessages` 限制返回条数 | ✅ 改名 `StoreMemoryConfig.SearchLimit`——**语义略变**：旧 `MaxReadMessages` 截断的是 message 数（旧 `InMemoryMemory.Read` 直接返 messages 数组）；新 `SearchLimit` 是 `store.Search` 返 Item 数。**1:1 等价**仅当每个 Item.Value 恰好是一条 `schema.Message`；业务 Value 含 `{"content": "...", "metadata": {...}}` 这种富结构时单 Item 可能远大于一条 message——**业务迁移时实测典型 query 返 Item 总 token 数再校准** |
 
@@ -976,7 +976,7 @@ ag := agent_v2.NewBasicAgent(
 | API | 角色 | 调用方 | 调用时机 |
 |---|---|---|---|
 | `WithSubAgentStoreScope(ctx, true)` | **producer**——push flag 进 ctx | 框架（**7 编排 sub-agent 入口** — Sequential/Parallel/Loop/Routing/Reflect/Handoff/Plan; BasicAgent ReAct 无 sub-agent / GraphAgent 走 `RunSubAgent` helper）| 进入 sub-agent 前 |
-| `IsSubAgentStoreScope(ctx)` | **consumer**——查 flag | **仅**业务自定义 Store 实现的 `Put`（框架自己不读，见下方 ⚠️） | 准备 Put 前 |
+| `IsSubAgentStoreScope(ctx)` | **consumer**——查 flag | 业务 Store 和 MicroCompact | 选存储策略或转存去重地址时 |
 
 **典型业务用法**（自定义 store backend 防双重持久化）：
 
@@ -1101,7 +1101,7 @@ IsSubAgentMemoryScope   → IsSubAgentStoreScope
     （RunSubAgent + AgentAsTool + SkillTool fork）/ Handoff 铸造——此前是 15 处散在
     各编排里，由注释里一句人肉计数维持，而 `5afb8eb` 那次加协议就漏了 2 处）：
     见 `grep -rn "WithSubAgentStoreScope" agent_v2/`
-  ↑ **框架自己不读这个 flag**——防重复写改由「写入者维进 ns」解决，见上文 #4
+  ↑ 记忆按写入者选择 namespace，转存去重区分成员与顶层，见上文 #4
 ```
 
 ### Step 3：文档全面同步

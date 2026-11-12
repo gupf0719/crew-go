@@ -25,6 +25,7 @@ import (
 type clientMsg struct {
 	id, role, content string
 	toolCalls         []string
+	toolResultFor     string
 }
 
 // applyAGUI 按 AG-UI 1.0 的规则把事件应用到消息列表（只覆盖本测试用到的事件）：TEXT_MESSAGE_* 按 messageId 建 / 追加；
@@ -61,7 +62,8 @@ func applyAGUI(start []clientMsg, events []map[string]any) []clientMsg {
 		case "TOOL_CALL_RESULT":
 			id, _ := ev["messageId"].(string)
 			c, _ := ev["content"].(string)
-			msgs = append(msgs, clientMsg{id: id, role: "tool", content: c})
+			callID, _ := ev["toolCallId"].(string)
+			msgs = append(msgs, clientMsg{id: id, role: "tool", content: c, toolResultFor: callID})
 		case "MESSAGES_SNAPSHOT":
 			snap, _ := ev["messages"].([]any)
 			seen := map[string]bool{}
@@ -71,7 +73,8 @@ func applyAGUI(start []clientMsg, events []map[string]any) []clientMsg {
 				role, _ := sm["role"].(string)
 				content, _ := sm["content"].(string)
 				seen[id] = true
-				m := clientMsg{id: id, role: role, content: content}
+				callID, _ := sm["toolCallId"].(string)
+				m := clientMsg{id: id, role: role, content: content, toolResultFor: callID}
 				if tcs, ok := sm["toolCalls"].([]any); ok {
 					for _, tc := range tcs {
 						tcm, _ := tc.(map[string]any)
@@ -175,7 +178,8 @@ func TestResetSnapshot_KeepsEarlierToolCall(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("应是 用户 / 工具调用 / 工具结果 / 完整答复 四条，实际 %+v", got)
 	}
-	if got[1].id != "call_1" || len(got[1].toolCalls) != 1 || got[2].role != "tool" || got[2].content != "找到了" || got[3].content != "full" {
+	if len(got[1].toolCalls) != 1 || got[1].id == "" || got[1].toolCalls[0] != got[1].id ||
+		got[2].role != "tool" || got[2].toolResultFor != got[1].id || got[2].content != "找到了" || got[3].content != "full" {
 		t.Fatalf("快照应保住工具调用与结果、只丢半截那条，实际 %+v", got)
 	}
 }
@@ -502,12 +506,16 @@ func TestResetSnapshot_ReusedToolCallID(t *testing.T) {
 	}
 	got := applyAGUI([]clientMsg{{id: "u1", role: "user", content: "go"}}, events)
 	var results []string
+	var calls, paired []string
 	for _, cm := range got {
+		calls = append(calls, cm.toolCalls...)
 		if cm.role == "tool" {
 			results = append(results, cm.content)
+			paired = append(paired, cm.toolResultFor)
 		}
 	}
-	if len(results) != 2 || results[0] != "Ra" || results[1] != "Rb" || got[len(got)-1].content != "full" {
+	if len(calls) != 2 || calls[0] == calls[1] || len(results) != 2 || paired[0] != calls[0] || paired[1] != calls[1] ||
+		results[0] != "Ra" || results[1] != "Rb" || got[len(got)-1].content != "full" {
 		t.Fatalf("快照之后两次结果应各是一条（Ra、Rb），最后是完整答复，实际 %+v", got)
 	}
 }

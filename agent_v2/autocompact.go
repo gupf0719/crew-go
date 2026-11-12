@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -338,7 +339,7 @@ func AutoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 type compactCut struct {
 	headLen  int               // messages 的前 headLen 条是上一次压缩的输出；0 = 没套用
 	original []*schema.Message // 套用之前、MicroCompact 之前的原始消息流——文件重注入从这里倒扫；nil = 用 messages
-	cleared  map[string]bool   // MicroCompact 在 original 上会清掉的 tool_use_id（microCompactToClear）：重注入跳过它们
+	cleared  map[int]bool      // MicroCompact 会清理的结果在 original 中的位置
 	tailLen  int               // 输出：真做了一次摘要时尾部原样保留的条数（输入的后缀），否则保持 -1
 }
 
@@ -741,14 +742,10 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	// 从原始 contextMsgs 倒扫，不从压缩结果回扫——保证多轮压缩仍能找到原始文件证据。
 	var reinjected []*schema.Message
 	if cfg.reinjectRecentFiles() {
-		// 从入参 messages 倒扫（含 sys + 全部历史）—— extractRecentFiles 内部
-		// 已通过 idToPath 双 pass 扫 assistant tool_call + tool_result，
-		// 重复扫 sys/已 reinject 的 user message 不会误识别（非 Read tool_call
-		// 不会进 idToPath）。
 		// 从原始消息流（套用备忘之前、MicroCompact 之前）倒扫：套用了上一次的结果时，更早读过的文件已在摘要里。
 		// 原始流里的结果没经过 MicroCompact，它会清掉的那些（cut.cleared，同一个判据 microCompactToClear）不注回
 		// 原文——跟没套用备忘时、从 MicroCompact 之后的输入倒扫看到的是同一批。
-		src, skip := messages, map[string]bool(nil)
+		src, skip := messages, map[int]bool(nil)
 		if cut != nil && cut.original != nil {
 			src, skip = cut.original, cut.cleared
 		}
@@ -1002,45 +999,37 @@ type reinjectedFile struct {
 // path 提取：从 assistant tool_call.Function.Arguments 解析 JSON 取 "path" 字段。
 // 简化处理：直接字符串匹配 `"path":"..."`，避免引入 json 解析依赖。
 //
-// skip 是要跳过的 tool_use_id（MicroCompact 会清掉的那些，见 microCompactToClear）；nil 不跳。
-func extractRecentFiles(messages []*schema.Message, skip map[string]bool, maxFiles, perFileBudget, totalBudget int) []reinjectedFile {
+// skip 按原始结果消息的位置过滤 MicroCompact 选中的结果。
+func extractRecentFiles(messages []*schema.Message, skip map[int]bool, maxFiles, perFileBudget, totalBudget int) []reinjectedFile {
 	if maxFiles <= 0 || perFileBudget <= 0 || totalBudget <= 0 {
 		return nil
 	}
-	// 先建 tool_call_id → path 映射
-	idToPath := map[string]string{}
-	for _, m := range messages {
-		if m == nil || m.Role != schema.RoleAssistant {
-			continue
-		}
-		for _, tc := range schema.GetToolCalls(m) {
-			if tc.Function.Name != "Read" {
-				continue
-			}
-			if path := extractPathFromArgs(tc.Function.Arguments); path != "" {
-				idToPath[tc.ID] = path
-			}
+	var reads []historyToolPair
+	for _, pair := range pairToolResults(messages) {
+		if pair.result != nil && pair.call.Function.Name == "Read" && messages[pair.declaredAt].Role == schema.RoleAssistant {
+			reads = append(reads, pair)
 		}
 	}
+	slices.SortFunc(reads, func(a, b historyToolPair) int {
+		if a.resultAt != b.resultAt {
+			return b.resultAt - a.resultAt
+		}
+		return b.resultPart - a.resultPart
+	})
 
 	seen := map[string]bool{}
 	var out []reinjectedFile
 	totalTokens := 0
-	// 倒序扫 tool_result
-	for i := len(messages) - 1; i >= 0; i-- {
-		m := messages[i]
-		if m == nil || m.Role != schema.RoleTool {
-			continue
-		}
-		id := schema.GetToolResultID(m)
-		path, ok := idToPath[id]
-		if !ok || seen[path] {
+	for _, read := range reads {
+		path := extractPathFromArgs(read.call.Function.Arguments)
+		if path == "" || seen[path] {
 			continue
 		}
 		seen[path] = true
-		if skip[id] {
+		if skip[read.resultAt] {
 			continue // MicroCompact 会清掉的
 		}
+		m := read.result
 		// 产生时就转存过的：正文是转存说明 + 预览，不是文件内容
 		if sid, _ := m.Annotations[ToolResultSpillAnnotation].(string); sid != "" {
 			continue
@@ -1066,7 +1055,8 @@ func extractRecentFiles(messages []*schema.Message, skip map[string]bool, maxFil
 		}
 
 		content := m.Content
-		if content == "" && len(m.ContentBlocks) > 0 {
+		// 拆出的配对结果使用自己的块正文，合并消息的平面文本可能包含其它结果。
+		if content == "" || m != messages[read.resultAt] {
 			for _, cb := range m.ContentBlocks {
 				if cb != nil && cb.Toolresult != nil {
 					content = cb.Toolresult.Content

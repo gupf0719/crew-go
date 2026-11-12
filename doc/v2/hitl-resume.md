@@ -232,7 +232,8 @@ type AskQuery struct {
     InterruptID string   `json:"interrupt_id,omitempty"` // 稳定 ID —— **必填**，见 §3.4
     Reason      string   `json:"reason,omitempty"`       // 业务可读的 per-query 中断原因
                                                           // (MergeInterrupts 聚合 N 个 ie 时透传 ie.Reason → query.Reason)
-    ToolCallID  string   `json:"tool_call_id,omitempty"` // 可选：这条挂起指向哪次工具调用
+    ToolCallID  string   `json:"tool_call_id,omitempty"` // 可选：工具调用的模型协议 ID
+    ToolCallInstanceID string `json:"tool_call_instance_id,omitempty"` // 可选：适配器关联工具事件的实例 ID
     ToolName    string   `json:"tool_name,omitempty"`    // （空 = 纯问答，不指向任何待执行动作）
     Breakpoint  *Breakpoint `json:"breakpoint,omitempty"` // 非 nil = 声明式断点停下的（框架填，Ask 会清掉业务填的）
 }

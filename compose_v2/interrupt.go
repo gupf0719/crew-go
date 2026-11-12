@@ -14,9 +14,7 @@ import (
 
 // AskQuery 是 NodeFunc 抛 InterruptError 时附带的用户询问 payload。
 //
-// 字段：Question / Options / InterruptID / Reason 四个核心字段，外加
-// ToolCallID / ToolName 两个**可选的**工具身份（空 = 这条挂起不指向任何待执行动作，
-// 见下面那两个字段自己的说明）。ns 维度不在这里——cp 按 (sid, ns) 物理分离寻址。
+// Question / Options / InterruptID / Reason 是核心字段。工具审批可附上调用身份和工具名。
 //
 // 所有字段必须 JSON-friendly——AskQuery 整体随 cp 持久化，不做类型保真。
 type AskQuery struct {
@@ -60,8 +58,8 @@ type AskQuery struct {
 	// Resume 拿 cp.PendingInterrupts 仍能读 (区别于 ie.Data any 跨 Resume 丢失).
 	Reason string `json:"reason,omitempty"`
 
-	// ToolCallID / ToolName 标出**这条挂起指向哪一次工具调用**——空表示它不指向任何
-	// 待执行的动作（`ask_user` 那种纯问答就该留空）。
+	// ToolCallID / ToolName 记录挂起的工具调用使用的模型协议 ID 和工具名。
+	// 普通问答留空。适配层区分复用同一协议 ID 的调用时使用 ToolCallInstanceID。
 	//
 	// **为什么需要**：两类挂起被放弃时的损失是不对称的。问答型放弃是对称损失（重问
 	// 的代价只是一次提问）；而工具审批型，模型**已经在自己的输出里公告过那个
@@ -76,6 +74,8 @@ type AskQuery struct {
 	// **业务自定义工具想要同款能力**时自填即可（框架只在审批路径自动填）。
 	ToolCallID string `json:"tool_call_id,omitempty"`
 	ToolName   string `json:"tool_name,omitempty"`
+	// ToolCallInstanceID 供适配器关联工具事件和审批。旧档及自研调用可留空，答复仍使用 InterruptID。
+	ToolCallInstanceID string `json:"tool_call_instance_id,omitempty"`
 
 	// Breakpoint 非 nil 表示这一问是声明式断点停下的（[GraphBuilder.WithInterruptBefore] /
 	// [WithInterruptBefore] 等），不是节点在提问：没有要回答的问题，续跑（带不带答案都行）就继续。
@@ -137,8 +137,7 @@ type InterruptError struct {
 	//
 	// **⚠️ 跨 Resume 不持久化**：framework 把 `cm.pendingInterrupts []*AskQuery` 存
 	// `cp.PendingInterrupts`（`compose_v2/serialization.go::Snapshot`）——**只存
-	// AskQuery 全字段（Question/Options/InterruptID/Reason + 可选的 ToolCallID/
-	// ToolName）**，不存 InterruptError 自身
+	// AskQuery 全字段**，不存 InterruptError 自身
 	// 因此 Data 字段。Resume 时 caller 拿到的 InterruptError 是 nil（业务通过
 	// `cp.PendingInterrupts` 读 AskQuery 不读 InterruptError.Data）。
 	//
@@ -770,6 +769,19 @@ type nodeInstanceIDKey struct{}
 // toolsFn fan-out 化直接 race-free，无需架构改动 AgentAsTool 自动安全。
 type currentToolCallIDKey struct{}
 
+type toolCallInstanceKey struct{}
+
+type toolCallInstance struct {
+	providerID string
+	id         string
+}
+
+// WithToolCallInstanceID 标记框架正派发的工具实例。工具体和工具钩子中的 [Ask]
+// 可用对应的模型协议 ID 关联这次调用。空 instanceID 清除此标记。
+func WithToolCallInstanceID(ctx context.Context, providerID, instanceID string) context.Context {
+	return context.WithValue(ctx, toolCallInstanceKey{}, toolCallInstance{providerID: providerID, id: instanceID})
+}
+
 // WithNodeInstanceID 把当前节点的**实例身份**注入 ctx（ISSUE-96）。
 //
 // 框架在 graph_loop 进节点时调用——**先于 OnNodeStart**，让观测层能把同一 NodeID
@@ -908,6 +920,7 @@ func GetCurrentNodeVisit(ctx context.Context) int {
 // 业务自定义 toolsFn 想做并发化时**必须**在 goroutine 入口调此 helper，否则多
 // 并发 ask_user_tool 算同 InterruptID 串台。
 func WithCurrentToolCallContext(ctx context.Context, tcID string, toolCallIdx int) context.Context {
+	ctx = WithToolCallInstanceID(ctx, "", "")
 	ctx = context.WithValue(ctx, currentToolCallIDKey{}, tcID)
 	ctx = context.WithValue(ctx, inToolCallKey{}, true)
 	// ISSUE-96：注入**独立**的 tc 下标维度，不再覆盖 nodeBranchIdxKey（图级位置）。
@@ -1206,6 +1219,12 @@ func Ask(ctx context.Context, q *AskQuery) (*schema.Message, error) {
 	rec := q.clone()
 	rec.InterruptID = id
 	rec.Breakpoint = nil // 断点信息只由框架填，提问不是断点
+	if rec.Reason == "tool_call" && rec.ToolCallID != "" && rec.ToolCallInstanceID == "" {
+		instance, _ := ctx.Value(toolCallInstanceKey{}).(toolCallInstance)
+		if instance.providerID == rec.ToolCallID {
+			rec.ToolCallInstanceID = instance.id
+		}
+	}
 	return nil, &InterruptError{Reason: rec.Reason, Query: rec}
 }
 
@@ -1233,6 +1252,7 @@ func clearInheritedNodePosition(ctx context.Context) context.Context {
 	ctx = context.WithValue(ctx, nodeVisitKey{}, 0)
 	ctx = WithNodeInstanceID(ctx, "")
 	ctx = context.WithValue(ctx, currentToolCallIDKey{}, "")
+	ctx = WithToolCallInstanceID(ctx, "", "")
 	ctx = context.WithValue(ctx, inToolCallKey{}, false)
 	ctx = context.WithValue(ctx, toolCallIdxKey{}, 0)
 	// 嵌套调用的次序计数器同理：新图的钩子相位若接着外层节点的数，序号取决于「本次跑到

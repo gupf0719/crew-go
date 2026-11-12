@@ -5,7 +5,7 @@ import (
 )
 
 // subAgentStoreScopeKey 是「这次调用发生在成员位置上」标记的 ctx key（见
-// [WithSubAgentStoreScope]；框架自己不读，留给业务的 store 后端）。
+// [WithSubAgentStoreScope]）。
 type subAgentStoreScopeKey struct{}
 
 // WithSubAgentStoreScope 标记 ctx 为"sub-agent 调用 scope"。
@@ -20,7 +20,7 @@ type subAgentStoreScopeKey struct{}
 // 那次加协议就漏了 ParallelAgent 和 Routing 的 classifier。哨兵
 // TestMemberDispatch_AllAgentRunsGoThroughHelper 现在机械盯着「有没有第 5 处派发」。
 //
-// ⚠️ **框架自己不再读这个 flag**（2026-08）。它曾经守在 `commitFinal` 的 store.Put
+// `WithStoreMemory` 的写入始终按写入者选 namespace。这个标记曾经守在 `commitFinal` 的 store.Put
 // 前面——那道闸的本意是「让顶层唯一写入」，实际效果是**成员配了 WithStoreMemory 也一条
 // 写不进去**。真正的撞键根因是键里没有写入者维，补上那一维之后闸就没有存在理由了
 // （现在顶层和成员写的是**不同 ns**，本来就不重复）。
@@ -51,8 +51,7 @@ func WithSubAgentStoreScope(ctx context.Context, isSubAgent bool) context.Contex
 
 // IsSubAgentStoreScope 查 ctx 是否标记为 sub-agent 调用 scope。
 //
-// ⚠️ **框架自己不读它**（见 [WithSubAgentStoreScope]）——曾经守在 commitFinal 的
-// store.Put 前面，那道闸让成员的 WithStoreMemory 完全失效，已删。业务可以继续读。
+// 业务可据此给成员选择存储后端。MicroCompact 的写入去重也区分成员与顶层调用。
 //
 // 返 false 当 ctx 未标记 (顶层 BasicAgent 调用 / 业务直接调 store.Put) 或显式标
 // false。

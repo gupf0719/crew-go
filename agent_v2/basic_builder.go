@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strconv"
 
 	"crew-go/compose_v2"
@@ -364,6 +365,12 @@ const ToolRedispatchedExtraKey = "redispatched"
 // 会在一个 run 里复用 ID，按 ID 认会把别的调用的工具调用与结果一起撤掉（审计实测）。模型的答复上没有 run_id 时不带。
 const ToolModelRunIDExtraKey = "model_run_id"
 
+// ToolCallInstanceIDExtraKey 标识 OnToolStart 与 OnToolEnd 所属的工具调用实例。
+// 值是框架按模型答复及批内位置派生的不透明字符串，续跑重派时沿用。
+const ToolCallInstanceIDExtraKey = "tool_call_instance_id"
+
+const toolCallBatchIDAnnotation = "tool_call_batch_id"
+
 // ToolCallErrCode 是一批 tool_call 没整体成功时，硬失败的那个调用（工具返回 error、panic、中间件出错）交给 OnToolEnd
 // 的失败结果的错误码；它自身超时（错误链上有 context.DeadlineExceeded、调用方还没放弃）时用 [ToolTimeoutErrCode]。也是
 // 这时 OnError 的 Code。
@@ -459,18 +466,6 @@ func retractModelAnswer(ctx context.Context, out *schema.Message, agentName stri
 	compose_v2.ForgetStream(ctx, runID) // 撤过了：所在的尝试作废时不再撤一次
 }
 
-// withModelRunID 在 Extra 上标这个 tool_call 出自哪次模型调用（见 ToolModelRunIDExtraKey）；runID 为空时原样返回。
-func withModelRunID(extra map[string]any, runID string) map[string]any {
-	if runID == "" {
-		return extra
-	}
-	if extra == nil {
-		extra = map[string]any{}
-	}
-	extra[ToolModelRunIDExtraKey] = runID
-	return extra
-}
-
 // endSettledToolCalls 在一批 tool_call 没整体成功时，给 ends[from:] 里已经有结局的调用触发 OnToolEnd（规则见
 // ToolCallErrCode），Extra 带 ToolBatchFailedExtraKey。各调用的结局来自框架的 toolsFn（toolBatch.ends），或者成功路径上
 // 钩子中途报错时剩下的那几个；业务自写的 toolsFn 交不出，这时一个都不触发。
@@ -478,7 +473,7 @@ func withModelRunID(extra map[string]any, runID string) map[string]any {
 // 钩子的改写不被消费、做出的上行信号作废（这批的结果整体作废）；它返回的错误与 panic 只记日志——这一批已经以别的错误
 // 收尾，只在这里出错的钩子不该把一个能回答的提问变成失败。
 func endSettledToolCalls(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo, toolCalls []schema.ToolCall,
-	callCtxs []context.Context, ends []toolCallEnd, from int) {
+	callCtxs []context.Context, batch *toolBatch, ends []toolCallEnd, from int) {
 	for i := from; i < len(ends); i++ {
 		e := ends[i]
 		if i >= len(toolCalls) || i >= len(callCtxs) {
@@ -504,6 +499,7 @@ func endSettledToolCalls(ctx context.Context, hooks hook.Hooks, info *hook.Agent
 			to.Extra = map[string]any{}
 		}
 		to.Extra[ToolBatchFailedExtraKey] = true
+		to.Extra = batch.withIdentity(to.Extra, i)
 		endOneSettled(ctx, hooks, info, toolCalls[i].Function.Name, to, callCtxs[i], i)
 	}
 }
@@ -1225,7 +1221,14 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 回到 model（见 isPendingUserInput）——迟到的话不留到下一次 Run。最后一轮不取（没有下一轮回应它，留在
 		// 收件箱里给调用方）。取在定下这一轮之前：定下的那份连同它们一起重放。
 		var late []*schema.Message
-		if len(schema.GetToolCalls(out)) == 0 && !finalRound {
+		if len(schema.GetToolCalls(out)) != 0 {
+			// 这批的身份随模型答复保存。已挂起的旧批次没有这个标注，沿用原调用 ID。
+			stamped := *out
+			stamped.Annotations = make(map[string]any, len(out.Annotations)+1)
+			maps.Copy(stamped.Annotations, out.Annotations)
+			stamped.Annotations[toolCallBatchIDAnnotation] = newUUID()
+			out = &stamped
+		} else if !finalRound {
 			all, err := takeInterjections(ctx)
 			if err != nil {
 				return nil, fmt.Errorf("interjections: %w", err)
@@ -1295,6 +1298,8 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		}
 		// 这一批出自哪次模型调用（见 ToolModelRunIDExtraKey）
 		modelRunID, _ := last.Annotations[compose_v2.RunIDAnnotationKey].(string)
+		batchID, _ := last.Annotations[toolCallBatchIDAnnotation].(string)
+		batch := &toolBatch{messages: msgs, modelRunID: modelRunID, batchID: batchID}
 
 		// 每个 tool_call 触发 OnToolStart——消费 hook 对 Name / ArgumentsJSON 的改写
 		// 后再调用业务工具（参数注入 / 重定向）。CallId 是 tool_call ↔ tool_result
@@ -1338,7 +1343,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			if redispatched {
 				ti.Extra = map[string]any{ToolRedispatchedExtraKey: true}
 			}
-			ti.Extra = withModelRunID(ti.Extra, modelRunID)
+			ti.Extra = batch.withIdentity(ti.Extra, i)
 			if categoryLookup != nil {
 				if cat := categoryLookup(ti.Name); cat != "" {
 					if ti.Extra == nil {
@@ -1349,12 +1354,13 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			}
 			// 业务钩子不是节点体：每次钩子调用在自己的相位里跑（见 toolHookCtx）；采纳钩子返回的
 			// ctx 时把节点体自己的那套相位铺回来。
-			callCtx, startErr := compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
+			startCtx := compose_v2.WithToolCallInstanceID(ctx, ti.CallId, batch.callInstanceID(i))
+			callCtx, startErr := compose_v2.CallHook(startCtx, func(c context.Context) (context.Context, error) {
 				return hooks.OnToolStart(toolHookCtx(c, "OnToolStart", toolCalls[i].Function.Name, ti.CallId, i), info, ti)
 			})
 			if startErr != nil {
 				if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
-					hooks.OnError(toolHookCtx(ctx, "OnError", toolCalls[i].Function.Name, ti.CallId, i), info, &schema.CommError{Code: "tool_start_error", Message: startErr.Error()})
+					hooks.OnError(toolHookCtx(startCtx, "OnError", toolCalls[i].Function.Name, ti.CallId, i), info, &schema.CommError{Code: "tool_start_error", Message: startErr.Error()})
 				}
 				return nil, fmt.Errorf("OnToolStart: %w", startErr)
 			}
@@ -1374,7 +1380,6 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 每个调用执行用的 ctx）：钩子里的调用不是工具本身，交给 OnToolEnd 的 callCtxs 不带章。
 		// 收集器：框架自己的 toolsFn 把每个调用收到的上行信号登记在这里，OnToolEnd 跑完之后再定（见
 		// tool_batch_signals.go）。
-		batch := &toolBatch{messages: msgs}
 		execCtxs := make([]context.Context, len(callCtxs))
 		for i, c := range callCtxs {
 			execCtxs[i] = withToolBatch(withToolResultRecorder(c), batch)
@@ -1382,7 +1387,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		results, err := tools(withToolBatch(withToolResultRecorder(ctx), batch), toolCalls, execCtxs)
 		if err != nil {
 			// 这一批没整体成功：已经有结局的调用先各自收尾（OnToolEnd），挂起的、被停下的不收（见 endSettledToolCalls）
-			endSettledToolCalls(ctx, hooks, info, toolCalls, callCtxs, unfixed(batch.ends), 0)
+			endSettledToolCalls(ctx, hooks, info, toolCalls, callCtxs, batch, unfixed(batch.ends), 0)
 			// audit Round 7 Bug 3: compose_v2.InterruptError 是控制流, 不上报 OnError (HITL ask_user)
 			if _, isInt := compose_v2.IsInterrupt(err); !isInt {
 				// 业务自写的 toolsFn 交不出各调用的结局，OnError 是钩子给 OnToolStart 里开的东西（span 等）收尾的唯一机会。
@@ -1420,7 +1425,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			}
 			// 还原成交给 OnToolEnd 的 ToolOutput（失败的结构化信息、审批拒绝、从工具账重放的，见 toolOutputFor）
 			to := toolOutputFor(r, toolCalls[i].ID, i < len(batch.ends) && batch.ends[i].replayed)
-			to.Extra = withModelRunID(to.Extra, modelRunID)
+			to.Extra = batch.withIdentity(to.Extra, i)
 			res := to.Result
 			before := *res // 钩子之前那份（值拷贝：钩子可能就地改 res）
 			if !before.Success {
@@ -1458,7 +1463,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				for j := i + 1; j < len(toolCalls) && j < len(results); j++ {
 					rest[j] = toolCallEnd{msg: results[j], replayed: j < len(batch.ends) && batch.ends[j].replayed}
 				}
-				endSettledToolCalls(ctx, hooks, info, toolCalls, callCtxs, unfixed(rest), i+1)
+				endSettledToolCalls(ctx, hooks, info, toolCalls, callCtxs, batch, unfixed(rest), i+1)
 				if _, isInt := compose_v2.IsInterrupt(hookErr); !isInt && ctx.Err() == nil {
 					hooks.OnError(toolHookCtx(callCtxs[i], "OnError", toolCalls[i].Function.Name, to.CallId, i), info, &schema.CommError{Code: "tool_end_error", Message: hookErr.Error()})
 				}

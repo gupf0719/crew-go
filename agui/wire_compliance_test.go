@@ -132,9 +132,12 @@ func TestToolCallStart_OncePerCallAcrossResume(t *testing.T) {
 			results[tc]++
 		}
 	}
-	for _, tc := range []string{"c1", "c2"} {
-		if starts[tc] != 1 || args[tc] != 1 {
-			t.Errorf("toolCallId %s：START %d 次、ARGS %d 次，want 各 1——续跑再发会让前端把参数追加成两份", tc, starts[tc], args[tc])
+	if len(starts) != 2 || len(args) != 2 || len(results) != 2 {
+		t.Fatalf("应有两个调用实例，实际 START %v、ARGS %v、RESULT %v", starts, args, results)
+	}
+	for tc, n := range starts {
+		if tc == "" || n != 1 || args[tc] != 1 {
+			t.Errorf("toolCallId %s：START %d 次、ARGS %d 次，want 各 1——续跑再发会让前端把参数追加成两份", tc, n, args[tc])
 		}
 		if results[tc] != 1 {
 			t.Errorf("toolCallId %s：RESULT %d 次，want 1", tc, results[tc])
@@ -180,18 +183,22 @@ func TestToolCallStart_ReusedIDAcrossRoundsBothSent(t *testing.T) {
 			agent_v2.WithToolkit(tk), agent_v2.WithHooks(hooks), agent_v2.WithMaxRounds(5))
 	}, agui.WithCheckpointer(compose_v2.NewInMemoryCheckpointer()))
 	evs := parseSSE(postAGUI(h, `{"threadId":"t-reuse","runId":"r1","messages":[{"role":"user","content":"go"}]}`).Body.String())
-	var starts int
-	var args []string
+	var starts []string
+	args, results := map[string]string{}, map[string]string{}
 	for _, ev := range evs {
+		id, _ := ev["toolCallId"].(string)
 		switch ev["type"] {
 		case "TOOL_CALL_START":
-			starts++
+			starts = append(starts, id)
 		case "TOOL_CALL_ARGS":
-			d, _ := ev["delta"].(string)
-			args = append(args, d)
+			args[id], _ = ev["delta"].(string)
+		case "TOOL_CALL_RESULT":
+			results[id], _ = ev["content"].(string)
 		}
 	}
-	if starts != 2 || len(args) != 2 || args[0] != `{"q":"round1"}` || args[1] != `{"q":"round2"}` {
-		t.Errorf("两轮复用同一个 id 的调用应各发一组：START %d 次，ARGS %q", starts, args)
+	if len(starts) != 2 || starts[0] == "" || starts[1] == "" || starts[0] == starts[1] ||
+		args[starts[0]] != `{"q":"round1"}` || args[starts[1]] != `{"q":"round2"}` ||
+		results[starts[0]] != "round1" || results[starts[1]] != "round2" {
+		t.Errorf("两轮复用同一个 provider ID 的调用应分别配对，START %q、ARGS %q、RESULT %q", starts, args, results)
 	}
 }

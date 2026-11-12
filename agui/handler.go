@@ -1457,11 +1457,12 @@ func approvalResponseSchema() map[string]any {
 }
 
 // approvalInterrupt 把一条工具审批提问转成 AG-UI 的中断：reason 用规范的核心值 tool_call（必须带 toolCallId），
-// 通用前端据此渲染审批界面；provider 没给工具调用 ID 时用 confirmation（不绑定工具调用的是 / 否确认）。
+// 通用前端据此渲染审批界面。没有可关联的调用 ID 时使用 confirmation。
 // 四个选项与工具名放进 metadata，给认得它们的前端用。
 func approvalInterrupt(q *compose_v2.AskQuery) RunInterrupt {
 	reason := "tool_call"
-	if q.ToolCallID == "" {
+	callID := interruptToolCallID(q)
+	if callID == "" {
 		reason = "confirmation"
 	}
 	meta := map[string]any{MetadataKeyApprovalOptions: q.Options}
@@ -1472,7 +1473,7 @@ func approvalInterrupt(q *compose_v2.AskQuery) RunInterrupt {
 		ID:             q.InterruptID,
 		Reason:         reason,
 		Message:        q.Question,
-		ToolCallID:     q.ToolCallID,
+		ToolCallID:     callID,
 		ResponseSchema: approvalResponseSchema(),
 		Metadata:       meta,
 	}

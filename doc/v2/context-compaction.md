@@ -107,13 +107,13 @@ var DefaultCompactableTools = []string{
 ### 算法
 
 ```
-1. 按 tool name **分组**收集所有可压缩 tool 的 tool_use ID（不是全局合并）
+1. 按出现顺序配对工具声明和结果，再按工具名分组
 2. **每个 tool name 各自保留最近 N 个**（默认 KeepRecent=5）
    例：3 个 Read + 3 个 Bash + KeepRecent=5 → 全部保留（每 tool 5 个内）
-3. 早于该 tool 第 N 个的 tool_result 内容替换为占位符：
+3. 按结果在消息流中的位置清理较早的配对结果。合并消息仅在全部结果块可压缩时替换：
    "[Old tool result content cleared by microcompact]"
 4. tool_use 块完全保留（保持 API 配对完整性）
-5. 入参已带 cleared / offloaded marker 的 tool_result 原样透传（BasicAgent 图路径下压缩产物不写回消息 channel，命中的只有业务直接喂进来的、与 AutoCompact 备忘套用之后 Head 里保下的清理过的结果——见「压缩结果的复用」）；offload 的跨轮 `store.Put` 去重由 ctx 内 `offloadDedup` 集合承担，同一 Run 内同一 (ns, key) 只写一次
+5. 入参已带 cleared 或 offloaded 标记的结果原样透传。同一 Run 内复用相同存储地址已成功的写入。失败时本轮使用纯占位符，下一轮扫描原消息时可重试。
 6. 带 `SkillBodyAnnotation` marker 的 tool_result **跳过不清**
    （跨层契约保护：清了会让 skill body 被压成占位符 + AutoCompact 整组保留无意义占位符，R17 MED-2）
 ```
@@ -140,7 +140,7 @@ type MicroCompactConfig struct {
 
 **Offload 模式行为差异**：
 - 默认 `OffloadEnabled = false`：纯占位符替换（同上 6 步算法）
-- `OffloadEnabled = true` + store 已挂：tool_result 内容 `store.Put(ctx, OffloadNS, key=tcID, value=*schema.Message)` 然后 message Content 替换为 offload 指针（`[offloaded:<key>] preview: <前 200 字节，UTF-8 安全截断>`，见 `microcompact.go::cloneToolResultWithOffloadRef`）+ 打 `MicroCompactOffloadedAnnotation` + `MicroCompactOffloadKeyAnnotation`（存 key 供回溯）marker。业务后续可按 key 回溯原始 tool_result。**store 未挂时退化为纯占位符**（不报错）。
+- `OffloadEnabled = true` 且已配置 Store 时，按消息的 JSON 内容派生新 key。写入成功后用 `[offloaded:<key>] preview: <前 200 字节>` 替换正文，预览在 UTF-8 字符边界截断。按 `MicroCompactOffloadKeyAnnotation` 里的 key 取回，旧版引用也继续使用各自记录的 key。未配置 Store 或写入失败时使用纯占位符。
 - 详见 [`agent_v2/microcompact.go::MicroCompactRun`](../../agent_v2/microcompact.go) `cloneToolResultWithOffloadRef` 路径。
 
 **Offload 模式的两项业务责任**（启用 `OffloadEnabled` 前必读）：
@@ -599,7 +599,7 @@ MicroCompact → AutoCompact → ChatModel.WithTools(toolkit) → LLM 调用
 | `StoreInjectedAnnotation` | bool | `buildInitialMessages` 给 store.Search 注入消息打 marker | （a）AutoCompact 跳过不重 summarize；（b）ReactiveCompact `isProtectedGroup` 不删此组 | 随 channel 进 cp（非 session.Events） |
 | `AutoCompactSummaryAnnotation` (= `CompactionSummaryAnnotationKey`) | bool | AutoCompact 给生成的 summary 消息打 marker | （a）ReactiveCompact `isProtectedGroup` 跳过保护 summary；（b）`SelfHistoryCompacted` 倒扫找 marker 跨 Run 截断早期事件（⚠️ 标准路径不命中，见协作语义图后存疑） | **不进 channel / cp**——marker 只打在本次调用合成的 summaryMsg 上 |
 | `MicroCompactClearedAnnotation` | bool | MicroCompact 给已清 tool_result 占位符消息打 marker（含幂等保护：已带此 marker 的不重 clone）| AutoCompact `extractRecentFiles` 跳过避免占位符当真实文件 | **不进 channel / cp**——marker 只打在本次调用的 clone 上 |
-| `MicroCompactOffloadedAnnotation` (= `"microcompact_offloaded"`) | bool | MicroCompact **offload 模式**给 placeholder 打 marker（`OffloadEnabled=true` + store 已挂，tool_result content 替为 offload 指针 + `store.Put`，见 `cloneToolResultWithOffloadRef`）| （a）AutoCompactRun summary 装配跳过、offload preview 不进 summary input；（b）`extractRecentFiles` 跳过避免 offload 占位符当真实文件 reinject；（c）MicroCompact 幂等检不重 offload（`microcompact.go` 的 `MicroCompactRun` 短路段）| **不进 channel / cp**——marker 只打在本次调用的 clone 上；但 offload 的 `store.Put` 是真副作用，业务可按 tcID 从 store 回溯原始 tool_result |
+| `MicroCompactOffloadedAnnotation` (= `"microcompact_offloaded"`) | bool | MicroCompact 成功转存后标在占位符上 | AutoCompact 摘要装配和文件重注入跳过占位符，MicroCompact 复用已有引用 | 压缩视图上的标记随占位符保存，按 `MicroCompactOffloadKeyAnnotation` 读取 Store 中的结果 |
 | ~~`SupersededEventAnnotation`~~ | ~~删除~~ | — | **R32+ 视角 4 audit 删** — 生产 0 caller, godoc 自称"AutoCompact 调用"实际 0 调用; 跨 Run 复用 summary 改用 `SelfHistoryCompacted` 倒扫 + `CompactionSummaryAnnotationKey` marker (FAQ §"AutoCompact summary 不写 session.Events" 已澄清此事实) | — |
 | `SkillBodyAnnotation` (= `"skill_body_injected"`) | bool | `makeToolsFn` 给成功激活的 `activate_skill` 打 marker（仅 toolCall + framework actTool）：默认 full-body `tool_result` 打；**P2.D `InlineSkillBody=true` 时 terse-ack `tool_result` + body UserMessage 都打（R19——两 group 都保护，否则 tool_call group 整组压进 summary 丢激活上下文 + body 语义倒置；非 422）**| （a）MicroCompact 跳过清除带此 marker 的 tool_result（R17 MED-2，否则 marker 残留 + body 被清成占位符 → AutoCompact 整组保留无意义占位符）；（b）AutoCompact `splitProtectedGroups` 按 group 整组保留（保 tool_call/tool_result pair 完整）；（c）ReactiveCompact `isProtectedGroup` 不删此组——4 层一致防护否则前功尽弃 | 随 channel 进 cp（非 session.Events） |
 

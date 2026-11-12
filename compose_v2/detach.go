@@ -271,7 +271,7 @@ func isExecutionKey(key any) bool {
 	switch key.(type) {
 	case sessionIDKey, runTaskIDKey, currentTaskIDKey, freshRunCtxKey, resumeCtxKey, answerLedgerKey,
 		graphNSKey, nodeIDKey, nodeVisitKey, nodeInstanceIDKey, nodeInterruptCounterKey,
-		toolCallIdxKey, currentToolCallIDKey, inToolCallKey, withinNodeScopeKey,
+		toolCallIdxKey, currentToolCallIDKey, toolCallInstanceKey, inToolCallKey, withinNodeScopeKey,
 		nodeStateAccessorKey, subCallCounterKey, subCallScopeKey, abnormalNodeExitKey,
 		componentKindKey, eventSinkKey, sendSinkKey, toolCategoryLookupKey, outerRerunGensKey, outerRegensKey,
 		threadIDKey, softCancelCtxKey, detachedKey, detachedFromKey, runAliveKey, signalScopeKey, taskRecipientKeyCtxKey, hookCallKey,

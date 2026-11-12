@@ -72,6 +72,7 @@ func EnterPhase(ctx context.Context, scope string) context.Context {
 //
 // scope 是这次交接在调用方执行里唯一的名字（嵌套调用用调用的身份、编排成员用子 ns 后缀）。
 func HandOver(ctx context.Context, scope string) context.Context {
+	ctx = WithToolCallInstanceID(ctx, "", "")
 	return enterPhase(ctx, "handover\x00"+scope, true)
 }
 

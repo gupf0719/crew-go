@@ -213,6 +213,11 @@ func TestInputDigest_IgnoresPerConstructionFields(t *testing.T) {
 	if inputDigest(a) != inputDigest(b) {
 		t.Errorf("响应元数据不同不该影响摘要")
 	}
+	a.Annotations = map[string]any{toolCallBatchIDAnnotation: "batch-a"}
+	b.Annotations = map[string]any{toolCallBatchIDAnnotation: "batch-b"}
+	if inputDigest(a) != inputDigest(b) {
+		t.Error("调用批次的观测 ID 不应改变嵌套输入身份")
+	}
 	if inputDigest(a) == inputDigest(schema.UserMessage("另一句话")) {
 		t.Errorf("内容不同，摘要应不同")
 	}

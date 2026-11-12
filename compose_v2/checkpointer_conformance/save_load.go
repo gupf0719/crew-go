@@ -177,7 +177,7 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 				// round-trip**：空表达「这条挂起不指向任何待执行动作」，跟「没存下来」
 				// 是两回事，业务 backend 把空串写成 NULL 再读回非空就串档了。
 				{InterruptID: "q1", Question: "Q1?", Reason: "因为用户操作",
-					ToolCallID: "tc_abc", ToolName: "transfer"},
+					ToolCallID: "tc_abc", ToolName: "transfer", ToolCallInstanceID: "round/tool/0"},
 				{InterruptID: "q2", Question: "Q2?", Options: []string{"yes", "no"}, Reason: "需要确认",
 					ResponseSchema: json.RawMessage(`{"type":"object","required":["decision"]}`)},
 				// 声明式断点停下的挂起：Breakpoint 漏序列化不报错，但引擎靠它判「上次是不是停在断点上」——
@@ -459,8 +459,7 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 			t.Errorf("PendingInterrupts[0].Reason: expected '因为用户操作', got %q (业务 backend 漏 Reason 字段 → MergeInterrupts 聚合时丢)",
 				loaded.PendingInterrupts[0].Reason)
 		}
-		// 工具身份：审批型挂起靠它认出「这条挂起卡的是哪次调用」。漏序列化不报错，
-		// 只是挂起被放弃时补不出能配对的合成结果 → 历史里留一条永远悬空的 tool_call。
+		// 审批挂起同时往返模型协议 ID、实例 ID 和工具名。
 		if loaded.PendingInterrupts[0].ToolCallID != "tc_abc" {
 			t.Errorf("PendingInterrupts[0].ToolCallID: expected tc_abc, got %q (业务 backend 漏 tool_call_id 字段)",
 				loaded.PendingInterrupts[0].ToolCallID)
@@ -469,10 +468,11 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 			t.Errorf("PendingInterrupts[0].ToolName: expected transfer, got %q (业务 backend 漏 tool_name 字段)",
 				loaded.PendingInterrupts[0].ToolName)
 		}
-		// q2 是问答型：两个字段必须**保持空**——非空说明 backend 把别处的值串了过来
-		if loaded.PendingInterrupts[1].ToolCallID != "" || loaded.PendingInterrupts[1].ToolName != "" {
-			t.Errorf("PendingInterrupts[1] 工具身份应为空（问答型挂起不指向动作），got (%q, %q)",
-				loaded.PendingInterrupts[1].ToolCallID, loaded.PendingInterrupts[1].ToolName)
+		if loaded.PendingInterrupts[0].ToolCallInstanceID != "round/tool/0" {
+			t.Errorf("PendingInterrupts[0].ToolCallInstanceID = %q, want round/tool/0", loaded.PendingInterrupts[0].ToolCallInstanceID)
+		}
+		if q := loaded.PendingInterrupts[1]; q.ToolCallID != "" || q.ToolName != "" || q.ToolCallInstanceID != "" {
+			t.Errorf("普通问答的工具身份应为空，实际 (%q, %q, %q)", q.ToolCallID, q.ToolName, q.ToolCallInstanceID)
 		}
 
 		var responseSchema struct {

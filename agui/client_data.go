@@ -43,9 +43,8 @@ func questionInterrupt(q *compose_v2.AskQuery, reason string) RunInterrupt {
 		}
 	case "confirmation":
 	case "tool_call":
-		if q.ToolCallID != "" {
-			out.ToolCallID = q.ToolCallID
-		} else {
+		out.ToolCallID = interruptToolCallID(q)
+		if out.ToolCallID == "" {
 			out.Reason = "crew-go:tool_call"
 		}
 	default:
@@ -54,4 +53,11 @@ func questionInterrupt(q *compose_v2.AskQuery, reason string) RunInterrupt {
 		}
 	}
 	return out
+}
+
+func interruptToolCallID(q *compose_v2.AskQuery) string {
+	if q.ToolCallInstanceID != "" {
+		return q.ToolCallInstanceID
+	}
+	return q.ToolCallID
 }

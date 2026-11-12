@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"crew-go/compose_v2"
@@ -35,6 +36,9 @@ const SupersededDecisionErrCode = "decision_superseded"
 // toolBatch 是框架的 toolsFn 交给 tools 节点的、跟这一批 tool_call 一一对应的东西（下标与 tool_call 相同）：各调用收到
 // 的上行信号，以及各调用的结局。builder 放在 ctx 上，toolsFn 返回前填；业务自写的 toolsFn 不填。
 type toolBatch struct {
+	modelRunID string
+	batchID    string
+
 	// perCall：那个调用期间收到的上行信号（原样，作废在这里之后判）。这一批整体成功时才填。
 	perCall []compose_v2.Signals
 	filled  bool
@@ -64,6 +68,30 @@ func withToolBatch(ctx context.Context, b *toolBatch) context.Context {
 func toolBatchFrom(ctx context.Context) *toolBatch {
 	b, _ := ctx.Value(toolBatchKey{}).(*toolBatch)
 	return b
+}
+
+func (b *toolBatch) callInstanceID(index int) string {
+	if b == nil || b.batchID == "" {
+		return ""
+	}
+	return b.batchID + "/tool/" + strconv.Itoa(index)
+}
+
+func (b *toolBatch) withIdentity(extra map[string]any, index int) map[string]any {
+	instanceID := b.callInstanceID(index)
+	if instanceID == "" && b.modelRunID == "" {
+		return extra
+	}
+	if extra == nil {
+		extra = make(map[string]any, 2)
+	}
+	if b.modelRunID != "" {
+		extra[ToolModelRunIDExtraKey] = b.modelRunID
+	}
+	if instanceID != "" {
+		extra[ToolCallInstanceIDExtraKey] = instanceID
+	}
+	return extra
 }
 
 // finishToolBatchSignals 定下这批 tool_call 的决定并交给 ctx 上正在收的那段执行（tools 节点这次执行）：

@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"crew-go/internal/panicerr"
+	"crew-go/internal/streamdelta"
 	"crew-go/model"
 	"crew-go/schema"
 )
@@ -642,17 +643,21 @@ func (c *Client) handleStreamEvent(ctx context.Context, ev sseEvent, st *streamS
 		// json_schema strict 拒答流式 delta——per-chunk emit，上层聚合（§4.6）
 		Refusal: delta.Refusal,
 	}
+	var toolCallIndices map[int]int
 	for _, tc := range delta.ToolCalls {
-		// audit Round 3 Bug #2 修复：OpenAI 流式 delta 后续 chunks
-		// 仅含 index 不含 id——用 indexMap 按首 chunk id 回填，让
-		// 上层 streamOrGenerate 按 id 正确累加 args。
+		// 用索引聚合参数，原 ID 仍随片段交给消费方。后续片段可以只带索引。
 		id := tc.ID
-		if id == "" && tc.Index != nil {
-			if mapped, ok := indexMap[*tc.Index]; ok {
-				id = mapped
+		if tc.Index != nil {
+			index := *tc.Index
+			if id == "" {
+				id = indexMap[index]
+			} else {
+				indexMap[index] = id
 			}
-		} else if id != "" && tc.Index != nil {
-			indexMap[*tc.Index] = id
+			if toolCallIndices == nil {
+				toolCallIndices = make(map[int]int, len(delta.ToolCalls))
+			}
+			toolCallIndices[len(msg.ContentBlocks)] = index
 		}
 		msg.ContentBlocks = append(msg.ContentBlocks, &schema.ContentBlock{
 			Type: "tool_call",
@@ -662,6 +667,9 @@ func (c *Client) handleStreamEvent(ctx context.Context, ev sseEvent, st *streamS
 				Arguments: tc.Function.Arguments,
 			},
 		})
+	}
+	if len(toolCallIndices) > 0 {
+		msg.Annotations = map[string]any{streamdelta.ToolCallIndices: toolCallIndices}
 	}
 	finishReason := chunk.Choices[0].FinishReason
 	if finishReason != "" || streamUsage != nil || chunk.Model != "" || c.system != "" {

@@ -20,10 +20,10 @@ import (
 // + preview 占位符. LLM 看到 preview 知道有内容, 业务可通过 Backend.Read 拿全文.
 //
 // crew-go 实施: 复用 store.Store 作 Backend, OffloadEnabled opt-in, 默认 NS
-// store.NS("_micro_offload"), key = tool_use_id, value = 原 *schema.Message.
+// store.NS("_micro_offload"), key 由消息内容派生，value 是原消息的 JSON 形状。
 //
 // 测覆盖:
-//  1. OffloadEnabled=true + store 注入 → store.Get(NS, callID) 拿到原 message
+//  1. OffloadEnabled=true + store 注入 → 按占位符的 key 读回原消息
 //  2. 占位符含 "[offloaded:<key>] preview: <head>" + 双 marker (Offloaded + OffloadKey)
 //  3. OffloadEnabled=false (默认) → 行为同纯清占位符 (向后兼容)
 //  4. OffloadEnabled=true 但 store 未注入 → 降级为纯占位符 + slog.Warn (不阻断)
@@ -62,7 +62,11 @@ func TestAudit5_HIGH2_MicroCompact_OffloadToStore_StoresOriginalMessage(t *testi
 	offloadedCount := 0
 	for i := 0; i < 3; i++ {
 		callID := fmt.Sprintf("tc_%d", i)
-		item, err := st.Get(ctx, store.NS("_micro_offload"), callID)
+		key, _ := out[2*i+1].Annotations[agent_v2.MicroCompactOffloadKeyAnnotation].(string)
+		if key == "" {
+			t.Fatalf("callID=%s 缺少转存引用", callID)
+		}
+		item, err := st.Get(ctx, cfg.OffloadNamespace(ctx), key)
 		if err != nil {
 			t.Fatalf("store.Get(%s) err: %v", callID, err)
 		}
@@ -140,7 +144,8 @@ func TestMicroCompactOffload_DescribesStoredTruncatedResult(t *testing.T) {
 		strings.Contains(placeholder.Content, "读回全文") || placeholder.ContentBlocks[0].Toolresult.Content != placeholder.Content {
 		t.Fatalf("占位符应描述可取回的截断内容，实际 %+v", placeholder)
 	}
-	if item, err := st.Get(ctx, cfg.OffloadNamespace(ctx), "old"); err != nil || item == nil {
+	key, _ := placeholder.Annotations[agent_v2.MicroCompactOffloadKeyAnnotation].(string)
+	if item, err := st.Get(ctx, cfg.OffloadNamespace(ctx), key); err != nil || item == nil {
 		t.Fatalf("占位符应对应实际存储的内容，实际 %+v，错误 %v", item, err)
 	}
 }

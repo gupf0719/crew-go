@@ -1,7 +1,7 @@
 package agui_test
 
-// 请求原文里的工具调用装在一条 id 不等于 toolCallId 的 assistant 消息下（外来历史带 parentMessageId），provider 这次又复用了
-// 同一个 tool_call ID：官方客户端把这次的调用并进它手上那条，快照里同一个工具调用只能出现一份（曾经另记一条，两份，⑩）。
+// 请求原文里的工具调用装在一条带 parentMessageId 的 assistant 消息下。
+// Provider 复用原 ID 时，快照保留原有调用和本次新调用各一份。
 
 import (
 	"context"
@@ -42,24 +42,28 @@ func TestResetSnapshot_ForeignHeldToolCallNotDuplicated(t *testing.T) {
 		`{"id":"u1","role":"user","content":"go"}]}`
 	events := parseSSE(postAGUI(h, body).Body.String())
 	snapshots := 0
+	var newID string
 	for _, ev := range events {
+		if ev["type"] == "TOOL_CALL_START" {
+			newID, _ = ev["toolCallId"].(string)
+		}
 		if ev["type"] != "MESSAGES_SNAPSHOT" {
 			continue
 		}
 		snapshots++
-		held := 0
+		held := map[string]int{}
 		msgs, _ := ev["messages"].([]any)
 		for _, raw := range msgs {
 			msg, _ := raw.(map[string]any)
 			calls, _ := msg["toolCalls"].([]any)
 			for _, c := range calls {
-				if cm, _ := c.(map[string]any); cm["id"] == "call_1" {
-					held++
-				}
+				cm, _ := c.(map[string]any)
+				id, _ := cm["id"].(string)
+				held[id]++
 			}
 		}
-		if held != 1 {
-			t.Fatalf("快照里工具调用 call_1 应只出现一份（并进原文的 M），实际 %d 份：%v", held, msgs)
+		if newID == "" || newID == "call_1" || len(held) != 2 || held["call_1"] != 1 || held[newID] != 1 {
+			t.Fatalf("快照应同时保留旧调用 call_1 和新调用 %q，实际 %v", newID, held)
 		}
 	}
 	if snapshots == 0 {

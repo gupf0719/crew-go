@@ -333,8 +333,8 @@ func (m noCallIDModel) Stream(ctx context.Context, msgs []*schema.Message, opts 
 
 func (m noCallIDModel) WithTools([]*schema.ToolInfo) (model.ChatModel, error) { return m, nil }
 
-// 没有 tool_call ID 的审批：reason 用 confirmation（tool_call 必须带 toolCallId），批准之后照常执行。
-func TestHandler_ApprovalInterrupt_ConfirmationWithoutToolCallID(t *testing.T) {
+// Provider 未返回 ID 时，框架仍为 AG-UI 调用与审批提供同一个实例 ID。
+func TestHandler_ApprovalInterrupt_WithoutProviderToolCallID(t *testing.T) {
 	var runs atomic.Int32
 	h := ownedHandler(func(hooks hook.Hooks) agent_v2.Agent {
 		tk := tool.NewToolkit()
@@ -347,15 +347,19 @@ func TestHandler_ApprovalInterrupt_ConfirmationWithoutToolCallID(t *testing.T) {
 			agent_v2.WithToolkit(tk), agent_v2.WithApprovalMode(agent_v2.ApprovalAsk),
 			agent_v2.WithHooks(hooks), agent_v2.WithMaxRounds(4))
 	}, agui.WithCheckpointer(compose_v2.NewInMemoryCheckpointer()))
-	its := interruptsIn(parseSSE(postAGUI(h, `{"threadId":"t-conf","runId":"r1","messages":[{"role":"user","content":"go"}]}`).Body.String()))
+	events := parseSSE(postAGUI(h, `{"threadId":"t-conf","runId":"r1","messages":[{"role":"user","content":"go"}]}`).Body.String())
+	var callID string
+	for _, e := range events {
+		if e["type"] == "TOOL_CALL_START" {
+			callID, _ = e["toolCallId"].(string)
+		}
+	}
+	its := interruptsIn(events)
 	if len(its) != 1 {
 		t.Fatalf("前置：应停在一条审批上，实际 %v", its)
 	}
-	if its[0]["reason"] != "confirmation" {
-		t.Fatalf("没有 tool_call ID 的审批 reason 应为 confirmation，实际 %v", its[0]["reason"])
-	}
-	if _, has := its[0]["toolCallId"]; has {
-		t.Fatalf("没有 tool_call ID 时不该带 toolCallId，实际 %v", its[0]["toolCallId"])
+	if callID == "" || its[0]["reason"] != "tool_call" || its[0]["toolCallId"] != callID {
+		t.Fatalf("没有 provider ID 的审批应指向实例 %q，实际 %v", callID, its[0])
 	}
 	id, _ := its[0]["id"].(string)
 	if code := findErrorCode(resumeEntries(t, h, "t-conf", "r2", resolved(id, true))); code != "" || runs.Load() != 1 {

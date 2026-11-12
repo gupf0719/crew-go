@@ -30,8 +30,8 @@ import (
 //  2. **NewSharedChildSession**: 父 ctx 含 sess 时构造半共享 child sess (events 独立,
 //     values 共享指针, RunID 沿用, parentSess 反向指针——ISSUE-79). 业务 store.Search
 //     可走 `sess.RootSession()` 沿链上追看父 history.
-//  3. **WithSubAgentStoreScope**: 标记「这次调用发生在成员位置上」。框架自己不读它；
-//     业务的 store 后端可以据此给 sub-agent 的记忆换后端 / TTL（见 WithSubAgentStoreScope）。
+//  3. **WithSubAgentStoreScope**: 标记「这次调用发生在成员位置上」。业务 Store 可据此选择后端或 TTL，
+//     MicroCompact 据此隔离写入去重（见 WithSubAgentStoreScope）。
 //
 // **why helper** (#7 audit follow-up F4 fix): GraphAgent 业务自定义 NodeFunc 嵌套
 // sub-agent.Run 时必须手 push 上述 3 件 ctx, 漏 1 件就 silent bug——
@@ -211,7 +211,7 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 续得上；开新任务的方式跟别处一样是换 RunID（`sess.NextTask()`）。
 	subCtx = withTaskScope(subCtx, childSess.RunID)
 
-	// 3. 标记「这次调用发生在成员位置上」（框架不读，留给业务 store 后端，见 WithSubAgentStoreScope）
+	// 3. 标记「这次调用发生在成员位置上」（见 WithSubAgentStoreScope）。
 	subCtx = WithSubAgentStoreScope(subCtx, true)
 
 	// 4. 把这次执行连同输入交给被调方（compose_v2.HandOver）：被调方在自己的图之外（它的 agent 级

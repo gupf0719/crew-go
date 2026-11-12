@@ -45,6 +45,22 @@ curl -N -H 'Content-Type: application/json' http://127.0.0.1:8094/agui \
 省略 `reviewer` 会返回 400，仍可继续回答原问题。
 [示例回归](orchestration/sop_demo/main_test.go)
 
+
+### Agent 行为评测
+
+```bash
+go run ./example/decision/trajectory_eval -runs 3
+go run ./example/decision/trajectory_eval -cases /path/to/cases.jsonl -mode qwen -runs 5
+```
+
+用例声明输入、预期路由、审批序列、工具体实际执行的名称和参数、终态及最终答复包含的文本。
+`answers` 按实际挂起批次提交，省略答复可以验任务仍挂起。工具调用数组逐项比对，重复项表示预期执行多次。
+内置用例覆盖批准、拒绝、保留挂起和帮助路由，默认 `go test ./...` 在 CI 运行 mock 评测。
+命令也支持 `-mode openai` 使用 Responses，以及用 `-model` 指定模型。真机模式读取对应的
+`QWEN_API_KEY` 或 `OPENAI_API_KEY`。报告包含通过次数、`pass@k`、`pass^k`、P95 和 token 用量，
+给出 `-input-price` 与 `-output-price` 时按每百万 token 单价估算费用。
+[JSONL 示例](decision/trajectory_eval/cases.jsonl)
+
 ## 常用命令
 
 **交互式 REPL**（输入 `/exit` 或 Ctrl-D 退出）：

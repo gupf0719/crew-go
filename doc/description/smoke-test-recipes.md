@@ -319,7 +319,8 @@ go test -tags=integration ./example/model/anthropic_smoke -run '^TestSmoke_Strea
 ## §11 OpenAI 流式与工具调用
 
 从环境变量或项目根目录 `.env` 读取 `OPENAI_API_KEY`，缺少凭据时跳过。默认模型是
-`gpt-5.4-mini`，可用 `OPENAI_SMOKE_MODEL` 指定支持 Chat Completions 流式和工具调用的模型。
+`gpt-5.4-mini`。Chat Completions 用例读取 `OPENAI_SMOKE_MODEL`，Responses 用例读取
+`OPENAI_RESPONSES_SMOKE_MODEL`。两组都覆盖流式和工具调用。
 [OpenAI Docs](https://developers.openai.com/api/docs/models/gpt-5.4-mini)
 
 ```bash

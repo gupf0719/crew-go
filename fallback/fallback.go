@@ -153,12 +153,9 @@ func (f *FallbackChatModel) Generate(ctx context.Context, messages []*schema.Mes
 	}, nil)
 }
 
-// Stream 按序在候选间故障切换建立流式调用。
-//
-// **仅建流阶段切换**（model-fallback.md §6）：一旦某候选 Stream 成功返回 reader、
-// chunk 开始投递，就不再切换（下游已收到半截输出无法干净回切）；流中途的错误照常
-// 向下游传递。建流阶段同步返回 error（如 HTTP 非 200 在拿到首 chunk 前）才触发切换。
-// 断路器在消费方读到流结局时结算，读完记成功，候选故障记失败，提前关闭归还探测名额。
+// Stream 按序在候选间切换，直到某条流交出首个有效片段。
+// 首片段前的建流和读取错误都走候选的重试、切换与断路器策略。选中后保持该条流，
+// 后续错误交给消费者。断路器在消费者读到流结局或关闭时结算。
 //
 // **不支持流式的候选**（Stream 返回 model.ErrStreamUnsupported，或 nil reader 且没有错误）
 // 就地用它的 Generate，结果包成只有一项的流——轮到哪个候选就用哪个，顺序不倒退。把
@@ -169,11 +166,14 @@ func (f *FallbackChatModel) Generate(ctx context.Context, messages []*schema.Mes
 func (f *FallbackChatModel) Stream(ctx context.Context, messages []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
 	return tryMembers(ctx, f, func(ctx context.Context, m model.ChatModel) (*schema.StreamReader[*schema.Message], error) {
 		sr, err := m.Stream(ctx, messages, opts...)
-		if sr != nil && err != nil {
+		if sr != nil {
+			if err == nil {
+				return peekStream(ctx, sr)
+			}
 			sr.Close()
 		}
-		if !errors.Is(err, model.ErrStreamUnsupported) && (err != nil || sr != nil) {
-			return sr, err
+		if err != nil && !errors.Is(err, model.ErrStreamUnsupported) {
+			return nil, err
 		}
 		msg, err := generateMember(ctx, m, messages, opts...)
 		if err != nil {

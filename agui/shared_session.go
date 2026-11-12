@@ -18,11 +18,12 @@ import (
 
 // SessionRecord 保存一个 thread 当前任务的请求前文和已采纳答复。挂起问题以根存档为准。
 type SessionRecord struct {
-	TaskID    string                     `json:"task_id"`
-	Prior     []*schema.Message          `json:"prior,omitempty"`
-	Closing   bool                       `json:"closing,omitempty"`
-	ModelData string                     `json:"model_data,omitempty"`
-	Answers   map[string]*schema.Message `json:"answers,omitempty"`
+	WorkflowVersion string                     `json:"workflow_version,omitempty"`
+	TaskID          string                     `json:"task_id"`
+	Prior           []*schema.Message          `json:"prior,omitempty"`
+	Closing         bool                       `json:"closing,omitempty"`
+	ModelData       string                     `json:"model_data,omitempty"`
+	Answers         map[string]*schema.Message `json:"answers,omitempty"`
 }
 
 // SessionStore 在同一共享后端保存会话记录、任务租约及图存档。key 由 Handler 生成，代表
@@ -240,7 +241,9 @@ func (h *handler) servePending(w http.ResponseWriter, r *http.Request) {
 		batch.events = []RunInterrupt{}
 	}
 	var accepted []string
+	var version string
 	if s.record != nil {
+		version = s.record.WorkflowVersion
 		for _, q := range batch.events {
 			if s.record.Answers[q.ID] != nil {
 				accepted = append(accepted, q.ID)
@@ -251,7 +254,8 @@ func (h *handler) servePending(w http.ResponseWriter, r *http.Request) {
 		ThreadID   string         `json:"threadId"`
 		Interrupts []RunInterrupt `json:"interrupts"`
 		Accepted   []string       `json:"acceptedInterruptIds,omitempty"`
-	}{threadID, batch.events, accepted})
+		Version    string         `json:"workflowVersion,omitempty"`
+	}{threadID, batch.events, accepted, version})
 	if err != nil {
 		slog.DebugContext(ctx, "agui: 挂起查询响应未送达", "err", err)
 	}
@@ -268,7 +272,7 @@ func sharedSessionError(ctx context.Context, err error) (int, string, string) {
 	return http.StatusServiceUnavailable, "session_store_failed", "the shared session could not be read or updated"
 }
 
-func rejectSharedSession(ctx context.Context, sse *SSEWriter, err error) {
+func rejectSharedSession(ctx context.Context, sse eventWriter, err error) {
 	status, code, message := sharedSessionError(ctx, err)
 	_ = sse.Reject(status, code, message)
 }

@@ -42,7 +42,7 @@ func setupAGUI(t *testing.T, dialect crewsql.Dialect, open func() *dbsql.DB) agu
 	table := "agui_" + strings.ToLower(rand.Text())
 	dbA, dbB := open(), open()
 	t.Cleanup(func() {
-		for _, tbl := range []string{table + "_agui_session", table + "_task_lease", table} {
+		for _, tbl := range []string{table + "_agui_events", table + "_agui_runs", table + "_agui_session", table + "_task_lease", table} {
 			if _, err := dbB.Exec("DROP TABLE IF EXISTS " + tbl); err != nil {
 				t.Error(err)
 			}
@@ -220,11 +220,12 @@ func (q *questions) factory(t *testing.T) agui.AgentFactory {
 	}
 }
 
-func sharedHandler(factory agui.AgentFactory, st agui.SessionStore) http.Handler {
-	return agui.Handler(factory, agui.WithSessionStore(st), agui.WithOwnerResolver(func(ctx context.Context) string {
+func sharedHandler(factory agui.AgentFactory, st agui.SessionStore, opts ...agui.Option) http.Handler {
+	base := []agui.Option{agui.WithSessionStore(st), agui.WithOwnerResolver(func(ctx context.Context) string {
 		owner, _ := ctx.Value(aguiOwnerKey{}).(string)
 		return owner
-	}))
+	})}
+	return agui.Handler(factory, append(base, opts...)...)
 }
 
 func aguiRequest(t *testing.T, owner, method string, body any) *http.Request {
@@ -270,6 +271,7 @@ func aguiPost(t *testing.T, h http.Handler, owner string, body any) *httptest.Re
 type pendingAGUI struct {
 	Interrupts []agui.RunInterrupt `json:"interrupts"`
 	Accepted   []string            `json:"acceptedInterruptIds"`
+	Version    string              `json:"workflowVersion"`
 }
 
 func aguiPending(t *testing.T, h http.Handler, owner string) pendingAGUI {
@@ -320,6 +322,8 @@ func (s *faultSessions) SaveSession(ctx context.Context, key string, record *agu
 
 func runAGUISessionScenarios(t *testing.T, dialect crewsql.Dialect, open func() *dbsql.DB) {
 	t.Helper()
+	checkRunJournal(t, dialect, open)
+	checkWorkflowVersions(t, dialect, open)
 	t.Run("restart_disconnect_busy_owner_stale", func(t *testing.T) {
 		f := setupAGUI(t, dialect, open)
 		reached, proceed := make(chan struct{}), make(chan struct{})

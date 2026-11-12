@@ -707,8 +707,8 @@ ResumeContext 默认全 ctx 子树可见（适合"父节点直接是子 agent"�
 ### 7.4 Resume 恢复的是 state，不是 event
 
 `Checkpoint` **没有 Events 字段**。`cm.Restore(cp)` 恢复 channel state + frontier +
-PendingInterrupts，从 frontier 续跑，**不回放 event**。前端 SSE 断线重连要业务自己持久化流
-（如 Redis Stream）+ 按 last-event-id 续传。
+PendingInterrupts，从 frontier 续跑。AG-UI 接入可以使用独立的
+[Run 日志](agui.md#持久回执与断线续传) 回放 SSE。
 
 ### 7.5 防御机制
 

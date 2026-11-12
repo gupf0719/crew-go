@@ -24,6 +24,7 @@ type SSEWriter struct {
 	w        http.ResponseWriter
 	flusher  http.Flusher
 	opened   bool // 响应已开始（事件流已开，或已经按 HTTP 错误码拒掉）
+	replay   bool // 重放时开流后的错误通过关闭订阅报告，游标只指向已存帧。
 	rejected bool // 开流之前已经拒掉：之后不再写事件
 }
 
@@ -70,7 +71,11 @@ func (s *SSEWriter) Reject(status int, code, message string) error {
 		s.rejected = true
 		return writeReject(s.w, status, code, message)
 	}
+	replay := s.replay
 	s.mu.Unlock()
+	if replay {
+		return nil
+	}
 	return s.WriteEvent(NewRunError(message, code))
 }
 
@@ -95,21 +100,41 @@ func writeReject(w http.ResponseWriter, status int, code, message string) error 
 // data 是单行 JSON——encoding/json 保证输出不含裸换行（字符串里的 \n 被编码成 `\n`
 // 字面），故 SSE data 行安全。事件未设时间戳时补当前毫秒（AG-UI 约定 Unix ms）。
 func (s *SSEWriter) WriteEvent(ev Event) error {
+	payload, err := encodeEvent(ev)
+	if err != nil {
+		return err
+	}
+	return s.writeFrame(fmt.Sprintf("%s_%d", ev.Type(), ev.timestampMs()), payload)
+}
+
+func encodeEvent(ev Event) (json.RawMessage, error) {
 	if ev.timestampMs() == 0 {
 		ev.setTimestampMs(time.Now().UnixMilli())
 	}
 	payload, err := json.Marshal(ev)
 	if err != nil {
-		return fmt.Errorf("agui: marshal event: %w", err)
+		return nil, fmt.Errorf("agui: marshal event: %w", err)
 	}
-	// 锁只护共享的 w + flusher；timestamp/marshal 作用于独立 ev，放锁外减小临界区。
+	return payload, nil
+}
+
+func (s *SSEWriter) openStream() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.opened {
+		s.openLocked()
+		s.flusher.Flush()
+	}
+}
+
+func (s *SSEWriter) writeFrame(id string, payload json.RawMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.rejected {
 		return errRejected
 	}
 	s.openLocked()
-	if _, err := fmt.Fprintf(s.w, "id: %s_%d\ndata: %s\n\n", ev.Type(), ev.timestampMs(), payload); err != nil {
+	if _, err := fmt.Fprintf(s.w, "id: %s\ndata: %s\n\n", id, payload); err != nil {
 		return fmt.Errorf("agui: write sse frame: %w", err)
 	}
 	s.flusher.Flush()

@@ -13,8 +13,8 @@ import (
 	"crew-go/schema"
 )
 
-// sseAdapter 把 crew-go 的事件源映射成 AG-UI 事件写入 SSE。一个 adapter 对应一次
-// agent.Run（一个 HTTP SSE 连接）。它同时实现两个 crew-go hook 接口：
+// sseAdapter 把 crew-go 的事件源映射成 AG-UI 事件。每次 Run 或 Resume 使用自己的 adapter，
+// 事件写入连接或日志。它同时实现两个 crew-go hook 接口：
 //
 //   - hook.Hooks（8 回调，业务级）—— 拿 LLM 输出收尾 + tool 调用
 //   - agent_v2.OrchestrationHooks（5 回调，编排级）—— 拿流式 chunk 实时投递
@@ -37,7 +37,7 @@ import (
 type sseAdapter struct {
 	hook.NoOpHooks // 未映射的 hook.Hooks 回调（OnAgentStart/End、OnModelStart 等）走 NoOp
 
-	w  *SSEWriter
+	w  eventWriter
 	mu sync.Mutex // 保护 w + openMsgs：并发 sub-agent 的 chunk / tool 回调经此串行化
 
 	// openMsgs 是当前打开（已发 TextMessageStart、未发 End）的流式 TextMessage 集合，
@@ -112,7 +112,7 @@ var (
 )
 
 // newSSEAdapter 构造 adapter。runID 是本次 AG-UI run 的 id，input 是请求带来的消息（撤回消息时重述它们）。
-func newSSEAdapter(w *SSEWriter, runID string, input []AGUIMessage) *sseAdapter {
+func newSSEAdapter(w eventWriter, runID string, input []AGUIMessage) *sseAdapter {
 	a := &sseAdapter{w: w, runID: runID, openMsgs: map[string]bool{}, byID: map[string]*emittedMessage{},
 		inputIDs: map[string]bool{}, inputCallIDs: map[string]bool{}}
 	for _, m := range input {

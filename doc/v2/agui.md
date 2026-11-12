@@ -46,11 +46,10 @@ http.Handle("/agui", h)
 
 ## 3. 为什么是 `AgentFactory`（而非直接传 agent）
 
-AG-UI 是 **per-connection SSE**——每个请求的 adapter 绑定各自的 HTTP response。而
-crew-go 的 `hook.Hooks` 是**构造期注入**（`RunOption` 无 per-Run hook.Hooks），故每请求
-经工厂构造挂独立 adapter 的 agent。BasicAgent 等构造是轻量 builder，每请求构造开销可
-接受；业务想复用重资源（model / toolkit / skillbox）在工厂闭包**外**预建、闭包内只 new
-agent 引用即可。
+每次实际执行使用独立的事件 adapter，`hook.Hooks` 在构造 agent 时注入。业务可在
+工厂闭包外预建 model、toolkit、skillbox，再在每次执行时构造带当前 adapter 的 agent。
+事件重放直接读日志，不调用工厂。
+
 
 ---
 
@@ -120,7 +119,7 @@ Run → 中断 → RunFinished(outcome=interrupt, interrupts=[{id, reason, messa
 
 ### 共享会话
 
-每个实例用同一 SQL 数据库、存档表和相同的 Agent 图定义。`sql.AGUISessionStore.Setup` 建立
+每个实例用同一 SQL 数据库和存档表。同一个工作流版本须使用兼容的 Agent 图定义。`sql.AGUISessionStore.Setup` 建立
 会话表、存档表和租约表，`agui.WithSessionStore` 同时给 Handler 提供会话与 Checkpointer。
 
 ```go
@@ -153,7 +152,7 @@ sequenceDiagram
     B->>DB: 续跑并写入下一问或清理已完成任务
 ```
 
-重连时调用 `GET /agui?threadId=<id>`，仍通过配置的 owner 解析器确定归属。返回
+查询待审批时调用 `GET /agui?threadId=<id>`，仍通过配置的 owner 解析器确定归属。返回
 `{"threadId":"...","interrupts":[...]}`，暂无待答问题时 `interrupts` 为空数组。
 如果某条当前问题的答复已保存且图还停在该处，响应会带 `acceptedInterruptIds`。
 这时可发送同一个 ID、`status:"resolved"` 并省略 `payload`，由服务端重放已采纳的答复。
@@ -163,6 +162,67 @@ sequenceDiagram
 挂起上限和 TTL 适用于进程内会话。共享会话写入终态标记后，后续同线程请求会补偿未完成的清理。
 如果终态标记本身未能写入，可以在数据库恢复后重新发起 Run 清理上一任务。
 进程在形成根存档前退出时，可以用同一线程重新发起 Run 并清理上一任务。
+
+
+### 持久回执与断线续传
+
+应用可以配置 `agui.WithRunStore` 保存每次 HTTP Run 或 Resume 的回执和事件。各入口实例共享日志与
+会话后端。调用方带固定的 `threadId`、`runId`，重试时保留原请求的 JSON 成员顺序及内容，空白可以变化。
+同一归属、线程和 Run ID 的首次提交认领执行，重试订阅原事件，内容变更返回 `409 run_id_conflict`。
+每次新的 Run 或审批 Resume 使用新的 `runId`。
+
+```go
+runs := crewsql.NewAGUIRunStore(cp)
+if err := runs.Setup(ctx); err != nil {
+    return err
+}
+mux.Handle("/agui", agui.Handler(build,
+    agui.WithOwnerResolver(resolveAuthenticatedOwner),
+    agui.WithSessionStore(sessions),
+    agui.WithRunStore(runs, 2*time.Minute),
+))
+```
+
+- `GET /agui?threadId=t&runId=r` 查询回执。响应包含 `status`、`lastEventId`，收尾后有 `terminal`。
+  认领后、开流前拒绝的状态是 `rejected`，并带 `httpStatus`。请求格式、协议版本和游标检查在认领前执行。
+  无记录或其他归属查询返回 `404 run_not_found`。
+- 同一个 GET 带 `Accept: text/event-stream` 可订阅。用 `Last-Event-ID` 或 `after` 指定已消费的最后一帧，
+  从下一帧继续。两处都给时优先取请求头。每个 Run 的 SSE `id` 从 1 递增，连接追上终态后关闭。
+  重试 POST 也可带游标。负数或超范围的游标返回 `400 invalid_cursor`。
+- Run 认领后独立于连接执行。超时由 `WithRunStore` 配置，零值为五分钟，保留请求上下文中更短的 deadline。
+  执行正常收尾时先归还会话与任务租约，再提交终帧，事件与终态同事务。订阅读库失败时连接结束，客户端可以沿最后一个有效游标重连。
+- 已存回执的拒绝会在重试时返回原 HTTP 状态和错误。明确收到 `busy` 或版本不可用后，重新提交时使用新的 `runId`。
+  超过执行与收尾期限且回执仍在途时，查询会将状态置为 `error`，代码为 `run_interrupted`。业务可以按
+  挂起查询与外部工具的幂等凭证对账。
+- 日志保存原始 AG-UI 事件，包括文本和工具参数。应用按重连窗口和数据保留策略调用
+  `runs.PruneRuns(ctx, before)` 回收已完成记录与事件，回收后的 `runId` 应退役。
+  启用前把流量切到均配置共享日志的入口实例。
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant A as 实例 A
+    participant DB as 共享 SQL
+    participant B as 实例 B
+    C->>A: POST 带 threadId 和 runId
+    A->>DB: 认领回执并保存事件
+    A-->>C: SSE 事件与游标
+    Note over A: 连接断开后继续执行
+    C->>B: GET SSE 带原 runId 和游标
+    B->>DB: 读游标之后的事件
+    A->>DB: 释放任务租约并提交终帧
+    B-->>C: 补发事件和终帧
+```
+
+### 挂起任务的工作流版本
+
+用 `agui.WithWorkflowVersions("v2", map[string]agui.AgentFactory{"v1": buildV1})` 配置共享会话时，
+`Handler` 传入的工厂承接 v2 的新任务。任务创建时保存版本，后续审批、取消与恢复使用任务记录中的版本。
+缺少对应工厂会返回 `409 workflow_version_unavailable`，已挂起的问题与已采纳答复保持原样。
+明确收到该拒绝后，把保留的 `interruptId` 和新 `runId` 提交给支持该版本的实例。断线后的原请求重试沿用原 `runId`。
+
+已存在的未标记任务可以通过 `previous` 的空键显式交给原定义。版本标识对应一套兼容的图、工具与审批规则，
+修改其语义时使用新版本。内建 SQL 后端会让旧二进制在加载带版本的记录时返回 503。发布时在旧版本的任务处理完前保留其工厂。
 
 ---
 
@@ -230,9 +290,8 @@ Anthropic 支持图片、PDF、内联纯文本文档和 Anthropic 文件 ID。�
 
 ## 8. 限制
 
-- **client 断开**：agent 跑期间 client 断开 → `r.Context()` canceled → 框架超步边界停 +
-  清 sess（省 LLM/工具开销）；RunStarted 前断开 → 短路不跑 agent。（单个长超步 / LLM 调用
-  期间断开需该请求响应 ctx 取消才立即停。）
+- **默认连接生命周期**：进程内会话和只配置共享会话的请求随 `r.Context()` 取消。启用
+  `WithRunStore` 后，认领的执行拥有独立期限，连接断开后可按游标重连。
 - **StateSnapshot 不自动**：Go 泛型擦除，业务 opt-in emit（§6）。
 - **编排特有语义丢失**：`ForkLane` / Plan replan / 嵌套 ns 在 AG-UI 无原生对应，降级
   `Custom` / metadata 或不映射（AG-UI 前端心智是 message + tool，不需引擎内部结构）。

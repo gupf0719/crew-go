@@ -161,15 +161,14 @@ func (m *AGUIMessage) UnmarshalJSON(b []byte) error {
 	}
 }
 
-// AgentFactory 每个 AG-UI 请求调一次，返回处理该请求的 agent。传入的 hooks 是 AG-UI
+// AgentFactory 为实际执行的 AG-UI Run 或 Resume 构造 agent。传入的 hooks 是 AG-UI
 // adapter——**必须注入 agent**（`agent_v2.WithHooks(hooks)` 或 chain 进业务 hooks），
 // 否则拿不到 LLM 输出 / tool 调用、AG-UI 事件流只剩纯文本。chain 时 adapter 排在会在 OnModelEnd
 // 里问人的业务钩子前面：续跑沿用那次答复时 adapter 按 hook.ModelResponseReusedKey 不再发（上一次 run
 // 已经交给前端），排在后面、模型又不流式时那次没发出去、这一遍也不发。**必须返回非 nil agent**
 // （返 nil 时 handler fail-fast 发 RunError(code=nil_agent)）。
 //
-// 为什么是工厂而非直接传 agent：AG-UI 是 per-connection SSE，每个请求的 adapter 绑定
-// 各自的 HTTP response；而 crew-go 的 hook.Hooks 是构造期注入（RunOption 无 per-Run
+// 每次实际执行使用独立的事件 adapter。crew-go 的 hook.Hooks 是构造期注入（RunOption 无 per-Run
 // hook.Hooks），故每请求构造挂独立 adapter 的 agent。BasicAgent 等构造是轻量 builder，
 // 每请求构造开销可接受；业务想复用重资源（model / toolkit / skillbox）在工厂闭包外
 // 预建、闭包内只 new agent 引用它们即可。Resume 也走工厂新建 agent——crew-go Resume
@@ -286,6 +285,7 @@ func WithOwnerResolver(fn compose_v2.OwnerResolver) Option {
 // HITL 闭环：中断→前端收 RunFinished(interrupt)→用户答→带同 threadId + resume=[{interruptId,
 // status, payload}]（对齐官方 ResumeEntry）续发→server 走 Resume。会话默认在进程内持有。配置
 // [WithSessionStore] 可跨实例继续，并通过 GET 查询当前挂起项。
+// [WithRunStore] 可查询执行回执和续接 SSE，[WithWorkflowVersions] 可为挂起任务选择原定义。
 //
 // 并发：同一 threadId 至多一个在途 Run/Resume（busy 保护）——第二个并发请求返
 // RunError(code=busy)，避免同一挂起 sess 被两个 Resume 并发驱动 / cp 双写。
@@ -309,6 +309,12 @@ func Handler(build AgentFactory, opts ...Option) http.Handler {
 	}
 	if h.sessionStore != nil {
 		h.cp = h.sessionStore
+	}
+	if h.runStore != nil && h.sessionStore == nil {
+		panic("agui: WithRunStore requires WithSessionStore")
+	}
+	if h.workflowVersion != "" && h.sessionStore == nil {
+		panic("agui: WithWorkflowVersions requires WithSessionStore")
 	}
 	return h
 }
@@ -348,12 +354,16 @@ type sessionEntry struct {
 }
 
 type handler struct {
-	build         AgentFactory
-	sessionStore  SessionStore
-	cp            compose_v2.Checkpointer // HITL Resume 用（nil = 不支持 Resume）
-	maxSessions   int                     // 挂起会话上限（<=0 不限）
-	sessionTTL    time.Duration           // 挂起会话最长闲置（<=0 不按时间回收），见 WithSessionTTL
-	ownerResolver compose_v2.OwnerResolver
+	build             AgentFactory
+	sessionStore      SessionStore
+	runStore          RunStore
+	runTimeout        time.Duration
+	workflowVersion   string
+	previousFactories map[string]AgentFactory
+	cp                compose_v2.Checkpointer // HITL Resume 用（nil = 不支持 Resume）
+	maxSessions       int                     // 挂起会话上限（<=0 不限）
+	sessionTTL        time.Duration           // 挂起会话最长闲置（<=0 不按时间回收），见 WithSessionTTL
+	ownerResolver     compose_v2.OwnerResolver
 
 	// 客户端内容没采信 / 没取时各告警一次（见 warnClientMessages）
 	warnedInstructions atomic.Bool
@@ -367,6 +377,10 @@ type handler struct {
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && h.sessionStore != nil {
+		if runID := r.URL.Query().Get("runId"); h.runStore != nil && runID != "" {
+			h.serveRunQuery(w, r, runID)
+			return
+		}
 		h.servePending(w, r)
 		return
 	}
@@ -375,7 +389,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in RunAgentInput
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	var raw json.RawMessage
+	decoder := json.NewDecoder(r.Body)
+	var err error
+	if h.runStore == nil {
+		err = decoder.Decode(&in)
+	} else if err = decoder.Decode(&raw); err == nil {
+		err = json.Unmarshal(raw, &in)
+	}
+	if err != nil {
 		_ = writeReject(w, http.StatusBadRequest, "bad_request", "agui: bad request body: "+err.Error())
 		return
 	}
@@ -385,18 +407,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = writeReject(w, http.StatusInternalServerError, "streaming_unsupported", "agui: streaming unsupported")
 		return
 	}
-	// panic 兜底：handler goroutine 上（serveRun/serveResume/handleOutcome/factory 构造
-	// 等 agent.Run 之外）的 panic 若不兜底，net/http 掐连接会留半截 SSE 流——RunStarted
-	// 已 flush 却无 RUN_FINISHED/RUN_ERROR 终态，违反 AG-UI 生命周期契约、前端等终态挂死。
-	// 此 recover 补发 RUN_ERROR 收尾（agent.Run 内部 panic 已由 agent_v2 recoverToErr 转
-	// err 走正常 RunError 路径；此兜底只覆盖 Run 外的 handler 层 panic）。
-	defer func() {
-		if rec := recover(); rec != nil {
-			// 栈只进服务端日志，不发给前端
-			panicerr.Log(r.Context(), slog.LevelError, "agui: handler 兜住 panic，已给前端发 RUN_ERROR", panicerr.New(rec))
-			_ = sse.Reject(http.StatusInternalServerError, "panic", fmt.Sprintf("agui: internal panic: %v", rec))
-		}
-	}()
+	defer recoverRequest(r.Context(), sse)
 
 	// **没给 threadId 就当场铸一个**（仅新一轮运行；续跑见下）。
 	//
@@ -430,6 +441,22 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx, key := h.requestContext(r, in.ThreadID)
+	if h.runStore != nil {
+		h.serveTrackedRun(ctx, sse, r, &in, key, raw)
+		return
+	}
+	h.serveRequest(ctx, sse, &in, key)
+}
+
+func recoverRequest(ctx context.Context, w eventWriter) {
+	if rec := recover(); rec != nil {
+		panicerr.Log(ctx, slog.LevelError, "agui: handler 兜住 panic，已给前端发 RUN_ERROR", panicerr.New(rec))
+		_ = w.Reject(http.StatusInternalServerError, "panic", fmt.Sprintf("agui: internal panic: %v", rec))
+	}
+}
+
+func (h *handler) serveRequest(ctx context.Context, sse eventWriter, in *RunAgentInput, key sessionKey) {
+	defer recoverRequest(ctx, sse)
 	if h.sessionStore != nil {
 		var activity *compose_v2.TaskActivity
 		var err error
@@ -440,13 +467,13 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer activity.Release()
 	}
-	ctx = withClientModelData(ctx, &in)
+	ctx = withClientModelData(ctx, in)
 
 	if len(in.Resume) > 0 {
-		h.serveResume(ctx, sse, &in, key)
+		h.serveResume(ctx, sse, in, key)
 		return
 	}
-	h.serveRun(ctx, sse, &in, key)
+	h.serveRun(ctx, sse, in, key)
 }
 
 func (h *handler) requestContext(r *http.Request, threadID string) (context.Context, sessionKey) {
@@ -460,7 +487,7 @@ func (h *handler) requestContext(r *http.Request, threadID string) (context.Cont
 }
 
 // serveRun 处理新一轮运行。
-func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInput, key sessionKey) {
+func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInput, key sessionKey) {
 	prior, inputMsg, rep := splitClientMessages(in.Messages)
 	if inputMsg == nil {
 		_ = sse.Reject(http.StatusBadRequest, "bad_request", "no user message in request")
@@ -546,8 +573,7 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 	}
 	adapter.runID = runID
 
-	// RunStarted 写失败 = client 已断开——短路不跑 agent，省 LLM/工具开销。（agent 跑
-	// 期间断开由 r.Context() canceled 触发框架超步边界 ctx.Err() 停 + handleOutcome 清 sess。）
+	// 先提交 RUN_STARTED 再执行。默认路径写入连接，持久路径写入 Run 日志。
 	if err := sse.WriteEvent(NewRunStarted(in.ThreadID, runID)); err != nil {
 		return
 	}
@@ -563,7 +589,9 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 		}
 		defer activity.Release()
 		ctx = taskCtx
-		record := &SessionRecord{TaskID: sess.RunID, Prior: prior, ModelData: clientModelData(in)}
+		record := &SessionRecord{
+			TaskID: sess.RunID, Prior: prior, ModelData: clientModelData(in), WorkflowVersion: h.workflowVersion,
+		}
 		if err := shared.save(ctx, record, oldTask); err != nil {
 			rejectSharedSession(ctx, sse, err)
 			return
@@ -634,7 +662,7 @@ func (h *handler) serveRun(ctx context.Context, sse *SSEWriter, in *RunAgentInpu
 
 // serveResume 处理 HITL 续跑——用上次中断挂起的 sess + cp 重建，把答案按 InterruptID
 // 配对注入。
-func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentInput, key sessionKey) {
+func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgentInput, key sessionKey) {
 	if h.cp == nil {
 		_ = sse.Reject(http.StatusNotImplemented, "no_checkpointer", "resume requires checkpointer (agui.WithCheckpointer)")
 		return
@@ -765,8 +793,16 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 		wireRunID = sess.RunID
 	}
 
+	factory := h.build
+	if shared != nil {
+		factory = h.workflowFactory(shared.record.WorkflowVersion)
+		if factory == nil {
+			_ = sse.Reject(http.StatusConflict, "workflow_version_unavailable", "the task's workflow version is not available on this instance")
+			return
+		}
+	}
 	adapter := newSSEAdapter(sse, wireRunID, in.Messages)
-	ag := h.build(adapter)
+	ag := factory(adapter)
 	if agent_v2.IsNilAgent(ag) {
 		_ = sse.Reject(http.StatusInternalServerError, "nil_agent", "agui: AgentFactory returned nil agent")
 		return
@@ -795,7 +831,7 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 		answers[e.InterruptID] = schema.UserMessage(text)
 	}
 
-	// RunStarted 写失败 = client 已断开——短路不跑 Resume。
+	// RUN_STARTED 提交成功后才采纳答复和执行 Resume。
 	if err := sse.WriteEvent(NewRunStarted(in.ThreadID, wireRunID)); err != nil {
 		return
 	}
@@ -898,7 +934,7 @@ func (h *handler) serveResume(ctx context.Context, sse *SSEWriter, in *RunAgentI
 // （多轮 HITL），成功 / 错误则清 entry（会话结束）。
 // ⚠️ **发回前端的只能是 key.threadID 那一维**——owner 是服务端解析出来的身份，前端只认
 // 它自己给的那个 threadId，把整个键的内容发出去它就认不出来了（顺带把身份泄给了浏览器）。
-func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key sessionKey, runID string, sess *agent_v2.RunSession, prior []*schema.Message, err error) {
+func (h *handler) handleOutcome(ctx context.Context, sse eventWriter, key sessionKey, runID string, sess *agent_v2.RunSession, prior []*schema.Message, err error) {
 	shared := sharedSessionFrom(ctx)
 	// **陈旧写回**（`WithStaleWriteGuard` 开启时才可能出现）：这次的结果没落盘，槽里是另一个执行者
 	// 的状态，留 entry 等续发是徒劳——前端答完发回来，框架载入的是别人的状态，于是重新问一遍已经
@@ -1027,7 +1063,7 @@ func (h *handler) handleOutcome(ctx context.Context, sse *SSEWriter, key session
 	_ = sse.WriteEvent(NewRunFinished(key.threadID, runID))
 }
 
-func (h *handler) finishSession(ctx context.Context, sse *SSEWriter, key sessionKey) bool {
+func (h *handler) finishSession(ctx context.Context, sse eventWriter, key sessionKey) bool {
 	if err := h.completeSession(ctx, key); err != nil {
 		rejectSharedSession(ctx, sse, err)
 		return false

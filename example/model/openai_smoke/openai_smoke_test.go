@@ -22,24 +22,38 @@ import (
 	"crew-go/tool"
 )
 
-func newClient(t *testing.T) *openai.Client {
+func smokeConfig(t *testing.T, modelEnv string) (string, string) {
 	t.Helper()
 	envloader.Load()
 	key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
 	if key == "" {
 		t.Skip("OPENAI_API_KEY 未设置（环境变量或项目根目录 .env）")
 	}
-	name := strings.TrimSpace(os.Getenv("OPENAI_SMOKE_MODEL"))
+	name := strings.TrimSpace(os.Getenv(modelEnv))
 	if name == "" {
 		name = "gpt-5.4-mini"
 	}
-	return openai.NewClient(key, name, openai.WithExtraBody(map[string]any{
-		"max_completion_tokens": 512,
-	}))
+	return key, name
 }
 
-func TestSmoke_Stream(t *testing.T) {
-	client := newClient(t)
+func newClient(t *testing.T) model.ChatModel {
+	t.Helper()
+	key, name := smokeConfig(t, "OPENAI_SMOKE_MODEL")
+	return openai.NewClient(key, name, openai.WithExtraBody(map[string]any{"max_completion_tokens": 512}))
+}
+
+func newResponsesClient(t *testing.T) model.ChatModel {
+	t.Helper()
+	key, name := smokeConfig(t, "OPENAI_RESPONSES_SMOKE_MODEL")
+	return openai.NewResponsesClient(key, name, openai.WithExtraBody(map[string]any{"max_output_tokens": 512}))
+}
+
+func TestSmoke_Stream(t *testing.T) { smokeStream(t, newClient(t)) }
+
+func TestSmoke_ResponsesStream(t *testing.T) { smokeStream(t, newResponsesClient(t)) }
+
+func smokeStream(t *testing.T, client model.ChatModel) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 
@@ -73,8 +87,12 @@ func TestSmoke_Stream(t *testing.T) {
 	t.Logf("收到 %d 个文本分片并正常结束", chunks)
 }
 
-func TestSmoke_ToolCalling(t *testing.T) {
-	client := newClient(t)
+func TestSmoke_ToolCalling(t *testing.T) { smokeToolCalling(t, newClient(t)) }
+
+func TestSmoke_ResponsesToolCalling(t *testing.T) { smokeToolCalling(t, newResponsesClient(t)) }
+
+func smokeToolCalling(t *testing.T, client model.ChatModel) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 

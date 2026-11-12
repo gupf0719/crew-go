@@ -15,7 +15,18 @@
 - 约定发了新版本，要判断跟进哪些
 - 有人问「为什么这里不照约定写」
 
-## 一句话结论
+## 截至 2026-11-06 的上游变更
+
+- 上游将进程内 workflow 合入 `gen_ai.invoke_agent.internal` 和 `gen_ai.invoke_agent.duration`，
+  用 `gen_ai.agent.name` 记录调用目标名称。应用定义的编排仍报 `gen_ai.operation.name=invoke_workflow`，
+  框架入口可用 `invoke_{framework_entrypoint}`，例如 `invoke_runner`。[合并记录](https://github.com/open-telemetry/semantic-conventions-genai/pull/571)
+- agent 间工具式委派与转交可用 `gen_ai.execute_tool.transfer.internal` 表达，
+  属性包含 `gen_ai.transfer.mode` 和 `gen_ai.transfer.target.name`。[语义约定](https://github.com/open-telemetry/semantic-conventions-genai/pull/447)
+- crew-go 当前仍按 10 月快照导出 `gen_ai.invoke_workflow.duration` 和 `gen_ai.workflow.name`。
+  迁移到新约定会影响按名称查 workflow 的仪表盘、告警和 exporter 规则。对照 11 月快照时以下文为
+  已实现行为、以上游合并记录为新约定。[本仓属性与指标](../../../observability/semconv.go) · [11 月行业调查](industry-survey-2026q4.md)
+
+## 2026-10-07 对照基线
 
 - span 形状（名字、kind、`gen_ai.operation.name`）按约定：`chat` / `invoke_agent`（INTERNAL 与 CLIENT）/
   `invoke_workflow` / `execute_tool`；加载 skill 的工具调用按 skill refinement 命名。
@@ -46,7 +57,7 @@ A2A 的 server 侧 span（`a2a.server {操作}`，SERVER）约定里没有对应
 
 ## 二、invoke_workflow 报还是不报
 
-约定的三条：编排图、协调多个 agent 的过程 SHOULD 报；单独的 agent 调用 SHOULD NOT 报；agent 内部为了实现自己
+10 月快照的三条：编排图、协调多个 agent 的过程 SHOULD 报；单独的 agent 调用 SHOULD NOT 报；agent 内部为了实现自己
 而起的 runner / 图 SHOULD NOT 报，而应用定义的图即使嵌套（子图作为另一张图的节点）也 SHOULD 报。框架可以自己
 定判据。
 

@@ -10,6 +10,9 @@
 > 不是「没找到」。涉及 crew-go 自身的论断已 grep 实际代码核实。
 >
 > **时间锚点**：2026-09-21。
+>
+> 截至 2026-11-12，插话和回合闸门已落地，§四记录的两处 AG-UI 问题已有回归覆盖。
+> [执行控制](execution-control.md) · [11 月行业调查](industry-survey-2026q4.md)
 
 ## 一、调查对象与增量
 
@@ -254,6 +257,10 @@ Goal 续跑挂在 **thread idle** 上而不是 turn 循环里：回合正常结�
 > **形状干净，但没被重度使用验证过。**
 
 ## 四、AG-UI 1.0：我们有两处真不合规
+
+> 截至 2026-11-12，`NewRunCancelled` 发出带 `cancelled` outcome 的 `RUN_FINISHED`。
+> Resume 按请求提供的 wire `runId` 发事件，内部用任务的 `sess.RunID` 找存档。下文保留当时的缺陷记录。
+> [终态实现](../../../agui/events.go) · [Resume 入口](../../../agui/handler.go) · [两项回归](../../../agui/agui_test.go)
 
 我们有 `agui` 适配包（内联精简协议层），1.0 定稿于 2026-09-17。
 

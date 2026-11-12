@@ -1,5 +1,8 @@
 # 三方对照文档（crew-go / LangGraph / eino）
 
+最近两个月的框架发布、14 个本地参考仓的同步快照，以及与 crew-go 的对照，见
+[2026-11-12 行业增量调查](industry-survey-2026q4.md)。
+
 ## 用途
 
 crew-go 借鉴 LangGraph + eino 设计但不完全照抄——做架构决策时需要快速对照三方在同一问题上的处理方式，找出对方不足、吸收对方优势、形成我们自己的取舍。
@@ -64,23 +67,30 @@ CLAUDE.md 已加：
 | `tool-visibility.md` | 工具可见性 / 裁剪三方对照（ToolFilter / AllowedTools / 框架工具豁免）| ✅ 已写 | OKR 8.4 |
 | `routing-decision.md` | 带置信度的路由决策：门槛放在哪、报错与低置信是否同路、弃权与回落形态（通用框架 + Rasa / Dialogflow / Semantic Router / NeMo / RouteLLM / TypeSafe）| ✅ 已写 | RouteDecider |
 | `runtime-model-params.md` | 运行时模型参数控制（thinking/reasoning 按次开关）**五方**对照（eino/OpenAI-Agents/MAF/LangChain·LangGraph/CrewAI）| ✅ 已写 | ISSUE-89 |
-| `industry-survey-2026q3.md` | **2026-09-21 增量调查**（10 仓全量 pull 后）：「运行中插话」与「回合结束闸门」五家做法对照 + **AG-UI 1.0 定稿后我们两处真不合规** + OTel semconv 三个月零影响核对 + 16 条可迁移发现 | ✅ 已写 | 插话/闸门拍板 |
+| [`industry-survey-2026q3.md`](industry-survey-2026q3.md) | **2026-09-21 增量调查**：运行中插话、回合结束闸门、AG-UI 1.0 和当时的 OTel 快照 | ✅ 已写 | 插话/闸门拍板 |
+| [`industry-survey-2026q4.md`](industry-survey-2026q4.md) | **2026-09-12 至 11-12 增量调查**：逐问恢复、异步子 agent、决策模型、过程评测、流式与观测 | ✅ 已写 | 上游版本和源码快照 |
 
 ## 三方源码本地路径
 
-| 项目 | 路径 | 版本 |
-|---|---|---|
-| crew-go | `/Users/gupengfei/program/go/src/crew-go` | `redesign/channel-based` (v1 已删，看 `agent_v2/` + `compose_v2/`) |
-| LangGraph | `/Users/gupengfei/program/go/src/langgraph` | 主分支克隆（2026-09-20 拉；另有 `langgraph-bb` 已停滞在 2026-04-29）|
-| eino | `/Users/gupengfei/program/go/src/eino` | 主分支克隆（2026-09-20 拉）|
-| Codex (OpenAI，Rust) | `/Users/gupengfei/program/go/src/codex` | 主分支克隆（**2026-09-21 拉**）；`codex-rs/` 100+ crates |
-| DeepSeek Harness (`dsh`) | `/Users/gupengfei/program/go/src/deepseek-harness` | **`0.1.6-alpha.2`**（2026-09-17 拉；developer preview，明示会破坏兼容）|
-| Grok harness (xAI，Rust) | `/Users/gupengfei/program/go/src/grok-build` | 主分支克隆（2026-09-19 拉）|
-| MAF (Microsoft Agent Framework) | `/Users/gupengfei/program/go/src/agent-framework` | 主分支克隆（2026-09-21 拉）|
-| OpenAI Agents SDK | `/Users/gupengfei/program/go/src/openai-agents-python` | 主分支克隆（2026-09-21 拉）|
-| CrewAI | `/Users/gupengfei/program/go/src/crewAI` | 主分支克隆（2026-09-19 拉）|
-| AG-UI | `/Users/gupengfei/program/go/src/ag-ui` | **1.0.0 已定稿**（2026-09-17 拉）|
-| OTel GenAI semconv | `/Users/gupengfei/program/go/src/otel-semconv-genai` | 主分支克隆（2026-09-16 拉；**整体仍 `development`，零 stable**）|
-| TypeSafe（Jev 决策模型）| `/Users/gupengfei/program/go/src/typesafe-ai` | 官方 Python / JS SDK、LLM 模拟适配器、agent skill 四个仓库（2026-09-22 拉）|
+2026-11-12 调研的具体 SHA、同步范围和发布版本见 [本轮源码快照](industry-survey-2026q4.md)。
 
-> **v1→v2 等价 cheatsheet** 见 [`../v2/migration-history.md`](../../v2/migration-history.md)。本目录文件中 `compose/*.go:line` 引用都是 v1 时代位置，等价位置自查 v2 包 godoc。
+| 项目 | 路径 | 核对分支 |
+|---|---|---|
+| crew-go | `/Users/gupengfei/program/go/src/crew-go` | `test`，调研基线 `c35ef98` |
+| LangGraph | `/Users/gupengfei/program/go/src/langgraph` | `main` |
+| eino | `/Users/gupengfei/program/go/src/eino` | `main`、`origin/alpha/10` |
+| LangChain | `/Users/gupengfei/program/go/src/langchain` | `master` |
+| Google ADK Python | `/Users/gupengfei/program/go/src/adk-python` | `main` |
+| MAF（Microsoft Agent Framework） | `/Users/gupengfei/program/go/src/agent-framework` | `main` |
+| OpenAI Agents SDK | `/Users/gupengfei/program/go/src/openai-agents-python` | `main` |
+| CrewAI | `/Users/gupengfei/program/go/src/crewAI` | `main` |
+| AgentScope | `/Users/gupengfei/program/go/src/agentscope` | `origin/main` |
+| Codex | `/Users/gupengfei/program/go/src/codex` | `main` |
+| DeepSeek Harness | `/Users/gupengfei/program/go/src/deepseek-harness` | `master` |
+| Grok Build | `/Users/gupengfei/program/go/src/grok-build` | `main` |
+| Claude Agent SDK Python | `/Users/gupengfei/program/go/src/claude-agent-sdk-python` | `main` |
+| AG-UI | `/Users/gupengfei/program/go/src/ag-ui` | `main` |
+| OTel GenAI semconv | `/Users/gupengfei/program/go/src/otel-semconv-genai` | `main` |
+| TypeSafe（Jev 决策模型） | `/Users/gupengfei/program/go/src/typesafe-ai` | 9 月调研快照，含 Python / JS SDK、LLM 模拟适配器、agent skill |
+
+> **v1→v2 等价 cheatsheet** 见 [迁移速查](../../v2/migration-history.md)。本目录文件中 `compose/*.go:line` 引用都是 v1 时代位置，等价位置自查 v2 包 godoc。

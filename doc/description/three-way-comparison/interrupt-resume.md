@@ -10,6 +10,9 @@
 >   - **禁止 interrupt**: cond 抛任何 InterruptError 都被转**非-interrupt** error 拒绝。理由是语义的——中断的本质是**要新输入**; cond 要新输入才能判断 = 判断所需信息没备齐 = **上游 node 没尽责**。HITL 在 node 内抛; RoutingAgent 的 Router/classifier 已移到 classify node 内跑, 原生支持 HITL 且不必自填 ID
 >   - **报错的 Resume 语义业务声明** (`WithCondFailPolicy`): `CondFailAbort` (默认, 终局失败 → wrap `ErrRunAborted` → Run 出口**主动清 cp 子树**) / `CondFailRerunFrom` (存 Pending cp, Resume 重跑 from)
 
+> **2026-11-12 更新**。LangGraph 1.2.20 给同一 task 内后续挂起的提问分配独立 ID，并提供
+> opt-in 的 `strict_resume`。本文早期实测仍按各自的版本解释。新旧行为和 AG-UI 入口的对照见
+> [11 月行业调查](industry-survey-2026q4.md)。
 
 ## 触发场景
 
@@ -24,15 +27,15 @@
 
 | 维度 | crew-go v2 | LangGraph | eino |
 |---|---|---|---|
-| **Interrupt 数据结构** | 平铺 `*InterruptError{Reason, Query, Queries, Data}`——Query (单) / Queries (多, ISSUE-81) 互斥 | 平铺 `Interrupt{value, id}` | 树 `InterruptSignal{ID, Address, State, Subs[]}` |
+| **Interrupt 数据结构** | 平铺 `*InterruptError{Reason, Query, Queries, Data}`——Query (单) / Queries (多, ISSUE-81) 互斥 | 平铺 `Interrupt{value, id, response_schema}`，schema 可选 | 树 `InterruptSignal{ID, Address, State, Subs[]}` |
 | **多 query 协议** | `Queries []*AskQuery` + `AllQueries()` + `MergeInterrupts()` helper (fanout 聚合) | 多 pending 全平铺 `tuple[Interrupt, ...]` | `Subs []*InterruptSignal` 树 |
 | **fan-out 多分支同时中断时返给 caller 几个** | **全部**（`MergeInterrupts(res.AllInterrupts)`，2026-07-27 `4bf9568` 补齐——此前只返 FirstErr、cp 侧却记全，业务照 AllQueries() 建答案 map 系统性少答）| **全部**（`_runner.py:688-690` `# raise combined interrupts` → `GraphInterrupt(tuple(i for exc in interrupts for i in exc.args[0]))` 双层展开；与普通异常明确分开处理——普通异常 `raise exc` 直接抛第一个，中断先 `# collect interrupts` 攒起来）| **全部**（`internal/core/interrupt.go:196` `FromInterruptContexts` 收 `[]*InterruptCtx` 列表，合并公共祖先建成一棵树，注释明写 "reconstructs a single InterruptSignal tree from a **list**"）|
-| **InterruptID 生成** | `InterruptSite.InterruptID()` fnv-64 hex (16 字符)，维度 = TaskID + graphNS + nodeID + 实例身份⊻visit + tc ID + tc 下标 + idx，被条件边否决重做之后再加重做代际（按分域）与外层代际链（嵌套图里） | `xxh3_128_hexdigest(ns)` 16 字符 hex | runtime 生成 + Address 关联 |
+| **InterruptID 生成** | `InterruptSite.InterruptID()` 用 FNV-1a 64 位（16 个十六进制字符），按任务、执行位置和重做代际等维度派生。[实现](../../../compose_v2/interrupt.go) | 1.2.20 用 xxHash 128 位（32 个十六进制字符）。第一个回答槽沿用 namespace 哈希，后续把已采纳答案数编入 ID。[源码改动](https://github.com/langchain-ai/langgraph/commit/6ea1751a9) | runtime 生成 + Address 关联 |
 | **嵌套表达** | graphNS 编入 InterruptID + 每层 cp 物理分离 (parentSID, parentNS/childName) | `checkpoint_ns` 链 + hash 自然命中 | `InterruptSignal.Subs` 树 |
 | **cond fn 协议** | **cond = 纯判断**（读 channel → 返目标，不产 writes/不改 state），由此两条: ① **禁止 interrupt**——中断的本质是要新输入；cond 要新输入才能判断 = 判断所需信息没备齐 = **上游 node 没尽责**（且 cond 是纯函数、Resume 后重新执行，答案仍得从 channel 读——绕一圈还是得让上游备好）。抛任何 InterruptError 转**非-interrupt** error 拒绝，HITL 归 node（RoutingAgent 的 Router/classifier 已在 classify node 内跑原生支持）。② **报错的 Resume 语义业务声明**（`WithCondFailPolicy`）——纯判断报错只可能是「上游数据缺失/非法」，该重试还是放弃取决于上游是否确定性（纯计算重跑必拿同样坏数据；LLM 上游重跑很可能就好），只有业务知道: `CondFailAbort`(默认，终局失败——wrap `ErrRunAborted` → Run 出口**主动 DeleteSubtree 清子树**，子图终局性经错误链自动向上传播) / `CondFailRerunFrom`(存 Pending cp、Resume 重跑 from，业务须保其 writes 幂等) | path **机械上能** interrupt，但**是实现副作用非契约**(靠 path 被 coerce 成 `trace=True` 重设 config context；官方 25 个 path 测试 0 个用、`interrupt()` docstring 明写 "from within a **node**"); **它同样做 matched-writes-skip**，但 branch 在 task **内** → interrupt 时节点 writes 压根没 commit → 恒整 task 重跑(连 LLM)，**无"已 commit 却重跑"的违约** | branch.invoke 抛 err 直接**整图 fail** (`newGraphRunError` 不做 interrupt 特判), 不支持 branch HITL |
 | **Resume 答案 API** | `agent_v2.WithResumeUserInputs(map[InterruptID]*Message)` 显式 by ID | `Command(resume=val \| map)` 单值/map 二选一启发式探测（**多挂起 + 裸值一律 raise**，理由是「中断进队列的顺序不确定」——实测复现） | `BatchResumeWithData(ctx, map[id]any)` typed，**key 是每次中断现铸的 uuid 不是地址**（它自己的 godoc 写成地址串，是 stale，实测打印为 `884efdbd-…`） |
 | **节点取答案** | `compose_v2.GetResumeAnswer(ctx, myID)`（**唯一取法**，另有非寻址通道 `GetResumeUserText`） | 节点调 `interrupt(value)` 自动从 ctx 取 | `GetResumeContext[T](ctx)` typed + `isResumeTarget bool` |
-| **嵌套场景配对** | `ResumeContext.UserInputs` 整 map 透传 + ID 里编入 graphNS 自然分离 + opt-in `StripResumeContext`/`WithSubgraphIsolatedResumeContext` 隔离 | hash 自然命中 ns 层 (`Interrupt.from_ns(ns)`) | ctx 派生时主动扫 `id2Addr` 找前缀匹配 |
+| **嵌套场景配对** | `ResumeContext.UserInputs` 整 map 透传 + ID 里编入 graphNS 自然分离 + opt-in `StripResumeContext`/`WithSubgraphIsolatedResumeContext` 隔离 | 答案按由 task namespace 和回答槽派生的 ID 配对 | ctx 派生时主动扫 `id2Addr` 找前缀匹配 |
 | **跨 Resume Data 持久化** | ❌ `InterruptError.Data` **仅同进程**, cp 只存 AskQuery 的字段（Question/Options/InterruptID/Reason + ToolCallID/ToolName；audit follow-up #5 godoc 已警示） | ❌ Interrupt 仅 value + id, 无独立 Data 字段 | ✅ `InterruptState{State, LayerSpecificPayload}` 落盘 + Resume 重建 |
 | **业务调试可观测** | InterruptID hex 不可逆 → framework auto-fill 时 `slog.LogAttrs` 输出 5 维 (audit follow-up #5) | hash 后丢 ns, 调试需反查 | **句柄与位置是两个字段**：`InterruptCtx.ID` 是 uuid（**不是**地址串），可读位置在 `InterruptCtx.Address` |
 
@@ -58,9 +61,9 @@
 - **MAF**：`request_id = uuid4()` 现铸 → 存 `pending_request_info_events` → `apply_checkpoint`
   读回。同路线 ②。
 
-**护住它们的不是校验**：LangGraph 和 eino 对「答案 ID 对不上」**完全静默**（比我们的 warn
-还松）。静默无害，因为**撞不上**。我们的 `warnUnmatchedAnswerIDs` 位置是对的，它失灵的唯一
-原因是被比较的那把键不带发生维——陈旧答案不是 unmatched，而是**正好匹配上了新任务的问题**。
+**当时的校验**。该次实测中，LangGraph 和 eino 对匹配不到的答案 ID 静默跳过，靠 ID 的发生维隔离任务。
+当时 crew-go 的 `warnUnmatchedAnswerIDs` 对碰撞无效，因为旧答案 ID 恰好匹配新任务的问题。
+LangGraph 1.2.20 已可在当前顶层挂起档的写入前拒绝未知 ID，需开启 `strict_resume`。[严格续跑实现](https://github.com/langchain-ai/langgraph/commit/dbc60dd11)
 
 ⚠️ **`Checkpoint.Epoch` 不能直接拿来当这一维**：它每次 `SaveNS` 都换（`Durability=Sync` 每
 超步一次），是「写代」不是「任务代」，而中断 ID 必须跨 Resume 稳定。要的是**只在新开路径
@@ -164,7 +167,7 @@ if msg, ok := compose_v2.GetResumeAnswer(ctx, myID); ok { ... }
 - **eino**: branch condition 抛 error 直接整图 fail（`newGraphRunError` 不做 interrupt 特判），不支持 branch HITL；LLM 一律在 ChatModelNode/LambdaNode（穷尽搜两 repo，branch 用法零处调 LLM），condition 基本纯读（`flow/agent/multiagent/host/compose.go:233-238` 有 condition 经 `ProcessState` **写** state 的例外）。
 - 方向一致（判断/干活分离），但我们的 cond 是**框架生成**的（业务只写 Router 在 node 跑），业务/框架分离比两者更彻底。
 
-## LangGraph 设计（v0.6.x 当前）
+## LangGraph 设计（v0.6.x 历史基线）
 
 ### Interrupt 数据结构
 
@@ -192,7 +195,9 @@ def from_ns(cls, value: Any, ns: str) -> Interrupt:
 
 ### Resume 答案 API
 
-`Command(resume=value)` 单值或 `Command(resume={id: value})` map 二选一. Resume 注入逻辑 inline 在 `pregel/_loop.py` (line ~622-639, 当前版本无独立 `_put_resumes` 函数), 根据 `isinstance(resume, dict) and all(is_xxh3_128_hexdigest(k) for k in resume)` 探测 map 形态——map 形态 inject `_scratchpad.resume_map[id] = value`; 单值多 pending 时 RuntimeError.
+`Command(resume=value)` 传单值，`Command(resume={id: value})` 传 map。该快照的 Resume 注入逻辑位于
+`pregel/_loop.py` 约 622–639 行，通过 `isinstance(resume, dict) and all(is_xxh3_128_hexdigest(k) for k in resume)`
+识别 ID map，再注入 `_scratchpad.resume_map[id] = value`。多项挂起时传单值会触发 RuntimeError。
 
 map 形态由 "全是 hex" 探测——没有显式标志位。多 pending 时单值 → 框架报错。
 
@@ -212,7 +217,7 @@ def interrupt(value: Any) -> Any:                  # types.py:403
 
 ### 优势
 
-- ID 定长（16 字符），ns 多深都不膨胀
+- ID 固定为 32 个十六进制字符，长度独立于 namespace 深度
 - 节点 API 极简：调 `interrupt(value)` 一行
 - 嵌套场景靠 hash 自然命中，无需自检 helper
 
@@ -289,7 +294,7 @@ type InterruptCtx struct {
 ## 我们的优势（v2 保留不动）
 
 1. **`AskQuery` 直接含 `Question/Options`**：业务直接用，不需要再 unwrap typed payload；前端 SSE 渲染极简
-2. **坐标显式**：与 LangGraph 同样 16 字符 hex 定长，但 `InterruptSite` 的各维度是显式字段——业务侧出 ID 可追溯。LangGraph hash `"|".join(ns)` 维度隐含在 ns 派生里，调试反查难
+2. **坐标显式**。`InterruptSite` 的各维度是显式字段，方便从日志追溯 ID 对应的位置。LangGraph 的输入坐标来自 task namespace 和回答槽。
 3. **v2 走 LangGraph 风格纯 map ID 命中** (无 self/ancestor/sibling 自检): 嵌套靠 ID 里编入 graphNS + opt-in `StripResumeContext` 隔离. 对比 eino 在 `AppendAddressSegment` (76 行) 耦合"自身或后代"派生+resume——crew-go v2 完全删自检走 map lookup 协议更简
 4. **Query/Queries 互斥协议 (ISSUE-81) + MergeInterrupts**：toolsFn fanout 多 tc 同时抛 Interrupt 时 framework 聚合到单 ie.Queries 让 graph_loop record 全部 query——LangGraph 单值/map 启发式探测有 footgun (业务 ID 撞 hex 时误判); eino Subs 树构造 + 落盘双 map 拍平复杂度高
 5. **`slog.LogAttrs` 输出各维度 (audit follow-up #5)**：业务开 DEBUG level 即可反查 hex ID 对应位置——LangGraph hash 后丢 ns 调试需手动反算 (xxh3 几乎不可能); eino Address 字段强保留代价跨包视图重

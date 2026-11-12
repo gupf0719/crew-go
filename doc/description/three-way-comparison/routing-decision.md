@@ -2,6 +2,10 @@
 
 > 调研时间 2026-09-22。本地源码按当时拉取的版本读，网上产品按当日文档。设计本身见
 > [`doc/v2/route-decider.md`](../../v2/route-decider.md)。
+>
+> **2026-11-12 更新**。Google ADK 已有实验性的分类路由节点，LangChain 1.5.0 提供按次选模型的中间件。
+> 本仓的路由事件已配套升级计数与置信度直方图。各自的决策位置和回落行为见
+> [11 月行业调查](industry-survey-2026q4.md)。
 
 ## 触发场景
 
@@ -29,7 +33,7 @@ Jev 支持。10 月的完整情况见 §五。）
 
 ## 二、各家要点
 
-- **通用编排框架都不带置信度。** LangGraph、eino、openai-agents、agentscope、MAF 的路由原语
+- **9 月调查中的路由原语只消费标签。** 当时核对的 LangGraph、eino、openai-agents、agentscope、MAF
   只接收已经定好的标签；未知标签报错或落到默认分支。（这条结论里 agentscope 读的是过时的 5 月克隆；它的 Python 版
   2026-09-22 合入了 Jev 支持，Java 版与 Go 的 agent-sdk-go 也有了，见 §五。）
 - **带门槛的都是有自己打分器的平台。** Rasa、Dialogflow、Semantic Router、NeMo、RouteLLM

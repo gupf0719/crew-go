@@ -181,3 +181,67 @@ AgentScope SOP 的逐步验收可与 crew-go 通过 GraphAgent 拼接执行和�
 两种跨进程等待的参考，前者给工具一个可持久化的挂起位置，后者用 Workflow 历史保存调度进度。评估接入时可用同一
 业务样本核对谁保存任务归属、谁接收迟到回调、重试从哪一步开始。
 [crew-go 编排模式](../../v2/orchestration-patterns.md)
+
+## 八、crew-go 优化建议
+
+先补外部路由样本入口，能用现有评测工具快速验证业务收益。服务需要滚动发布或多副本时，把跨实例审批恢复提到
+上线前验证。以下现状以 `47351a0` 为基线。
+
+### 1. 用真实样本决定路由门槛
+
+`routing_eval` 已有升级链、重复运行、标注分歧复核和输入指纹缓存，样本入口目前读内嵌 JSONL。增加外部 JSONL
+输入后，先选一套现有业务分支，用脱敏的请求和上下文按分支人工标注，比较同一批样本上的升级率、自动承接比例、
+自动承接中的错路由率及 P95 路由延迟。线上有流量时，可用同步的 `WithShadow` 按请求抽样并设短超时，
+收集决策分歧供复核。影子结果和线上实际分支都可以作为复核线索，业务标注作为对照答案。
+[现有待办](../../code/todo.md) · [评测入口](../../../example/decision/routing_eval/main.go) · [影子档契约](../../v2/route-decider.md)
+
+### 2. 让同一条挂起审批跨实例续跑
+
+用两个 AG-UI Handler 共用一个内存 Checkpointer 做了对照。A 发起 Run、回答第一问并停在第二问，第二问交给新建的 B
+返回 `404/no_session`。同一份答复交回 A 返回成功，节点拿到 `one+two`，两问各发出一次。当前通用 Handler
+在进程内保存从 `(owner, threadId)` 到挂起任务的映射、原请求前文和已采纳答复。
+[Handler 状态](../../../agui/handler.go) · [两问测试基线](../../../agui/resume_coverage_test.go)
+
+首期验证 AG-UI 的挂起恢复。用服务端解析的 owner 和 thread ID 寻址，持久化可重建任务的身份、Run 时前文及已采纳
+答复，并让协议侧暴露的挂起集合与执行存档对应。Redis / SQL 的任务租约可保护同一任务的执行与清理。会话认领还需
+原子核对当前任务和当前挂起版本，同一个任务从第一问推进到第二问时也要拒绝迟到的第一问答复。
+
+单次工具的审批结论随存档走。`approve_always` 和 `approve_always_tool` 规则存在 RunSession 中，限定到任务与
+agent 实例。首期沿用已准入调用的结论，新调用按当前规则判定。验收用真实共享后端，A 挂起后退出，由同一图定义的 B
+接手完成。核对并发续跑、租约释放后重发同任务的旧答复、异租户请求，以及存档写成后会话记录提交失败。SSE 在客户端收到
+中断 ID 前断开时，重连可查询当期挂起项。
+[任务租约](../../../compose_v2/task_lease.go) · [审批规则](../../../agent_v2/approval.go) · [AG-UI 使用说明](../../v2/agui.md)
+
+连续两问的成功对照还观察到 `WithResumeAnswers` 的 unmatched 告警，原因是累计答复包含已消费的第一问。AG-UI
+已用当次请求的新增答复校验挂起集合，已采纳的历史答复用于重放。日志可据来源区分用户传错 ID 和正常的历史答复。
+[告警实现](../../../compose_v2/graph_loop.go)
+
+### 3. 先用现有编排做一个逐步验收示例
+
+借鉴 AgentScope SOP，用 GraphAgent 表达「生成方案 → 校验 → 人审 → 执行」。校验节点产出结果，条件边按结果决定是否
+推进。人审放在独立节点，经 `compose_v2.Ask` 挂起。用失败回到方案生成、审批拒绝结束、同一审批续跑后执行一次这三条
+路径展示已有能力。若业务需要一次收集多个字段，再让提问的 schema 随存档往返，前端按 schema 渲染，协议入口在启动
+续跑前校验答案。验收时传错类型或缺字段，挂起档可继续答。
+[SOP 参考](https://github.com/agentscope-ai/agentscope/releases/tag/v2.0.9) · [LangGraph 响应 schema](https://github.com/langchain-ai/langgraph/commit/448a76377) · [GraphAgent](../../v2/orchestration-patterns.md) · [当前问答投影](../../../agui/client_data.go)
+
+### 4. 用一个外部作业验证可恢复等待
+
+配置 `WithBackgroundTasks` 后，慢工具可交给进程内管理器。跨进程等待先用一个支持幂等提交、可查询和取消的外部
+作业验证，例如提交构建后等 webhook。等待点由图节点发起并随存档保存。宿主在提交前保存幂等键和任务归属，
+提交后补作业句柄。
+回调先保存结果。挂起落档和回调到达时都尝试按任务与等待点原子认领，待二者齐备才触发续跑。验收覆盖提交后写句柄
+前退出、回调早于挂起、重复回调，以及完成、超时、取消的竞态。用两个任务验证各自只创建一份作业、只进入一个终态，
+结果回到原任务。这个用例能为是否扩展到后台子 agent 提供依据。
+[本仓后台工具](../../v2/background-tasks.md) · [Pi webhook 示例](https://github.com/earendil-works/pi/blob/473515f9c297c75cf2c3ebb3ba027049ed836d27/packages/durable/test/examples/40-tool-waits-for-webhook.ts)
+
+### 5. 用现网观测决定指标和存档改造
+
+先核对哪些看板、告警和采集规则消费 `gen_ai.invoke_workflow.duration` 及 `gen_ai.workflow.name`。若跟进 11 月约定，
+工作流时长迁入 `gen_ai.invoke_agent.duration`，用 `gen_ai.operation.name=invoke_workflow` 筛选。验收同一次工作流
+只记一次，并能在看板区分 workflow 与 agent。上游条目仍为 Development。
+[指标对照](observability-trace-spec.md)
+
+评估增量 checkpoint 前，先用业务长会话测持久后端的 P95 存档字节数、保存耗时和恢复耗时。大结果占主要体积时，
+先测 `WithToolResultSpill` 带来的变化。若全量快照仍是瓶颈，再比较增量方案的写入节省、恢复读放大，以及回收之后能否
+正确恢复旧任务。
+[工具结果转存](../../../agent_v2/tool_spill.go) · [存档取舍](checkpoint-storage.md)

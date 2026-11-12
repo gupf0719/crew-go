@@ -1,0 +1,531 @@
+diff --git a/a2a/server/zz_audit_inplace_hook_test.go b/a2a/server/zz_audit_inplace_hook_test.go
+new file mode 100644
+--- /dev/null
++++ b/a2a/server/zz_audit_inplace_hook_test.go
+@@ -0,0 +1,33 @@
++package server_test
++
++import (
++	"context"
++	"crew-go/a2a"
++	"crew-go/agent_v2"
++	"crew-go/hook"
++	"crew-go/schema"
++	"testing"
++)
++
++type zzInPlaceRedactOnEnd struct{ hook.NoOpHooks }
++
++func (zzInPlaceRedactOnEnd) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
++	out.Message.Content = "REDACTED"
++	return ctx, nil
++}
++func TestZZAuditRemoteAgentInPlaceReplacement(t *testing.T) {
++	base := serveAgent(t, agent_v2.NewBasicAgent(agent_v2.WithName("redact-inplace"), agent_v2.WithModel(&streamModel{}), agent_v2.WithHooks(zzInPlaceRedactOnEnd{})))
++	ra, err := a2a.NewRemoteAgent(context.Background(), base)
++	if err != nil {
++		t.Fatal(err)
++	}
++	events, err := ra.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("hi"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := agent_v2.FinalMessage(events).Content
++	t.Logf("remote final=%q", got)
++	if got != "REDACTED" {
++		t.Fatalf("remote final kept pre-hook original: %q", got)
++	}
++}
+diff --git a/agent_v2/zz_audit_basic_flow_test.go b/agent_v2/zz_audit_basic_flow_test.go
+new file mode 100644
+--- /dev/null
++++ b/agent_v2/zz_audit_basic_flow_test.go
+@@ -0,0 +1,177 @@
++package agent_v2_test
++
++import (
++	"context"
++	"crew-go/agent_v2"
++	"crew-go/compose_v2"
++	"crew-go/hook"
++	"crew-go/model"
++	"crew-go/schema"
++	"errors"
++	"strings"
++	"testing"
++)
++
++type zzInPlaceRedact struct{ hook.NoOpHooks }
++
++func (zzInPlaceRedact) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
++	out.Message.Content = "[redacted]"
++	return ctx, nil
++}
++func TestZZAuditInPlaceModelEndRewrite(t *testing.T) {
++	capture := &captureEventsHook{}
++	ag := agent_v2.NewBasicAgent(agent_v2.WithName("audit"), agent_v2.WithModel(&chunkStreamModel{contents: []string{"secret", " value"}}), agent_v2.WithHooks(zzInPlaceRedact{}))
++	events, err := ag.Run(context.Background(), &agent_v2.RunSession{RunID: "zz-audit-redact"}, schema.UserMessage("hello"), agent_v2.WithOrchHooks(capture))
++	if err != nil {
++		t.Fatal(err)
++	}
++	final := agent_v2.FinalMessage(events)
++	if final == nil || final.Content != "[redacted]" {
++		t.Fatalf("final=%+v", final)
++	}
++	var raw strings.Builder
++	reset := false
++	for _, ev := range capture.events {
++		if ev.Type == "chunk" {
++			raw.WriteString(ev.Content)
++		}
++		if ev.Type == "reset_stream" && ev.Metadata["replacement"] == "[redacted]" {
++			reset = true
++		}
++	}
++	t.Logf("final=%q chunks=%q replacement_event=%v", final.Content, raw.String(), reset)
++	if raw.String() == "secret value" && !reset {
++		t.Fatal("in-place OnModelEnd rewrite leaves original chunks visible without replacement event")
++	}
++}
++
++type zzAbortSummary struct{ calls int }
++
++func (m *zzAbortSummary) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
++	m.calls++
++	return nil, compose_v2.ErrRunAborted
++}
++func (m *zzAbortSummary) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
++	return nil, model.ErrStreamUnsupported
++}
++func (m *zzAbortSummary) WithTools([]*schema.ToolInfo) (model.ChatModel, error) { return m, nil }
++func TestZZAuditAutoCompactAbort(t *testing.T) {
++	summary := &zzAbortSummary{}
++	main := &compactLoopModel{}
++	ag := agent_v2.NewBasicAgent(agent_v2.WithName("audit-compact"), agent_v2.WithModel(main), agent_v2.WithAutoCompact(&agent_v2.AutoCompactConfig{Enabled: true, Model: summary, ModelContextWindow: 300, SummaryMaxTokens: 50, SummaryBufferTokens: 50, MinCompactableTokens: 1}))
++	sess := &agent_v2.RunSession{RunID: "zz-audit-compact"}
++	for i := 0; i < 5; i++ {
++		sess.AddEvent(agent_v2.NewOutputEvent("audit-compact", schema.UserMessage(strings.Repeat("old question ", 100))))
++		sess.AddEvent(agent_v2.NewOutputEvent("audit-compact", schema.AssistantMessage(strings.Repeat("old answer ", 100))))
++	}
++	events, err := ag.Run(context.Background(), sess, schema.UserMessage("new question"))
++	t.Logf("summary_calls=%d main_calls=%d err=%v final=%+v", summary.calls, main.calls, err, agent_v2.FinalMessage(events))
++	if summary.calls == 0 {
++		t.Fatal("fixture did not trigger AutoCompact")
++	}
++	if !errors.Is(err, compose_v2.ErrRunAborted) {
++		t.Fatalf("terminal error swallowed, err=%v", err)
++	}
++}
++
++type zzAskSummary struct{ calls, answered int }
++
++func (m *zzAskSummary) Generate(ctx context.Context, in []*schema.Message, _ ...model.Option) (*schema.Message, error) {
++	m.calls++
++	ans, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "允许摘要吗"})
++	if err != nil {
++		return nil, err
++	}
++	if ans.Content != "yes" {
++		return nil, errors.New("wrong answer")
++	}
++	m.answered++
++	return schema.AssistantMessage("<summary>approved</summary>"), nil
++}
++func (m *zzAskSummary) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
++	return nil, model.ErrStreamUnsupported
++}
++func (m *zzAskSummary) WithTools([]*schema.ToolInfo) (model.ChatModel, error) { return m, nil }
++func TestZZAuditAutoCompactAskResume(t *testing.T) {
++	summary := &zzAskSummary{}
++	main := &compactLoopModel{}
++	ag := agent_v2.NewBasicAgent(agent_v2.WithName("audit-ask"), agent_v2.WithModel(main), agent_v2.WithAutoCompact(&agent_v2.AutoCompactConfig{Enabled: true, Model: summary, ModelContextWindow: 300, SummaryMaxTokens: 50, SummaryBufferTokens: 50, MinCompactableTokens: 1}))
++	sess := &agent_v2.RunSession{RunID: "zz-audit-ask"}
++	for i := 0; i < 5; i++ {
++		sess.AddEvent(agent_v2.NewOutputEvent("audit-ask", schema.UserMessage(strings.Repeat("old question ", 100))))
++		sess.AddEvent(agent_v2.NewOutputEvent("audit-ask", schema.AssistantMessage(strings.Repeat("old answer ", 100))))
++	}
++	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
++	_, err := ag.Run(ctx, sess, schema.UserMessage("new question"))
++	ie, ok := compose_v2.IsInterrupt(err)
++	if !ok {
++		t.Fatalf("expected first interrupt, got %v", err)
++	}
++	id := ie.AllQueries()[0].InterruptID
++	for i := 0; i < 3; i++ {
++		_, err = ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess), agent_v2.WithResumeUserInputs(map[string]*schema.Message{id: schema.UserMessage("yes")}))
++		next, is := compose_v2.IsInterrupt(err)
++		if is {
++			t.Logf("resume=%d id=%s same_question=%v summary_calls=%d answered=%d main_calls=%d", i+1, next.AllQueries()[0].InterruptID, next.AllQueries()[0].InterruptID == id, summary.calls, summary.answered, main.calls)
++		}
++	}
++	if err != nil || summary.answered != 1 || main.calls != 1 {
++		t.Fatalf("answered addressed question must resume: err=%v summary_calls=%d answered=%d main_calls=%d", err, summary.calls, summary.answered, main.calls)
++	}
++}
++
++func TestZZAuditPrimaryModelAskResumeControl(t *testing.T) {
++	m := &zzAskSummary{}
++	ag := agent_v2.NewBasicAgent(agent_v2.WithName("audit-primary"), agent_v2.WithModel(m))
++	sess := agent_v2.NewRunSession()
++	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
++	_, err := ag.Run(ctx, sess, schema.UserMessage("new question"))
++	ie, ok := compose_v2.IsInterrupt(err)
++	if !ok {
++		t.Fatal(err)
++	}
++	_, err = ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess), agent_v2.WithResumeUserInputs(map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("yes")}))
++	t.Logf("primary calls=%d answered=%d err=%v", m.calls, m.answered, err)
++	if err != nil || m.calls != 2 || m.answered != 1 {
++		t.Fatalf("positive control failed: %v", err)
++	}
++}
++
++type zzSliceElementRewrite struct{ hook.NoOpHooks }
++
++func (zzSliceElementRewrite) OnModelStart(ctx context.Context, _ *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
++	if len(in.Messages) > 0 {
++		i := len(in.Messages) - 1
++		cp := *in.Messages[i]
++		cp.Content += " TRANSIENT-HOOK"
++		in.Messages[i] = &cp
++	}
++	return ctx, nil
++}
++func TestZZAuditHookSliceReplacementLeaksIntoBoundary(t *testing.T) {
++	ctx := compose_v2.WithThreadIDCtx(context.Background(), "zz-audit-boundary")
++	key := agent_v2.HistoryKey{Owner: "t", ConvID: "zz-audit-boundary"}
++	hs := agent_v2.NewInMemoryHistoryStore()
++	summary := &countingSummarizer{}
++	ag := agent_v2.NewBasicAgent(agent_v2.WithName("coder"), agent_v2.WithModel(&compactLoopModel{rounds: 60}), agent_v2.WithToolkit(grepToolkit()), agent_v2.WithMaxRounds(100), agent_v2.WithHistory(hs, "t"), agent_v2.WithMaxHistoryPairs(0), agent_v2.WithHooks(zzSliceElementRewrite{}), agent_v2.WithAutoCompact(smallWindow(summary)))
++	if _, err := ag.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("original")); err != nil {
++		t.Fatal(err)
++	}
++	all, err := agent_v2.LoadAllHistory(ctx, hs, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	leaked := 0
++	for _, m := range all {
++		if raw, ok := m.Annotations[agent_v2.HistoryCompactionAnnotation].(string); ok && strings.Contains(raw, "TRANSIENT-HOOK") {
++			leaked++
++		}
++	}
++	t.Logf("summary_calls=%d boundaries=%d leaked=%d", summary.count(), countBoundaries(all), leaked)
++	if summary.count() == 0 {
++		t.Fatal("fixture did not compact")
++	}
++	if leaked != 0 {
++		t.Fatalf("transient OnModelStart replacement persisted in %d history boundaries", leaked)
++	}
++}
+diff --git a/agent_v2/zz_audit_orchestration_test.go b/agent_v2/zz_audit_orchestration_test.go
+new file mode 100644
+--- /dev/null
++++ b/agent_v2/zz_audit_orchestration_test.go
+@@ -0,0 +1,117 @@
++package agent_v2_test
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++
++	"crew-go/agent_v2"
++	"crew-go/compose_v2"
++	"crew-go/hook"
++	"crew-go/schema"
++)
++
++type zzAuditStartAsk struct{ hook.NoOpHooks }
++
++func (zzAuditStartAsk) OnAgentStart(ctx context.Context, _ *hook.AgentInfo, _ *hook.AgentInput) (context.Context, error) {
++	_, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "批准 B 开始"})
++	return ctx, err
++}
++
++func TestZZAuditParallelResumeSiblingIsolation(t *testing.T) {
++	t.Run("control_fresh_session", func(t *testing.T) { zzAuditParallelResume(t, false) })
++	t.Run("preserved_session", func(t *testing.T) { zzAuditParallelResume(t, true) })
++}
++
++func zzAuditParallelResume(t *testing.T, preserveSession bool) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	ctx = compose_v2.WithCheckpointerCtx(ctx, compose_v2.NewInMemoryCheckpointer())
++	a, b, mb := sameNameWorkers(zzAuditStartAsk{})
++	par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("zz-par")).AddBranch("a", a).AddBranch("b", b)
++	sess := agent_v2.NewRunSession()
++	_, err := par.Run(ctx, sess, schema.UserMessage(laneQ))
++	ie, ok := compose_v2.IsInterrupt(err)
++	if !ok || len(ie.AllQueries()) != 1 {
++		t.Fatalf("want one question, got %v", err)
++	}
++	opts := []agent_v2.ResumeOption{agent_v2.WithResumeUserInputs(map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("yes")})}
++	if preserveSession {
++		opts = append(opts, agent_v2.WithResumeSession(sess))
++	}
++	_, err = par.Resume(ctx, sess.RunID, opts...)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, msg := range mb.call(0) {
++		t.Logf("B received %s: %q", msg.Role, msg.Content)
++		if msg.Content == "A-ans" {
++			t.Error("B resumed preamble received successful sibling A output")
++		}
++	}
++}
++
++func TestZZAuditDecisionSessionIsolation(t *testing.T) {
++	t.Run("control_distinct_name", func(t *testing.T) { zzAuditDecisionSession(t, "evaluator") })
++	t.Run("same_name", func(t *testing.T) { zzAuditDecisionSession(t, "worker") })
++}
++
++func zzAuditDecisionSession(t *testing.T, evaluatorName string) {
++	ma := &scriptModel{steps: []func([]*schema.Message) (*schema.Message, error){reply(schema.AssistantMessage("draft")), reply(schema.AssistantMessage("final"))}}
++	me := &scriptModel{steps: []func([]*schema.Message) (*schema.Message, error){reply(schema.AssistantMessage("PRIVATE-CRITIQUE")), reply(schema.AssistantMessage("yes"))}}
++	actor := agent_v2.NewBasicAgent(agent_v2.WithName("worker"), agent_v2.WithModel(ma))
++	eval := agent_v2.NewBasicAgent(agent_v2.WithName(evaluatorName), agent_v2.WithModel(me))
++	r := agent_v2.NewReflectAgent(agent_v2.WithReflectName("zz-reflect"), agent_v2.WithReflectMaxRounds(2), agent_v2.WithEvaluator(eval)).WithActor(actor)
++	if _, err := r.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("用户请求")); err != nil {
++		t.Fatal(err)
++	}
++	if ma.count() != 2 || me.count() != 2 {
++		t.Fatalf("wrong calls actor=%d eval=%d", ma.count(), me.count())
++	}
++	for _, msg := range ma.call(1) {
++		t.Logf("actor round 2 received %s: %q", msg.Role, msg.Content)
++		if msg.Role == "assistant" && msg.Content == "PRIVATE-CRITIQUE" {
++			t.Error("internal evaluator reply became actor's own previous assistant message")
++		}
++	}
++}
++
++func TestZZAuditPlanTmpHistorySlotCollision(t *testing.T) {
++	t.Run("control_distinct_slot", func(t *testing.T) { zzAuditPlanTmpSlot(t, "normal_slot") })
++	t.Run("colliding_slot", func(t *testing.T) { zzAuditPlanTmpSlot(t, "tmp_step_0") })
++}
++
++func zzAuditPlanTmpSlot(t *testing.T, registeredName string) {
++	ctx, _ := historyCtx("zz-plan-history")
++	tmpModel := &scriptModel{steps: []func([]*schema.Message) (*schema.Message, error){reply(schema.AssistantMessage("TMP-PRIVATE-OUTPUT"))}}
++	workerModel := &scriptModel{steps: []func([]*schema.Message) (*schema.Message, error){reply(schema.AssistantMessage("worker done"))}}
++	worker := agent_v2.NewBasicAgent(agent_v2.WithName("normal-worker"), agent_v2.WithModel(workerModel))
++	planner := func(_ context.Context, _ *agent_v2.RunSession, _ string, done []agent_v2.ExecutedStep) ([]agent_v2.PlanStep, string, error) {
++		switch len(done) {
++		case 0:
++			return []agent_v2.PlanStep{{Description: "临时任务", TmpSubAgent: &agent_v2.TmpSubAgentConfig{}}}, "", nil
++		case 1:
++			return []agent_v2.PlanStep{{Description: "独立任务", SubAgentName: registeredName}}, "", nil
++		default:
++			return nil, "done", nil
++		}
++	}
++	p := agent_v2.NewPlanAgent(planner, agent_v2.PlanName("zz-plan"), agent_v2.WithPlanModel(tmpModel),
++		agent_v2.WithSubAgents(map[string]agent_v2.Agent{registeredName: worker}),
++		agent_v2.WithExecInputBuilder(func(_ context.Context, _ string, _ []agent_v2.ExecutedStep, current agent_v2.PlanStep, _ []int) (*schema.Message, error) {
++			return schema.UserMessage(current.Description), nil
++		}))
++	if _, err := p.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("原始请求")); err != nil {
++		t.Fatal(err)
++	}
++	if tmpModel.count() != 1 || workerModel.count() != 1 {
++		t.Fatalf("wrong calls tmp=%d worker=%d", tmpModel.count(), workerModel.count())
++	}
++	for _, msg := range workerModel.call(0) {
++		t.Logf("worker received %s: %q", msg.Role, msg.Content)
++		if strings.Contains(msg.Content, "TMP-PRIVATE-OUTPUT") {
++			t.Error("explicit worker received temporary worker's private history")
++		}
++	}
++}
+diff --git a/agui/zz_audit_abort_cleanup_test.go b/agui/zz_audit_abort_cleanup_test.go
+new file mode 100644
+--- /dev/null
++++ b/agui/zz_audit_abort_cleanup_test.go
+@@ -0,0 +1,59 @@
++package agui_test
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	"crew-go/agent_v2"
++	"crew-go/agui"
++	"crew-go/compose_v2"
++	"crew-go/hook"
++)
++
++type zzFailAbortCP struct {
++	compose_v2.Checkpointer
++	fail bool
++	sid  string
++}
++
++func (c *zzFailAbortCP) SaveNS(ctx context.Context, sid, ns string, cp *compose_v2.Checkpoint) error {
++	c.sid = sid
++	return c.Checkpointer.SaveNS(ctx, sid, ns, cp)
++}
++
++func (c *zzFailAbortCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
++	if c.fail {
++		return 0, errors.New("temporary delete outage")
++	}
++	return c.Checkpointer.DeleteSubtree(ctx, sid, ns)
++}
++
++func TestZZAuditAbortFailureRetainsRetryHandle(t *testing.T) {
++	cp := &zzFailAbortCP{Checkpointer: compose_v2.NewInMemoryCheckpointer()}
++	h := ownedHandler(func(hooks hook.Hooks) agent_v2.Agent {
++		return agent_v2.NewBasicAgent(agent_v2.WithName("audit-abort"), agent_v2.WithModel(&askThenAnswerModel{}), agent_v2.WithAskUser(), agent_v2.WithHooks(hooks))
++	}, agui.WithCheckpointer(cp))
++	iid := findInterruptID(parseSSE(postAGUI(h, `{"threadId":"audit-abort","runId":"start","messages":[{"role":"user","content":"hi"}]}`).Body.String()))
++	if iid == "" {
++		t.Fatal("missing interrupt")
++	}
++	cp.fail = true
++	body := `{"threadId":"audit-abort","runId":"cancel","resume":[{"interruptId":"` + iid + `","status":"cancelled"}]}`
++	first := postAGUI(h, body)
++	if !strings.Contains(first.Body.String(), `"type":"cancelled"`) {
++		t.Fatalf("expected current best-effort cancel behavior: %s", first.Body.String())
++	}
++	cp.fail = false
++	saved, err := cp.LoadNS(context.Background(), cp.sid, "")
++	if err != nil || saved == nil {
++		t.Fatalf("checkpoint missing before retry: %v", err)
++	}
++	second := postAGUI(h, body)
++	saved, err = cp.LoadNS(context.Background(), cp.sid, "")
++	t.Logf("retry_http=%d retry=%s checkpoint_retained=%v", second.Code, second.Body.String(), saved != nil)
++	if err != nil || saved != nil {
++		t.Fatal("abort failure discarded session handle, so healthy backend cannot clean checkpoint on retry")
++	}
++}
+diff --git a/compose_v2/zz_audit_interface_channel_resume_test.go b/compose_v2/zz_audit_interface_channel_resume_test.go
+new file mode 100644
+--- /dev/null
++++ b/compose_v2/zz_audit_interface_channel_resume_test.go
+@@ -0,0 +1,52 @@
++package compose_v2_test
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"crew-go/compose_v2"
++	"crew-go/schema"
++)
++
++func TestZZAuditInterfaceChannelResume(t *testing.T) {
++	value := compose_v2.LastValue[any]("interface_value")
++	b := compose_v2.NewBuilder()
++	compose_v2.WithChannel(b, value)
++	writes, reads := 0, 0
++	b.AddNode("write", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
++		writes++
++		return []compose_v2.ChannelWrite{compose_v2.Write[any](value, "hello")}, nil
++	})
++	b.AddNode("read", func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
++		reads++
++		got := compose_v2.MustGet(chs, value)
++		if got != "hello" {
++			t.Errorf("read %v, want hello", got)
++		}
++		_, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "continue?"})
++		return nil, err
++	})
++	b.AddEdge(compose_v2.StartNode, "write").AddEdge("write", "read").AddEdge("read", compose_v2.EndNode)
++	g, err := b.Compile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	cp := compose_v2.NewInMemoryCheckpointer()
++	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
++	defer cancel()
++	const sid = "zz-interface-channel"
++	err = compose_v2.Run(ctx, g, compose_v2.NewChannelManager(), compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID(sid))
++	ie, ok := compose_v2.IsInterrupt(err)
++	if !ok {
++		t.Fatalf("expected first interrupt: %v", err)
++	}
++	t.Logf("before resume: writes=%d reads=%d", writes, reads)
++	err = compose_v2.Run(ctx, g, compose_v2.NewChannelManager(), compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID(sid), compose_v2.WithResumeAnswers(map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("yes")}))
++	if err != nil {
++		t.Fatalf("valid interface channel cannot resume: %v (writes=%d reads=%d)", err, writes, reads)
++	}
++	if writes != 1 || reads != 2 {
++		t.Fatalf("unexpected execution counts writes=%d reads=%d", writes, reads)
++	}
++}
+diff --git a/compose_v2/zz_audit_single_writer_resume_test.go b/compose_v2/zz_audit_single_writer_resume_test.go
+new file mode 100644
+--- /dev/null
++++ b/compose_v2/zz_audit_single_writer_resume_test.go
+@@ -0,0 +1,63 @@
++package compose_v2_test
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"crew-go/compose_v2"
++)
++
++// 同一超步的单写入者规则不能因为兄弟分支中途失败而放行。
++func TestZZAuditSingleWriterAcrossResume(t *testing.T) {
++	for _, pause := range []bool{false, true} {
++		t.Run(fmt.Sprintf("pause=%v", pause), func(t *testing.T) {
++			value := compose_v2.LastValue[string]("shared")
++			var aCalls, bCalls atomic.Int32
++			b := compose_v2.NewBuilder()
++			compose_v2.WithChannel(b, value)
++			b.AddNode("A", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
++				if aCalls.Add(1) == 1 && pause {
++					return nil, errors.New("transient A failure")
++				}
++				return []compose_v2.ChannelWrite{compose_v2.Write(value, "A")}, nil
++			})
++			b.AddNode("B", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
++				bCalls.Add(1)
++				return []compose_v2.ChannelWrite{compose_v2.Write(value, "B")}, nil
++			})
++			b.AddEdge(compose_v2.StartNode, "A").AddEdge(compose_v2.StartNode, "B")
++			b.AddEdge("A", compose_v2.EndNode).AddEdge("B", compose_v2.EndNode)
++			g, err := b.Compile()
++			if err != nil {
++				t.Fatal(err)
++			}
++			cp := compose_v2.NewInMemoryCheckpointer()
++			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
++			defer cancel()
++			const sid = "zz-single-writer-resume"
++			cm := compose_v2.NewChannelManager()
++			err = compose_v2.Run(ctx, g, cm, compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID(sid))
++			if pause {
++				if err == nil {
++					t.Fatal("first run should fail")
++				}
++				saved, loadErr := cp.LoadNS(ctx, sid, "")
++				if loadErr != nil || saved == nil || len(saved.CurrentFrontier) != 1 || len(saved.CompletedFrontier) != 1 {
++					t.Fatalf("bad partial checkpoint: %+v err=%v", saved, loadErr)
++				}
++				t.Logf("after pause: value=%s frontier=%v completed=%v", compose_v2.MustGet(cm.Channels(), value), saved.CurrentFrontier, saved.CompletedFrontier)
++				cm = compose_v2.NewChannelManager()
++				err = compose_v2.Run(ctx, g, cm, compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID(sid))
++			}
++			final, _ := compose_v2.Get(cm.Channels(), value)
++			t.Logf("final: err=%v value=%s A=%d B=%d", err, final, aCalls.Load(), bCalls.Load())
++			if !errors.Is(err, compose_v2.ErrRunAborted) {
++				t.Fatalf("same superstep has two LastValue writers but err=%v, final=%s", err, final)
++			}
++		})
++	}
++}

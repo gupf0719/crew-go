@@ -945,14 +945,7 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	}
 	prior, fromHistory := historyPrior(ctx, a.historyCfgFor(ctx), historyOwner(ctx, a.config.Name), mode, need)
 	if !fromHistory {
-		switch mode {
-		case HandoffHistoryRaw:
-			prior = session.HistoryForRaw(a.config.Name)
-		case HandoffHistoryRewrite:
-			prior = session.HistoryFor(a.config.Name)
-		default: // HandoffHistorySelfOnly（含非 handoff 场景缺省）——只自己，零回归
-			prior = session.SelfHistoryCompacted(a.config.Name)
-		}
+		prior = session.modelHistory(a.config.Name, HistorySlot(ctx), mode)
 		// 调用方提供的前文排在最前：events 只有这个进程里发生的，更早的轮次在调用方手里（见 caller_history.go）
 		if turns := callerHistory(ctx); len(turns) > 0 {
 			prior = append(turns, prior...)
@@ -2809,7 +2802,8 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 		memoCtx := compactionMemoFrom(ctx)
 		origMsgs := msgs
 		memoUpto, memoHead := 0, 0
-		if memoCtx != nil && cfg.AutoCompact != nil && cfg.AutoCompact.Enabled {
+		if memoCtx != nil && memoCtx.in != nil && memoCtx.in.Transient == memoCtx.transient &&
+			cfg.AutoCompact != nil && cfg.AutoCompact.Enabled {
 			msgs, memoUpto, memoHead = memoCtx.in.apply(msgs)
 		}
 
@@ -2832,17 +2826,13 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			// 模型调用失败 / 中断时这份结果随节点作废，续跑重做——跟消息流同生共死）。
 			if ccErr == nil && cut.tailLen >= 0 && memoCtx != nil {
 				memoCtx.out = nextCompactionMemo(origMsgs, memoUpto, memoHead, inputLen, compacted, cut.tailLen)
-			}
-			// **R23 audit HIGH-1 fix**：control flow err 必须 propagate——业务自定义
-			// cfg.AutoCompact.Model 抛 InterruptError / ctx.Err() 时 AutoCompactRun
-			// 已 propagate（不 wrap），caller 这里也必须直接返。原 `_` 吞掉破坏 HITL。
-			// 业务错（非控制流）AutoCompact 内部已 wrap "auto compact: summarize: %w"——
-			// caller 走 fallback "忽略压缩" 主链路继续（保 best-effort 优化语义）。
-			if ccErr != nil {
-				if _, isInt := compose_v2.IsInterrupt(ccErr); isInt {
-					return nil, ccErr
+				if memoCtx.out != nil {
+					memoCtx.out.Transient = memoCtx.transient
 				}
-				if ctx.Err() != nil {
+			}
+			// 摘要是可选优化，只有普通模型错误回退到原消息。任务控制错误由执行引擎处理。
+			if ccErr != nil {
+				if compose_v2.MustPropagate(ctx, ccErr) {
 					return nil, ccErr
 				}
 				// 业务错——记录但继续主链路（compacted 通常仍是原 messages，下层照走）

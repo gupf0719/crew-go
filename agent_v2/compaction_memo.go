@@ -46,6 +46,8 @@ type compactionMemo struct {
 	Anchor string `json:"anchor"`
 	// Head 是那段的压缩形态：前导 system + 长期记忆注入 + 受保护的组 + 摘要（+ 文件重注入）。
 	Head []*schema.Message `json:"head"`
+	// Transient 表示摘要来自钩子改写后的视图。只在同类视图中复用，不作为跨 Run 历史边界。
+	Transient bool `json:"transient,omitempty"`
 }
 
 // prefixAnchor 是一段消息的指纹：逐条送给模型的全部内容——角色、身份、正文、推理文本、拒答、内容块（工具调用
@@ -118,8 +120,9 @@ func (m *compactionMemo) apply(msgs []*schema.Message) (reduced []*schema.Messag
 // compactionMemoCtx 是模型节点交给 modelFn 的备忘：in 是这一轮开始时 channel 里的那份，out 由 modelFn
 // 在这一轮压缩成功时填，模型节点成功后写回 channel。
 type compactionMemoCtx struct {
-	in  *compactionMemo
-	out *compactionMemo
+	in        *compactionMemo
+	out       *compactionMemo
+	transient bool
 }
 
 type compactionMemoKey struct{}

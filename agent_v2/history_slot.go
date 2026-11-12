@@ -20,7 +20,7 @@ package agent_v2
 //
 // 路径由父编排在调 sub-agent 前 push 进 ctx，子 agent 记历史时读出来当归属。
 //
-// # 只放注册名，不放轮次 / 跳数 / 下标
+// # 注册成员跨执行保持同一归属
 //
 // 这是跟 graphNS（cp 寻址用）的**关键区别**，也是这套设计能成立的前提：
 //
@@ -33,7 +33,7 @@ package agent_v2
 //
 // 更要命的是跳数/轮次**跨 Run 会重置**（hops 存 ctx、每个 Run 从 0 起）：同一个 agent
 // 在 Run 1 记成 `agent_billing_hop1`、Run 2 续接时变 `agent_billing_hop0`，按它归属就
-// **读不回自己上一轮的历史**——那正是这一层存在的理由。所以带序号的段一律剔掉。
+// **读不回自己上一轮的历史**。临时成员只属于创建它的任务和步骤，使用独立编码的临时位置。
 //
 // # 代价：归属是编排结构的函数，改结构就是换身份
 //
@@ -78,6 +78,7 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -87,6 +88,20 @@ import (
 
 // historySlotCtxKey 是归属路径的 ctx key（私有类型防碰撞）。
 type historySlotCtxKey struct{}
+
+type historySegment string
+
+var historyNameEscaper = strings.NewReplacer("%", "%25", "/", "%2F")
+
+// namedHistorySegment 编码外部名称，保留斜杠为层级分隔符，保留前缀 % 给框架生成的位置。
+func namedHistorySegment(name string) historySegment {
+	return historySegment(historyNameEscaper.Replace(name))
+}
+
+// temporaryHistorySegment 只标识当前任务的这一步，下一任务创建的临时成员拥有自己的历史。
+func temporaryHistorySegment(taskID string, step int) historySegment {
+	return historySegment(fmt.Sprintf("%%tmp-%x-%d", taskID, step))
+}
 
 // WithHistorySlot 声明「接下来这个 sub-agent 在编排树里的位置」。
 //
@@ -98,14 +113,19 @@ type historySlotCtxKey struct{}
 // 业务自写编排（GraphAgent 的 NodeFunc 里调 sub-agent）时同样该 push，否则子 agent 的
 // 产出会回落到用 agent 名标归属——**同名就会合并**。`RunSubAgent` helper 已经代劳。
 //
-// name 为空时原样透传（不产生空段）。
+// name 为空时原样透传。名称中的 % 和 / 转义为 %25 和 %2F，框架生成的临时位置独立编码。
 //
 // 同时开一张**回执**：从这里往下实际产生了多少条历史记录（见 historyReceipt）。边界补记
 // 据此判断「这一步的执行体到底记了没有」。
 func WithHistorySlot(ctx context.Context, name string) context.Context {
-	if name == "" {
+	return pushHistorySegment(ctx, namedHistorySegment(name))
+}
+
+func pushHistorySegment(ctx context.Context, segment historySegment) context.Context {
+	if segment == "" {
 		return ctx
 	}
+	name := string(segment)
 	parent := HistorySlot(ctx)
 	if parent != "" {
 		name = parent + "/" + name
@@ -201,7 +221,7 @@ func historyOwner(ctx context.Context, agentName string) string {
 	if slot := HistorySlot(ctx); slot != "" {
 		return slot
 	}
-	return agentName
+	return string(namedHistorySegment(agentName))
 }
 
 // settleHistoryOnPause 在子调用以「可 Resume 的方式」退出时结算**输入**——只落输入，
@@ -316,7 +336,7 @@ func settleHistorySlot(ctx context.Context, agentName string, input, final *sche
 // 所以位置只传给这一次结算（做认领的流键 + 过守卫），不进 ctx。归属仍按
 // `historyOwner` 的既定回落取 agentName，后代归属逐字不变。
 func settleHistoryTopLevel(ctx context.Context, agentName string, input, final *schema.Message) {
-	settleHistoryAt(ctx, agentName, agentName, gateInputRecorded, input, final)
+	settleHistoryAt(ctx, string(namedHistorySegment(agentName)), agentName, gateInputRecorded, input, final)
 }
 
 // deferRootInput 让顶层执行体（GraphAgent）这次 Run 的原始输入排在这次 Run 写进历史的第一批记录前面。
@@ -337,12 +357,13 @@ func settleHistoryTopLevel(ctx context.Context, agentName string, input, final *
 // 终局失败不记。
 func deferRootInput(ctx context.Context, agentName string, input *schema.Message) {
 	w := historyWriterFrom(ctx)
+	owner := historyOwner(ctx, agentName)
 	if w == nil || historySuppressed(ctx) || agentName == "" || input == nil ||
 		input.Role != schema.RoleUser || isDerivedInput(input) || recordedInThisRun(ctx, input) ||
-		inputAlreadyInHistorySlot(ctx, agentName, input) {
+		inputAlreadyInHistorySlot(ctx, owner, input) {
 		return
 	}
-	w.deferRoot(input, w.stamp(input, historyOwner(ctx, agentName), agentName), agentName)
+	w.deferRoot(input, w.stamp(input, owner, agentName), owner)
 }
 
 // endRootInputWindow 在顶层 GraphAgent 的图跑完时调：还没补的原始输入收回，交给出口结算（见 deferRootInput）。

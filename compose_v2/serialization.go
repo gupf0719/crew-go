@@ -3,6 +3,7 @@ package compose_v2
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"reflect"
 	"sync"
 
@@ -275,6 +276,9 @@ func UnmarshalTagged(data []byte) (any, error) {
 //     旧 cp 里那一格的可重做记录（`:redo`）续跑时读不到——被调方在图外按 Rerunnable 记下的东西会重新产出，
 //     而那一格里的提问（没被否决过时）ID 不变，旧答案会兑付给重新产出的内容。别跨版本续跑在途任务。
 
+//   - v20：部分提交保存 CompletedWriteOwners。含单写入者 channel 的部分提交需要该字段，
+//     空表表示没有这类写入。缺少归属时拒绝恢复并保留存档，避免成功兄弟的写入被覆盖。
+
 // CheckpointSchemaVer 是 Checkpoint 当前 schema 版本号, 仅供观测 / 业务 debug
 // 用 — 框架不在 Marshal/Unmarshal 路径校验.
 //
@@ -290,7 +294,7 @@ func UnmarshalTagged(data []byte) (any, error) {
 //   - 业务侧迁移逻辑负责按 cp.SchemaVer 分支决定 unmarshal 字段
 //   - framework 加 `Migrate(v Old, vNew int) (*Checkpoint, error)` 类工具
 //   - 不在 Unmarshal 路径加 fail-fast
-const CheckpointSchemaVer = 19
+const CheckpointSchemaVer = 20
 
 // checkpointSchemaVer (private alias 保 framework 内部 reference 兼容).
 const checkpointSchemaVer = CheckpointSchemaVer
@@ -437,6 +441,7 @@ func (cm *ChannelManager) Snapshot() (*Checkpoint, error) {
 		cp.CompletedFrontier = make([]FrontierMember, len(cm.completedFrontier))
 		copy(cp.CompletedFrontier, cm.completedFrontier)
 	}
+	cp.CompletedWriteOwners = maps.Clone(cm.completedWriteOwners)
 	// 它们当时算好的出边目标——不存的话 Resume 只能重算，而重算就等于让「已成功已提交」
 	// 的成员还能在出边上失败（见 Checkpoint.CompletedTargets godoc）。
 	if len(cm.completedTargets) > 0 {
@@ -703,6 +708,9 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 	}
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+	if err := cm.validateCompletedWriteOwnersLocked(cp); err != nil {
+		return err
+	}
 
 	// 入口 snapshot 三类 state 用于 panic 回滚——values / visitCount /
 	// pendingInterrupts 都可能被本函数 mutate。audit Round 10 Bug L1 修复。
@@ -719,6 +727,7 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 	}
 	prevPending := cm.pendingInterrupts
 	prevCompleted := cm.completedFrontier
+	prevWriteOwners := cm.completedWriteOwners
 	prevCompletedTargets := cm.completedTargets
 	prevConsumedAnswers := cm.consumedAnswers
 	prevSignals := cm.signals
@@ -744,6 +753,7 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 		cm.visitCount = prevVisit
 		cm.pendingInterrupts = prevPending
 		cm.completedFrontier = prevCompleted
+		cm.completedWriteOwners = prevWriteOwners
 		cm.completedTargets = prevCompletedTargets
 		cm.consumedAnswers = prevConsumedAnswers
 		cm.signals = prevSignals
@@ -808,7 +818,7 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 		if v == nil {
 			continue // 跳过写, channel zero value 兜底
 		}
-		if expected := ch.typeRep(); expected != nil && reflect.TypeOf(v) != expected {
+		if expected := ch.typeRep(); !channelValueTypeMatches(expected, reflect.TypeOf(v)) {
 			restored = true // 本处自带回滚，别让 Goexit 兜底支重复回滚
 			rollbackOnErr()
 			return fmt.Errorf("Restore: channel %q type mismatch — cp wire type %T vs ChannelManager registered %v",
@@ -846,10 +856,8 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 	// PA-H1：恢复部分失败超步的成功成员 + 其 SendDirectives——Resume 重跑失败
 	// 成员成功后 peekCompletedSiblings 取出并入出边计算。unmarshal 失败走统一
 	// rollback（与 channel 值同 fail-fast 协议）。
-	if len(cp.CompletedFrontier) > 0 {
-		cm.completedFrontier = make([]FrontierMember, len(cp.CompletedFrontier))
-		copy(cm.completedFrontier, cp.CompletedFrontier)
-	}
+	cm.completedFrontier = append([]FrontierMember(nil), cp.CompletedFrontier...)
+	cm.completedWriteOwners = maps.Clone(cp.CompletedWriteOwners)
 	if len(cp.CompletedTargets) > 0 {
 		cm.completedTargets = make([]NodeID, len(cp.CompletedTargets))
 		copy(cm.completedTargets, cp.CompletedTargets)

@@ -265,6 +265,11 @@ type Checkpoint struct {
 	// 身份同样内联（见 CurrentFrontier / FrontierMember godoc）。
 	CompletedFrontier []FrontierMember `json:"completed_frontier,omitempty"`
 
+	// CompletedWriteOwners 保存本超步已完成成员对单写入者 channel 的写入归属。
+	// 部分提交时即使没有这类写入也保存空表。nil 表示没有归属记录，不能据此续跑含单写入者
+	// channel 的部分提交存档。
+	CompletedWriteOwners map[string]FrontierMember `json:"completed_write_owners"`
+
 	// CompletedTargets 是上面那些成员**当时算好的出边目标**。
 	//
 	// **为什么要存、而不是 Resume 时重算**：出边是「那个成员成功」的一部分，在它成功

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strconv"
 
 	"crew-go/compose_v2"
@@ -918,6 +919,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	if isFrameworkNil(hooks) {
 		hooks = hook.NoOpHooks{}
 	}
+	hasModelHooks := true
+	switch hooks.(type) {
+	case hook.NoOpHooks, *hook.NoOpHooks:
+		hasModelHooks = false
+	}
 	name := b.name
 	if name == "" {
 		name = "basic_agent"
@@ -1023,6 +1029,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		sysPre, _ := compose_v2.Get(chs, basicSysPreambleCh)
 
 		modelIn := &schema.ModelInput{Preamble: sysPre, Messages: msgs}
+		if hasModelHooks {
+			// 钩子持有本轮可改写的视图。channel 与历史保留原始消息，供后续轮次、续跑和压缩边界使用。
+			modelIn.Preamble = cloneMessageList(sysPre)
+			modelIn.Messages = cloneMessageList(msgs)
+		}
 		if modelConfig != nil {
 			modelIn.Config = modelConfig(ctx)
 		}
@@ -1030,7 +1041,6 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			// 沿用原样：这一遍没有模型调用，按调用计数、计时的钩子据此不再记一次（见 hook.ModelResponseReusedKey）
 			modelIn.Extra = map[string]any{hook.ModelResponseReusedKey: true}
 		}
-		streamMsgs := msgs // 钩子改写之前的消息流——压缩边界只在钩子没动它时写（见下）
 		// 上一次摘要的结果（见 basicCompactionCh）；modelFn 这一轮又摘要了就填 out。
 		memoIn, _ := compose_v2.Get(chs, basicCompactionCh)
 		memo := &compactionMemoCtx{in: memoIn}
@@ -1062,7 +1072,9 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			// 钩子可能留下 nil（往末尾 append 一个零值、整段换成含 nil 的切片）：压缩层分组时跳过 nil、按条数算位置的
 			// 地方就差一位（备忘的 Upto 会多算一条，之后模型输入里出现找不到声明者的 tool_result），provider 的消息
 			// 转换遇到 nil 也会 panic。在这里去掉，下面每一层都不必再防。
-			msgs = dropNilMessages(modelIn.Messages)
+			view := dropNilMessages(modelIn.Messages)
+			memo.transient = hasModelHooks && !reflect.DeepEqual(msgs, view)
+			msgs = view
 			// hook 可能往 Preamble 里塞 nil（`append` 一个零值、或整段换成含 nil 的切片）。
 			// 它会一路走到 provider 的消息转换里——实测真 openai client 在那里 panic。
 			modelIn.Preamble = dropNilMessages(modelIn.Preamble)
@@ -1106,13 +1118,8 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 					hooks.OnError(callCtx, info, &schema.CommError{Code: "model_nil_output", Message: err.Error()})
 					return err
 				}
-				// 压缩边界在这一刻定（它只看这一轮的摘要与 OnModelStart 钩子动没动消息列表）：沿用原样续跑时 OnModelStart
-				// 再触发一次，它这次动没动跟那次答复无关。
-				//
-				// **只在 OnModelStart 钩子没动消息列表时写**：压缩是在钩子改写之后的那份上做的，钩子插进来的、
-				// 改写过的消息会跟着进替代历史、在下一次 Run 里当成历史重放（每轮插一条「当前时间」的钩子，
-				// 下一次 Run 就看到两条）。钩子动了就不写，下一次 Run 照旧读全量。
-				if memo.out != nil && sameMessageSlice(streamMsgs, msgs) {
+				// 只有源自原始消息流的摘要能成为跨 Run 历史。恢复时沿用当次答复确定的边界。
+				if memo.out != nil && !memo.out.Transient {
 					boundary = buildCompactionBoundary(memo.out, msgs, GetHandoffHistoryMode(ctx))
 				}
 				// 模型调用成功那一刻记下原样：OnModelEnd 因为要等人或被叫停停下时，续跑沿用这一份（见 modelCallRecord）。
@@ -1130,21 +1137,27 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			// mock 模式 + Sub-5c 单测直接构造 ModelOutput{Usage:...} 绕开此真实路径未暴露 —
 			// 8 轮 audit + 单测全绿没抓到, 真 LLM 端到端集成验证才暴露 (印证 CLAUDE.md
 			// "mock 闭包绕开真实路径不算端到端覆盖").
-			modelOut := &schema.ModelOutput{Message: out}
+			originalText := out.Content
+			runID, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string)
+			hookMessage := out
+			if hasModelHooks {
+				hookMessage = cloneCalleeInput(out)
+			}
+			modelOut := &schema.ModelOutput{Message: hookMessage}
 			if hasRec {
 				modelOut.Extra = map[string]any{hook.ModelResponseReusedKey: true}
 			}
 			// 这是哪次模型调用（见 hook.ModelRunIDKey）：钩子可能换掉 Message，按消息标注就认不出了
-			if rid, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string); rid != "" {
+			if runID != "" {
 				if modelOut.Extra == nil {
 					modelOut.Extra = map[string]any{}
 				}
-				modelOut.Extra[hook.ModelRunIDKey] = rid
+				modelOut.Extra[hook.ModelRunIDKey] = runID
 			}
 			// 一次模型调用的用量只交给 OnModelEnd 一次：沿用原样时，上一次 OnModelEnd 停下之前排在前面的钩子已经收到过
 			// （观测链装在最前），再带一次就是一次调用报两次。
-			if out.Metadata != nil && out.Metadata.Usage != nil && !hasRec {
-				modelOut.Usage = out.Metadata.Usage
+			if hookMessage.Metadata != nil && !hasRec {
+				modelOut.Usage = hookMessage.Metadata.Usage
 			}
 			// OnModelEnd 的返回值不往后流（同 OnToolEnd / OnNodeEnd）。
 			_, hookErr := compose_v2.CallHook(callCtx, func(c context.Context) (context.Context, error) {
@@ -1160,7 +1173,6 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				}
 				return fmt.Errorf("OnModelEnd: %w", hookErr)
 			}
-			preHookMsg := out      // 非 nil（:328 已保证 model 自身输出非 nil）
 			out = modelOut.Message // hook 可能替换
 			if out == nil {
 				// **对称 :328（model 自身 nil）+ :475（OnToolEnd 置 nil）守卫**：OnModelEnd 的
@@ -1173,33 +1185,22 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				hooks.OnError(callCtx, info, &schema.CommError{Code: "model_end_nil_message", Message: err.Error()})
 				return err
 			}
-			// out / preHookMsg 现都保证非 nil——条件简化 + 下方 len(out.Content) 安全
-			//
-			// 钩子换上的消息仍是这次模型调用的答复：盖上这次调用的 run_id（下面的改写信号、tools 节点给工具调用标的出处都从
-			// 它取）。最自然的写法 `out.Message = &schema.Message{...}` 不带标注，曾经改写信号的 run_id 为空、前端与对端对不上
-			// 原来那条消息，没脱敏的原文留着（审计实测，经 A2A 一跳宿主拿到的也是原文）。盖在消息与标注表的拷贝上，钩子交来的
-			// 对象不动：护栏钩子常返回一条共享的固定回复（out.Message = blocked），在它身上盖章会让并发的调用互相改写、
-			// 各自的改写信号对不上自己那条（-race 实测）。
-			if rid, _ := preHookMsg.Annotations[compose_v2.RunIDAnnotationKey].(string); rid != "" {
-				if cur, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string); cur != rid {
+			// 输出归属来自原调用。钩子可原地改写标注，也可能返回多个请求共享的固定答复，补章要拷贝。
+			replaced := out != hookMessage || out.Content != originalText
+			if runID != "" {
+				if cur, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string); cur != runID {
 					ann := make(map[string]any, len(out.Annotations)+1)
 					for k, v := range out.Annotations {
 						ann[k] = v
 					}
-					ann[compose_v2.RunIDAnnotationKey] = rid
+					ann[compose_v2.RunIDAnnotationKey] = runID
 					stamped := *out
 					stamped.Annotations = ann
 					out = &stamped
 				}
 			}
-			if out != preHookMsg || out.Content != preHookMsg.Content {
+			if replaced {
 				if sink := compose_v2.GetEventSink(segCtx); sink != nil {
-					runID := ""
-					if out.Annotations != nil {
-						if v, ok := out.Annotations[compose_v2.RunIDAnnotationKey].(string); ok {
-							runID = v
-						}
-					}
 					// 不是作废、是替换：带上新答复的正文（replacement），前端与对端用它替换那条消息。只有清片段的信号时，适配层
 					// 无从得知新内容，按作废处理会让整条答复消失（审计实测）
 					sink.Send(compose_v2.Event{

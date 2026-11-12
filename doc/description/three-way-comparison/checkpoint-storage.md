@@ -81,6 +81,12 @@ per-超步的临时并列 slice，cp round-trip 后就没了 → 重跑节点时
 
 `InMemoryCheckpointer` 用 `data[sessionID][ns]` 二级 map（`checkpointer.go`）；**crew-go 已内置持久 Checkpointer：`redis/`（Redis）+ `sql/`（Postgres + MySQL 双方言）独立 module**，业务也可自实现 `Checkpointer`（8 方法接口）。
 
+**2026-11-12 部分提交的写入归属**。本地 LangGraph `1b4cb0f19e` 在 `pregel/_loop.py` 的 pending writes
+保留 `(task_id, channel, value)`。eino `4a4b7186` 的 `compose/graph_run.go` 保留重跑节点和各节点输入。
+crew-go 已合并成功成员的值，因此只保留单写入者 channel 到 `FrontierMember` 的归属，同已有完成记录一次提交。
+续跑按同一逻辑超步核对成员和共享 payload。缺少归属的部分提交在含单写入者 channel 时拒绝恢复并保留原档。
+详细契约见 [Checkpoint](../../v2/checkpoint.md#21-checkpoint-全字段)。
+
 ### 生命周期（成功即清）
 
 `compose_v2.Run` 出口 defer 自动管理：
@@ -223,7 +229,7 @@ task_checkpoint_ns = f"{checkpoint_ns}:{task_id}"
 
 ### 存储数据结构
 
-极简——裸 KV（`internal/core/interrupt.go:27-30`）：
+极简——裸 KV（eino 的 `internal/core` 包，`interrupt.go` 第 27–30 行）：
 ```go
 type CheckPointStore interface {
     Get(ctx context.Context, checkPointID string) ([]byte, bool, error)
@@ -330,7 +336,7 @@ class CheckpointNotLatest(Exception):
 
 ### eino：未进入设计视野
 
-`CheckPointStore`（`internal/core/interrupt.go:27-30`）只有 `Get` / `Set`，**签名层面无法表达条件写**（无 expected-value 参数、无冲突错误类型）；checkpoint 结构无 status/version/owner。
+`CheckPointStore`（eino 的 `internal/core` 包，`interrupt.go` 第 27–30 行）只有 `Get` / `Set`，**签名层面无法表达条件写**（无 expected-value 参数、无冲突错误类型）；checkpoint 结构无 status/version/owner。
 
 **checkpoint 相关的四个文件**（`internal/core/interrupt.go` / `compose/checkpoint.go` / `compose/interrupt.go` / `compose/graph_run.go`）里 `sync.` / `atomic.` / `Mutex` 零命中——注意这是**限定到 checkpoint 路径**的结论，eino 核心执行路径该用锁的地方都在用（`compose/state.go:36` `sync.Mutex`、`compose/tool_node.go:994` `WaitGroup`、`internal/core/address.go:91` `RWMutex`），不是"eino 不用并发原语"。
 
@@ -722,7 +728,7 @@ MAF 的 hosting 层实测在用：cp 路径是 `<root>/<user_id>/<context_id>`
 ### 挂起存档的 GC：没有一家给 checkpoint 做 TTL
 
 全是「显式 delete + 业务负责调」。eino 白纸黑字承认会堆积
-（`internal/core/interrupt.go:32-41`：不实现 `CheckPointDeleter` 时 stale checkpoints
+（eino 的 `internal/core` 包中 `interrupt.go` 第 32–41 行：不实现 `CheckPointDeleter` 时 stale checkpoints
 **will NOT** be automatically cleaned up），且有测试钉死这个行为
 （`adk/turn_loop_test.go:4520-4524`）。
 

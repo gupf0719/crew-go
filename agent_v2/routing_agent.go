@@ -560,7 +560,7 @@ func (r *RoutingAgent) buildComposeGraph(
 				input: input,
 				// ns 带 branch_ 前缀（与同层其它节点的 ns 不撞），归属用裸注册名。
 				nsSuffix:    "branch_" + br.Name,
-				historySlot: br.Name,
+				historySlot: namedHistorySegment(br.Name),
 				retryCfg:    retryCfg,
 			})
 		}
@@ -576,7 +576,7 @@ func (r *RoutingAgent) buildComposeGraph(
 				sess:        parentSession,
 				input:       input,
 				nsSuffix:    "branch_" + fallbackBranchName,
-				historySlot: fallbackBranchName,
+				historySlot: namedHistorySegment(fallbackBranchName),
 				retryCfg:    retryCfg,
 			})
 		})

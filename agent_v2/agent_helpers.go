@@ -385,8 +385,7 @@ func CallAgentStart(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo,
 // `IsInterrupt=true` 但挂起档为 0，前端照常渲染问题，用户答完 Resume 撞
 // `ErrNoPendingCheckpoint`——被误导到最后一步才失败。
 //
-// 「落一份初始档」试过：引擎自己的不变量当场拒绝（`checkpoint has pending interrupts
-// but no frontier to run them`）——那条防线是对的（挂起没人能跑），绕它等于对抗自己。
+// 构造一份仅含问题的初始档也无法恢复：引擎会拒绝缺少 frontier 的挂起存档。
 // 同类产品的同名机制也一致：中断原语第一行就取节点运行时上下文，图外调用直接崩。
 //
 // # 判据：引擎盖的「在节点执行范围内」章，不是 ns 字符串

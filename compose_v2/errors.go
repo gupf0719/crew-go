@@ -276,60 +276,13 @@ func (e *checkpointNotPersistedError) Unwrap() []error {
 // 而重跑会把这次已经做过的副作用再做一遍。
 func (*checkpointNotPersistedError) NonRetryable() {}
 
-// ErrCheckpointNotResumable 报「拿来续跑的这份存档自相矛盾」——它说有人在等回答
-// （`PendingInterrupts` 非空），却没有任何地方能跑到那个提问（`CurrentFrontier` 空）。
+// ErrCheckpointNotResumable 表示存档缺少恢复所需的进度，或记录之间不一致。
+// 例如有待回答问题却没有 frontier，或部分超步缺少单写入者的归属。无 frontier 且无挂起问题的
+// 完成快照仍支持幂等恢复。
 //
-// **名字说的是哪条不变量破了，不是「这东西坏了」**：存档的字节可能完好，只是这两个字段
-// 凑不成一个能执行的状态。
-//
-// # 「什么都不剩」不是矛盾
-//
-// frontier 空**且**没有挂起 = 上次跑完了。对这样一份快照续跑返成功、不重跑，是幂等语义，
-// **不报本错**。矛盾特指「有挂起、没地方跑」。
-//
-// # 引擎自然产不出这种矛盾
-//
-// 存档时 frontier 和挂起列表是一起写的，一个在另一个没了只能来自外部：
-//   - 调用方手搓 / 拿一份被截断的档喂进 [WithResumeFrom]；
-//   - 业务自己 `SaveNS` 拼了一份；
-//   - **业务自研 backend 漏序列化 `CurrentFrontier`** —— 这一类最隐蔽也最常见：一次真
-//     HITL 中断的档，挂起提问还在、`Status` 还是 Pending，只有起跑地址没了。
-//     （`checkpointer_conformance` 有 round-trip 断言，前提是业务真跑了它。）
-//
-// # 为什么必须报错而不是静默返成功
-//
-// 这条路原先无差别 `return nil`（注释写「上次已完整跑完」）。那个前提对上面第三类不成立，
-// 于是实际表现是：**Resume 返 nil、一个节点都没跑、用户的答案没送达、存档还被当成功
-// 清掉** —— 四件事全静默，调用方拿到的每一个信号都说「成功」。
-//
-// # 现场保留（有一个前提，别当成结构保证）
-//
-// 校验放在 `cm.Restore` **之前**，所以 Run 独占那个 `ChannelManager` 时它还是空的，
-// 出口「没 frontier 也没挂起就不写档」的早退成立 ⟹ 不会回写覆盖。也不 wrap
-// [ErrRunAborted]（那会触发主动清子树）—— 存档不自洽时最不该做的就是毁掉唯一的
-// 排查依据，而留着它也不会被误捡：下一次同样会在这儿被拒。
-//
-// ⚠️ **前提是「cm 是空的」，不是「校验在 Restore 之前」**。`cm` 由调用方给，而
-// 「先 `cm.Restore(cp)` 渲染待答问题、再 `Run(..., WithResumeFrom(cp))`」是本包支持
-// 的幂等用法（`Run` 认得已被 Restore 过的 cm，不会重复灌）。走那条路时 cm 非空 ⟹
-// 出口早退不成立 ⟹ **存储里那份好的会被内存里这份坏的覆盖**，而覆盖出来的形态是
-// 最坏的一档：**存档自己变成矛盾档**——frontier 被抹平、`Status` 仍是 `CPStatusPending`。
-// 于是此后每一次续跑都被这同一道守卫拒，**backend 修好了也回不来**，而它在业务的
-// 待处理列表里看着一切正常（实测：覆盖后 `pending frontier=0 pending=1`，修好
-// backend 再跑，提问节点执行 0 次）。
-//
-// 两条路各自的结局要摆在一起看，别只记住一个：不加守卫是**静默**删掉整份并返成功；
-// 走这条路是留下一份救不回来的档、但每次都明确报错。**别照着「结构保证」去推理**。
-// 想两条都保住，读 `cp.PendingInterrupts` 字段渲染 UI，别先 Restore 进 cm。
-//
-// **祖先层不受这个前提影响**：本错在 `shouldStayPending` 里被归到「挂起」那一档，
-// 所以嵌套时上面每一层的存档仍标 Pending——业务修好 backend 之后整条链还能续。
-// 漏掉那一步的话，子层保住了、祖先层全被盖成失败现场，`agent_v2.Resume` 走的正是
-// 祖先那层，会话就彻底救不回来（实测过）。
-//
-// 业务 `errors.Is(err, ErrCheckpointNotResumable)` 可判「这份档不能用来续跑」。
-// 它**不可重试**（[IsRetryable] 排除它）——重跑必然拿到同一份档。
-var ErrCheckpointNotResumable = errors.New("compose_v2: checkpoint has pending interrupts but no frontier to run them")
+// 恢复校验失败时，本图保持原存档，调用方可排查或修正后端。祖先图仍可保存各自的进度。
+// 此错误可用 errors.Is 判断，[IsRetryable] 将其排除在自动重试之外。
+var ErrCheckpointNotResumable = errors.New("compose_v2: checkpoint cannot be resumed")
 
 // ErrNoSubgraphCheckpoint 表示父 cp store 中未找到指定子图节点的嵌套 cp。
 //

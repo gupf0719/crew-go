@@ -124,16 +124,3 @@ func isStoreInjected(m *schema.Message) bool {
 	v, ok := m.Annotations[StoreInjectedAnnotation].(bool)
 	return ok && v
 }
-
-// sameMessageSlice 报两份消息列表是不是逐条同一个指针（钩子原样放行时是）。
-func sameMessageSlice(a, b []*schema.Message) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}

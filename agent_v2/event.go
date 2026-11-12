@@ -45,9 +45,18 @@ type AgentEvent struct {
 	// 幂等去重）。BasicAgent 每轮 LLM 调用前生成 UUID 透传到本轮所有事件。
 	RunID string `json:"run_id,omitempty"`
 
-	// **R32+ 视角 4 audit 删**: NS 字段生产 0 reader (仅 AddEventInGraph 写但没人读),
-	// SelfHistoryByNS 也不存在。子图嵌套场景已被 ParallelAgent ForkLane +
-	// CommitLaneEvents (ISSUE-80) lane 物理隔离替代。
+	// HistorySlot 是事件所属成员的历史路径。没有声明路径的会话事件仍按 AgentName 识别。
+	HistorySlot string `json:"history_slot,omitempty"`
+
+	// ParallelScopes 记录本事件经过哪些并行分支提交，顺序从内层到外层。
+	// 会话事件往返 JSON 后仍可区分当前并行执行的分支产出和会话已有事件。
+	ParallelScopes []ParallelEventScope `json:"parallel_scopes,omitempty"`
+}
+
+// ParallelEventScope 标识任务中一次并行编排执行。Namespace 含嵌套调用的位置与实例身份。
+type ParallelEventScope struct {
+	TaskID    string `json:"task_id"`
+	Namespace string `json:"namespace"`
 }
 
 // AgentOutput 包装 agent 在一个执行步骤中生成的消息。

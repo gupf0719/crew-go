@@ -96,9 +96,9 @@ type Hooks interface {
 | Hook | 触发锚点 / 频次 | 业务入参（关键字段）| 返回 & 返 error 后果 | 主要作用（设计意图）|
 |---|---|---|---|---|
 | **OnAgentStart** | agent 最外层、图执行**前**（同步）· 每 Run/Resume 1 次 | `AgentInput.Messages` = 本次调用的**原始输入**（Resume 时为空）| `(ctx, error)`；返 error → 中断整个 Run | 一次 agent 调用的开始锚：拿未加工输入 / 建顶层 trace span / 入口级改写 |
-| **OnModelStart** | model 节点内、**压缩之前** · 每轮 | **两个并列字段**：`ModelInput.Preamble` = agent 前言（`WithPromptTemplate` 渲染结果 + `WithSystemPrompt` 含 skill hint/body，不进压缩）；`ModelInput.Messages` = 被压缩的对话流（记忆注入 + 历史 + 本轮输入）。⚠️ **它不是发出去的那一份**：四层压缩在这个 hook **之后**跑，AGENTS.md 注入也在之后 prepend。要「模型最终看到什么」请在 model client 那一侧看 | `(ctx, error)`；返 error → 中断本轮 | 观测 / 改写每一轮送 LLM 的输入——**两个字段都是[消费]档**：改 `Preamble` 换 agent 的 persona、改 `Messages` 动对话流，互不误伤（整段替换 `Preamble` 也生效，旧的不会残留）|
+| **OnModelStart** | model 节点内、压缩之前 · 每轮 | `ModelInput.Preamble` 是前言，`ModelInput.Messages` 是待压缩的对话流。两者均为本轮可改写的视图，压缩和 AGENTS.md 注入在钩子之后执行 | `(ctx, error)`，报错结束本轮 | 可原地改字段、换消息元素或替换整个列表。消息结构和标注容器与原始流隔离。钩子改写后的摘要不能成为跨 Run 历史边界 |
 | **OnModelEndStream** | model 内部流式路径，介于 ModelStart / End · 每轮（仅模型流式可用时）| 上游 LLM 的 `MessageStreamReader` | `(ctx, reader, error)`；返 error → **降级非流式，不中断** | 包装流 reader 做逐 chunk 观测 / 转换 / 审计 |
-| **OnModelEnd** | model 节点内、LLM 返回后 & tool 解析**前** · 每轮 | `ModelOutput.Message` = 聚合后完整响应 | `(ctx, error)`；返 error → 中断本轮 | 观测 / 改写模型输出（`len(toolCalls)==0` 即最终答复）|
+| **OnModelEnd** | model 节点内、LLM 返回后和 tool 解析前 · 每轮 | `ModelOutput.Message` 是聚合后完整响应 | `(ctx, error)`，报错结束本轮 | 原地改正文或替换消息都会更新最终输出。`reset_stream` 携带原模型调用 ID 和新正文，流式消费方据此修正先前已发送的内容 |
 | **OnToolStart** | tools 节点内、每个 tool_call **前** · per tool_call · 串行 | `ToolInput.Name` / `ArgumentsJSON`（只在这一批第一次交给工具执行时生效，续跑沿用定下的内容、随中断档落盘；每次都要新取的值走钩子返回的 ctx 或工具中间件）| `(ctx, error)`；返 error → 中断本轮 | 改写工具名 / 参数（参数注入 / 工具重定向）|
 | **OnToolEnd** | tools 节点内、每个 tool_call **后** · per tool_call · 串行 | `ToolOutput.Result`（`Output` / `Success` / `Error` / `ErrorCode`）| `(ctx, error)`；返 error → 中断本轮 | 改写工具结果（脱敏 / 注入缓存）写回 LLM 历史 |
 | **OnAgentEnd** | agent 最外层、图执行**后**（defer）· 每 Run/Resume 1 次 | `AgentOutput.Messages` = 本 Run 累积消息快照 | `ctx`（**无 error**）；不中断 | 一次调用的收尾：trace span 结束 / 在途计数 -- / 审计 |

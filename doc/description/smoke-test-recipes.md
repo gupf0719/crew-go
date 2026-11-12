@@ -315,3 +315,16 @@ go test -tags=integration ./example/model/anthropic_smoke -run '^TestSmoke_Strea
 
 正常响应时记录 SSE 的最大字节间隔、ping 次数和最大 ping 间隔。服务端因计费拒绝时，
 用例验证 `model.ErrBillingExhausted` 并跳过流式间隔。流式成功和真实计费拒绝分别记录结果。
+
+## §11 OpenAI 流式与工具调用
+
+从环境变量或项目根目录 `.env` 读取 `OPENAI_API_KEY`，缺少凭据时跳过。默认模型是
+`gpt-5.4-mini`，可用 `OPENAI_SMOKE_MODEL` 指定支持 Chat Completions 流式和工具调用的模型。
+[OpenAI Docs](https://developers.openai.com/api/docs/models/gpt-5.4-mini)
+
+```bash
+go test -tags=integration -count=1 -v ./example/model/openai_smoke
+```
+
+流式用例读取文本分片直到正常结束。工具用例通过 `BasicAgent` 验证实际执行一次、参数正确，
+并检查模型在最终答复中使用工具返回的校验码。

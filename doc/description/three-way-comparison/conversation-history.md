@@ -156,6 +156,10 @@ MAF .NET 的 `AgentSessionStore` godoc 几乎逐字写了同一段理由（"续�
 
 ## 五、多 agent 归属与嵌套
 
+**2026-11-12 会话事件归属**。编排成员写入的 Session 事件和 HistoryStore 记录使用相同的成员路径。
+注册成员跨任务保留位置，临时成员的路径包含任务与步号，展示名独立保留。并行分支另记任务与图 namespace，
+用于在原会话及 JSON 恢复的会话中滤除同一次并行执行的其他分支事件。内部决策使用独立事件视图，共享业务 KV。
+
 | | 怎么标 speaker | 一条流还是多条 | 编排派生 input 进不进历史 | 内部决策 LLM 进不进 |
 |---|---|---|---|---|
 | crew-go | 消息 annotation | **一条**（嵌套沿用父 writer） | **看成分**：全可重算的不进（Sequential），含被摘除 LLM 产出的进（Reflect / Plan） | 不进（框架调内部决策方时一律摘：分类器 / 评估器 / 规划器 / 路由函数与决策方 / Reflector·EvalFunc / Loop 退出判断 / 回合结束闸门） |

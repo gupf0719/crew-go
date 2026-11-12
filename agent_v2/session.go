@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -102,6 +103,8 @@ type RunSession struct {
 	// 快照（私有、之后不变），不跟父共享切片，也就不用共享父的锁。
 	eventsMu sync.RWMutex
 	events   []*AgentEvent
+	// historySlot 是这条成员 lane 追加事件时的归属。创建后保持不变。
+	historySlot string
 
 	// valuesMu 保护 values map。**父子共享指针**（NewSharedChildSession 让 child
 	// 复制父 valuesMu 指针）—— 父子并发 SetValue/GetValue 同 map 走同一个锁
@@ -138,6 +141,8 @@ type RunSession struct {
 type laneEvents struct {
 	mu     sync.Mutex // R33 A HIGH-1: 嵌套 fan-out 时多 inner branch 同时 append 同 outer Events 必须加锁
 	Events []*AgentEvent
+	// parallelScope 由分支 lane 的构造方设置，随该 lane 的事件一起提交。
+	parallelScope *ParallelEventScope
 }
 
 // NewRunSession 创建空 root RunSession，自动生成 RunID。
@@ -420,6 +425,11 @@ func (s *RunSession) AddEvent(e *AgentEvent) {
 	if e.Action != nil && e.Action.IsChunk {
 		return
 	}
+	if s.historySlot != "" {
+		copyEvent := *e
+		copyEvent.HistorySlot = s.historySlot
+		e = &copyEvent
+	}
 	if e.CreatedAt == 0 {
 		e.CreatedAt = time.Now().UnixNano()
 	}
@@ -459,8 +469,7 @@ func (s *RunSession) Events() []*AgentEvent {
 // （共享 values 指针 + valuesMu）。
 //
 // 框架里编排成员每次尝试用它派生一条（attemptLanes：失败的尝试被下一次从头再跑的尝试取代时，它写的事件不提交）；
-// ParallelAgent 的分支 lane 走同一个实现 forkLaneFrom，上文去掉兄弟分支提交上来的（见 parallel_agent.go 的
-// siblingEvents）。
+// ParallelAgent 的分支 lane 通过 forkParallelLane 过滤同一次并行执行的分支事件。
 //
 // **为什么是快照**：lane 是拿来隔离的——兄弟分支之后提交进父的、父那边后来追加的，都不该出现在这条 lane 的上文里。
 // 曾经 lane 对主线只记切片（长度在派生时定住）、对祖先 lane 却挂着实时指针：并行作为编排成员跑在成员的暂存 lane
@@ -482,30 +491,39 @@ func (s *RunSession) ForkLane() *RunSession {
 	return s.forkLaneFrom(s.Events())
 }
 
+// forkParallelLane 保留分支启动前写入会话的事件，过滤这次并行执行此前已经提交的分支事件。
+func (s *RunSession) forkParallelLane(scope ParallelEventScope) *RunSession {
+	base := slices.DeleteFunc(s.Events(), func(event *AgentEvent) bool {
+		return event != nil && slices.Contains(event.ParallelScopes, scope)
+	})
+	lane := s.forkLaneFrom(base)
+	lane.laneEvents.parallelScope = &scope
+	return lane
+}
+
 // forkLaneFrom 派生一条 lane，它看到的上文是 base——调用方取好的 s 的事件（可以是 s.Events() 的子集）。
-// ParallelAgent 用它让分支看不到兄弟：分支开始时取编排会话的事件、去掉兄弟分支提交上来的，再从结果派生（见
-// parallel_agent.go 的 siblingEvents）。
+// ParallelAgent 传入按并行归属过滤后的会话事件。
 //
 // lane 只读 base：lane 的 AddEvent 写自己的 slice，CommitLaneEvents 往父 lane 自己的 slice 上追加，都不碰
 // events；容量截到长度，万一有人往上追加也会另起数组。
 func (s *RunSession) forkLaneFrom(base []*AgentEvent) *RunSession {
 	s.ensureValues()
 	return &RunSession{
-		RunID:      s.RunID,
-		valuesMu:   s.valuesMu,   // 共享 mu 指针 — race-free 父子并发
-		values:     s.values,     // 共享 values map
-		parentSess: s.parentSess, // 沿用父链（lane 不改变 sess 嵌套层级）
-		events:     base[:len(base):len(base)],
-		laneEvents: &laneEvents{Events: make([]*AgentEvent, 0)},
+		RunID:       s.RunID,
+		valuesMu:    s.valuesMu,   // 共享 mu 指针 — race-free 父子并发
+		values:      s.values,     // 共享 values map
+		parentSess:  s.parentSess, // 沿用父链（lane 不改变 sess 嵌套层级）
+		historySlot: s.historySlot,
+		events:      base[:len(base):len(base)],
+		laneEvents:  &laneEvents{Events: make([]*AgentEvent, 0)},
 	}
 }
 
 // CommitLaneEvents 把 child sess 的 lane events 合并回 parent sess（按 child lane 内原有
 // 顺序 append，不跨 lane 排序）。
 //
-// 框架里编排成员的尝试 lane 经它提交（attemptLanes）；ParallelAgent 的分支 lane 经同一个实现提交、顺带记下
-// 提交了哪些事件（commitLane / siblingEvents.commit）。几条 lane 各自完成时分别提交——父的事件跨 lane 的顺序
-// = 完成顺序（各 lane 内部事件连续且有序）。
+// 编排成员的尝试 lane 与 ParallelAgent 的分支 lane 共用此提交点。并行分支的归属与事件一起
+// 追加，后启动的分支读到的事件已带归属。各 lane 内部事件连续有序，跨 lane 按提交顺序追加。
 //
 // **路由规则**：
 //   - parent.laneEvents != nil（parent 也在 lane 内：嵌套 fan-out、分支成员的尝试 lane）→
@@ -514,14 +532,8 @@ func (s *RunSession) forkLaneFrom(base []*AgentEvent) *RunSession {
 //
 // child 必须是 parent.ForkLane() 的产物——其他情况行为未定义。
 func CommitLaneEvents(parent, child *RunSession) {
-	commitLane(parent, child)
-}
-
-// commitLane 是 CommitLaneEvents 的实现，返回这次提交上去的事件——ParallelAgent 据此记下兄弟分支提交了什么
-// （见 parallel_agent.go 的 siblingEvents）。
-func commitLane(parent, child *RunSession) []*AgentEvent {
 	if parent == nil || child == nil || child.laneEvents == nil {
-		return nil
+		return
 	}
 	// 读 child lane.Events 走 lane.mu (R33 A HIGH-1: 防 child branch 内还在写时 commit 读)
 	child.laneEvents.mu.Lock()
@@ -529,20 +541,27 @@ func commitLane(parent, child *RunSession) []*AgentEvent {
 	copy(laneEvts, child.laneEvents.Events)
 	child.laneEvents.mu.Unlock()
 	if len(laneEvts) == 0 {
-		return nil
+		return
+	}
+	if scope := child.laneEvents.parallelScope; scope != nil {
+		for i, event := range laneEvts {
+			// 内层提交已写入的归属继续保留。其他读者可能持有事件原件，发布前只改这次提交的副本。
+			copyEvent := *event
+			copyEvent.ParallelScopes = append(slices.Clone(event.ParallelScopes), *scope)
+			laneEvts[i] = &copyEvent
+		}
 	}
 	// parent 也在 lane 内（嵌套 fan-out）— 走 parent lane.mu 保护 (R33 A HIGH-1)
 	if parent.laneEvents != nil {
 		parent.laneEvents.mu.Lock()
 		parent.laneEvents.Events = append(parent.laneEvents.Events, laneEvts...)
 		parent.laneEvents.mu.Unlock()
-		return laneEvts
+		return
 	}
 	// 主线 parent
 	parent.eventsMu.Lock()
 	parent.events = append(parent.events, laneEvts...)
 	parent.eventsMu.Unlock()
-	return laneEvts
 }
 
 // RestoreEvents 用持久化的事件切片填充 events——业务从外部存储（数据库 / KV）
@@ -629,17 +648,7 @@ const CompactionSummaryAnnotationKey = "compaction_summary"
 // 用途：BasicAgent 的 buildInitialMessages 跨 Run 复用 session 时，从本 agent
 // 自产事件流重建初始 messages 流（不引入跨 agent cross-talk）。
 func (s *RunSession) SelfHistory(ownerAgentName string) []*schema.Message {
-	evs := s.Events()
-	out := make([]*schema.Message, 0, len(evs))
-	for _, e := range evs {
-		if e.AgentName != ownerAgentName {
-			continue
-		}
-		if e.Output != nil && e.Output.Message != nil {
-			out = append(out, e.Output.Message)
-		}
-	}
-	return out
+	return s.projectHistory(byAgentName(ownerAgentName), HandoffHistorySelfOnly)
 }
 
 // HistoryFor 返回**跨 agent 改写后**的完整对话视图——非本 agent 产出的
@@ -657,24 +666,7 @@ func (s *RunSession) SelfHistory(ownerAgentName string) []*schema.Message {
 // 空 ownerAgentName 视作"无所属"——所有非本 agent 消息（即所有 assistant/tool
 // 消息）都按 cross-agent 改写。
 func (s *RunSession) HistoryFor(ownerAgentName string) []*schema.Message {
-	evs := s.Events()
-	out := make([]*schema.Message, 0, len(evs))
-	for _, e := range evs {
-		if e.Output == nil || e.Output.Message == nil {
-			continue
-		}
-		msg := e.Output.Message
-		if e.AgentName == ownerAgentName {
-			out = append(out, msg)
-			continue
-		}
-		// cross-agent 改写：assistant(tool_call) / tool 降级为 user("For context: ...")；
-		// 改写后无实质内容（空 content 无 tool_call）返 nil 跳过，不注入 junk。
-		if rewritten := rewriteCrossAgentMessage(msg, e.AgentName); rewritten != nil {
-			out = append(out, rewritten)
-		}
-	}
-	return out
+	return s.projectHistory(byAgentName(ownerAgentName), HandoffHistoryRewrite)
 }
 
 // rewriteCrossAgentMessage 把跨 agent 的 assistant/tool 消息降级为 user("For context: ...")。
@@ -733,31 +725,53 @@ func rewriteCrossAgentMessage(msg *schema.Message, fromAgent string) *schema.Mes
 //
 // 空 ownerAgentName 视作"无所属"——所有消息原样返 (含 from_agent annotation)。
 func (s *RunSession) HistoryForRaw(ownerAgentName string) []*schema.Message {
+	return s.projectHistory(byAgentName(ownerAgentName), HandoffHistoryRaw)
+}
+
+func byAgentName(name string) func(*AgentEvent) bool {
+	return func(event *AgentEvent) bool { return event.AgentName == name }
+}
+
+// modelHistory 使用成员路径识别已声明归属的事件。调用方手动添加或从旧会话导入的无路径事件仍按名称读取。
+func (s *RunSession) modelHistory(name, slot string, mode HandoffHistoryMode) []*schema.Message {
+	msgs := s.projectHistory(func(event *AgentEvent) bool {
+		if event.HistorySlot != "" {
+			return event.HistorySlot == slot
+		}
+		return event.AgentName == name
+	}, mode)
+	if mode != HandoffHistoryRaw && mode != HandoffHistoryRewrite {
+		return afterLastSessionSummary(msgs)
+	}
+	return msgs
+}
+
+func (s *RunSession) projectHistory(owns func(*AgentEvent) bool, mode HandoffHistoryMode) []*schema.Message {
 	evs := s.Events()
 	out := make([]*schema.Message, 0, len(evs))
 	for _, e := range evs {
-		if e.Output == nil || e.Output.Message == nil {
+		if e == nil || e.Output == nil || e.Output.Message == nil {
 			continue
 		}
 		msg := e.Output.Message
-		if e.AgentName == ownerAgentName {
+		if owns(e) {
 			out = append(out, msg)
 			continue
 		}
-		// 非 owner agent — 保原 role + 标 from_agent annotation
-		newMsg := *msg
-		if newMsg.Annotations == nil {
-			newMsg.Annotations = map[string]any{}
-		} else {
-			// 深拷贝 Annotations 防 mutate 原 events
-			ann := make(map[string]any, len(newMsg.Annotations)+1)
-			for k, v := range newMsg.Annotations {
-				ann[k] = v
+		switch mode {
+		case HandoffHistoryRewrite:
+			if rewritten := rewriteCrossAgentMessage(msg, e.AgentName); rewritten != nil {
+				out = append(out, rewritten)
 			}
-			newMsg.Annotations = ann
+		case HandoffHistoryRaw:
+			copyMsg := *msg
+			copyMsg.Annotations = make(map[string]any, len(msg.Annotations)+1)
+			for k, v := range msg.Annotations {
+				copyMsg.Annotations[k] = v
+			}
+			copyMsg.Annotations["from_agent"] = e.AgentName
+			out = append(out, &copyMsg)
 		}
-		newMsg.Annotations["from_agent"] = e.AgentName
-		out = append(out, &newMsg)
 	}
 	return out
 }
@@ -809,7 +823,10 @@ func (s *RunSession) HistoryForRaw(ownerAgentName string) []*schema.Message {
 //
 // 找不到 marker → 行为等同 SelfHistory（返回全量 owner 消息）。
 func (s *RunSession) SelfHistoryCompacted(ownerAgentName string) []*schema.Message {
-	full := s.SelfHistory(ownerAgentName)
+	return afterLastSessionSummary(s.SelfHistory(ownerAgentName))
+}
+
+func afterLastSessionSummary(full []*schema.Message) []*schema.Message {
 	if len(full) == 0 {
 		return full
 	}

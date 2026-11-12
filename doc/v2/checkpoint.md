@@ -47,7 +47,7 @@ type Checkpoint struct {
     NS        string           // 本 cp 的 ns 路径（嵌套寻址用）
     ParentNS  string           // 父 ns（O(1) 反查祖先）
     Status    CheckpointStatus // Unset / Pending / Failed —— **只是报告位**，不参与控制流，见 §3.1
-    SchemaVer int              // 当前 CheckpointSchemaVer = 19
+    SchemaVer int              // 当前 CheckpointSchemaVer = 20
     GraphID   string           // 防 cp 串台（§4.3）
     CreatedAt int64            // UnixNano，Cleanup 按它排序；框架只在 caller 没给时盖
     Epoch     string           // 写代：每次 SaveNS 换一枚（§2.2）
@@ -69,8 +69,10 @@ type Checkpoint struct {
     FrontierStarted   bool                   // 这一超步开没开始执行（成员中断 / 失败之后的档为真；停在超步边界上的——软取消、ctx 取消、断点停下——为假）——续跑时决定判不判 before 断点
     NodeVisits        map[NodeID]int         // 每节点成功跑过几次——中断 ID 的 visit 维度靠它跨 cp 递增
 
-    // ── 部分失败超步的补充（缺一个都是静默丢数据，见 §2.4）──
+    // ── 部分失败超步的补充 ──
     CompletedFrontier []FrontierMember  // 中断超步里已成功的成员
+    CompletedWriteOwners map[string]FrontierMember // 已提交的单写入者 channel 归属，空表表示没有这类写入
+    CompletedTargets  []NodeID          // 成功成员执行时已确定的出边目标
     DeferredSends     []SerializedSend  // 成功成员发出的 SendFrom 指令
     PendingSendWrites []SerializedWrite // 没能提交的 SendFrom payload（待 Resume 补 apply）
 
@@ -149,12 +151,12 @@ type SignalRecord struct {
 ⚠️ **`Durability` 的崩溃恢复价值需要配持久 backend 才成立**——InMemory 随进程一起没了，
 sync/async 每超步写出来的中途 cp 救不回任何东西。
 
-**真要自研**（Mongo / 自家 KV / 多租户分片）时，这一层最隐蔽的地方是：**漏序列化任何一个字段
-都不报错**，只是各自退化成一种静默的错。
+**自研后端必须完整往返存档字段**。缺失字段可能拒绝恢复，也可能改变后续执行。
 
 | 漏了 | 退化成 |
 |---|---|
 | `CompletedFrontier` | 发散 fan-out 部分失败时，Resume 后**成功分支的后继永久丢失** |
+| `CompletedWriteOwners` | 含单写入者 channel 的部分提交会拒绝恢复并保留原档。空表表示已核对且无此类写入，后端须区分空表与 nil |
 | `DeferredSends`（或其中 `Owner`）| Target **双发** |
 | `PendingSendWrites` | SendFrom 的 target **静默读到零值** |
 | `FrontierMember.InstanceID`（含空身份那条记录整条要留）| 多实例 Resume 后**实例互相冒充**，InterruptID 撞 → query 被 dedupe 吞 → 那个实例永远等不到答案 |
@@ -170,6 +172,9 @@ sync/async 每超步写出来的中途 cp 救不回任何东西。
 | `RecipientKey` | 续跑时密钥重铸、收件人变了，停下之前已提交的转交 / 路由决定认不出是发给谁的，静默丢失 |
 | `NodeStates` | 退化成「全部重跑」（= 引入前行为）：节点里已做成的副作用重放，其中包括已完成的嵌套调用——它们的完成记录也在这里（§5）。问过人的嵌套调用丢了记录之后：调用方只答当前一问时，两个问题轮流出现、永不收敛（实测）；累积传答案时不重问（旧答案被静默复用），但子 agent 整个重跑、副作用重放 |
 | `CreatedAt`（绕过 `Run` 直接写 backend 时）| 恒 0，被 `Cleanup` 当成最旧的优先删 |
+
+从 v19 或更早版本升级时，含单写入者 channel 的部分提交存档缺少写入归属。上线前应在旧版本完成这些任务，
+或由业务确认放弃后重新运行。判断依据是存档内容。已注册的接口 channel 可恢复实现该接口的具体类型，具体类型仍须在值注册表中注册。
 
 ⚠️ 同一类静默错还有一处不在字段里，在**键怎么比较**：(sid, ns) 逐字节就是存档的身份，逐字节
 不同的两个会话 / 两个 ns 是两份档——只差尾随空格、大小写、重音或组合字符写法的也是。键列用了

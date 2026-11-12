@@ -479,7 +479,7 @@ func (s *SequentialAgent) buildComposeGraph(
 				// ns 与归属都用步骤注册名（AddStep 强制唯一）：一条链上每步只跑一次，
 				// 两者的「逐次唯一」与「跨次稳定」在这里不冲突。
 				nsSuffix:    step.Name,
-				historySlot: step.Name,
+				historySlot: namedHistorySegment(step.Name),
 				retryCfg:    retryCfg,
 			})
 		}

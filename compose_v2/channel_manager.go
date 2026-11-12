@@ -2,6 +2,7 @@ package compose_v2
 
 import (
 	"fmt"
+	"maps"
 	"reflect"
 	"sync"
 
@@ -130,6 +131,8 @@ type ChannelManager struct {
 	completedFrontier []FrontierMember
 	deferredSends     []SendDirective
 	completedTargets  []NodeID
+	// completedWriteOwners 记录同一逻辑超步已经提交的单写入者 channel 及其成员身份。
+	completedWriteOwners map[string]FrontierMember
 
 	// consumedAnswers 是**已经兑付过的答案位**（见 answer_consumption.go）。
 	// 在提交点由本超步成功成员的记账并入；读取答案时跳过它们、并让落在其上的新提问
@@ -587,11 +590,16 @@ func validateSendInput(writes []ChannelWrite, channels map[string]anyChannel) er
 		if !ok {
 			return fmt.Errorf("channel %q not registered", name)
 		}
-		if typ := reflect.TypeOf(write.valueAny()); typ != nil && !typ.AssignableTo(ch.typeRep()) {
+		if typ := reflect.TypeOf(write.valueAny()); !channelValueTypeMatches(ch.typeRep(), typ) {
 			return fmt.Errorf("channel %q: input has type %v, want %v", name, typ, ch.typeRep())
 		}
 	}
 	return nil
+}
+
+// channelValueTypeMatches 对齐 Get 和 reducer 的类型断言。接口 channel 接受实现它的具体类型。
+func channelValueTypeMatches(want, got reflect.Type) bool {
+	return got == nil || want == got || (want.Kind() == reflect.Interface && got.Implements(want))
 }
 
 // updateFrontier 是 Run 内部 helper：更新当前帧 frontier 到 cm，便于中断时
@@ -695,6 +703,7 @@ func (cm *ChannelManager) commitSuperstepPartial(
 	signals []SignalRecord,
 	deferredSends []SendDirective,
 	deferredTargets []NodeID,
+	writeOwners map[string]FrontierMember,
 ) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -714,6 +723,11 @@ func (cm *ChannelManager) commitSuperstepPartial(
 	// 这里原先在方法外面，两者之间被掐会让成功兄弟的出边与 sends 整批丢失，
 	// 那个后继节点一次都没跑而 err 全程 nil（独立审计注入实测）。
 	cm.appendCompletedSiblingsLocked(succeeded, deferredSends, deferredTargets)
+	// 归属随写入与完成记录一起提交。空表表示已核对，没有单写入者 channel 写入。
+	cm.completedWriteOwners = writeOwners
+	if len(cm.completedFrontier) > 0 && cm.completedWriteOwners == nil {
+		cm.completedWriteOwners = make(map[string]FrontierMember)
+	}
 	return nil
 }
 
@@ -756,6 +770,7 @@ func (cm *ChannelManager) commitSuperstepAdvance(
 	// dirWrites、信号已随上一行并入。留着会让同一批 payload 在存档里存两份，Resume 双放。
 	cm.completedFrontier, cm.deferredSends, cm.completedTargets = nil, nil, nil
 	cm.completedSignals = nil
+	cm.completedWriteOwners = nil
 	cm.frontierInputs = nil
 	cm.updateFrontierLocked(nextFrontier)
 	cm.frontierInputs = nextInputs
@@ -770,6 +785,38 @@ func (cm *ChannelManager) commitSuperstepAdvance(
 			return &sendPayloadApplyErr{err: err}
 		}
 		cm.pendingSendWrites = nil
+	}
+	return nil
+}
+
+func (cm *ChannelManager) completedWriteOwnersSnapshot() map[string]FrontierMember {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return maps.Clone(cm.completedWriteOwners)
+}
+
+// validateCompletedWriteOwnersLocked 在恢复前核对部分提交的归属。调用方持有 cm.mu。
+func (cm *ChannelManager) validateCompletedWriteOwnersLocked(cp *Checkpoint) error {
+	if len(cp.CompletedFrontier) > 0 && cp.CompletedWriteOwners == nil {
+		for _, ch := range cm.channels {
+			if ch.singleWriterPerStep() {
+				return fmt.Errorf("%w: sid=%q ns=%q: partial superstep checkpoint lacks single-writer ownership", ErrCheckpointNotResumable, cp.ID, cp.NS)
+			}
+		}
+	}
+	if len(cp.CompletedWriteOwners) == 0 {
+		return nil
+	}
+	completed := make(map[FrontierMember]bool, len(cp.CompletedFrontier))
+	for _, member := range cp.CompletedFrontier {
+		completed[member] = true
+	}
+	for name, member := range cp.CompletedWriteOwners {
+		ch, ok := cm.channels[name]
+		if !ok || !ch.singleWriterPerStep() || !completed[member] {
+			return fmt.Errorf("%w: sid=%q ns=%q: invalid owner %s for channel %q in partial superstep checkpoint",
+				ErrCheckpointNotResumable, cp.ID, cp.NS, formatFrontierMember(member), name)
+		}
 	}
 	return nil
 }

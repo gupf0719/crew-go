@@ -2,6 +2,7 @@ package agent_v2
 
 import (
 	"reflect"
+	"slices"
 
 	"crew-go/hook"
 	"crew-go/schema"
@@ -49,9 +50,6 @@ import (
 // 让每一次首跑都先吃一遍。
 //
 // 摘要照旧按「存档往返之后的样子」算（见 inputDigest），跟这里拷成什么样无关。
-//
-// 元数据里的 logprobs 切片拷一份、元素共享：那是模型输出的附属，出现在一条输入消息上已经很少见，
-// 钩子更没有理由改它。
 //
 // 新增字段时 `TestCloneCalleeInput_FieldCoverage` 会红，逼着这里跟上。
 // ownRunInput 返回这次运行自己持有的那份输入：调用方交来的消息的独立拷贝（见 cloneCalleeInput），没有消息 ID
@@ -104,11 +102,34 @@ func cloneCalleeInput(m *schema.Message) *schema.Message {
 		md.Usage = clonePtr(m.Metadata.Usage)
 		if m.Metadata.Logprobs != nil {
 			md.Logprobs = make([]*schema.LogProbContent, len(m.Metadata.Logprobs))
-			copy(md.Logprobs, m.Metadata.Logprobs)
+			for i, p := range m.Metadata.Logprobs {
+				if p == nil {
+					continue
+				}
+				cp := *p
+				cp.Bytes = slices.Clone(p.Bytes)
+				cp.TopLogprobs = slices.Clone(p.TopLogprobs)
+				for j, top := range cp.TopLogprobs {
+					if top != nil {
+						copyTop := *top
+						copyTop.Bytes = slices.Clone(top.Bytes)
+						cp.TopLogprobs[j] = &copyTop
+					}
+				}
+				md.Logprobs[i] = &cp
+			}
 		}
 		c.Metadata = &md
 	}
 	return &c
+}
+
+func cloneMessageList(msgs []*schema.Message) []*schema.Message {
+	view := slices.Clone(msgs)
+	for i, m := range view {
+		view[i] = cloneCalleeInput(m)
+	}
+	return view
 }
 
 func cloneContentBlock(b *schema.ContentBlock) *schema.ContentBlock {

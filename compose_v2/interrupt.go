@@ -557,12 +557,24 @@ type ResumeContext struct {
 
 type resumeCtxKey struct{}
 
+type resumeDelivery struct {
+	context       *ResumeContext
+	addressedOnly bool
+}
+
+func resumeDeliveryFrom(ctx context.Context) resumeDelivery {
+	delivery, _ := ctx.Value(resumeCtxKey{}).(resumeDelivery)
+	return delivery
+}
+
 // withResumeContext 注入 ResumeContext 到 ctx。仅供 Run 内部调用。
 func withResumeContext(ctx context.Context, rc *ResumeContext) context.Context {
 	if rc == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, resumeCtxKey{}, rc)
+	delivery := resumeDeliveryFrom(ctx)
+	delivery.context = rc
+	return context.WithValue(ctx, resumeCtxKey{}, delivery)
 }
 
 // WithResumeContextValue 把 ResumeContext 显式注入 ctx——**业务高级 escape hatch**。
@@ -577,10 +589,7 @@ func withResumeContext(ctx context.Context, rc *ResumeContext) context.Context {
 //
 // rc=nil 时 no-op 返原 ctx。
 func WithResumeContextValue(ctx context.Context, rc *ResumeContext) context.Context {
-	if rc == nil {
-		return ctx
-	}
-	return context.WithValue(ctx, resumeCtxKey{}, rc)
+	return withResumeContext(ctx, rc)
 }
 
 // StripResumeContext 显式移除 ctx 中的 ResumeContext——audit Round 9 Bug B2 修复。
@@ -606,16 +615,30 @@ func WithResumeContextValue(ctx context.Context, rc *ResumeContext) context.Cont
 //   - 业务也可用 `compose_v2.WithSubgraphIsolatedResumeContext()` 在 GraphAgent
 //     内 AddSubgraphNode 时直接隔离（仅 AddSubgraphNode 路径，9 编排嵌套用上面的手动方式）
 //
-// 框架 auto-ID 路径（InterruptSite 编入 graphNS）父子 ID 不冲突——本 strip
-// 不影响 auto-ID 路由正确性，只防 sentinel-key 串台。
+// 本 helper 会移除所有恢复答复，包括 [Ask] 可读取的答复。仍需要执行位置寻址时使用
+// [WithAddressedResumeOnly]。
 func StripResumeContext(ctx context.Context) context.Context {
-	return context.WithValue(ctx, resumeCtxKey{}, (*ResumeContext)(nil))
+	delivery := resumeDeliveryFrom(ctx)
+	delivery.context = nil
+	return context.WithValue(ctx, resumeCtxKey{}, delivery)
 }
 
-// GetResumeContext 从 ctx 读取 ResumeContext——节点函数可调用。
+// WithAddressedResumeOnly 保留由 [Ask] 和 [NextAnswerSlot] 按执行位置读取的答复，并隐藏
+// [GetResumeContext]、[GetResumeAnswer] 和 [GetResumeUserText] 的恢复数据。子调用继承此限制。
+// 独立调用相位仍由 [EnterPhase] 分配。
+func WithAddressedResumeOnly(ctx context.Context) context.Context {
+	delivery := resumeDeliveryFrom(ctx)
+	delivery.addressedOnly = true
+	return context.WithValue(ctx, resumeCtxKey{}, delivery)
+}
+
+// GetResumeContext 从 ctx 读取可供当前调用直接查看的恢复数据。
 func GetResumeContext(ctx context.Context) (*ResumeContext, bool) {
-	rc, ok := ctx.Value(resumeCtxKey{}).(*ResumeContext)
-	return rc, ok && rc != nil
+	delivery := resumeDeliveryFrom(ctx)
+	if delivery.addressedOnly {
+		return nil, false
+	}
+	return delivery.context, delivery.context != nil
 }
 
 // NextAnswerSlot 取**本站点下一个提问位**的身份，连同那个位置上已经有的答案。
@@ -660,8 +683,8 @@ func GetResumeContext(ctx context.Context) (*ResumeContext, bool) {
 //     ——调用方自己判，或者干脆走 `Ask`。
 func NextAnswerSlot(ctx context.Context) (id string, ans *schema.Message, ok bool) {
 	id = CurrentInterruptSite(ctx).InterruptID()
-	rc, has := GetResumeContext(ctx)
-	if !has || rc.UserInputs == nil {
+	rc := resumeDeliveryFrom(ctx).context
+	if rc == nil || rc.UserInputs == nil {
 		return id, nil, false
 	}
 	// **已兑付的答案不再兑付第二次**（见 answer_consumption.go）：调用方累积传历次

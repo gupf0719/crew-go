@@ -908,12 +908,13 @@ b.AddSubgraphNode("planner", planGraph,
 )
 ```
 
-### 8.3 框架 auto-ID 路径不受隔离影响
+### 8.3 保留按执行位置投递的答复
 
 框架 auto-ID 算法把 `graphNS` 编入 InterruptID——父子 ID 不冲突（不同 ns 哈希不同）。
 
-**隔离只防「业务自己约定固定 key」的串台**（那种 key 不带 graphNS）。框架 auto-ID
-路径默认就安全，不需要隔离；框架自己曾用过的那个假 key（`_replan_`）已随通道拆分消失。
+需要让被调方继续用 `Ask` 时，用 `compose_v2.WithAddressedResumeOnly` 隐藏任意 ID 查询和非寻址续跑文本。
+同一节点内的独立调用可经 `compose_v2.EnterPhase` 分配自己的提问序号。AutoCompact 的摘要模型采用这一组合。
+`StripResumeContext` 会移除全部答复，也会使 `Ask` 无法读到答案。
 
 ### 8.4 关于"子图想 opt-in 继承父答案"
 

@@ -610,11 +610,8 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		if entry != nil && !entry.breaker.Allow() {
 			return nil, errBreakerTripped // sentinel
 		}
-		// **R30 视角C MED-1 fix**：summarize Model 是纯压缩工具，不应读"用户 Resume
-		// 答案"——业务自定义 cfg.AutoCompact.Model 实现内若调 GetResumeAnswerSingle（已删）
-		// 会误命中为 sub-agent ask_user 准备的答案当成"摘要 LLM 特殊指令"。strip
-		// ResumeContext 对齐 R14 audit 对 PlanAgent fork mode 隔离思路。
-		summarizeCtx := compose_v2.StripResumeContext(ctx)
+		// 摘要拥有独立的提问序号。按位置回答它自己的问题，主模型的答复和续跑文本继续隔离。
+		summarizeCtx := compose_v2.WithAddressedResumeOnly(compose_v2.EnterPhase(ctx, "auto_compact"))
 		emitBefore() // 真要调摘要模型了：这一轮算一次压缩（见 emitBefore 的说明）
 		r, e := cfg.Model.Generate(summarizeCtx, callInput)
 		// emit Generate event — primary phase attempt=1 (AutoCompactRun
@@ -634,14 +631,8 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 				Generate: generateAction,
 			})
 		}
-		// **R23 audit HIGH-1 fix（关键扩展）**：control flow error 不算 breaker
-		// failure——InterruptError / ctx.Err() 是业务/用户主动控制流，AutoCompact
-		// 本身没有"失败"。原计入 breaker → 3 次 Interrupt 后 breaker 跳 → AutoCompact
-		// 在该 sess 内永久失效，严重时业务后续 Run 全部 silent 不压缩 → ctx 爆。
-		if e != nil && entry != nil {
-			if _, isInt := compose_v2.IsInterrupt(e); !isInt && ctx.Err() == nil {
-				entry.breaker.RecordFailure()
-			}
+		if e != nil && entry != nil && !compose_v2.MustPropagate(ctx, e) {
+			entry.breaker.RecordFailure()
 		}
 		return r, e
 	}()
@@ -649,16 +640,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		return messages, nil // 安静跳过，行为等同 shouldTrigger 失败
 	}
 	if err != nil {
-		// **R23 audit HIGH-1 fix**：control flow error 必须 propagate（与 R14
-		// runForkMode + R5 selectSkillAdaptive 同协议）——业务自定义 cfg.Model 实现
-		// 可能在 prompt 长度超限 / 内容审查不通过 / 用户取消等场景抛 InterruptError /
-		// ctx.Err()。原 wrap 成 "auto compact: summarize: %w" 后 caller 用 `_` 吞掉
-		// 整个 error → 框架不存 cp / 父不挂起 / Resume 找不到入口 → HITL 链断。
-		// 改：先判 IsInterrupt + ctx.Err() 直接 propagate；其他业务错才 wrap。
-		if _, isInt := compose_v2.IsInterrupt(err); isInt {
-			return messages, err
-		}
-		if ctx.Err() != nil {
+		if compose_v2.MustPropagate(ctx, err) {
 			return messages, err
 		}
 		return messages, fmt.Errorf("auto compact: summarize: %w", err)

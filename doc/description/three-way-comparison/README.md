@@ -1,6 +1,6 @@
 # 三方对照文档（crew-go / LangGraph / eino）
 
-最近两个月的框架发布、14 个本地参考仓的同步快照，以及与 crew-go 的对照，见
+最近两个月的框架发布、15 个本地参考仓的同步快照，以及与 crew-go 的对照，见
 [2026-11-12 行业增量调查](industry-survey-2026q4.md)。
 
 ## 用途
@@ -89,6 +89,7 @@ CLAUDE.md 已加：
 | DeepSeek Harness | `/Users/gupengfei/program/go/src/deepseek-harness` | `master` |
 | Grok Build | `/Users/gupengfei/program/go/src/grok-build` | `main` |
 | Claude Agent SDK Python | `/Users/gupengfei/program/go/src/claude-agent-sdk-python` | `main` |
+| Pi | `/Users/gupengfei/program/go/src/pi` | `main` |
 | AG-UI | `/Users/gupengfei/program/go/src/ag-ui` | `main` |
 | OTel GenAI semconv | `/Users/gupengfei/program/go/src/otel-semconv-genai` | `main` |
 | TypeSafe（Jev 决策模型） | `/Users/gupengfei/program/go/src/typesafe-ai` | 9 月调研快照，含 Python / JS SDK、LLM 模拟适配器、agent skill |

@@ -1,8 +1,8 @@
 # Agent 开发与编排框架进展（2026-09-12 至 2026-11-12）
 
 本轮延续 9 月的行业调查，时间窗口按北京时间计算。发布状态取自官方 release 和文档，执行语义以本地
-checkout 的提交、实现和测试为准。文末记录这次同步的起止 SHA。Deep Agents、Cursor Agent SDK 和
-OpenAI 托管 Agents API 按官方公开资料核对。[9 月行业调查](industry-survey-2026q3.md)
+checkout 的提交、实现和测试为准。§六记录这次同步的起止 SHA。托管能力和没有本地快照的项目按官方公开资料
+核对。[9 月行业调查](industry-survey-2026q3.md)
 
 恢复开始区分同一节点里先后发出的每一问。后台任务有了独立于前台回合的身份和通知机制。决策模型进入图节点
 和中间件，可独立评估。工具参数、挂起状态和事件流也逐渐进入开发期评测。
@@ -16,6 +16,9 @@ OpenAI 托管 Agents API 按官方公开资料核对。[9 月行业调查](indus
   `runs.create`、`runs.stream` 和 `runs.wait`
   暴露该选项，由声明支持它的服务端执行。
   [1.2.20](https://github.com/langchain-ai/langgraph/releases/tag/1.2.20) · [严格续跑实现](https://github.com/langchain-ai/langgraph/commit/dbc60dd11) · [逐问 ID](https://github.com/langchain-ai/langgraph/commit/6ea1751a9) · [SDK 选项](https://github.com/langchain-ai/langgraph/commit/2643345bf)
+  9 月发布的 1.2.12 还支持 `interrupt(response_schema=…)`，可把答案结构交给客户端。传 Pydantic 类型时
+  引擎在取答处校验，传字典时按原样发布 schema。
+  [响应 schema 实现](https://github.com/langchain-ai/langgraph/commit/448a76377)
 - **Google ADK 2.11–2.12** 让工作流的工具节点用 `RequestInput` 等待审批，并给 `FunctionNode` 增加
   `require_confirmation`，可以设布尔值或按绑定参数判断。确认请求随节点路径和参数发出。拒绝时，节点跳过
   函数体，返回表示拒绝的输出。2.11 也让 Runner、Workflow 和节点接受 `abort_signal`。
@@ -29,6 +32,9 @@ OpenAI 托管 Agents API 按官方公开资料核对。[9 月行业调查](indus
   Resume 或 Rollback 返回 `ErrSessionBusy`，同时收窄 `TurnLoop` 的 `GenResume` 回调，将返回值限定为
   续跑参数和缓冲项。
   [工具流取消](https://github.com/cloudwego/eino/commit/b9539ec1) · [v0.9.22](https://github.com/cloudwego/eino/releases/tag/v0.9.22) · [v0.9.23](https://github.com/cloudwego/eino/releases/tag/v0.9.23) · [alpha 会话并发](https://github.com/cloudwego/eino/commit/21ed97b4) · [alpha 续跑](https://github.com/cloudwego/eino/commit/50c4becb)
+  v0.10 的设计已把会话事件历史与执行存档分开。窗口内的预发布调整包括动态后台任务心跳，以及减少
+  TurnLoop 保存挂起态时的内存放大。
+  [v0.10 设计](https://github.com/cloudwego/eino/discussions/1159) · [alpha.33](https://github.com/cloudwego/eino/releases/tag/v0.10.0-alpha.33) · [alpha.34](https://github.com/cloudwego/eino/releases/tag/v0.10.0-alpha.34)
 - **CrewAI** 让恢复后的人工反馈沿用被审输出的类型。1.15.40 的 Flow SQLite 持久化可按行 ID 查具体历史状态。
   11 月还加入实验性的单 Agent 对话会话，复用对话 Flow 承载历史与多轮交互。
   [人工反馈恢复](https://github.com/crewAIInc/crewAI/commit/75808b0ec) · [1.15.40](https://github.com/crewAIInc/crewAI/releases/tag/1.15.40) · [实验性对话会话](https://github.com/crewAIInc/crewAI/commit/305d6a0e8)
@@ -101,6 +107,9 @@ crew-go 可以用脱敏的真实样本扩充路由评测的用例覆盖，复用
   `stream_resumable` 和有效游标。核心也修正了子图消息和工具事件的 namespace，并将 `TracePolicy` 的
   payload 变换限制在 trace 中，保留业务流中的节点数据。
   [SSE 续接](https://github.com/langchain-ai/langgraph/commit/9791c686e) · [事件 namespace](https://github.com/langchain-ai/langgraph/commit/1f0cf816d) · [TracePolicy](https://github.com/langchain-ai/langgraph/commit/8d5637b2d)
+  10 月上游也把职责写进仓库指引，LangGraph 聚焦图执行、存档、流和恢复，`prebuilt`、`supervisor`、
+  `swarm` 等包进入维护模式，新 agent 开发示例优先用 Deep Agents。
+  [上游仓库指引](https://github.com/langchain-ai/langgraph/commit/244ca657e)
 - **AG-UI** 的 OpenAI Agents Python 适配器把工具审批映射为协议中断，从客户端回传的消息历史和 `resume`
   条目重建未决调用。获批调用由适配器执行，执行发生在 SDK 的 run hooks 和 tool guardrails 之外。
   LangGraph Python 适配器读取原生 `Interrupt.response_schema`，避免将中断的工具调用记为失败。
@@ -120,7 +129,7 @@ crew-go 的取消终态与 Resume wire `runId` 两处 Q3 问题已有对应回�
 
 ## 六、本地源码快照
 
-2026-11-12 同步了 14 个已有参考仓。13 个 checkout 对齐跟踪分支，其中 12 个快进，Grok Build 已对齐。AgentScope 本地与上游分叉，以下以更新后的远端跟踪引用核对。eino 另同步 `origin/alpha/10`，供预发布对照。表里的新增数为同步前后 `git rev-list --count OLD..NEW`，包含 merge 引入的提交，统计区间由各仓起始 SHA 决定。
+2026-11-12 同步了 15 个已有参考仓。14 个 checkout 对齐跟踪分支，其中 13 个快进，Grok Build 已对齐。AgentScope 本地与上游分叉，以下以更新后的远端跟踪引用核对。eino 另同步 `origin/alpha/10`，供预发布对照。表里的新增数为同步前后 `git rev-list --count OLD..NEW`，包含 merge 引入的提交，统计区间由各仓起始 SHA 决定。
 
 | 仓库与核对引用 | 同步前 → 同步后 | 新增 | 本轮核对的代表性变化 |
 |---|---|---:|---|
@@ -132,10 +141,43 @@ crew-go 的取消终态与 Resume wire `runId` 两处 Q3 问题已有对应回�
 | MAF `main` | [`1b9879c58` → `22b5e752b`](https://github.com/microsoft/agent-framework/compare/1b9879c58...22b5e752b) | 403 | Python 1.25.0 给 MCP 发现加了页数和项目数上限。主分支还收紧了 MCP 生命周期与审批作用域。[发布记录](https://github.com/microsoft/agent-framework/releases/tag/python-1.25.0) |
 | OpenAI Agents Python `main` | [`1c1a28df` → `64fbde5d`](https://github.com/openai/openai-agents-python/compare/1c1a28df...64fbde5d) | 85 | 自动压缩避开挂起审批、嵌套 RunState 恢复 |
 | CrewAI `main` | [`75808b0ec` → `7e4efa91c`](https://github.com/crewAIInc/crewAI/compare/75808b0ec...7e4efa91c) | 213 | 对话 Flow 压缩、单 Agent 会话、历史状态查询 |
-| AgentScope `origin/main` | [`3a0e73fa` → `3fef100e`](https://github.com/agentscope-ai/agentscope/compare/3a0e73fa...3fef100e) | 137 | 更新远端引用。本地 `main` 有 29 个自身提交，调研取上游快照 |
+| AgentScope `origin/main` | [`3a0e73fa` → `3fef100e`](https://github.com/agentscope-ai/agentscope/compare/3a0e73fa...3fef100e) | 137 | SOP、TeamPipeline、分类器。更新远端引用，本地 `main` 有 29 个自身提交 |
 | Codex `main` | [`2cab11ca4` → `0702ebed4`](https://github.com/openai/codex/compare/2cab11ca4...0702ebed4) | 736 | 任务所有权、恢复历史、计划附件交接。邮件与 wait 改动见 §二 |
 | DeepSeek Harness `master` | [`687f282e86` → `e8f7b93a34`](https://github.com/deepseek-ai/deepseek-harness/compare/687f282e86...e8f7b93a34) | 4,376 | Team 模式、审批 projection、`0.2.2-rc.2` |
 | Grok Build `main` | [`2bdd1d6a`](https://github.com/xai-org/grok-build/commit/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8) | 0 | 公开主分支最后一次同步在北京时间 9 月 30 日。窗口内的同步涉及子 agent attempt 恢复和插话测试 |
 | Claude Agent SDK Python `main` | [`c857c31` → `3cf3446`](https://github.com/anthropics/claude-agent-sdk-python/compare/c857c31...3cf3446) | 307 | [v0.2.180](https://github.com/anthropics/claude-agent-sdk-python/releases/tag/v0.2.180)。SDK 等 CLI 空闲后才关 stdin，[保留后续 turn](https://github.com/anthropics/claude-agent-sdk-python/commit/dbc975e)。历史读取[保留并行工具的各条调用和结果](https://github.com/anthropics/claude-agent-sdk-python/commit/beffc50) |
+| Pi `main` | [`f1b2e77f5` → `a40abecaa`](https://github.com/earendil-works/pi/compare/f1b2e77f5...a40abecaa) | 1,017 | 11 月主分支合入可挂起工具、持久信号和审批闸门 |
 | AG-UI `main` | [`7d14c417` → `f6f6c566`](https://github.com/ag-ui-protocol/ag-ui/compare/7d14c417...f6f6c566) | 931 | 适配器的中断、续跑与事件重放 |
 | OTel GenAI semconv `main` | [`06ec68e` → `e6658f14`](https://github.com/open-telemetry/semantic-conventions-genai/compare/06ec68e...e6658f14) | 67 | workflow span / 指标合并、agent transfer、realtime 语义 |
+
+## 七、其他框架与托管运行时
+
+- **AgentScope 2.0.9** 增加两种编排入口。实验性的 SOP 由业务定义有序里程碑，校验通过才推进，挂起时可保存
+  `SOPRunState`。框架入口恢复 SOP 自身的运行状态，执行者自己的状态由构造方恢复。`TeamPipeline` 让 leader
+  通过工具派单，成员各自维护上下文。同批不同成员可并行，同一成员按派单顺序执行，成员挂起时按 `reply_id` 投回答案。
+  [2.0.9](https://github.com/agentscope-ai/agentscope/releases/tag/v2.0.9) · [SOP 状态恢复](https://github.com/agentscope-ai/agentscope/blob/3fef100ee13d70905723d0000608bcce2d7e4a0d/src/agentscope/sop/_engine.py) · [TeamPipeline](https://github.com/agentscope-ai/agentscope/commit/2258f3f4)
+- **Claude Managed Agents** 10 月 9 日开放 Dynamic Workflows beta。模型可以生成一个分阶段的工作流，服务端
+  在后台运行它、分派子 agent 并汇总结果，宿主从 session 事件流观察 `workflow_run.*`。这是托管服务的更新。
+  [10 月发布记录](https://platform.claude.com/docs/en/release-notes/overview) · [Workflow runs](https://platform.claude.com/docs/en/managed-agents/workflow-runs)
+- **Pi Durable** 的 11 月 11 日主分支加入实验性的挂起工作。工具可以保存 checkpoint 后挂起，等定时器或带类型的
+  外部信号唤醒，调度器会带着原参数和已保存状态重新调用工具。仓内示例以 webhook 交回 CI 结果，挂起期间释放执行槽，
+  外部构建靠幂等键在重试时找回。
+  这使长等待可以由持久化调度器接手。
+  [主分支实现](https://github.com/earendil-works/pi/commit/473515f9c) · [webhook 示例](https://github.com/earendil-works/pi/blob/473515f9c297c75cf2c3ebb3ba027049ed836d27/packages/durable/test/examples/40-tool-waits-for-webhook.ts)
+- **Temporal** 10 月 30 日宣布 Google ADK、AWS Strands、LangGraph Python、OpenAI Agents SDK TypeScript 等
+  适配 GA。以 ADK Python 为例，模型调用作为 Activity，长生命周期的编排留在 Workflow。OpenAI Agents SDK Python
+  适配在这次公告前已 GA。**Pydantic AI** 为 Temporal 长任务加入可选的 `continue_as_new` 回调。
+  Temporal 建议开启新历史时，在下一次模型请求前调用该回调，应用决定是否接续并传递所需状态。
+  2.66 又给其 harness 接入 Azure Durable Task。
+  [Temporal GA](https://temporal.io/blog/ai-framework-integrations) · [Pydantic AI 接续](https://github.com/pydantic/pydantic-ai/pull/7312) · [Pydantic AI 2.66](https://github.com/pydantic/pydantic-ai/releases/tag/v2.66.0)
+- **Strands** 9 月推出预装工具、prompt 缓存和上下文管理的通用 harness，10 月发布可本地运行的开源 Decider 2B，
+  专门对候选决策打分。双向语音 Agent 也在 10 月 GA，直接支持 Amazon Nova Sonic、OpenAI 和 Gemini。
+  [Strands harness](https://strandsagents.com/blog/introducing-strands-harness/) · [Decider 2B](https://strandsagents.com/blog/introducing-strands-decider/) · [Bidi Agents GA](https://strandsagents.com/blog/bidi-agents-now-ga/)
+- **Mastra** 10 月 6 日将 Agent Controller 推到 GA。每个会话维护持久 thread，模式可切换模型、指令和工具。
+  客户端能订阅实时状态、插话和处理审批，应用层可以围绕同一控制器搭终端或 Web 交互。
+  [Agent Controller GA](https://mastra.ai/blog/announcing-agent-controller-ga)
+
+AgentScope SOP 的逐步验收可与 crew-go 通过 GraphAgent 拼接执行和校验节点的做法对照。Pi 和 Temporal 提供了
+两种跨进程等待的参考，前者给工具一个可持久化的挂起位置，后者用 Workflow 历史保存调度进度。评估接入时可用同一
+业务样本核对谁保存任务归属、谁接收迟到回调、重试从哪一步开始。
+[crew-go 编排模式](../../v2/orchestration-patterns.md)

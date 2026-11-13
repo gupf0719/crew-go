@@ -177,18 +177,18 @@ func (m *strippableModelStub) WithTools(_ []*schema.ToolInfo) (model.ChatModel, 
 	return m, nil
 }
 
-// TestAutoCompact_R30C_MED1_SummarizeStripResumeContext 是 R30C MED-1 回归——
+// TestAutoCompact_SummarizerCannotReadResumeContext 是 R30C MED-1 回归。
 // 验证 AutoCompact summarize Model 不可见 ResumeContext（避免业务自定义 Model
 // 误读 sub-agent ask_user 答案）。
 //
 // **Bug 历史**：AutoCompact cfg.Model.Generate 用 ctx 含 ResumeContext → 业务自定义
 // Model 内调 GetResumeAnswerSingle 误命中 sub-agent 准备的答案当摘要指令。
 //
-// **修法**：summarizeCtx := compose_v2.StripResumeContext(ctx) 隔离。
+// 摘要模型经 compose_v2.WithAddressedResumeOnly 只能按执行位置接收答复。
 //
 // **测试设计**：直接调 AutoCompactRun，构造业务 model 在 Generate 内 spy
 // ResumeContext 是否可见。修前可见，修后不可见。
-func TestAutoCompact_R30C_MED1_SummarizeStripResumeContext(t *testing.T) {
+func TestAutoCompact_SummarizerCannotReadResumeContext(t *testing.T) {
 	spyModel := &strippableModelStub{}
 	cfg := &agent_v2.AutoCompactConfig{
 		Enabled: true,
@@ -230,9 +230,6 @@ func TestAutoCompact_R30C_MED1_SummarizeStripResumeContext(t *testing.T) {
 	}
 
 	if spyModel.sawResumeContext.Load() {
-		t.Errorf("R30C MED-1 回归：AutoCompact summarize Model 不应看到 ResumeContext " +
-			"（应被 StripResumeContext 隔离）；实际看到 → 业务自定义 Model 内 GetResumeAnswerSingle " +
-			"会误命中 sub-agent ask_user 答案当摘要指令\n" +
-			"sanity-revert 删 summarizeCtx StripResumeContext → 测试 fail")
+		t.Error("摘要模型应按自己的提问位置取答复，实际可以直接读 ResumeContext")
 	}
 }

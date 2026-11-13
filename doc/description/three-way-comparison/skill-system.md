@@ -453,6 +453,7 @@ AutoCompact breaker 双层物理隔离：① **per-BasicAgent**（`config.go::Wi
 
 | 时间 | 决策 | 关联 ISSUE / commit | 理由 |
 |---|---|---|---|
+| 2026-11-13 | 内建 SkillBox 返回独立的元数据和 action schema 快照 | Skill 快照回归 | 注册时固定 JSON 表示，读取时复制可变字段。模型看到的描述、匹配结果和实际 action 使用同一份注册数据 |
 | v1 时代 | 选 SKILL.md + activate_skill 工具 protocol（不学 LangGraph 的 tool 化）| ISSUE-19 | Claude Code 的 SKILL.md 已是事实标准，规约统一让生态可复用 skill 包 |
 | v1 时代 | spec 设计 3 种激活模式但 V1 仅实现 toolCall | ISSUE-19 | toolCall 是最简实现，让业务先用上；adaptive / preMatch 等业务有真实需求再做 |
 | v1 时代 | 自研 frontmatter parser 不引 yaml 库 | ISSUE-19 | 减少依赖；frontmatter 字段简单（string/bool/int/string-list），不值得引第三方 |

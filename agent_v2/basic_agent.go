@@ -2836,16 +2836,9 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			if ccErr == nil && cut.tailLen >= 0 && memoCtx != nil {
 				memoCtx.out = nextCompactionMemo(origMsgs, memoUpto, memoHead, inputLen, compacted, cut.tailLen)
 			}
-			// **R23 audit HIGH-1 fix**：control flow err 必须 propagate——业务自定义
-			// cfg.AutoCompact.Model 抛 InterruptError / ctx.Err() 时 AutoCompactRun
-			// 已 propagate（不 wrap），caller 这里也必须直接返。原 `_` 吞掉破坏 HITL。
-			// 业务错（非控制流）AutoCompact 内部已 wrap "auto compact: summarize: %w"——
-			// caller 走 fallback "忽略压缩" 主链路继续（保 best-effort 优化语义）。
+			// 中断和终局错误由引擎处理。普通摘要失败时主模型继续使用原消息。
 			if ccErr != nil {
-				if _, isInt := compose_v2.IsInterrupt(ccErr); isInt {
-					return nil, ccErr
-				}
-				if ctx.Err() != nil {
+				if compose_v2.MustPropagate(ctx, ccErr) {
 					return nil, ccErr
 				}
 				// 业务错——记录但继续主链路（compacted 通常仍是原 messages，下层照走）
@@ -2854,6 +2847,9 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			}
 			if compacted != nil {
 				msgs = compacted
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
 		}
 

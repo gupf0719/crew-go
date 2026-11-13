@@ -176,7 +176,11 @@ type BasicAgentPostambleInput struct {
 //	// 把它拼进 msgs 再压缩，等于把「判据消失」这件事又倒回去。
 //	wrappedModel := func(ctx context.Context, preamble, msgs []*schema.Message) (*schema.Message, error) {
 //	    // 第 2 层：进入前自动摘要（token 阈值触发）
-//	    msgs, _ = agent_v2.AutoCompactRun(ctx, autoCfg, msgs)
+//	    compacted, ccErr := agent_v2.AutoCompactRun(ctx, autoCfg, msgs)
+//	    if compose_v2.MustPropagate(ctx, ccErr) {
+//	        return nil, ccErr
+//	    }
+//	    msgs = compacted
 //	    out, err := originalModel(ctx, preamble, msgs)
 //	    if err != nil && agent_v2.IsPromptTooLongError(err) {
 //	        // 第 3 层：报 prompt-too-long 时压缩并重试

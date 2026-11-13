@@ -137,9 +137,11 @@ type SkillResource struct {
 
 // SkillActionDescriptor 描述 skill 暴露的一个可执行 action。
 type SkillActionDescriptor struct {
-	Name            string         `json:"name"`
-	Description     string         `json:"description,omitempty"`
-	Runtime         string         `json:"runtime,omitempty"` // 当前仅 "go"（进程内函数，经 WithSkillActionFunc 注册）
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Runtime     string `json:"runtime,omitempty"` // 当前仅 "go"（进程内函数，经 WithSkillActionFunc 注册）
+	// ArgumentsSchema 是供模型参考的 JSON Schema。DefaultSkillBox 返回独立的 JSON 数据，
+	// 其中数字为 json.Number。无法编码的 schema 会省略，action 仍可执行。
 	ArgumentsSchema map[string]any `json:"argumentsSchema,omitempty"`
 	Examples        []string       `json:"examples,omitempty"`
 }

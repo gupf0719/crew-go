@@ -169,7 +169,7 @@ func TestAutoCompactRun_InsufficientReductionCountsTowardBreaker(t *testing.T) {
 	if entry == nil {
 		t.Fatal("前置假设：breakers 已初始化，entry 不应为 nil")
 	}
-	if !cfg.shouldTrigger(entry, msgs) {
+	if !cfg.shouldTrigger(msgs) || !entry.breaker.WouldAllow() {
 		t.Fatal("前置假设：首次应可触发压缩")
 	}
 
@@ -177,7 +177,7 @@ func TestAutoCompactRun_InsufficientReductionCountsTowardBreaker(t *testing.T) {
 		t.Fatal("前置假设：本次压缩应因缩减不足而失败")
 	}
 
-	if cfg.shouldTrigger(entry, msgs) {
+	if entry.breaker.WouldAllow() {
 		t.Fatal("压缩无效应计入断路器（maxFailures=1 → 一次即跳），但断路器仍放行——" +
 			"摘要持续无效时会每轮白烧一次 LLM 调用")
 	}

@@ -118,6 +118,47 @@ func TestRunSkillAction_EndToEnd(t *testing.T) {
 	}
 }
 
+func TestBasicAgent_SkillActionUsesRegisteredSnapshot(t *testing.T) {
+	properties := map[string]any{"x": map[string]any{"type": "string", "description": "original argument"}}
+	actionCalls := 0
+	box := actionSkillBox(t, false, skill.WithSkillActionFunc("calc", skill.SkillActionDescriptor{
+		Name: "add", Description: "original action",
+		ArgumentsSchema: map[string]any{"type": "object", "properties": properties, "required": []string{"x"}},
+	}, func(_ context.Context, args map[string]any) (*skill.SkillExecutionResult, error) {
+		actionCalls++
+		return &skill.SkillExecutionResult{Success: true, Output: "sum=" + args["x"].(string)}, nil
+	}))
+	properties["x"].(map[string]any)["description"] = "changed registration"
+	active, err := box.ActivateSkill(t.Context(), "calc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	active.Actions[0].ArgumentsSchema["required"] = []any{"changed activation"}
+	list := box.ListSkillActions("calc")
+	list[0].Description = "changed list"
+	list[0].Runtime = "unsupported"
+
+	main := &captureMsgsStub{responses: []*schema.Message{
+		schema.AssistantToolCallMessage([]schema.ToolCall{{ID: "add-1",
+			Function: schema.FunctionCall{Name: agent_v2.RunSkillActionToolName,
+				Arguments: `{"skill":"calc","action":"add","args":{"x":"42"}}`}}}),
+		schema.AssistantMessage("算好了"),
+	}}
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("snapshot"), agent_v2.WithModel(main),
+		agent_v2.WithSkills(skill.SkillSource{SkillBox: box}))
+	if _, err := ag.Run(t.Context(), nil, schema.UserMessage("算 42")); err != nil {
+		t.Fatal(err)
+	}
+	desc := strings.Join(main.lastTools, "\n")
+	if !strings.Contains(desc, "original action") || !strings.Contains(desc, "original argument") ||
+		!strings.Contains(desc, `"required":["x"]`) || strings.Contains(desc, "changed ") {
+		t.Errorf("模型应收到注册时的 action 和 schema，实际 %q", desc)
+	}
+	if actionCalls != 1 || len(main.allCalls) != 2 || !strings.Contains(concatContent(main.allCalls[1]), "tool: sum=42") {
+		t.Fatalf("应执行一次 action 并将其结果送回模型，执行 %d 次，模型调用 %d 次", actionCalls, len(main.allCalls))
+	}
+}
+
 // TestRunSkillAction_NonToolCallModeDispatch：非 toolCall mode（pre_match）+ 纯 actions + 无
 // user toolkit → run_skill_action 仍可执行（audit MED：makeToolsFn early-return 不能漏掉 actions，
 // 否则 LLM bind 了却无处 dispatch）。

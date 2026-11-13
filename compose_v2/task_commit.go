@@ -35,9 +35,12 @@ func taskCommitBase(ctx context.Context) *taskCommitScope {
 }
 
 // TaskCommitContext 返回任务最外层图进入时的 ctx，供提交信号的写入者核对外层持有的配置。
-// 图外调用返回传入的 ctx。
+// 图外调用返回传入的 ctx。若当前调用限制了恢复答复的访问，返回的任务入口 ctx 同样受限。
 func TaskCommitContext(ctx context.Context) context.Context {
 	if base := taskCommitBase(ctx); base != nil {
+		if resumeDeliveryFrom(ctx).addressedOnly {
+			return StripResumeContext(WithAddressedResumeOnly(base.base))
+		}
 		return base.base
 	}
 	return ctx

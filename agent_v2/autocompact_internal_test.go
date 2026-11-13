@@ -61,7 +61,7 @@ func TestAutoCompactShouldTrigger_UsesFilteredCharEstimateNotUsage(t *testing.T)
 	}
 
 	// 过滤后 convMsgs = [user "hi", assistant "ok"]，字符估 ~几个 token << 150000 → 不该触发
-	if cfg.shouldTrigger(nil, messages) {
+	if cfg.shouldTrigger(messages) {
 		t.Fatalf("shouldTrigger 应为 FALSE：过滤后 convMsgs 字符估 << threshold=150000；" +
 			"若用 EstimateTokens 会误读 assistant Usage.InputTokens=180000 >= 150000 而 true（Usage 架空过滤）")
 	}
@@ -71,7 +71,7 @@ func TestAutoCompactShouldTrigger_UsesFilteredCharEstimateNotUsage(t *testing.T)
 	longMsgs := []*schema.Message{
 		schema.UserMessage(strings.Repeat("长文本内容填充", 200_000)),
 	}
-	if !cfg.shouldTrigger(nil, longMsgs) {
+	if !cfg.shouldTrigger(longMsgs) {
 		t.Fatalf("shouldTrigger 应为 TRUE：未过滤的超长消息字符估 >> threshold（防恒-false 假绿）")
 	}
 }
@@ -104,7 +104,7 @@ func TestAutoCompactShouldTrigger_SkipsOffloaded(t *testing.T) {
 	messages = append(messages, schema.AssistantMessage("ok"))
 
 	// 过滤 offloaded 后 convMsgs = [user "hi", assistant "ok"]，字符估 << 150000 → 不触发
-	if cfg.shouldTrigger(nil, messages) {
+	if cfg.shouldTrigger(messages) {
 		t.Fatalf("shouldTrigger 应为 FALSE：offloaded 消息应被过滤不算触发估算；" +
 			"若不跳 offloaded，5 组大占位符字符量 >> threshold 会反复空触发烧断路器")
 	}

@@ -73,7 +73,8 @@ whenToUse: 用户要求翻译 / 跨语言转换时
 | `ListSkillActions(name)` | 列 skill 的 action 清单（**已实现**；`WithSkillActionFunc` 程序化注册的 go-func action）|
 | `RunSkillAction` | go-func action 执行（**已实现**：进程内 Go 函数，见 §11；找不到 action 返 `ErrSkillActionNotFound`。自定义 SkillBox 不提供 action 时 `ListSkillActions` 返空、本方法同样返它——框架只在有可调 action 时才挂 `run_skill_action`，见 §11.3）|
 
-> `DefaultSkillBox` 构造时一次性全量加载（`NewDefaultSkillBox`），运行时只读 → 天然并发安全。业务自实现 backend 须自负并发安全。
+> `NewDefaultSkillBox` 和 `NewInMemorySkillBox` 装配后可并发读取。列举、匹配和激活返回独立的元数据，
+> 包括标签、示例、资源主题和嵌套 action schema。业务自实现 backend 须自负并发安全。
 
 ### BasicAgent 集成点
 
@@ -301,6 +302,8 @@ ag := agent_v2.NewBasicAgent(agent_v2.WithSkills(skill.SkillSource{SkillBox: box
 
 - **action 须挂在已加载 skill 上**：`WithSkillActionFunc(skillName, ...)` 的 skillName 必须对应有 SKILL.md 的 skill；注册到未加载 skill 静默不生效。
 - **go-func action 须程序化注册**：经 `WithSkillActionFunc` 注册（SKILL.md frontmatter 声明不了 go 函数）。
+- **action schema 快照**。创建 `WithSkillActionFunc` 选项时保存参数 schema 的 JSON 表示和示例。
+  后续读取返回独立的 JSON 对象和数组，数字保留为 `json.Number`。无法编码的 schema 会省略，action 仍可执行。
 - **可重入契约**：框架可能并发调用同一 `ActionFunc`（同轮多 action / 多 branch），业务实现须可重入 / 线程安全。
 
 > 设计综合：单 meta-tool 触发 + 结构化 `SkillExecutionResult`（ExitCode/Stdout/Stderr，优于扁平字符串）；脚本执行不在 skill 层做（已删，收敛到 tool 层 open-bash，见删除依据）。真 qwen 端到端 smoke → [`smoke-test-recipes.md` §6](../description/smoke-test-recipes.md)；三方对照 → [`skill-system.md`](../description/three-way-comparison/skill-system.md)。

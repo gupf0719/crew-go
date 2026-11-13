@@ -63,7 +63,7 @@ func TestAutoCompact_R29LOW1_ShouldTriggerSkipsMemoryMarker(t *testing.T) {
 	messages := []*schema.Message{memMsg, smallMsg}
 
 	// 直接调 unexported shouldTrigger
-	got := cfg.shouldTrigger(nil, messages)
+	got := cfg.shouldTrigger(messages)
 	if got {
 		t.Errorf("R29 视角2 LOW-1 回归：含 Memory marker 时 shouldTrigger 应返 false（跳过 Memory 后小消息 < 阈值）；实际返 true\n" +
 			"sanity-revert 删 shouldTrigger 内 StoreInjectedAnnotation 跳过分支 → Memory 大内容计入 token → 触发摘要无效循环 → 测试 fail")
@@ -71,7 +71,7 @@ func TestAutoCompact_R29LOW1_ShouldTriggerSkipsMemoryMarker(t *testing.T) {
 
 	// 反向验证：去掉 marker 后 shouldTrigger 应返 true（确认大 Memory 内容确实超阈）
 	memMsgNoMarker := schema.UserMessage(bigContent)
-	got2 := cfg.shouldTrigger(nil, []*schema.Message{memMsgNoMarker, smallMsg})
+	got2 := cfg.shouldTrigger([]*schema.Message{memMsgNoMarker, smallMsg})
 	if !got2 {
 		t.Fatalf("前置假设：去 marker 后大内容应触发 shouldTrigger=true（验证测试有意义）；实际 false")
 	}

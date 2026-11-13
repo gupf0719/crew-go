@@ -14,7 +14,7 @@ func matchSkills(skills []loadedSkill, query string) []SkillMatchResult {
 		score := keywordScore(query, s.matchText)
 		if score > 0 {
 			results = append(results, SkillMatchResult{
-				Skill: s.descriptor,
+				Skill: copySkillDescriptor(s.descriptor),
 				Score: score,
 			})
 		}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -64,9 +65,8 @@ type SkillBox interface {
 // ErrSkillActionNotFound 表示 RunSkillAction 找不到指定 skill/action（或 go action 未注册实现）。
 var ErrSkillActionNotFound = errors.New("skill: action not found")
 
-// DefaultSkillBox 是基于文件系统的 SkillBox 实现。
-// 扫描 rootDir 的一级子目录，加载每个目录下的 SKILL.md。
-// 容错设计：目录不存在或单个 SKILL.md 解析失败均不报错，静默跳过。
+// DefaultSkillBox 从文件系统或预解析的内存内容加载 skill。
+// 加载后可并发读取。列表、匹配和激活各自返回独立的元数据快照。
 type DefaultSkillBox struct {
 	name      string
 	rootDir   string
@@ -112,19 +112,22 @@ func WithAllowList(names []string) SkillBoxOption {
 func actionKey(skillName, actionName string) string { return skillName + "\x00" + actionName }
 
 // WithSkillActionFunc 注册一个 go runtime 的进程内 action（descriptor 元数据 + Go 实现）。
+// 创建选项时保存 descriptor 的独立快照。
 // desc.Runtime 留空默认 "go"。同 (skillName, desc.Name) 重复注册后者覆盖实现、descriptor 不重复加。
 // fn 为 nil 或 desc.Name 为空时静默忽略。
 //
 // **skillName 必须对应一个已加载的 skill**（有 SKILL.md 且过 allow-list）——注册到未加载 skill
 // 的 action 静默不生效（ListSkillActions / RunSkillAction 都看不到，typo skill 名时无运行时报错）。
 func WithSkillActionFunc(skillName string, desc SkillActionDescriptor, fn ActionFunc) SkillBoxOption {
+	if fn == nil || desc.Name == "" {
+		return func(*DefaultSkillBox) {}
+	}
+	if desc.Runtime == "" {
+		desc.Runtime = string(RuntimeGo)
+	}
+	desc.ArgumentsSchema = snapshotActionSchema(desc.ArgumentsSchema)
+	desc.Examples = slices.Clone(desc.Examples)
 	return func(b *DefaultSkillBox) {
-		if fn == nil || desc.Name == "" {
-			return
-		}
-		if desc.Runtime == "" {
-			desc.Runtime = string(RuntimeGo)
-		}
 		if b.actionFuncs == nil {
 			b.actionFuncs = make(map[string]ActionFunc)
 		}
@@ -167,7 +170,7 @@ func (b *DefaultSkillBox) RootDir() string { return b.rootDir }
 func (b *DefaultSkillBox) ListSkills() []SkillDescriptor {
 	out := make([]SkillDescriptor, 0, len(b.skills))
 	for _, s := range b.skills {
-		out = append(out, s.descriptor)
+		out = append(out, copySkillDescriptor(s.descriptor))
 	}
 	return out
 }
@@ -188,9 +191,9 @@ func (b *DefaultSkillBox) ListSkillResources(name string) []SkillResource {
 }
 
 func copySkillResources(src []SkillResource) []SkillResource {
-	resources := append([]SkillResource(nil), src...)
+	resources := slices.Clone(src)
 	for i := range resources {
-		resources[i].Topics = append([]string(nil), resources[i].Topics...)
+		resources[i].Topics = slices.Clone(resources[i].Topics)
 	}
 	return resources
 }
@@ -229,7 +232,7 @@ func (b *DefaultSkillBox) ReadSkillPrompt(name string) string {
 func (b *DefaultSkillBox) ListSkillActions(name string) []SkillActionDescriptor {
 	for _, s := range b.skills {
 		if s.descriptor.Name == name {
-			return s.actions
+			return copySkillActions(s.actions)
 		}
 	}
 	return nil
@@ -240,15 +243,31 @@ func (b *DefaultSkillBox) ActivateSkill(_ context.Context, name string) (*Active
 	for _, s := range b.skills {
 		if s.descriptor.Name == name {
 			return &ActiveSkill{
-				Skill:     s.descriptor,
+				Skill:     copySkillDescriptor(s.descriptor),
 				RootDir:   s.dir,
 				Prompt:    s.prompt,
 				Resources: copySkillResources(s.resources),
-				Actions:   s.actions,
+				Actions:   copySkillActions(s.actions),
 			}, nil
 		}
 	}
 	return nil, fmt.Errorf("skill %q not found", name)
+}
+
+func copySkillDescriptor(desc SkillDescriptor) SkillDescriptor {
+	desc.Tags = slices.Clone(desc.Tags)
+	desc.Examples = slices.Clone(desc.Examples)
+	desc.AllowedTools = slices.Clone(desc.AllowedTools)
+	return desc
+}
+
+func copySkillActions(src []SkillActionDescriptor) []SkillActionDescriptor {
+	out := slices.Clone(src)
+	for i := range out {
+		out[i].ArgumentsSchema = copyActionSchema(out[i].ArgumentsSchema)
+		out[i].Examples = slices.Clone(out[i].Examples)
+	}
+	return out
 }
 
 // RunSkillAction 运行 skill 的命名 action（go runtime 进程内函数，经 WithSkillActionFunc 注册）。

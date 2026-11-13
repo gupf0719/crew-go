@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +24,7 @@ import (
 // summary 替代原始消息。是 4 层中最复杂的一层，承担主要 token 控制工作。
 //
 // 触发：BasicAgent makeModelFn 入口（MicroCompact 之后、LLM 调用之前）；
-//       估算 token >= Threshold 且断路器未跳。
+//       估算 token >= Threshold 且断路器放行。
 // 算法：1）调用 cfg.Model 生成 summary（单次 LLM 调用），2）后处理删 <analysis>
 // 提取 <summary>，3）替换 messages = [system, memoryInjected, summary,
 // reinject 文件（如启用）, tail（触发后保留的最近消息）]。
@@ -49,7 +50,8 @@ type AutoCompactConfig struct {
 	// SummaryBufferTokens 距硬上限的安全缓冲。<= 0 时使用默认值 13_000。
 	SummaryBufferTokens int
 
-	// MaxConsecutiveFailures 断路器阈值；连续失败 N 次后跳过。<= 0 时使用默认值 3。
+	// MaxConsecutiveFailures 断路器阈值。连续失败达到阈值后进入冷却，默认 5 分钟。
+	// 冷却结束后放行一次探测。<= 0 时使用默认失败阈值 3。
 	MaxConsecutiveFailures int
 
 	// MinCompactableTokens 可压缩区（early）里上一份摘要之外的新内容最小 token 数；低于此值静默跳过不调 LLM。
@@ -60,12 +62,7 @@ type AutoCompactConfig struct {
 	// 巨大当前轮（一次超大 tool_result）把总量顶过阈值，可压缩的历史其实没多少。
 	// 此时摘要省不下几个 token，却要付一次完整 LLM 调用。
 	//
-	// 跳过**不计断路器**——"没东西可压"不是失败。残留：阈值下一轮仍会触发，但每次都
-	// **不调 LLM、不烧断路器**，严格优于修复前每轮一次无效调用。
-	//
-	// ⚠️ **它不是「零成本」**（这里曾这么写）：早退点在压缩事件的 Before emit 与 After
-	// defer **之后**，所以跳过的那些轮照样各发一对事件 ⟹ 接了 observability 的业务会看到
-	// `crew.compactions{crew.outcome=success}` 每轮 +1、ratio 恒 1.0。见 `doc/code/todo.md` 同名条目。
+	// 在申请探测名额和发送压缩事件前完成判断。
 	MinCompactableTokens int
 
 	// MaxReductionRatio 摘要相对原文的最大占比；摘要 token > early * 此比例时判定
@@ -102,8 +99,7 @@ type AutoCompactConfig struct {
 	// 也被禁用 AutoCompact，跨业务隔离破坏。修复为 per-session lazy 实例。
 	//
 	// 设计：sync.Map[sessionID]*sessionBreakerEntry。每个 entry 含独立 breaker
-	// + 独立 callMu。callMu 串行化 LLM 摘要调用避免 fan-out N 分支 thundering
-	// herd（Bug U）——保护范围限本 session 内的 fan-out。
+	// + 独立 callSem。callSem 串行化摘要尝试及其结算，保护范围限本 session。
 	//
 	// breaker 不持久化（per-process latency 优化，不属于业务状态），隔离粒度从
 	// "per-Agent 单例"改为"per-session 实例"——既避免共享污染，又不引入持久化复杂度。
@@ -173,10 +169,6 @@ func (cfg *AutoCompactConfig) getOrCreateBreakerEntry(sessionID string) *session
 	return actual.(*sessionBreakerEntry)
 }
 
-// errBreakerTripped 是内部 sentinel——AutoCompact 检测到 breaker 已 trip 时
-// 用此 error 在闭包内传出，外层 errors.Is 识别后做"安静跳过"（不报错）。
-var errBreakerTripped = errors.New("auto compact: breaker tripped, skipping")
-
 const (
 	defaultAutoCompactSummaryMaxTokens      = 20_000
 	defaultAutoCompactSummaryBufferTokens   = 13_000
@@ -231,11 +223,7 @@ func (cfg *AutoCompactConfig) Threshold() int {
 	return cfg.ModelContextWindow - smax - sbuf
 }
 
-// shouldTrigger 判定是否应该触发 AutoCompact。
-//
-// entry 由 caller 通过 getOrCreateBreakerEntry(sessionID) 获取并传入；nil 时
-// 走无 breaker 路径（等同旧 cfg.breaker==nil 行为）。
-//
+// shouldTrigger 判断配置和 token 估算是否满足 AutoCompact 的触发条件。
 // **token 估算只算非 system messages**（综合 audit H2 fix）：AutoCompactRun
 // 内部 `sys = messages[:sysEnd]` 不动 system，sys 进 token 估算却不被压缩 →
 // adaptive 模式注入大 SKILL.md body 进 system 时会持续超阈值反复触发摘要无效，
@@ -243,11 +231,8 @@ func (cfg *AutoCompactConfig) Threshold() int {
 //
 // 改算策略：跳过 system 段，只算 conversation 部分 token，跟 AutoCompactRun
 // 实际能压缩的范围对齐。
-func (cfg *AutoCompactConfig) shouldTrigger(entry *sessionBreakerEntry, messages []*schema.Message) bool {
+func (cfg *AutoCompactConfig) shouldTrigger(messages []*schema.Message) bool {
 	if cfg == nil || !cfg.Enabled || cfg.Model == nil || cfg.ModelContextWindow <= 0 {
-		return false
-	}
-	if entry != nil && !entry.breaker.Allow() {
 		return false
 	}
 	threshold := cfg.Threshold()
@@ -306,8 +291,10 @@ func (cfg *AutoCompactConfig) shouldTrigger(entry *sessionBreakerEntry, messages
 
 // AutoCompactRun 在阈值触发时跑摘要压缩，返回压缩后 messages。
 //
-// 不触发 / 断路器跳 / model nil 时直接返回原 messages。压缩过程中 model 报错时
-// 记录失败并返回原 messages + error（caller 决定是否继续）。
+// 跳过压缩时返回原消息。普通摘要错误计入断路器并返回原消息和错误，控制流错误交给调用方。
+//
+// 节点内调用时，摘要模型可经 [compose_v2.Ask] 提问。摘要相位按调用方相位和调用顺序派生，
+// 续跑时需要按原顺序调用。可能被独立跳过的多处调用应各用一个稳定的 [compose_v2.EnterPhase]。
 //
 // **panic 防御**：cfg.Model.Generate 是用户提供（自定义 ChatModel 实现），
 // 可能 panic（buggy SDK / nil deref 等）。AutoCompact 是 best-effort 优化，
@@ -343,6 +330,8 @@ type compactCut struct {
 	tailLen  int               // 输出：真做了一次摘要时尾部原样保留的条数（输入的后缀），否则保持 -1
 }
 
+const autoCompactAsked = "auto_compact_asked"
+
 // autoCompactRun 是 [AutoCompactRun] 的本体。cut 非 nil 时按它处理上一次的压缩结果，并在**真做了一次
 // 摘要**（输出里有新的摘要消息）时写 cut.tailLen；其余所有出口（没触发、跳过、失败）都不写。
 func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*schema.Message, cut *compactCut) (out []*schema.Message, err error) {
@@ -354,28 +343,43 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	}
 	entry := cfg.getOrCreateBreakerEntry(sessionID)
 
-	// panic 防御——cfg.Model 是用户实现，buggy SDK 可能 panic
+	var recovered *panicerr.Error
 	defer func() {
-		if r := recover(); r != nil {
-			out = messages
-			pe := panicerr.New(r)
-			err = panicerr.WrapOpaque("auto compact: recovered panic", pe)
-			// 调用方对这类失败只记一条 WARN 就继续用原消息，栈只能在这里记下
-			panicerr.Log(ctx, slog.LevelError, "agent_v2: AutoCompact 摘要 panic，已转成错误", pe)
-			if entry != nil {
-				entry.breaker.RecordFailure()
-			}
+		if recovered != nil {
+			// 在归还会话调用槽后调用业务日志处理器。
+			panicerr.Log(ctx, slog.LevelError, "agent_v2: AutoCompact 摘要 panic，已转成错误", recovered)
 		}
 	}()
+	recoverPanic := func() {
+		if r := recover(); r != nil {
+			out = messages
+			recovered = panicerr.New(r)
+			err = panicerr.WrapOpaque("auto compact: recovered panic", recovered)
+		}
+	}
+	defer recoverPanic()
 
-	if !cfg.shouldTrigger(entry, messages) {
+	// 保留调用方相位和同相位内的调用次序。跳过压缩时也保留位置，后续提问的 ID 才能稳定。
+	phaseKey := identityString("auto_compact", compose_v2.SubCallScope(ctx))
+	index := compose_v2.NextSubCallIndex(ctx, phaseKey)
+	phase := identityString(phaseKey, strconv.Itoa(index))
+	phaseCtx := compose_v2.EnterPhase(ctx, phase)
+	stateCtx := compose_v2.WithNodeStateSealed(phaseCtx, autoCompactAsked)
+
+	var asked bool
+	if entry != nil && !entry.breaker.WouldAllow() {
+		// 摘要已经向用户提出的问题属于当前节点。兄弟分支触发熔断后，当前节点仍须把答复交给摘要。
+		asked, _ = compose_v2.GetStepResult[bool](stateCtx, autoCompactAsked)
+		if !asked {
+			return messages, ctx.Err()
+		}
+	}
+	if !cfg.shouldTrigger(messages) {
 		return messages, nil
 	}
 
-	// 压缩事件只在**真要调摘要模型**时成对发出：Before 在断路器复查通过、调 Generate 之前那一刻发（emitBefore），
-	// After 经下面的 defer 覆盖之后所有退出路径（含 panic / error / 成功）。可压缩区太小、没有可摘的、断路器已熔断这些
-	// 跳过都不发——跟 shouldTrigger 的跳过一致：这一轮没有压缩。曾经 Before 在这里就发，跳过的轮次照样各发一对，
-	// observability 的 crew.compactions{crew.outcome=success} 每轮 +1、crew.compaction.ratio 恒 1.0，把「压缩效果在退化」的信号抹平。
+	// 可压缩区和断路器都放行后，才发送 Before。已发 Before 的尝试在退出时发送 After，
+	// 包括调用前刚被取消、模型报错或 panic 的情况。
 	//
 	// Sub-5d audit fix: 测 inputTokens + startNanos 让 After event 自带 InputTokens +
 	// DurationMs (OTel self-contained — observability 端 fire metric 单 event 即得完整数据).
@@ -400,9 +404,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		beforeEmitted = true
 	}
 	{
-		// emit After event via defer — 覆盖所有退出路径 (含 panic / error / 成功)，只在 Before 发过时发.
-		// 注: 跟 panic recover defer LIFO 关系:
-		//   After defer 后注册 → 先跑; panic recover 先注册 → 后跑.
+		// 摘要尝试先收尾，After 再读取它的最终输出和错误。
 		defer func() {
 			if !beforeEmitted {
 				return
@@ -547,9 +549,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	// 用 EstimateMessageTokens（纯字符估）而非 EstimateTokens：理由同 shouldTrigger——
 	// 后者优先读 LLM usage InputTokens（= 全 prompt），会把"只算 early 切片"架空。
 	//
-	// 不计断路器——"没东西可压"不是失败，跟 errBreakerTripped 一样静默返回原
-	// messages。注意**不能**走 len(early)==0 那条拼装路径：early 非空，丢弃它会
-	// 真丢消息。
+	// 直接返回原消息。此时可压缩区非空，仍需保留其中的消息。
 	//
 	// 上一份摘要（增量摘要时它在 early 里：套用了备忘，或 prior 从压缩边界读起）已经是压缩过的，可压缩量与下面的
 	// 缩减比都只按它之外的新内容算。按整个 early 算的话，上一份摘要越长、两次触发之间的新内容越少（触发看的是整段
@@ -594,81 +594,73 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	callInput = append(callInput, early...)
 	callInput = append(callInput, schema.UserMessage(buildExtractionPrompt(cfg)))
 
-	// 4）调摘要 LLM——串行化保护断路器对并发场景生效（Bug U）
-	// entry 由 getOrCreateBreakerEntry 返回，nil 时走无锁退化（白盒测试 / 用户
-	// 直接构造 cfg 路径）。defer 保证所有早退路径都释放锁，避免遗漏。
-	//
-	// **audit Round 6 Bug 6 修复**：用 ctx-aware acquireCallSlot 取代 sync.Mutex.Lock，
-	// caller ctx cancel 时 worker 立即退出不卡等长 LLM 完成。
-	resp, err := func() (*schema.Message, error) {
-		if entry != nil {
-			if acqErr := entry.acquireCallSlot(ctx); acqErr != nil {
-				return nil, acqErr
-			}
-			defer entry.releaseCallSlot()
-		}
-		// 重新检查 breaker——锁等待期间可能已被其它分支调用 trip
-		if entry != nil && !entry.breaker.Allow() {
-			return nil, errBreakerTripped // sentinel
-		}
-		// **R30 视角C MED-1 fix**：summarize Model 是纯压缩工具，不应读"用户 Resume
-		// 答案"——业务自定义 cfg.AutoCompact.Model 实现内若调 GetResumeAnswerSingle（已删）
-		// 会误命中为 sub-agent ask_user 准备的答案当成"摘要 LLM 特殊指令"。strip
-		// ResumeContext 对齐 R14 audit 对 PlanAgent fork mode 隔离思路。
-		summarizeCtx := compose_v2.StripResumeContext(ctx)
-		emitBefore() // 真要调摘要模型了：这一轮算一次压缩（见 emitBefore 的说明）
-		r, e := cfg.Model.Generate(summarizeCtx, callInput)
-		// emit Generate event — primary phase attempt=1 (AutoCompactRun
-		// 内部不 retry, retry 由 caller modelFn 包围). 失败 attempt 也 emit 让业务可观测.
-		if hasEventSink(ctx) {
-			generateAction := &CompactionGenerateAction{
-				Attempt:  1,
-				Phase:    CompactionGeneratePhasePrimary,
-				Response: r,
-			}
-			if e != nil {
-				generateAction.Err = e.Error()
-			}
-			EmitCompactionEvent(ctx, &CompactionAction{
-				Layer:    CompactionLayerAuto,
-				Type:     CompactionActionGenerate,
-				Generate: generateAction,
-			})
-		}
-		// **R23 audit HIGH-1 fix（关键扩展）**：control flow error 不算 breaker
-		// failure——InterruptError / ctx.Err() 是业务/用户主动控制流，AutoCompact
-		// 本身没有"失败"。原计入 breaker → 3 次 Interrupt 后 breaker 跳 → AutoCompact
-		// 在该 sess 内永久失效，严重时业务后续 Run 全部 silent 不压缩 → ctx 爆。
-		if e != nil && entry != nil {
-			if _, isInt := compose_v2.IsInterrupt(e); !isInt && ctx.Err() == nil {
-				entry.breaker.RecordFailure()
-			}
-		}
-		return r, e
-	}()
-	if errors.Is(err, errBreakerTripped) {
-		return messages, nil // 安静跳过，行为等同 shouldTrigger 失败
-	}
-	if err != nil {
-		// **R23 audit HIGH-1 fix**：control flow error 必须 propagate（与 R14
-		// runForkMode + R5 selectSkillAdaptive 同协议）——业务自定义 cfg.Model 实现
-		// 可能在 prompt 长度超限 / 内容审查不通过 / 用户取消等场景抛 InterruptError /
-		// ctx.Err()。原 wrap 成 "auto compact: summarize: %w" 后 caller 用 `_` 吞掉
-		// 整个 error → 框架不存 cp / 父不挂起 / Resume 找不到入口 → HITL 链断。
-		// 改：先判 IsInterrupt + ctx.Err() 直接 propagate；其他业务错才 wrap。
-		if _, isInt := compose_v2.IsInterrupt(err); isInt {
+	// 4）按会话串行执行摘要。可压缩内容确认后才占探测名额，持有调用槽直到摘要校验完并结算。
+	result := compose_v2.CircuitBreakerFailed
+	if entry != nil {
+		if err := entry.acquireCallSlot(ctx); err != nil {
 			return messages, err
 		}
-		if ctx.Err() != nil {
+		defer entry.releaseCallSlot()
+		probeID, allowed := entry.breaker.AllowWithProbe()
+		if !allowed && !asked {
+			asked, _ = compose_v2.GetStepResult[bool](stateCtx, autoCompactAsked)
+			if !asked {
+				return messages, ctx.Err()
+			}
+		}
+		if allowed {
+			defer func() {
+				if ctx.Err() != nil || compose_v2.MustPropagate(ctx, err) {
+					result = compose_v2.CircuitBreakerIgnored
+				}
+				entry.breaker.RecordAttempt(probeID, result)
+			}()
+		}
+	}
+	// 模型 panic 先变成摘要失败，再结算断路器和发送 After。
+	defer recoverPanic()
+	if err := ctx.Err(); err != nil {
+		return messages, err
+	}
+	emitBefore()
+	if err := ctx.Err(); err != nil {
+		return messages, err
+	}
+	resp, err := cfg.Model.Generate(compose_v2.WithAddressedResumeOnly(phaseCtx), callInput)
+	if hasEventSink(ctx) {
+		generateAction := &CompactionGenerateAction{
+			Attempt:  1,
+			Phase:    CompactionGeneratePhasePrimary,
+			Response: resp,
+		}
+		if err != nil {
+			generateAction.Err = err.Error()
+		}
+		EmitCompactionEvent(ctx, &CompactionAction{
+			Layer:    CompactionLayerAuto,
+			Type:     CompactionActionGenerate,
+			Generate: generateAction,
+		})
+	}
+	if err != nil {
+		if entry != nil {
+			if _, interrupted := compose_v2.IsInterrupt(err); interrupted {
+				if saveErr := compose_v2.SaveStepResult(stateCtx, autoCompactAsked, true,
+					compose_v2.Rerunnable(), compose_v2.WithStreams(nil)); saveErr != nil {
+					return messages, fmt.Errorf("auto compact: record pending summary: %w", errors.Join(err, saveErr))
+				}
+			}
+		}
+		if compose_v2.MustPropagate(ctx, err) {
 			return messages, err
 		}
 		return messages, fmt.Errorf("auto compact: summarize: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return messages, err
+	}
 	// 防御 nil resp——某些 model 实现错误时不报 err 直接返回 nil（违反契约但实际见过）
 	if resp == nil {
-		if entry != nil {
-			entry.breaker.RecordFailure()
-		}
 		return messages, errors.New("auto compact: model returned nil response")
 	}
 
@@ -676,9 +668,6 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	if summary == "" {
 		// 没解析到 <summary> → LLM 没遵循指令——按失败计入断路器
 		// （如果连续 N 次提示词不生效，跳过避免持续浪费 quota）
-		if entry != nil {
-			entry.breaker.RecordFailure()
-		}
 		return messages, errors.New("auto compact: empty summary block")
 	}
 
@@ -704,9 +693,6 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	// 原样保留、新内容压到这个比例以内都算有效，把新内容原样抄进去的照样被拦下。
 	summaryTokens := compose_v2.EstimateMessageTokens([]*schema.Message{summaryMsg})
 	if limit := prevSummaryTokens + int(float64(freshTokens)*cfg.maxReductionRatio()); summaryTokens > limit {
-		if entry != nil {
-			entry.breaker.RecordFailure()
-		}
 		return messages, fmt.Errorf("auto compact: insufficient reduction: summary %d tokens > limit %d "+
 			"(previous summary %d tokens + new %d tokens * %.2f)",
 			summaryTokens, limit, prevSummaryTokens, freshTokens, cfg.maxReductionRatio())
@@ -720,15 +706,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	// 是框架加的、模型控制不了（最多 50 条，约 1100 token），算进去的话 SummaryMaxTokens 配得小时，可压缩区里转存过的
 	// 工具结果多到一定程度，一句话的摘要也判无效、每轮判无效、断路器跳闸，这个会话的压缩就停了（审计实测）。
 	if smax := cfg.summaryMaxTokens(); writtenTokens > smax {
-		if entry != nil {
-			entry.breaker.RecordFailure()
-		}
 		return messages, fmt.Errorf("auto compact: summary %d tokens exceeds SummaryMaxTokens %d", writtenTokens, smax)
-	}
-
-	// 真实 success（有效 summary + 缩减达标）才计 breaker
-	if entry != nil {
-		entry.breaker.RecordSuccess()
 	}
 
 	// 5）文件重注入（best-effort）
@@ -769,9 +747,13 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	out = append(out, summaryMsg)
 	out = append(out, reinjected...)
 	out = append(out, tail...)
+	if err := ctx.Err(); err != nil {
+		return messages, err
+	}
 	if cut != nil {
 		cut.tailLen = len(tail)
 	}
+	result = compose_v2.CircuitBreakerSucceeded
 	return out, nil
 }
 

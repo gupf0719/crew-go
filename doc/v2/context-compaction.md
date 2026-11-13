@@ -32,7 +32,7 @@ provider 的 context window 限制（typical 200K），同时保留对话语义�
    抢救式（删消息组）。每层比上一层代价更高，只在必要时升级。
 2. **API 不变量永不破坏**：任何切割都保持 `tool_use` ↔ `tool_result` 配对、
    `assistant` 消息内的 `thinking` 块完整性——否则下一次 LLM 调用直接 422。
-3. **断路器防雪崩**：连续 N 次失败立即停止，不让上下文不可恢复时无限重试浪费 API。
+3. **断路器防雪崩**。连续失败达到阈值后进入冷却，冷却结束后以一次探测验证恢复。
 4. **真实 token 优先——仅限观测上报**：`EstimateTokens` 会优先用 provider 返回的
    `Usage.InputTokens`，但那只喂给 compaction event。触发判定用纯字符估的
    `EstimateMessageTokens`（理由见 §第 2 层触发条件）。
@@ -62,7 +62,7 @@ provider 的 context window 限制（typical 200K），同时保留对话语义�
 | 层 | 触发时机 | LLM 调用 | 信息损失 | 延迟 | 断路器 |
 |---|---|---|---|---|---|
 | 1. MicroCompact | **model 节点入口**（先于 AutoCompact） | 否 | 最小（只删旧 tool 输出） | <1ms | 无 |
-| 2. AutoCompact | **model 节点入口**（MicroCompact 之后）、token 超阈值 | 是（生成摘要） | 中等（摘要替代早期对话） | 5-30s | 3 次失败停 |
+| 2. AutoCompact | **model 节点入口**（MicroCompact 之后）、token 超阈值 | 是（生成摘要） | 中等（摘要替代早期对话） | 5-30s | 默认连续 3 次失败后冷却 5 分钟 |
 | 3. ReactiveCompact | LLM 调用返回 prompt-too-long | 否（删最旧消息组重试） | 高（删最旧消息组） | ~0 | 3 次重试停（MaxAttempts，**非断路器**）|
 | 4. StoreMemory | **preamble 节点入口**（ISSUE-74 修后只跑首轮）、`store.Search` 注入到初始 messages | 否 | 中等（用历史摘要） | <10ms | 无 |
 
@@ -168,7 +168,7 @@ type MicroCompactConfig struct {
 - 配置 `AutoCompactConfig.Enabled == true`（默认 false——必须显式启用，因为需要
   用户配 `Model` 实例做摘要）
 - 当前估算 token >= 阈值
-- 断路器未触发（连续失败 < 3 次）
+- 断路器放行新的尝试，或当前节点需要续跑已提问的摘要
 
 ### 阈值计算
 
@@ -248,9 +248,8 @@ output:
    [tool-output-spill.md](tool-output-spill.md)）
 3b. **转存的取回 id 不随摘要消失**：被摘要掉的消息里的取回 id 收成一份索引（id、工具名、大小、行数，最近 50 条）
    附在摘要后面、并记在摘要的标注上——下一次增量摘要时上一份索引接着带
-4. **断路器**：连续失败 3 次后停止，不再尝试自动压缩本会话——避免上下文不可恢复
-   时无限消耗 API（Claude Code 实测：1,279 个会话曾连续失败 50+ 次，最多 3,272
-   次，每天浪费约 250K 次 API 调用）
+4. **断路器**。默认连续失败 3 次后进入 5 分钟冷却。下一个满足压缩条件的调用获得半开探测名额，
+   校验通过后恢复正常，失败时重新冷却。同一任务的尝试串行到摘要校验完成。
 
 ### 配置
 
@@ -322,6 +321,9 @@ type AutoCompactConfig struct {
   调用，模型输入涨到 20 万字符，`err == nil`）。
 - **钩子留下的 nil 先去掉**：`OnModelStart` 钩子往消息列表里留了 nil 时，压缩分组会跳过它、备忘的 Upto 却把它算进去，
   套用之后模型输入里出现找不到声明者的 tool_result。钩子改写之后先去掉 nil，下面每一层都不必再防。
+- **摘要提问拥有独立相位**。自定义摘要模型可用 `compose_v2.Ask` 按自己的提问位置接收答复。
+  摘要和主模型各自使用自己的问题 ID。摘要待答时保存节点进度，兄弟分支触发熔断后仍能续跑这一摘要。
+  直接在同一节点调用多次 `AutoCompactRun` 时，保持调用顺序。调用可能独立跳过时，用 `compose_v2.EnterPhase` 分配稳定相位。
 - **重注入从原始消息流挑**：套用备忘之后，文件重注入照样从套用之前的原始消息流倒扫，跳过 MicroCompact 这一轮会清
   掉的与转存过的（见上文 AutoCompact 第 3 条）。
 - 同样的 200 轮任务：摘要 18 次、摘要输入 0.8MB；喂给模型的上限不变。不变量：**同一个 Run 里模型输入有界、
@@ -575,7 +577,7 @@ type StoreMemoryCompactProvider interface {
 | 层 | Graph 节点 | 触发函数 | 触发时机 | 失败影响 |
 |---|---|---|---|---|
 | 第 1 层 MicroCompact | model | `agent_v2/microcompact.go::MicroCompactRun` | **model 节点 makeModelFn 最早段（先于 AutoCompact）** | 不阻断；记 slog.Warn 即可 |
-| 第 2 层 AutoCompact | model | `agent_v2/autocompact.go::AutoCompactRun` | model 节点 makeModelFn（MicroCompact 之后，LLM 调用之前） | breaker 记账；**不阻断主链路**；业务错 `slog.WarnContext` 后继续走原 messages（不 silent），InterruptError / ctx.Err 直接 return 阻断 |
+| 第 2 层 AutoCompact | model | `agent_v2/autocompact.go::AutoCompactRun` | model 节点 makeModelFn（MicroCompact 之后，LLM 调用之前） | 普通摘要失败记入断路器，主模型使用原消息。中断、取消和终局错误交给执行引擎 |
 | 第 3 层 ReactiveCompact | model | `agent_v2/reactive_compact.go::ReactiveCompactRun` | LLM 调用返回 prompt-too-long 时的 retry wrap | retry 用尽 → 真错 return；上层 graph_loop 走错误路径 → cp save |
 | 第 4 层 StoreMemory | 跨 Run | `RunSession + store.Store` 接口 | **preamble 节点入口**（ISSUE-74 修后 buildInitialMessages 搬到 BasicAgent graph 内 preamble 节点跑只跑首轮）调 store.Search 注入到初始 messages | 业务自己负责 |
 
@@ -628,8 +630,8 @@ MicroCompact → AutoCompact → ChatModel.WithTools(toolkit) → LLM 调用
 
 | 触发 | 第 1 层 (MicroCompact) | 第 2 层 (AutoCompact) | 第 3 层 (ReactiveCompact) | 整体效果 |
 |---|---|---|---|---|
-| LLM API 报错 | N/A（不调 LLM） | breaker.RecordFailure；业务错 `slog.WarnContext` 后继续走原 messages（`compacted, ccErr := AutoCompactRun(...)`，见 `basic_agent.go::makeModelFn`）；InterruptError/ctx.Err 不吞、propagate（R23 fix） | retry MaxAttempts；用尽返 error 给 caller | 第 2 层业务错 slog.Warn 继续；第 3 层 retry 直到用尽 |
-| breaker tripped | N/A | 跳过本次 AutoCompact（继续走原 messages） | N/A（ReactiveCompact 无 breaker，仅 MaxAttempts 硬上限） | 主链路不阻断 |
+| LLM API 报错 | N/A（不调 LLM） | 普通错误计入断路器并记录日志。控制流错误按 `compose_v2.MustPropagate` 交给引擎 | retry MaxAttempts；用尽返 error 给 caller | 普通摘要错误时主模型使用原消息 |
+| breaker tripped | N/A | 冷却期间跳过新摘要，当前节点已提问的摘要仍可续跑 | N/A（ReactiveCompact 受 MaxAttempts 限制） | 新尝试使用原消息，待答任务按原节点续跑 |
 | ctx cancel | 立即 return（业务自己 select ctx） | 立即 return | 立即 return | 整 Run 走 ctx cancel 错误路径 |
 | 配置 disabled | 直接 skip | 直接 skip | 直接 skip | 等同于不开启 4 层压缩 |
 | panic | safeNodeRun recover 转 error；frontier 非空时 Run defer 仍 SaveNS Pending | 同上 | 同上 | **业务避免用 panic 表达 HITL**——Resume 重跑节点会再次 panic 死循环 |
@@ -637,10 +639,8 @@ MicroCompact → AutoCompact → ChatModel.WithTools(toolkit) → LLM 调用
 | ReactiveCompact 删完一组后 messages 仍超 token gap | N/A | N/A | 继续 retry，直到 MaxAttempts；若 `compacted == nil \|\| len(compacted) >= len(curMsgs)` 提前 break | 用尽后返原始 prompt-too-long error 给 caller |
 
 **关键不变量**：
-- **第 1 / 2 层失败不阻断主链路** —— 业务错记账断路器 + `slog.WarnContext` 后继续走原 messages
-  （**注**：InterruptError / ctx.Err() **不吞**、propagate 给 caller（R23 fix）——只有业务错才 silent 继续；
-  接了 observability 时还会 emit compaction event 含 `After.Err`，业务可订阅观测压缩失败）
-- **只有第 3 层用尽才真错** —— 这是给 caller 的「最后兜底」信号
+- **普通摘要错误回退原消息**。断路器记录失败，`slog.WarnContext` 记录原因，压缩事件携带 `After.Err`。
+- **控制流错误交给引擎**。摘要中断、取消和终局错误在调用主模型前返回。第 3 层用尽时返回原始超长错误。
 - **breaker 仅 AutoCompact 用**：ReactiveCompact 只有 MaxAttempts 硬上限，无 breaker（与 §失败回退路径表 / §LangGraph 对比表一致）
 
 ### 排错决策树
@@ -877,7 +877,7 @@ before/after 事件 ⟹ 接了 observability 的业务会看到 `crew.compaction
 ⚠️ **写微缩配置的测试和 example 都要显式调小 `MinCompactableTokens`**：window 只有几百
 token 的 fixture 天然低于默认的 5000，不调小的话压缩根本不会发生——测试**照样绿**（它被
 跳过了）、demo 照样打印「触发了」但一条没丢。实测已因此打死过一条既有哨兵
-（`TestAutoCompact_R30C_MED1_SummarizeStripResumeContext`）和 `example/compact/compact_demo`。
+（`TestAutoCompact_SummarizerCannotReadResumeContext`）和 `example/compact/compact_demo`。
 ⚠️ 它**不能用 0 关掉**（`<= 0` 取默认值），要关只能写 1。
 
 ### 断路器（`compose_v2/circuit_breaker.go`）
@@ -898,8 +898,9 @@ func (cb *CircuitBreaker) RecordFailure() bool            // ++; >= max 时 trip
 func (cb *CircuitBreaker) RecordSuccess()                 // 重置 failures = 0, tripped = false
 ```
 
-**cooldown 自愈语义**：tripped 后等 5 分钟自动半开尝试探测——成功则重置；否则继续 trip。
-**断路器一旦 trip 必须能自愈**——CLAUDE.md "公开 API 防御" 强调。
+AutoCompact 用 `WouldAllow` 预检，在可压缩区通过校验并取得会话调用槽后用 `AllowWithProbe` 领取探测名额。
+同一次尝试以 `RecordAttempt` 结算。摘要通过格式、预算和缩减校验后关闭断路器，普通失败重新开始冷却。
+中断、调用方取消和其他控制流错误归还名额并保留冷却状态。冷却中续跑已提问的摘要仍使用同一个会话调用槽。
 
 ---
 

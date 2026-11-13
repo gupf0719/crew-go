@@ -46,8 +46,7 @@ func guardCfg(m model.ChatModel) *AutoCompactConfig {
 		ModelContextWindow:  35_000,
 		SummaryMaxTokens:    20_000,
 		SummaryBufferTokens: 13_000,
-		breakers:            &sync.Map{},
-		breakerMaxFailures:  3,
+		breakers:            &autoCompactBreakers{},
 	}
 }
 
@@ -152,23 +151,21 @@ func TestAutoCompactRun_RejectsInsufficientReduction(t *testing.T) {
 // TestAutoCompactRun_InsufficientReductionCountsTowardBreaker 验证"压缩无效"计入断路器。
 //
 // 底层 Generate 成功 ≠ 业务成功（CLAUDE.md「什么算成功」）——摘要持续无效时必须让
-// 断路器跳，否则每轮都白烧一次 LLM 调用。设 breakerMaxFailures=1 让一次失败即跳。
+// 断路器跳，否则每轮都白烧一次 LLM 调用。设 MaxConsecutiveFailures=1 让一次失败即跳。
 func TestAutoCompactRun_InsufficientReductionCountsTowardBreaker(t *testing.T) {
 	bulk := strings.Repeat("z", 20_000)
 	m := &guardModel{resp: "<summary>" + bulk + "</summary>"}
 	cfg := guardCfg(m)
 	cfg.MinCompactableTokens = 100
-	cfg.breakerMaxFailures = 1
+	cfg.MaxConsecutiveFailures = 1
 
 	msgs := []*schema.Message{
 		schema.UserMessage(bulk),
 		schema.UserMessage("now what"),
 	}
 
-	entry := cfg.getOrCreateBreakerEntry("")
-	if entry == nil {
-		t.Fatal("前置假设：breakers 已初始化，entry 不应为 nil")
-	}
+	entry := cfg.breakers.retain("", cfg.MaxConsecutiveFailures)
+	defer cfg.breakers.release("", entry)
 	if !cfg.shouldTrigger(msgs) || !entry.breaker.WouldAllow() {
 		t.Fatal("前置假设：首次应可触发压缩")
 	}

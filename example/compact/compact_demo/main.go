@@ -53,6 +53,7 @@ func main() {
 		if _, err := ag.Run(ctx, sess, schema.UserMessage(fmt.Sprintf("第 %d 轮，随便聊聊", i))); err != nil {
 			log.Fatalf("round %d: %v", i, err)
 		}
+		ag.CleanupSession(sess.RunID)
 		fmt.Printf("  round %d done, history=%d 条\n", i, len(sess.History()))
 	}
 	fmt.Println("=== 观察上面的 [compact:auto:*] 行——AutoCompact 在超阈值那轮触发，摘要替掉早期对话 ===")

@@ -3,7 +3,6 @@ package agent_v2
 import (
 	"context"
 	"strings"
-	"sync"
 	"testing"
 
 	"crew-go/model"
@@ -52,8 +51,7 @@ func TestAutoCompact_R29LOW1_ShouldTriggerSkipsMemoryMarker(t *testing.T) {
 		ModelContextWindow:  35_000, // 阈值 = 35000 - 20000 - 13000 = 2000
 		SummaryMaxTokens:    20_000,
 		SummaryBufferTokens: 13_000,
-		breakers:            &sync.Map{},
-		breakerMaxFailures:  3,
+		breakers:            &autoCompactBreakers{},
 	}
 	threshold := cfg.Threshold()
 	if threshold != 2000 {

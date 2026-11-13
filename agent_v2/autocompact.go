@@ -92,38 +92,23 @@ type AutoCompactConfig struct {
 	ReinjectPerFileBudget int  // 默认 5_000 tokens
 	ReinjectTotalBudget   int  // 默认 50_000 tokens
 
-	// per-session breaker registry（ISSUE-72 修跨 session 共享单例 breaker bug）
-	//
-	// **bug 历史**：旧版 `breaker *compose_v2.CircuitBreaker` 是 NewBasicAgent 构造期
-	// 单实例，**所有 session 共享**——session A 的 quota burst trip 后 session B
-	// 也被禁用 AutoCompact，跨业务隔离破坏。修复为 per-session lazy 实例。
-	//
-	// 设计：sync.Map[sessionID]*sessionBreakerEntry。每个 entry 含独立 breaker
-	// + 独立 callSem。callSem 串行化摘要尝试及其结算，保护范围限本 session。
-	//
-	// breaker 不持久化（per-process latency 优化，不属于业务状态），隔离粒度从
-	// "per-Agent 单例"改为"per-session 实例"——既避免共享污染，又不引入持久化复杂度。
-	//
-	// breakers 用 *sync.Map（不是值）——AutoCompactConfig 在 WithAutoCompact 内
-	// 走 `copied := *cfg` 浅拷贝，*sync.Map 共享同一实例，避免 sync.Map 值拷贝
-	// 的 lock 复制问题。WithAutoCompact 显式 `copied.breakers = &sync.Map{}`。
-	breakers           *sync.Map // key=sessionID(string), value=*sessionBreakerEntry
-	breakerMaxFailures int       // lazy 创建用
+	// BasicAgent 独占登记表，每个任务 RunID 的条目按需创建。
+	breakers *autoCompactBreakers
 }
 
-// sessionBreakerEntry 是 AutoCompactConfig.breakers 的 value 类型。
-// 每 session 独立持有 breaker + callSem。
-//
-// **audit Round 6 Bug 6 修复**：callSem 用 1-buffer chan struct{} 实现 ctx-aware
-// 互斥（取代旧 sync.Mutex）——sync.Mutex.Lock 不响应 ctx cancel，fan-out N 个
-// worker 共享同一 cfg 时 worker 1 持锁调长 LLM（如 5min），caller ctx cancel
-// 后 worker 2-N 仍卡 Lock 等到锁自然释放，goroutine 泄漏 + 延迟 cancellation。
-//
-// channel-based semaphore 让 acquireCallSlot 用 select { case sem<-{}; case <-ctx.Done() }
-// 实现 ctx-aware acquire，cancel 时立即退出。
+type autoCompactBreakers struct {
+	mu        sync.Mutex
+	bySession map[string]*sessionBreakerEntry
+}
+
+// sessionBreakerEntry 持有任务的断路器和支持取消的调用槽。
 type sessionBreakerEntry struct {
 	breaker *compose_v2.CircuitBreaker
-	callSem chan struct{} // 1-buffer semaphore；acquire 用 select + ctx
+	callSem chan struct{}
+
+	// 从取得条目到调用结束都计入，包括预检和排队。由登记表的 mu 保护。
+	users          int
+	cleanupPending bool
 }
 
 // acquireCallSlot 用 ctx-aware 模式获取 callSem。失败返 ctx.Err()。
@@ -141,38 +126,46 @@ func (e *sessionBreakerEntry) releaseCallSlot() {
 	<-e.callSem
 }
 
-// getOrCreateBreakerEntry 按 sessionID lazy 创建/返回 breaker entry。
-//
-// sessionID 为空（无 session 上下文，如裸调 AutoCompactRun 不带 ctx session）：
-// 用 "" 作 key fallback——所有"无 session"调用共享一个 entry，仍然实现"有
-// session 时跨 session 隔离"的核心目标。
-//
-// breakers nil 防御：用户白盒构造 cfg 没走 WithAutoCompact 注入时，breakers 为
-// nil。返回 nil entry，shouldTrigger / AutoCompactRun 检测 nil 走无 breaker 路径
-// （等同旧实现 cfg.breaker==nil）。
-func (cfg *AutoCompactConfig) getOrCreateBreakerEntry(sessionID string) *sessionBreakerEntry {
-	if cfg == nil || cfg.breakers == nil {
+func (cfg *AutoCompactConfig) withBreakerRegistry() *AutoCompactConfig {
+	if cfg == nil {
 		return nil
 	}
-	if v, ok := cfg.breakers.Load(sessionID); ok {
-		return v.(*sessionBreakerEntry)
+	copied := *cfg
+	copied.breakers = &autoCompactBreakers{}
+	return &copied
+}
+
+// retain 在同一个临界区取条目并登记使用者。无 session 的调用共用空键。
+func (r *autoCompactBreakers) retain(sessionID string, maxFailures int) *sessionBreakerEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.bySession == nil {
+		r.bySession = make(map[string]*sessionBreakerEntry)
 	}
-	failures := cfg.breakerMaxFailures
-	if failures <= 0 {
-		failures = defaultAutoCompactMaxFailures
+	entry := r.bySession[sessionID]
+	if entry == nil {
+		entry = &sessionBreakerEntry{
+			breaker: compose_v2.NewCircuitBreaker(maxFailures),
+			callSem: make(chan struct{}, 1),
+		}
+		r.bySession[sessionID] = entry
 	}
-	e := &sessionBreakerEntry{
-		breaker: compose_v2.NewCircuitBreaker(failures),
-		callSem: make(chan struct{}, 1),
+	entry.users++
+	return entry
+}
+
+func (r *autoCompactBreakers) release(sessionID string, entry *sessionBreakerEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry.users--
+	if entry.users == 0 && entry.cleanupPending {
+		delete(r.bySession, sessionID)
 	}
-	actual, _ := cfg.breakers.LoadOrStore(sessionID, e)
-	return actual.(*sessionBreakerEntry)
 }
 
 const (
 	defaultAutoCompactSummaryMaxTokens      = 20_000
 	defaultAutoCompactSummaryBufferTokens   = 13_000
-	defaultAutoCompactMaxFailures           = 3
 	defaultAutoCompactReinjectMaxFiles      = 5
 	defaultAutoCompactReinjectPerFileBudget = 5_000
 	defaultAutoCompactReinjectTotalBudget   = 50_000
@@ -200,17 +193,21 @@ const StoreInjectedAnnotation = "memory_injected"
 // 别名 CompactionSummaryAnnotationKey——保持值同步，agent 与 compose 双向可见。
 const AutoCompactSummaryAnnotation = CompactionSummaryAnnotationKey
 
-// CleanupSession 是业务侧主动清理一个 sessionID 的 breaker entry —
-// review-v6 M-22 fix: breakers map 永不自动清理, 长跑服务 + 高 session 流转率
-// 时 distinct RunID 累积让 map 缓慢膨胀 (含 *CircuitBreaker + chan struct{}
-// semaphore, 每 session 几 KB).
-//
-// 业务最佳实践: sweeper 扫已超时 session, 调 `cfg.CleanupSession(sid)` 主动清.
+// CleanupSession 清理经 [WithAutoCompact] 装配后用于直接调用 [AutoCompactRun] 的配置中，
+// 指定 RunID 的断路器。最后一个使用者释放后删除。BasicAgent 的运行态通过
+// [BasicAgent.CleanupSession] 清理。
 func (cfg *AutoCompactConfig) CleanupSession(sessionID string) {
 	if cfg == nil || cfg.breakers == nil || sessionID == "" {
 		return
 	}
-	cfg.breakers.Delete(sessionID)
+	r := cfg.breakers
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if entry := r.bySession[sessionID]; entry != nil && entry.users > 0 {
+		entry.cleanupPending = true
+		return
+	}
+	delete(r.bySession, sessionID)
 }
 
 // Threshold 返回触发 AutoCompact 的 token 阈值。
@@ -335,14 +332,6 @@ const autoCompactAsked = "auto_compact_asked"
 // autoCompactRun 是 [AutoCompactRun] 的本体。cut 非 nil 时按它处理上一次的压缩结果，并在**真做了一次
 // 摘要**（输出里有新的摘要消息）时写 cut.tailLen；其余所有出口（没触发、跳过、失败）都不写。
 func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*schema.Message, cut *compactCut) (out []*schema.Message, err error) {
-	// 取 per-session breaker entry——sessionID 来自 ctx 注入的 RunSession（修
-	// ISSUE-72 跨 session 共享单例 breaker bug）。无 session 上下文时用 "" 作 key。
-	var sessionID string
-	if sess := GetSession(ctx); sess != nil {
-		sessionID = sess.RunID
-	}
-	entry := cfg.getOrCreateBreakerEntry(sessionID)
-
 	var recovered *panicerr.Error
 	defer func() {
 		if recovered != nil {
@@ -358,6 +347,16 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		}
 	}
 	defer recoverPanic()
+
+	var entry *sessionBreakerEntry
+	if cfg != nil && cfg.breakers != nil {
+		var sessionID string
+		if sess := GetSession(ctx); sess != nil {
+			sessionID = sess.RunID
+		}
+		entry = cfg.breakers.retain(sessionID, cfg.MaxConsecutiveFailures)
+		defer cfg.breakers.release(sessionID, entry)
+	}
 
 	// 保留调用方相位和同相位内的调用次序。跳过压缩时也保留位置，后续提问的 ID 才能稳定。
 	phaseKey := identityString("auto_compact", compose_v2.SubCallScope(ctx))

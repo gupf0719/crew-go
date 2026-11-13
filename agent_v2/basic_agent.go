@@ -202,6 +202,8 @@ func NewBasicAgent(opts ...Option) *BasicAgent {
 	// 身份在选项之后铸：Option 是导出的 func(*Config)，整份覆盖 Config 的模板选项（`*c = tmpl`）会把先铸的身份冲成
 	// 模板里的值，按它建出来的几个 agent 共用一份 approve_always 规则（审计实测：模板建的 b 拿到了 a 的「一直允许」）。
 	cfg.approvalOwner = newUUID()
+	// Config 模板可以包含已经装配的压缩配置，断路器表由每个 Agent 自己持有。
+	cfg.AutoCompact = cfg.AutoCompact.withBreakerRegistry()
 	validateOutputSchemaConfig(&cfg)
 	warnAskUserOverride(&cfg)
 	warnReadToolOutputOverride(&cfg)
@@ -229,6 +231,15 @@ func (a *BasicAgent) Name() string { return a.config.Name }
 
 // Description 返回 agent 职责描述。
 func (a *BasicAgent) Description() string { return a.config.Description }
+
+// CleanupSession 清理本 Agent 指定任务 RunID 的 AutoCompact 断路器。
+// 有摘要调用正在使用条目时，清理延后到最后一个调用释放，期间同任务调用沿用该条目。
+// 重复调用安全。空 RunID 或未配置 AutoCompact 时直接返回。
+func (a *BasicAgent) CleanupSession(sessionID string) {
+	if a != nil {
+		a.config.AutoCompact.CleanupSession(sessionID)
+	}
+}
 
 // Run 启动一次 ReAct 循环并返回本次产生的 events。
 //

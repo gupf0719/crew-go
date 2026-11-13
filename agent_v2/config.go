@@ -4,7 +4,6 @@ import (
 	"context"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"crew-go/compose_v2"
@@ -747,13 +746,7 @@ func WithMicroCompact(cfg *MicroCompactConfig) Option {
 //
 // 必填：cfg.Model + cfg.ModelContextWindow（其它字段有默认值）。
 //
-// 必须显式 `copied.breakers = &sync.Map{}`——
-// autocompact.go:78 godoc 早就承诺会做但代码漏掉，导致 getOrCreateBreakerEntry
-// 第 100-102 行 `cfg.breakers == nil → return nil`，整个断路器路径被绕过 →
-// LLM 持续失败时不跳，反复浪费 quota。
-//
-// breakerMaxFailures 也必须从 cfg copy 出来——getOrCreateBreakerEntry 用此值
-// lazy 创建 per-session breaker 实例。
+// BasicAgent 持有独立的断路器表，通过 [BasicAgent.CleanupSession] 清理。
 func WithAutoCompact(cfg *AutoCompactConfig) Option {
 	return func(c *Config) {
 		if cfg == nil {
@@ -765,10 +758,7 @@ func WithAutoCompact(cfg *AutoCompactConfig) Option {
 		if cfg.Enabled && isFrameworkNil(cfg.Model) {
 			panic("WithAutoCompact: typed nil cfg.Model with Enabled=true (含 Go typed nil ChatModel 陷阱)")
 		}
-		copied := *cfg
-		copied.breakers = &sync.Map{}
-		copied.breakerMaxFailures = cfg.MaxConsecutiveFailures
-		c.AutoCompact = &copied
+		c.AutoCompact = cfg.withBreakerRegistry()
 	}
 }
 

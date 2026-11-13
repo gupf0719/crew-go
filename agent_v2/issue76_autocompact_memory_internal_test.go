@@ -61,8 +61,7 @@ func TestISSUE76_AutoCompact_ProtectedOnlyEarly_FallsBackToTriggerSummarize(t *t
 		ModelContextWindow:  35_000, // threshold = 35000 - 20000 - 13000 = 2000
 		SummaryMaxTokens:    20_000,
 		SummaryBufferTokens: 13_000,
-		breakers:            &sync.Map{},
-		breakerMaxFailures:  3,
+		breakers:            &autoCompactBreakers{},
 	}
 
 	// Memory marker message (大内容触发 token 估算 > threshold)
@@ -117,8 +116,7 @@ func TestISSUE76_AutoCompact_NoProtected_NoRegression(t *testing.T) {
 		ModelContextWindow:  35_000,
 		SummaryMaxTokens:    20_000,
 		SummaryBufferTokens: 13_000,
-		breakers:            &sync.Map{},
-		breakerMaxFailures:  3,
+		breakers:            &autoCompactBreakers{},
 	}
 
 	// 无 Memory marker, 多 user 多轮 ReAct (典型多 turn 场景) — 总 token > threshold

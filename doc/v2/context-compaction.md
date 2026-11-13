@@ -272,8 +272,7 @@ type AutoCompactConfig struct {
     ReinjectMaxFiles       int                  // 默认 5
     ReinjectPerFileBudget  int                  // 默认 5_000 tokens（单文件上限）
     ReinjectTotalBudget    int                  // 默认 50_000 tokens（共预算）
-    // 内部字段（业务不直接接触）：breakers *sync.Map / breakerMaxFailures int
-    // ——per-session lazy 实例化避免跨 session 共享 breaker 污染
+    // 内部断路器表按任务 RunID 创建条目。
 }
 ```
 
@@ -902,6 +901,12 @@ AutoCompact 用 `WouldAllow` 预检，在可压缩区通过校验并取得会话
 同一次尝试以 `RecordAttempt` 结算。摘要通过格式、预算和缩减校验后关闭断路器，普通失败重新开始冷却。
 中断、调用方取消和其他控制流错误归还名额并保留冷却状态。冷却中续跑已提问的摘要仍使用同一个会话调用槽。
 
+#### 清理任务断路器
+
+任务结束后，调用 `ag.CleanupSession(runID)` 清理该 `BasicAgent` 的 AutoCompact 断路器。
+有摘要调用或等待者时，所有调用沿用同一断路器和调用槽，最后一个调用释放后删除条目。
+后续同 RunID 的压缩会按需建立新条目。存档和会话历史有各自的生命周期。
+
 ---
 
 ## 配置与开关
@@ -1093,10 +1098,11 @@ A：Resume 时通过 cp restore + `ResumeContext` ctx 注入 user 答案——�
 
 ### ParallelAgent / RoutingAgent 多分支共享 breaker
 
-多个 fan-out 分支共享同一 `*AutoCompactConfig` 的 `breakers *sync.Map`（per-session entry 含独立 breaker + `callSem chan struct{}`，**仅同 session 内分支共享，跨 session 隔离**——ISSUE-72 修复）：
+同一任务的 fan-out 分支复用同一个 `BasicAgent` 时，共用该 RunID 的断路器和调用槽。
+每个 Agent 实例和每个 RunID 各有自己的状态。
 
 - **共享是有意**：摘要 LLM 失败通常是系统性问题（quota / model 不可用），N 个分支各自独立重试 N 次浪费 quota；共享 breaker 让一个分支失败 trip 后其它分支静默跳过 AutoCompact 走原 messages，graceful degradation
-- **代价**：单分支偶发失败会影响其它分支的 AutoCompact——如果你的场景里分支独立性重要（不同模型 / 不同 quota），手动给每个分支构造独立 cfg
+- **代价**。单分支失败可能暂停其它分支的 AutoCompact。使用不同模型或配额的分支可分别构造 Agent。
 
 ### AgentAsTool 内层 BasicAgent 完全独立 cfg
 

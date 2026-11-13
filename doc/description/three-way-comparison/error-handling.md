@@ -251,7 +251,7 @@ Go 标准库对 Goexit 本身也有两处独立实现，判据都是**一道正�
 3. **统一 best-effort 等兄弟**：fan-out 任一分支失败（业务错 / hook 错 / Interrupt）都 `wg.Wait` 等所有分支跑完不 cancel（`executeFrontier`，`graph_loop.go:1047`），与首次执行语义一致——成功分支 delta 靠 `SuccessWrites` 保留而非 cancel 隔离。LangGraph 用 `__cancel_on_exit__` 标记；eino 见非 Interrupt 立即返回。（v1 曾有"hook 错 / clone 错立即 cancel"二分，v2 channel-based 已统一去掉。）
 4. **只重跑失败分支 + 成功分支后继保留**（`frontierResult.SuccessWrites/FailedBranches` + R33 `cp.CompletedFrontier/DeferredSends`）：成功分支 writes 当场 `ApplyAll` 进 channel、cp 持久化 channel state，Resume 时 frontier 只设 `FailedBranches` 成功分支不重算；R33 PA-H1 后成功成员**身份 + SendFrom 指令**也持久化——Resume 重跑失败成员成功后并入出边计算（不重跑 NodeFunc），修复前发散拓扑（A→X,B→Y）成功分支后继 X 静默丢失 graph 假成功。三方：LangGraph **不是**"重跑整 superstep"（旧声明已被本地源码证伪）——它 per-task put_writes + resume 只执行无 writes 的 task（matched-writes-skip），真实差异是我们成功 writes 立即 apply 进 cm（它攒到超步末）+ 它有 mid-superstep 持久化；eino 按 `RerunNodes` 但成功 task 状态在 channel 里。（v1 时代是 `superstepSnapshot`/`buildBranchDelta` 完整序列化 delta，v2 channel-based 简化——channel 写即 delta。）
 5. **channel-based per-branch 记录**：v2 用 `frontierResult.SuccessWrites` + `FailedBranches` 记录超步结果——成功分支 writes apply 后即进 channel state、cp 恢复 channel 即还原，不需 v1 的 `superstepSnapshot`/`PreLocalState` 入口快照（channel reducer 天然增量，无 typed-local-state 回滚需求）。
-6. **`CircuitBreaker` 框架内置** + 仅 AutoCompact per-session breaker（`autocompact.go` `breakers *sync.Map`，ISSUE-72 修跨 session 共享 bug）+ mutex 保护并发触发 + 5min cooldown 自愈。三家中唯一一家把断路器作为框架原语。
+6. **`CircuitBreaker` 框架内置**。AutoCompact 按 Agent 实例和任务 RunID 隔离断路器，同任务的摘要尝试串行结算，冷却 5 分钟后可以半开探测。Agent 可按 RunID 清理已结束任务的断路器。
 7. **ChainHooks panic recovery + 失败时调 OnNodeEnd 配对**：OnNodeStart 返 error 也调 OnNodeEnd（修 Bug #4，`checkpoint.go:241-247`）——hook 实现者用 start/end 配对管理 tracing span / metric inc-dec / 资源 acquire-release，缺 end 会泄漏。三家中只有我们显式保证配对。
 8. **Status 3 档**（`Unset` / `Pending` / `Failed`；`CPStatusFailed` 曾在 v2 audit follow-up #3 删掉，ISSUE-94 又加回，2026-08-13 起只是报告位）：`ListPending` 仅返回 `Pending` cp（2026-09-18 注：本条下文「删 failed 状态枚举」的叙述已过时）. LangGraph 每 cp 都写无状态字段; eino 无概念. crew-go 删的是"failed"**状态枚举**（不再有"失败但不可 Resume"的 cp 态）——但失败/中断留非空 frontier 时仍写 `Status=Pending` cp（crash recovery，见 #9），**不是**"任何失败都不写 cp"。
 9. **失败/中断 SaveNS 用原 ctx**：Run cleanup defer 在 `runErr != nil` 时用**原 ctx** `SaveNS`（`graph_loop.go:316-355`）。（原文档"`saveCheckpointOnError` 双 ctx / timeout 用 5s background ctx"是 v1 语义——`saveCheckpointOnError` 在 v2 不存在，统一用原 ctx。）
@@ -513,7 +513,7 @@ LangGraph 的 `GraphBubbleUp`。ES 那种「默认且无条件降级」容不下
 leak information** about the existence of resources outside the caller's authorization scope」。
 「先无差别查、再在外面逐条滤」正是这条 MUST 禁止的形状。
 
-两个官方实现都是**谓词下推**，没有一个用外层包装：a2a-go `internal/taskstore/store.go:157-161`
+两个官方实现都做**谓词下推**。a2a-go 的内存任务存储
 （`filterTasks(s.tasks, userName, req)` 后 `totalSize := len(filteredTasks)`）；a2a-python
 `database_task_store.py:225-245`（count 从同一个 `base_stmt` 派生，两者结构上不可能分叉）。
 a2a-python 的 `TaskStore` ABC 每个方法都收 `ServerCallContext`，三个内置实现全吃

@@ -429,10 +429,8 @@ crew-go 没有「重建对话」这个动作。
 > crew-go 4 层压缩嵌入运行有同样隐患。**审计结果：无隐患**——crew-go 全局可变态最小化、**无任何
 > "模块级 process cache"**（Claude 有 `getUserContext.cache` 等才需 main/sub 区分）。
 
-AutoCompact breaker 双层物理隔离：① **per-BasicAgent**（`config.go::WithAutoCompact` 每次 `copied.breakers
-= &sync.Map{}`，主要机制——sub-agent 嵌入各自 NewBasicAgent 不同 cfg）+ ② **per-sessionID**
-（`autocompact.go::getOrCreateBreakerEntry` 补充，同 BasicAgent 跨 Run 不同 RunID）。注意 sub-agent 嵌入
-**多数编排共享 parent session**（Sequential/Parallel/... 传父 session），故隔离主靠机制①。全局态梳理
+AutoCompact 在 `NewBasicAgent` 为每个 Agent 实例建立私有断路器表，再按任务 RunID 取各自的条目。
+多数编排的嵌套 Agent 共享父任务 RunID，各实例仍持有独立的表。全局态梳理
 （typeRegistry / breakers / 各 regex 常量；PlanAgent 的临时子 agent 配置 2026-10-19 起随存档走、不在实例上）全部已隔离或不可变。加固：
 `agent_v2/compaction_test.go` 2 sanity test（`TestAutoCompact_BreakerIsolatedAcrossSessions` +
 `_AcrossCfgInstances`）守护两隔离层。**业务警示**：业务 `store.Store` 实现若引入"父子共享 cache"语义，

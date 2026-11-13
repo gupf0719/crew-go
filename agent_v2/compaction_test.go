@@ -14,27 +14,17 @@ import (
 	"crew-go/schema"
 )
 
-// applyWithAutoCompact 模拟业务通过 WithAutoCompact option apply cfg 后的默认值兜底
-// （MaxRetries / MaxConsecutiveFailures / SummaryBufferTokens 等业务未填时填默认）。
-// 原定义在 PR 3.3 删的 Memory 测试文件之一，迁来此文件让 compaction_test.go 共享。
-// makeCompactInput 构造 AutoCompactRun 测试用 messages（n 个 user/assistant 对）。
-// 每条 assistant payload 加长让总 token 估算超 AutoCompactConfig.ModelContextWindow=2000
-// 阈值触发 summarize（n>=5 时 ~5000 tokens > 2000）。
-// 原定义在 PR 3.3 删的 Memory 测试文件之一，迁来此文件让 compaction_test.go 共享。
+// makeCompactInput 构造多轮对话，长答复使消息总量超过测试配置的阈值。
 func makeCompactInput(n int) []*schema.Message {
 	msgs := make([]*schema.Message, 0, n*2)
 	for i := 0; i < n; i++ {
 		msgs = append(msgs, schema.UserMessage(fmt.Sprintf("user msg %d", i)))
-		// payload 加大让 EstimateMessageTokens 超过 ModelContextWindow 阈值触发 AutoCompact
 		msgs = append(msgs, schema.AssistantMessage(fmt.Sprintf("assistant resp %d %s", i, strings.Repeat("payload data ", 500))))
 	}
 	return msgs
 }
 
-// applyWithAutoCompact 用真实 WithAutoCompact option 初始化 cfg 让
-// cfg.breakers / breakerMaxFailures 等 unexported 字段被正确填——直接构造
-// AutoCompactConfig 字面值绕过这些 setup 会让 per-session breaker registry
-// 不生效（测试 TestAutoCompact_BreakerIsolatedAcrossSessions 等需要）。
+// applyWithAutoCompact 为独立调用 AutoCompactRun 装配带断路器表的配置。
 func applyWithAutoCompact(cfg *agent_v2.AutoCompactConfig) *agent_v2.AutoCompactConfig {
 	tmpCfg := &agent_v2.Config{}
 	agent_v2.WithAutoCompact(cfg)(tmpCfg)
@@ -265,28 +255,7 @@ func TestReactiveCompact_NoTriggerForUnrelatedError(t *testing.T) {
 	}
 }
 
-// ── Sub-agent 嵌入运行：AutoCompact breaker 隔离 sanity tests ──
-//
-// 背景：Claude Code postCompactCleanup.ts:31-51 用 querySource.startsWith("repl_main_thread")
-// 区分 main vs sub-agent compact，防 sub-agent 触发的 cleanup 误清父线程模块级 cache。
-//
-// crew-go 的设计哲学是「全局态最小化 + 状态走 ctx/session」——所有可变态都通过
-// session 或 ctx 传递，避免 process-global cache。本测试加固此隔离不可被未来重构破坏。
-//
-// **隔离机制（双重）**：
-//   1. WithAutoCompact 每次调用都 `copied.breakers = &sync.Map{}` —— 每个 BasicAgent
-//      独立 breakers Map。父子 BasicAgent 各自的 breakers 物理分离。
-//   2. AutoCompactRun 内 `getOrCreateBreakerEntry(sessionID)` per-sessionID lazy 创建
-//      —— 即使共享 cfg.breakers，不同 RunSession 也是不同的 breaker entry。
-//
-// **AgentAsTool.Call 协议**：sub-agent 调 `t.agent.Run(subCtx, nil, ...)` 传 nil
-// session，BasicAgent.Run 自动 NewRunSession() → 全新 RunID → breaker 自然隔离。
-
-// TestAutoCompact_BreakerIsolatedAcrossSessions 验证 per-sessionID 隔离：
-// 同一个 cfg 下 sessionA 拉爆 breaker，sessionB 完全不受影响。
-//
-// 这模拟「子 agent 嵌入运行拿到新 RunSession 后跟父 agent 共享同一 cfg.breakers」
-// 的（实际不发生但理论上）边界场景——证明即使共享 cfg，per-session 仍隔离。
+// TestAutoCompact_BreakerIsolatedAcrossSessions 验证同一份配置的断路器按 RunID 隔离。
 func TestAutoCompact_BreakerIsolatedAcrossSessions(t *testing.T) {
 	stub := &alwaysFailModel{}
 	rawCfg := &agent_v2.AutoCompactConfig{
@@ -317,8 +286,7 @@ func TestAutoCompact_BreakerIsolatedAcrossSessions(t *testing.T) {
 	delta := callsAfterB - callsAfterA
 	if delta == 0 {
 		t.Fatalf("sessionB breaker 被 sessionA 污染：sessionB 跑 1 次但 LLM 未被调（应正常调用）\n"+
-			"  callsAfterA=%d callsAfterB=%d delta=%d\n"+
-			"  修复方向：getOrCreateBreakerEntry per-sessionID 隔离不能破",
+			"  callsAfterA=%d callsAfterB=%d delta=%d",
 			callsAfterA, callsAfterB, delta)
 	}
 }
@@ -583,20 +551,8 @@ func TestAutoCompact_DoesNotCountSystemTokens(t *testing.T) {
 	}
 }
 
-// TestAutoCompact_BreakerIsolatedAcrossCfgInstances 验证 per-cfg 隔离：
-// 两次 WithAutoCompact 应得到完全独立的 breakers Map（即使 sessionID 相同）。
-//
-// 这模拟「父 BasicAgent + 子 BasicAgent 各自独立配置 AutoCompact」的真实场景——
-// 即使两 agent 跑在同一 sessionID 下（共享 RunSession 编排：Sequential / Parallel /
-// Loop / Handoff / Reflect / Routing 等都共享父 session），cfg.breakers 也是不同
-// sync.Map 实例。这才是 crew-go sub-agent 嵌入运行隔离的**主要机制**。
-//
-// **sanity 设计**：
-//   - 父 cfg.breakers 拉爆后，子 cfg 跑同样的 input 必须**调到次数与父一致**
-//     （证明子有独立 breaker 计数器，不受父 tripped 状态影响）
-//   - 若移除 `copied.breakers = &sync.Map{}`：cfgParent.breakers 与 cfgChild.breakers
-//     都将 nil → getOrCreateBreakerEntry 返 nil → breaker 路径全程绕过 → 子被调远超
-//     MaxConsecutiveFailures+1 → 本测试断言失败
+// TestAutoCompact_BreakerIsolatedAcrossCfgInstances 验证直接调用 AutoCompactRun 时，
+// 两次应用 WithAutoCompact 得到的配置即使传入同一 RunID，也会分别熔断。
 func TestAutoCompact_BreakerIsolatedAcrossCfgInstances(t *testing.T) {
 	stubParent := &alwaysFailModel{}
 	stubChild := &alwaysFailModel{}
@@ -634,20 +590,14 @@ func TestAutoCompact_BreakerIsolatedAcrossCfgInstances(t *testing.T) {
 		t.Fatalf("父 cfg breaker 未跳：%d 次调用 LLM 被打 %d 次（max %d）", rounds, parentCalls, maxAllowed)
 	}
 
-	// 子：跑同样 5 次，**子的 breaker 应当跟父独立**（独立计数 → 跟父一样 N+1 次后跳）
-	// 关键 assert：childCalls ≤ maxAllowed
-	// 假设 H：若移除 copied.breakers = &sync.Map{}（per-cfg 隔离破坏）：
-	//   父 cfg 的 5 次 LLM 调用都不会触发 breaker（breaker 路径绕过）→
-	//   父 stubParent.calls = 5 > maxAllowed → 第一条断言已 fail
-	//   即使第一条放过，子 stubChild.calls 也会 = 5 > maxAllowed → 本断言 fail
+	// 子配置沿用同一个 RunID，独立记录摘要失败并熔断。
 	for i := 0; i < rounds; i++ {
 		_, _ = agent_v2.AutoCompactRun(ctx, cfgChild, msgs)
 	}
 	childCalls := stubChild.calls.Load()
 	if childCalls > maxAllowed {
 		t.Fatalf("子 cfg breaker 被父污染或自身未生效：%d 次调用 LLM 被打 %d 次（max %d）\n"+
-			"  parentCalls=%d childCalls=%d\n"+
-			"  修复方向：WithAutoCompact 必须 `copied.breakers = &sync.Map{}` 物理分离",
+			"  parentCalls=%d childCalls=%d",
 			rounds, childCalls, maxAllowed, parentCalls, childCalls)
 	}
 }

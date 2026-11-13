@@ -816,6 +816,9 @@ ag := agent_v2.NewBasicAgent(
 )
 ```
 
+任务结束时可调用 `ag.CleanupSession(sess.RunID)` 清理该任务的 AutoCompact 断路器。
+如有摘要或排队调用，清理在它们退出后完成。详见 [AutoCompact 断路器](context-compaction.md#清理任务断路器)。
+
 **手写 modelFn 的高级用法**（直接用 agent_v2.NewBasicAgentBuilder 拼底层）：可在
 modelFn 内直接调 `agent_v2.AutoCompactRun(ctx, cfg, msgs)` /
 `agent_v2.ReactiveCompactRun(ctx, cfg, msgs, err)` / `agent_v2.MicroCompactRun(ctx, msgs, cfg)`

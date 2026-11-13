@@ -14,27 +14,27 @@ import (
 )
 
 type failAbortCleanupCP struct {
-	compose_v2.Checkpointer
+	*compose_v2.InMemoryCheckpointer
 	fail bool
 	sid  string
 }
 
 func (c *failAbortCleanupCP) SaveNS(ctx context.Context, sid, ns string, cp *compose_v2.Checkpoint) error {
 	c.sid = sid
-	return c.Checkpointer.SaveNS(ctx, sid, ns, cp)
+	return c.InMemoryCheckpointer.SaveNS(ctx, sid, ns, cp)
 }
 
 func (c *failAbortCleanupCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
 	if c.fail {
 		return 0, errors.New("temporary delete outage")
 	}
-	return c.Checkpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
 }
 
 func TestHandler_AbortCleanupRetry(t *testing.T) {
 	for _, retryByRun := range []bool{false, true} {
 		t.Run(map[bool]string{false: "cancel", true: "new_run"}[retryByRun], func(t *testing.T) {
-			cp := &failAbortCleanupCP{Checkpointer: compose_v2.NewInMemoryCheckpointer()}
+			cp := &failAbortCleanupCP{InMemoryCheckpointer: compose_v2.NewInMemoryCheckpointer()}
 			llm := &askThenAnswerModel{}
 			h := ownedHandler(func(hooks hook.Hooks) agent_v2.Agent {
 				return agent_v2.NewBasicAgent(agent_v2.WithName("abort-retry"), agent_v2.WithModel(llm), agent_v2.WithAskUser(), agent_v2.WithHooks(hooks))

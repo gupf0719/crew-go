@@ -13,6 +13,7 @@ import (
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/hook"
 	"crew-go/schema"
 )
 
@@ -22,8 +23,17 @@ type SessionRecord struct {
 	TaskID          string                     `json:"task_id"`
 	Prior           []*schema.Message          `json:"prior,omitempty"`
 	Closing         bool                       `json:"closing,omitempty"`
+	Cancellation    *SessionCancellation       `json:"cancellation,omitempty"`
+	HistoryKey      agent_v2.HistoryKey        `json:"history_key,omitzero"`
 	ModelData       string                     `json:"model_data,omitempty"`
 	Answers         map[string]*schema.Message `json:"answers,omitempty"`
+}
+
+// SessionCancellation 保存已接受的取消批次与历史归属。清理成功前随原 TaskID 保留。
+type SessionCancellation struct {
+	InterruptIDs       []string             `json:"interrupt_ids"`
+	HistoryKey         *agent_v2.HistoryKey `json:"history_key,omitempty"`
+	CheckpointsDeleted bool                 `json:"checkpoints_deleted,omitempty"`
 }
 
 // SessionStore 在同一共享后端保存会话记录、任务租约及图存档。key 由 Handler 生成，代表
@@ -92,8 +102,11 @@ func (h *handler) openSharedSession(ctx context.Context, key sessionKey) (contex
 	if record != nil && record.TaskID == "" {
 		return ctx, nil, errors.New("agui: shared session has an empty task id")
 	}
+	if record != nil && record.Cancellation != nil && !record.Closing {
+		return ctx, nil, errors.New("agui: shared cancellation is missing its closing state")
+	}
 	shared := &sharedSession{store: h.sessionStore, key: id, record: record}
-	if record != nil && record.Closing {
+	if record != nil && record.Closing && record.Cancellation == nil {
 		if err := h.finishSharedSession(ctx, shared); err != nil {
 			return ctx, nil, err
 		}
@@ -129,8 +142,23 @@ func (s *sharedSession) session() *agent_v2.RunSession {
 	return sess
 }
 
+func (s *sharedSession) bindHistory(ctx context.Context) context.Context {
+	sid, key := s.record.TaskID, s.record.HistoryKey
+	if key != (agent_v2.HistoryKey{}) {
+		return agent_v2.WithTaskHistoryBinding(ctx, sid, key, nil)
+	}
+	return agent_v2.WithTaskHistoryBinding(ctx, sid, key, func(ctx context.Context, key agent_v2.HistoryKey) error {
+		if s.record == nil || s.record.TaskID != sid || s.record.Closing {
+			return errPendingChanged
+		}
+		next := *s.record
+		next.HistoryKey = key
+		return s.save(ctx, &next, "")
+	})
+}
+
 func (s *sharedSession) pending(ctx context.Context) (interruptBatch, error) {
-	if s.record == nil {
+	if s.record == nil || s.record.Closing {
 		return interruptBatch{}, nil
 	}
 	cp, err := s.store.LoadNS(ctx, s.record.TaskID, "")
@@ -149,9 +177,82 @@ func (s *sharedSession) pending(ctx context.Context) (interruptBatch, error) {
 }
 
 var (
-	errAnswerAccepted = errors.New("a different answer has already been accepted for an interrupt")
-	errPendingChanged = errors.New("pending interrupts advanced before the task could be discarded")
+	errAnswerAccepted      = errors.New("a different answer has already been accepted for an interrupt")
+	errPendingChanged      = errors.New("pending interrupts advanced before the task could be discarded")
+	errWorkflowUnavailable = errors.New("the task's workflow version is not available on this instance")
 )
+
+// cancelSharedSession 由会话租约保护，Abort 回调中的变更还持有旧任务的放弃许可。
+func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agent, entries []ResumeEntry, epoch string) error {
+	sess := s.session()
+	opts := []agent_v2.ResumeOption{agent_v2.WithResumeSession(sess), agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)}
+	if saved := s.record.Cancellation; saved != nil {
+		opts = append(opts, agent_v2.WithResumeAbortHistoryKey(saved.HistoryKey))
+	} else if key := s.record.HistoryKey; key != (agent_v2.HistoryKey{}) {
+		opts = append(opts, agent_v2.WithResumeAbortHistoryKey(&key))
+	}
+	cleanup := func(ctx context.Context, sid, ns string, key *agent_v2.HistoryKey) (int32, error) {
+		if sid != sess.RunID || ns != "" || s.record == nil || s.record.TaskID != sid {
+			return 0, errors.New("agui: shared abort requires the root of the current task")
+		}
+		if s.record.Cancellation == nil {
+			batch, err := s.pending(ctx)
+			if err != nil {
+				return 0, err
+			}
+			if len(batch.open) == 0 || batch.epoch != epoch || coverageProblem(entries, batch.open) != "" {
+				return 0, errPendingChanged
+			}
+			next := *s.record
+			next.Closing = true
+			next.Cancellation = &SessionCancellation{HistoryKey: key, InterruptIDs: make([]string, len(entries))}
+			for i, e := range entries {
+				next.Cancellation.InterruptIDs[i] = e.InterruptID
+			}
+			next.Prior, next.Answers, next.ModelData = nil, nil, ""
+			if _, err := s.write(ctx, &next, ""); err != nil {
+				return 0, err
+			}
+		}
+		if s.record.Cancellation.CheckpointsDeleted {
+			return 0, nil
+		}
+		// 与删档原子提交，历史收尾可从该状态重试。
+		next := *s.record
+		progress := *next.Cancellation
+		progress.CheckpointsDeleted = true
+		next.Cancellation = &progress
+		return s.write(ctx, &next, sid)
+	}
+	finalize := func(ctx context.Context, sid string) error {
+		if s.record == nil || s.record.TaskID != sid || s.record.Cancellation == nil || !s.record.Cancellation.CheckpointsDeleted {
+			return errors.New("agui: cannot confirm cancellation before checkpoint cleanup")
+		}
+		// 即使没有存档，仍让后端原子核对会话及原任务的租约。
+		_, err := s.write(ctx, nil, sid)
+		return err
+	}
+	_, err := ag.Resume(ctx, sess.RunID, append(opts, agent_v2.WithResumeAbortCleanup(cleanup, finalize))...)
+	if err == nil && s.record != nil {
+		return errors.New("the agent did not finalize the cancelled shared session")
+	}
+	return err
+}
+
+func (h *handler) reconcileSharedCancellation(ctx context.Context, s *sharedSession) error {
+	if s.record == nil || s.record.Cancellation == nil {
+		return nil
+	}
+	factory := h.workflowFactory(s.record.WorkflowVersion)
+	if factory == nil {
+		return errWorkflowUnavailable
+	}
+	ag := factory(hook.NoOpHooks{})
+	if agent_v2.IsNilAgent(ag) {
+		return errors.New("agui: AgentFactory returned nil agent")
+	}
+	return cancelSharedSession(ctx, s, ag, nil, "")
+}
 
 func (s *sharedSession) accept(ctx context.Context, answers map[string]*schema.Message) (map[string]*schema.Message, error) {
 	next := *s.record
@@ -219,6 +320,11 @@ func (h *handler) servePending(w http.ResponseWriter, r *http.Request) {
 	}
 	defer activity.Release()
 	s := sharedSessionFrom(ctx)
+	if err := h.reconcileSharedCancellation(ctx, s); err != nil {
+		status, code, message := sharedSessionError(ctx, err)
+		_ = writeReject(w, status, code, message)
+		return
+	}
 	if s.record != nil {
 		taskCtx, lease, err := compose_v2.BeginTaskActivity(ctx, s.record.TaskID, nil)
 		if err != nil {
@@ -267,6 +373,9 @@ func sharedSessionError(ctx context.Context, err error) (int, string, string) {
 	}
 	if errors.Is(err, errAnswerAccepted) {
 		return http.StatusConflict, "answer_already_accepted", errAnswerAccepted.Error()
+	}
+	if errors.Is(err, errWorkflowUnavailable) {
+		return http.StatusConflict, "workflow_version_unavailable", errWorkflowUnavailable.Error()
 	}
 	slog.WarnContext(ctx, "agui: 共享会话操作失败", "err", err)
 	return http.StatusServiceUnavailable, "session_store_failed", "the shared session could not be read or updated"

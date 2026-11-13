@@ -38,7 +38,7 @@ func TestHandler_EvictionCompletesCancelledTaskHistory(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				hs := agent_v2.NewInMemoryHistoryStore()
-				cp := &evictionAbortCP{failAbortCleanupCP: &failAbortCleanupCP{Checkpointer: compose_v2.NewInMemoryCheckpointer()}}
+				cp := &evictionAbortCP{failAbortCleanupCP: &failAbortCleanupCP{InMemoryCheckpointer: compose_v2.NewInMemoryCheckpointer()}}
 				runs := 0
 				tk := tool.NewToolkit()
 				tk.Register(tool.NewFuncTool("transfer", "transfer", map[string]any{"type": "object"}, func(context.Context, map[string]any) (*tool.Result, error) { runs++; return tool.Success("done"), nil }))

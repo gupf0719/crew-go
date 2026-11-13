@@ -122,4 +122,6 @@ func (toolBindingKey) ExecutionState()           {}
 // 调用方给整个请求配的环境：脱离时留下；采纳钩子返回的 ctx 时，派生的听钩子的、外来的取框架这次的
 // （compose_v2.EnvironmentKey）。
 func (historyCfgCtxKey) Environment() {}
-func (orchHooksCtxKey) Environment()  {}
+
+func (taskHistoryBindingKey) ExecutionState() {}
+func (orchHooksCtxKey) Environment()          {}

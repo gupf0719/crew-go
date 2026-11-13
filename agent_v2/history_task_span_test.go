@@ -235,7 +235,7 @@ func TestHistoryTaskSpan_GraphPassthrough_OtherTasksInBetween(t *testing.T) {
 	}
 }
 
-// P4：放弃任务时补悬空 tool_call（closeUnansweredToolCallsOnAbort 按任务扫）
+// P4：放弃任务时补悬空 tool_call（closeUnansweredToolCalls 按任务扫）
 func TestHistoryTaskSpan_AbortCloser_OtherTasksInBetween(t *testing.T) {
 	for _, k := range []int{0, 32, 80} {
 		t.Run(fmt.Sprintf("k=%d", k), func(t *testing.T) {

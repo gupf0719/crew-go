@@ -385,7 +385,7 @@ func (e *Executor) cleanupCanceled(ctx context.Context, key taskKey, st *taskSta
 	sid := st.sess.RunID
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	ctx = compose_v2.WithCheckpointerCtx(ctx, e.cp)
+	ctx = compose_v2.WithBoundCheckpointerCtx(ctx, e.cp)
 	ctx = compose_v2.WithSessionIDCtx(ctx, sid)
 	if _, err := e.agent.Resume(ctx, sid, agent_v2.WithResumeSession(st.sess), agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
 		slog.WarnContext(ctx, "a2a server: 已取消任务的存档清理失败", "task", key.taskID, "err", err)
@@ -428,7 +428,7 @@ func (e *Executor) runStreaming(
 	st *taskState,
 	runFn func(context.Context, agent_v2.OrchestrationHooks) ([]*agent_v2.AgentEvent, error),
 ) {
-	runCtx, cancel := context.WithCancel(compose_v2.WithCheckpointerCtx(ctx, e.cp))
+	runCtx, cancel := context.WithCancel(compose_v2.WithBoundCheckpointerCtx(ctx, e.cp))
 	defer cancel()
 	// push sid（= st.sess.RunID）：agent.Run 内部也会 WithSession 同一个 sid，重复 push 同值无害。
 	runCtx = compose_v2.WithSessionIDCtx(runCtx, st.sess.RunID)
@@ -696,7 +696,7 @@ func taskMayBeBusy(err error, sid string) bool {
 
 // discardFailed 回收已失去续接入口的失败任务。在本地及后端许可下清理整棵任务子树。
 func (e *Executor) discardFailed(ctx context.Context, sid string) {
-	ctx = compose_v2.WithCheckpointerCtx(context.WithoutCancel(ctx), e.cp)
+	ctx = compose_v2.WithBoundCheckpointerCtx(context.WithoutCancel(ctx), e.cp)
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cleanupCtx, activity, err := compose_v2.BeginTaskActivity(ctx, "", []string{sid})

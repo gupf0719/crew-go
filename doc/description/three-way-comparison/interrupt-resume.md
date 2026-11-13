@@ -961,4 +961,16 @@ push 一个 flag 来补。**注意那家的不对称**：外层图**从调用方
 
 本地 A2A Go SDK v2.7.0 的 canceler 对已取消任务直接回放状态，完成阶段仍调用 `a2asrv.AgentExecutionCleaner`。
 Executor 在已取消但未清档时保留任务记录，完成回调和下一次 `CancelTask` 都可补偿。
-AG-UI 进程内会话由取消重试、新 Run 和回收接手清理，沿用原取消请求的身份。共享会话由存储事务确认清档。
+AG-UI 进程内会话由取消重试、新 Run 和回收接手清理，沿用原取消请求的身份。
+
+### 2026-11-13 · 取消补偿跨进程
+
+本地 Kubernetes `d5e5f48b880` 的 generic registry 先写入 deletionTimestamp 与 finalizers。
+namespace controller 根据持久标记继续收尾，finalizers 清空后 registry 才删除对象。
+LangGraph `b4cb0f19e` 的 SQLite saver 按 thread ID 在同一 cursor 事务内删除存档与写入记录。
+这个操作依赖调用方继续掌握 thread ID。源码位置分别是 Kubernetes 的 generic registry store 与 namespace controller，
+以及 LangGraph 的 SQLite saver 中的 delete_thread。
+
+AG-UI 在共享会话记录保存原任务的取消意图。删档和清档进度原子提交，历史收尾后再移除记录。
+会话和任务的租约在所有持久化状态转换中同时核对。匹配的取消请求、查询和新 Run 触发补偿。
+进程内模式要求存档与任务映射同寿命，持久化 SQL 与 Redis 接入共享会话路径。

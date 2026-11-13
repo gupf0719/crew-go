@@ -155,6 +155,8 @@ type AgentOutput struct {
 //	不是从入参派生的（存下来的、context.Background()）—— 只借你推的业务值；可配的与取消、截止时间
 //	                         取这次请求的，你在那个 ctx 上加的超时不生效（首次出现时告警一次）
 //
+// 宿主用 compose_v2.WithBoundCheckpointerCtx 绑定存档时，当前执行及嵌套执行沿用该后端。
+//
 // 业务值框架分不出哪些是 span、哪些是凭证，照用钩子返回的那份：**别跨请求存 ctx**——存下的 ctx 会把
 // 那个请求的凭证带进这一次。
 //

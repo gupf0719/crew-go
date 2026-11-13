@@ -771,7 +771,7 @@ var _ model.ChatModel = (*blockingModel)(nil)
 
 // recordingCP 包装 Checkpointer 记录 DeleteSubtree 调用——验证覆盖挂起 / evict 时清旧 cp。
 type recordingCP struct {
-	compose_v2.Checkpointer
+	*compose_v2.InMemoryCheckpointer
 	mu      sync.Mutex
 	deleted []string
 }
@@ -780,7 +780,7 @@ func (c *recordingCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32,
 	c.mu.Lock()
 	c.deleted = append(c.deleted, sid)
 	c.mu.Unlock()
-	return c.Checkpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
 }
 
 func (c *recordingCP) deletedCount() int {
@@ -834,7 +834,7 @@ func TestHandler_ConcurrentResume_Busy(t *testing.T) {
 // TestHandler_ServeRun_DropsStaleCP 验证 serveRun 覆盖已有挂起会话（用户开新对话）时
 // dropCP 清旧 cp 子树（DeleteSubtree），避免旧挂起 cp 孤儿泄漏。
 func TestHandler_ServeRun_DropsStaleCP(t *testing.T) {
-	rcp := &recordingCP{Checkpointer: compose_v2.NewInMemoryCheckpointer()}
+	rcp := &recordingCP{InMemoryCheckpointer: compose_v2.NewInMemoryCheckpointer()}
 	h := ownedHandler(func(hooks hook.Hooks) agent_v2.Agent {
 		return agent_v2.NewBasicAgent(agent_v2.WithName("x"), agent_v2.WithModel(&askThenAnswerModel{}),
 			agent_v2.WithAskUser(), agent_v2.WithHooks(hooks), agent_v2.WithMaxRounds(5))
@@ -955,7 +955,7 @@ func TestHandler_ClientDisconnect_ShortCircuit(t *testing.T) {
 func TestHandler_ReplacementStartupFailureKeepsPreviousQuestion(t *testing.T) {
 	for _, failure := range []string{"disconnect", "nil_factory", "typed_nil_factory", "delete_panic"} {
 		t.Run(failure, func(t *testing.T) {
-			cp := &panicOnReplacementDrop{Checkpointer: compose_v2.NewInMemoryCheckpointer()}
+			cp := &panicOnReplacementDrop{InMemoryCheckpointer: compose_v2.NewInMemoryCheckpointer()}
 			m := &askThenAnswerModel{}
 			var factoryFailure string
 			h := ownedHandler(func(hooks hook.Hooks) agent_v2.Agent {
@@ -1000,7 +1000,7 @@ func TestHandler_ReplacementStartupFailureKeepsPreviousQuestion(t *testing.T) {
 }
 
 type panicOnReplacementDrop struct {
-	compose_v2.Checkpointer
+	*compose_v2.InMemoryCheckpointer
 	fail bool
 }
 
@@ -1008,7 +1008,7 @@ func (cp *panicOnReplacementDrop) DeleteSubtree(ctx context.Context, sid, ns str
 	if cp.fail {
 		panic("replacement storage panic")
 	}
-	return cp.Checkpointer.DeleteSubtree(ctx, sid, ns)
+	return cp.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
 }
 
 // twoToolsModel 第一轮一次发两个 tool_call，第二轮给终局答复。

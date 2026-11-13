@@ -119,8 +119,11 @@ Run → 中断 → RunFinished(outcome=interrupt, interrupts=[{id, reason, messa
 
 ### 共享会话
 
-每个实例用同一 SQL 数据库和存档表。同一个工作流版本须使用兼容的 Agent 图定义。`sql.AGUISessionStore.Setup` 建立
-会话表、存档表和租约表，`agui.WithSessionStore` 同时给 Handler 提供会话与 Checkpointer。
+持久化部署使用 `agui.WithSessionStore` 同时提供会话与 Checkpointer。进程内模式的 `agui.WithCheckpointer`
+要求存档随进程退出而消失，由 `compose_v2.VolatileCheckpointer` 声明。仅经请求中间件注入 Checkpointer 时，Handler 会拒绝请求。
+当前任务和嵌套图沿用 Handler 绑定的存档后端，钩子或图选项设置的 Checkpointer 不会替换它。
+已有 SQLite、PostgreSQL 或 MySQL 部署可用原 Checkpointer 构造 `sql.NewAGUISessionStore` 并运行 `Setup`。
+Redis 部署使用 `redis.NewAGUISessionStore`。每个实例使用相同存储域，同一工作流版本使用兼容的 Agent 图定义。
 
 ```go
 cp := crewsql.NewCheckpointer(db, crewsql.Postgres{})
@@ -135,9 +138,11 @@ mux.Handle("/agui", agui.Handler(build,
 ```
 
 会话记录由 Handler 在启动 Run 前写入，保存任务 ID、Run 时的调用方前文、临时送模数据和已采纳答复。
+根历史写入器在写入前登记实际历史分区，续跑和取消补偿复用这个分区。应用在各实例提供同一 HistoryStore 配置。
+续答时缺少该配置会保留挂起存档与已采纳的答复，可在配置恢复后重试。
 框架按任务 ID 写图存档。挂起集合以根存档为准，SSE 和查询接口都从根存档投影。
 同一 `(owner, threadId)` 的请求先取得共享会话租约，续跑在任务租约内校验当前中断 ID。
-取消还会在放弃许可内复核存档写代。替换或取消时，SQL 后端在一个事务内核对租约、更新会话并清理旧存档。
+替换时，后端原子核对租约、更新会话并清理旧存档。
 
 ```mermaid
 sequenceDiagram
@@ -159,15 +164,29 @@ sequenceDiagram
 线程正被驱动时返回 HTTP 409 `busy`。图已进入下一问时，迟到的旧 ID 返回 `invalid_resume`。
 
 共享路径重建 `agent_v2.RunSession`。已准入工具依赖图存档中的调用状态，新调用按当前工具审批规则判定。
-挂起上限和 TTL 适用于进程内会话。共享会话写入终态标记后，后续同线程请求会补偿未完成的清理。
+挂起上限和 TTL 适用于进程内会话。普通执行写入共享会话终态标记后，后续同线程请求会补偿未完成的清理。
 如果终态标记本身未能写入，可以在数据库恢复后重新发起 Run 清理上一任务。
 进程在形成根存档前退出时，可以用同一线程重新发起 Run 并清理上一任务。
 
 进程内会话在用户全选 `cancelled` 后进入清理状态。清档失败会发送 `abort_failed` 并保留任务入口，
 再次发送原中断 ID 的取消请求可继续清理。送回答案会得到 HTTP 409 `cleanup_pending`。
 同线程新 Run 在清理成功后才能启动。容量或 TTL 回收也会用原取消请求的身份完成清档和历史收尾。
-补偿入口随默认的进程内会话保存。共享路径的取消由会话记录与存档的原子删除完成。
+补偿入口与存档随默认的进程内会话保存。
 
+### 持久化取消补偿
+
+1. 全部取消时，在会话租约和原任务的放弃许可内核对根存档写代及中断 ID。将取消意图与原任务 ID 持久化，任务进入关闭状态。
+2. 存储在同一操作中删除原任务的存档子树并记录清档进度。若该任务有根历史，框架在原分区补齐尚无结果的工具调用。历史后端故障或缺少配置时会保留关闭记录供重试。
+3. 历史收尾成功后，存储在两把租约的保护下移除会话记录。持久历史与存档可使用不同后端，重试会跳过已有结果的调用。
+
+关闭期间续答返回 HTTP 409 `cleanup_pending`。同一取消批次可重试，挂起查询和同线程新 Run 也会尝试补偿。
+如果保留的原工作流工厂不可用，返回 `workflow_version_unavailable`，待该版本恢复后继续。
+进程崩溃留下的有效租约到期后，新实例即可接手。带持久回执时，用新的 `runId` 重试清理，原 `runId` 继续回放原请求的回执。
+取消意图写入失败且未提交时，任务仍可通过原请求重试取消。关闭记录依赖上述请求触发补偿。
+
+旧版进程内模式丢失的会话映射无法从 Checkpointer 还原。清理这类存量档时，应用需要用可核实的原任务 ID 确定范围。
+未带历史分区的旧共享记录按首次取消请求解析历史配置。旧版实例会把关闭标记当成普通执行收尾，
+共享同一会话后端的实例需升级到支持持久化取消补偿的版本。
 
 ### 持久回执与断线续传
 

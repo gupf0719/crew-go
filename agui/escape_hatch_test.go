@@ -20,11 +20,11 @@ import (
 
 // dropFrontierOnLoad 模拟业务自研 backend 漏序列化 `CurrentFrontier`。
 type dropFrontierOnLoad struct {
-	compose_v2.Checkpointer
+	*compose_v2.InMemoryCheckpointer
 }
 
 func (d *dropFrontierOnLoad) LoadNS(ctx context.Context, sid, ns string) (*compose_v2.Checkpoint, error) {
-	cp, err := d.Checkpointer.LoadNS(ctx, sid, ns)
+	cp, err := d.InMemoryCheckpointer.LoadNS(ctx, sid, ns)
 	if err != nil || cp == nil {
 		return cp, err
 	}
@@ -45,7 +45,7 @@ func TestEscapeHatch_AbandonStaysReachableOnUnusableState(t *testing.T) {
 		return agent_v2.NewBasicAgent(agent_v2.WithName("esc"),
 			agent_v2.WithModel(&askThenAnswerModel{}), agent_v2.WithAskUser(),
 			agent_v2.WithHooks(hooks), agent_v2.WithMaxRounds(3))
-	}, agui.WithCheckpointer(&dropFrontierOnLoad{Checkpointer: inner}))
+	}, agui.WithCheckpointer(&dropFrontierOnLoad{InMemoryCheckpointer: inner}))
 
 	// 轮 1：正常中断（写进去的档是完整的，读回来才缺字段）
 	body1 := postAGUI(h, `{"threadId":"T","runId":"r1","messages":[{"role":"user","content":"hi"}]}`).Body.String()

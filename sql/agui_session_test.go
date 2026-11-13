@@ -264,7 +264,10 @@ func sharedHandler(factory agui.AgentFactory, st agui.SessionStore, opts ...agui
 		owner, _ := ctx.Value(aguiOwnerKey{}).(string)
 		return owner
 	})}
-	return agui.Handler(factory, append(base, opts...)...)
+	h := agui.Handler(factory, append(base, opts...)...)
+	// 请求路径用例单独验证请求触发的补偿。后台接管另有跨进程用例。
+	_ = h.Close()
+	return h
 }
 
 func aguiRequest(t *testing.T, owner, method string, body any) *http.Request {
@@ -364,6 +367,8 @@ func runAGUISessionScenarios(t *testing.T, dialect crewsql.Dialect, open func() 
 	checkRunJournal(t, dialect, open)
 	checkWorkflowVersions(t, dialect, open)
 	fixture := func(t *testing.T) aguiFixture { return setupAGUI(t, dialect, open) }
+	t.Run("list_cancellation_pages", func(t *testing.T) { testListAGUICancellations(t, fixture(t)) })
+	t.Run("idle_cancellation_shutdown_and_takeover", func(t *testing.T) { testIdleCancellationShutdown(t, fixture(t)) })
 	t.Run("cancel_recovery_with_old_workflow", func(t *testing.T) { testDurableCancelWorkflowRecovery(t, fixture) })
 	t.Run("cancel_transitions_require_both_fences", func(t *testing.T) { testDurableCancelFences(t, fixture) })
 	t.Run("restart_disconnect_busy_owner_stale", func(t *testing.T) {
@@ -567,4 +572,43 @@ func runAGUISessionScenarios(t *testing.T, dialect crewsql.Dialect, open func() 
 			})
 		}
 	})
+}
+
+func testListAGUICancellations(t *testing.T, f aguiFixture) {
+	t.Helper()
+	ctx := compose_v2.WithCheckpointerCtx(t.Context(), f.a)
+	write := func(key string, record *agui.SessionRecord) {
+		t.Helper()
+		leaseCtx, lease, err := compose_v2.BeginTaskActivity(ctx, key, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lease.Release()
+		if record != nil {
+			var task *compose_v2.TaskActivity
+			leaseCtx, task, err = compose_v2.BeginTaskActivity(leaseCtx, record.TaskID, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer task.Release()
+		}
+		if _, err := f.a.SaveSession(leaseCtx, key, record, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a", &agui.SessionRecord{TaskID: "task-a"})
+	write("b", &agui.SessionRecord{TaskID: "task-b", Closing: true, Cancellation: &agui.SessionCancellation{InterruptIDs: []string{"first"}}})
+	write("c", &agui.SessionRecord{TaskID: "task-c", Closing: true})
+	write("d", &agui.SessionRecord{TaskID: "task-d", Closing: true, Cancellation: &agui.SessionCancellation{CheckpointsDeleted: true}})
+	var cursor string
+	for i, want := range []string{"", "b", "", "d", ""} {
+		keys, next, err := f.b.ListCancellations(ctx, cursor, 1)
+		if err != nil || strings.Join(keys, ",") != want || (next == "") != (i == 4) {
+			t.Fatalf("page %d: keys=%v cursor=%q err=%v", i, keys, next, err)
+		}
+		if want == "b" {
+			write(want, nil)
+		}
+		cursor = next
+	}
 }

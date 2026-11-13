@@ -24,7 +24,7 @@ func newPolicyHandler(max int) *handler {
 		func(hook.Hooks) agent_v2.Agent { return nil },
 		WithOwnerResolver(func(context.Context) string { return "unused" }),
 		WithMaxSessions(max),
-	).(*handler)
+	).handler
 }
 
 func (h *handler) seed(entries []seedEntry) {

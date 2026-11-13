@@ -173,6 +173,7 @@ func (m *AGUIMessage) UnmarshalJSON(b []byte) error {
 // 每请求构造开销可接受；业务想复用重资源（model / toolkit / skillbox）在工厂闭包外
 // 预建、闭包内只 new agent 引用它们即可。Resume 也走工厂新建 agent——crew-go Resume
 // 靠 cp + sid 重建状态，与 agent 实例无关。
+// 后台取消补偿也可与 HTTP 请求并发调用工厂。工厂应只装配 agent，把需要等待的 I/O 放在支持 ctx 的接口里。
 type AgentFactory func(hooks hook.Hooks) agent_v2.Agent
 
 // Option 配置 Handler。
@@ -210,9 +211,7 @@ func WithCheckpointer(cp compose_v2.Checkpointer) Option {
 //
 // # 为什么是惰性而不是后台 sweeper
 //
-// **选择**，不是被逼的：后台 goroutine 的退出点是能解的（`runtime.SetFinalizer` 挂在外层
-// wrapper 上是成熟做法，也可以让 [Handler] 返一个带 `Close()` 的具体类型）。选惰性是因为
-// 它不引入生命周期管理负担、也不要求调用方记得关，而这里回收精度本来就不重要。
+// 进程内会话的过期回收随请求触发。共享会话的后台补偿只处理已写入取消意图的任务。
 //
 // # 为什么默认关
 //
@@ -286,14 +285,15 @@ func WithOwnerResolver(fn compose_v2.OwnerResolver) Option {
 //
 // HITL 闭环：中断→前端收 RunFinished(interrupt)→用户答→带同 threadId + resume=[{interruptId,
 // status, payload}]（对齐官方 ResumeEntry）续发→server 走 Resume。会话默认在进程内持有。配置
-// [WithSessionStore] 可跨实例继续，并通过 GET 查询当前挂起项。
+// [WithSessionStore] 可跨实例继续，并通过 GET 查询当前挂起项。共享 Handler 启动后主动补偿取消，
+// 关闭 HTTP 服务后调用返回值的 Close，等待补偿退出。
 // 存档须在构造 Handler 时配置，仅通过请求 ctx 注入的 Checkpointer 会被拒绝。
 // 当前任务及其嵌套图沿用 Handler 绑定的存档后端。
 // [WithRunStore] 可查询执行回执和续接 SSE，[WithWorkflowVersions] 可为挂起任务选择原定义。
 //
 // 并发：同一 threadId 至多一个在途 Run/Resume（busy 保护）——第二个并发请求返
 // RunError(code=busy)，避免同一挂起 sess 被两个 Resume 并发驱动 / cp 双写。
-func Handler(build AgentFactory, opts ...Option) http.Handler {
+func Handler(build AgentFactory, opts ...Option) *Server {
 	if build == nil {
 		panic("agui: AgentFactory must be non-nil")
 	}
@@ -319,13 +319,16 @@ func Handler(build AgentFactory, opts ...Option) http.Handler {
 			panic("agui: WithCheckpointer requires volatile checkpoints; use WithSessionStore for persistent checkpoints")
 		}
 	}
+	if h.cancellationHistory != nil && h.sessionStore == nil {
+		panic("agui: WithCancellationHistory requires WithSessionStore")
+	}
 	if h.runStore != nil && h.sessionStore == nil {
 		panic("agui: WithRunStore requires WithSessionStore")
 	}
 	if h.workflowVersion != "" && h.sessionStore == nil {
 		panic("agui: WithWorkflowVersions requires WithSessionStore")
 	}
-	return h
+	return newServer(h)
 }
 
 // sessionKey 是会话表的键：**owner 与 threadId 各占一维，不拼串**。
@@ -365,16 +368,17 @@ type sessionEntry struct {
 }
 
 type handler struct {
-	build             AgentFactory
-	sessionStore      SessionStore
-	runStore          RunStore
-	runTimeout        time.Duration
-	workflowVersion   string
-	previousFactories map[string]AgentFactory
-	cp                compose_v2.Checkpointer // HITL Resume 用（nil = 不支持 Resume）
-	maxSessions       int                     // 挂起会话上限（<=0 不限）
-	sessionTTL        time.Duration           // 挂起会话最长闲置（<=0 不按时间回收），见 WithSessionTTL
-	ownerResolver     compose_v2.OwnerResolver
+	build               AgentFactory
+	sessionStore        SessionStore
+	cancellationHistory func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error)
+	runStore            RunStore
+	runTimeout          time.Duration
+	workflowVersion     string
+	previousFactories   map[string]AgentFactory
+	cp                  compose_v2.Checkpointer // HITL Resume 用（nil = 不支持 Resume）
+	maxSessions         int                     // 挂起会话上限（<=0 不限）
+	sessionTTL          time.Duration           // 挂起会话最长闲置（<=0 不按时间回收），见 WithSessionTTL
+	ownerResolver       compose_v2.OwnerResolver
 
 	// 客户端内容没采信 / 没取时各告警一次（见 warnClientMessages）
 	warnedInstructions atomic.Bool
@@ -903,7 +907,7 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 	if allCancelled {
 		var err error
 		if shared != nil {
-			err = cancelSharedSession(ctx, shared, ag, in.Resume, pendingEpoch)
+			err = cancelSharedSession(ctx, shared, ag, in.Resume, pendingEpoch, h.cancellationHistory)
 		} else {
 			if entry.abortCtx == nil {
 				entry.abortCtx = context.WithoutCancel(agent_v2.WithCallerHistoryCtx(abortBase, prior))

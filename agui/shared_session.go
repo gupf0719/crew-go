@@ -3,6 +3,7 @@ package agui
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"maps"
 	"net/http"
 	"reflect"
+	"strings"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
@@ -29,8 +31,10 @@ type SessionRecord struct {
 	Answers         map[string]*schema.Message `json:"answers,omitempty"`
 }
 
-// SessionCancellation 保存已接受的取消批次与历史归属。清理成功前随原 TaskID 保留。
+// SessionCancellation 保存已接受的取消批次、请求身份与历史归属。清理成功前随原 TaskID 保留。
 type SessionCancellation struct {
+	Owner              string               `json:"owner,omitempty"`
+	ThreadID           string               `json:"thread_id,omitempty"`
 	InterruptIDs       []string             `json:"interrupt_ids"`
 	HistoryKey         *agent_v2.HistoryKey `json:"history_key,omitempty"`
 	CheckpointsDeleted bool                 `json:"checkpoints_deleted,omitempty"`
@@ -38,17 +42,22 @@ type SessionCancellation struct {
 
 // SessionStore 在同一共享后端保存会话记录、任务租约及图存档。key 由 Handler 生成，代表
 // (owner, threadId)。LoadSession 在无记录时返回 (nil, nil)，返回值由调用方持有。
+// Handler 的后台补偿可与 HTTP 请求并发调用这些方法。
 type SessionStore interface {
 	compose_v2.Checkpointer
 	compose_v2.TaskLeaseProvider
 	LoadSession(ctx context.Context, key string) (*SessionRecord, error)
+	// ListCancellations 分页列举含取消意图的会话键。空 cursor 从头开始，空 next 表示本轮结束。
+	// 一轮应枚举其间始终存在的取消意图，允许空页和重复键。游标独立于记录是否被删除。
+	// limit 控制一页扫描量，调用方会在持有租约后重读记录。
+	ListCancellations(ctx context.Context, cursor string, limit int) (keys []string, next string, err error)
 	// SaveSession 整体替换记录，record 为 nil 时删除。dropTask 非空时还原子删除该任务的
 	// 全部存档，并返回删除数量。写入时核对 [compose_v2.CheckpointTaskLeaseToken]
 	// 对应的会话租约、record.TaskID 和 dropTask 的任务租约，缺失或过期时拒绝写入。
 	SaveSession(ctx context.Context, key string, record *SessionRecord, dropTask string) (int32, error)
 }
 
-// WithSessionStore 启用共享会话和 GET 挂起查询。store 同时提供 Checkpointer；
+// WithSessionStore 启用共享会话、GET 挂起查询和后台取消补偿。store 同时提供 Checkpointer；
 // [WithSessionTTL] 和 [WithMaxSessions] 只作用于默认的进程内会话表。
 func WithSessionStore(store SessionStore) Option {
 	return func(h *handler) {
@@ -74,17 +83,32 @@ type sharedSessionKey struct{}
 
 func (sharedSessionKey) ExecutionState() {}
 
-// sharedSession 只在持有会话租约的请求内使用。
+// sharedSession 只在持有会话租约的执行范围内使用。
 type sharedSession struct {
 	store  SessionStore
 	key    string
 	record *SessionRecord
 }
 
-func (h *handler) openSharedSession(ctx context.Context, key sessionKey) (context.Context, *compose_v2.TaskActivity, error) {
+const sharedSessionPrefix = "agui-thread:"
+
+func sharedSessionID(key sessionKey) string {
 	// owner 长度先编码，保留 (owner, threadId) 的两个身份维度。
 	sum := sha256.Sum256(fmt.Appendf(nil, "%d:%s%s", len(key.owner), key.owner, key.threadID))
-	id := fmt.Sprintf("agui-thread:%x", sum)
+	return sharedSessionPrefix + hex.EncodeToString(sum[:])
+}
+
+func isSharedSessionID(id string) bool {
+	digest, ok := strings.CutPrefix(id, sharedSessionPrefix)
+	if !ok || len(digest) != sha256.Size*2 {
+		return false
+	}
+	var decoded [sha256.Size]byte
+	_, err := hex.Decode(decoded[:], []byte(digest))
+	return err == nil
+}
+
+func (h *handler) loadSharedSession(ctx context.Context, id string) (context.Context, *compose_v2.TaskActivity, error) {
 	ctx, activity, err := compose_v2.BeginTaskActivity(ctx, id, nil)
 	if err != nil {
 		return ctx, nil, err
@@ -106,13 +130,29 @@ func (h *handler) openSharedSession(ctx context.Context, key sessionKey) (contex
 		return ctx, nil, errors.New("agui: shared cancellation is missing its closing state")
 	}
 	shared := &sharedSession{store: h.sessionStore, key: id, record: record}
-	if record != nil && record.Closing && record.Cancellation == nil {
+	opened = true
+	return context.WithValue(ctx, sharedSessionKey{}, shared), activity, nil
+}
+
+func (h *handler) openSharedSession(ctx context.Context, key sessionKey) (context.Context, *compose_v2.TaskActivity, error) {
+	ctx, activity, err := h.loadSharedSession(ctx, sharedSessionID(key))
+	if err != nil {
+		return ctx, nil, err
+	}
+	var opened bool
+	defer func() {
+		if !opened {
+			activity.Release()
+		}
+	}()
+	shared := sharedSessionFrom(ctx)
+	if shared.record != nil && shared.record.Closing && shared.record.Cancellation == nil {
 		if err := h.finishSharedSession(ctx, shared); err != nil {
 			return ctx, nil, err
 		}
 	}
 	opened = true
-	return context.WithValue(ctx, sharedSessionKey{}, shared), activity, nil
+	return ctx, activity, nil
 }
 
 func sharedSessionFrom(ctx context.Context) *sharedSession {
@@ -183,13 +223,19 @@ var (
 )
 
 // cancelSharedSession 由会话租约保护，Abort 回调中的变更还持有旧任务的放弃许可。
-func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agent, entries []ResumeEntry, epoch string) error {
+func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agent, entries []ResumeEntry, epoch string,
+	resolveHistory func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error),
+	options ...agent_v2.ResumeOption,
+) error {
 	sess := s.session()
-	opts := []agent_v2.ResumeOption{agent_v2.WithResumeSession(sess), agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)}
+	opts := append(options, agent_v2.WithResumeSession(sess), agent_v2.WithResumeAction(agent_v2.ResumeActionAbort))
 	if saved := s.record.Cancellation; saved != nil {
 		opts = append(opts, agent_v2.WithResumeAbortHistoryKey(saved.HistoryKey))
 	} else if key := s.record.HistoryKey; key != (agent_v2.HistoryKey{}) {
 		opts = append(opts, agent_v2.WithResumeAbortHistoryKey(&key))
+	}
+	if resolveHistory != nil {
+		opts = append(opts, agent_v2.WithResumeAbortHistoryStore(resolveHistory))
 	}
 	cleanup := func(ctx context.Context, sid, ns string, key *agent_v2.HistoryKey) (int32, error) {
 		if sid != sess.RunID || ns != "" || s.record == nil || s.record.TaskID != sid {
@@ -205,7 +251,10 @@ func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agen
 			}
 			next := *s.record
 			next.Closing = true
-			next.Cancellation = &SessionCancellation{HistoryKey: key, InterruptIDs: make([]string, len(entries))}
+			next.Cancellation = &SessionCancellation{
+				Owner: compose_v2.GetOwner(ctx), ThreadID: compose_v2.GetThreadID(ctx),
+				HistoryKey: key, InterruptIDs: make([]string, len(entries)),
+			}
 			for i, e := range entries {
 				next.Cancellation.InterruptIDs[i] = e.InterruptID
 			}
@@ -239,7 +288,7 @@ func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agen
 	return err
 }
 
-func (h *handler) reconcileSharedCancellation(ctx context.Context, s *sharedSession) error {
+func (h *handler) reconcileSharedCancellation(ctx context.Context, s *sharedSession, opts ...agent_v2.ResumeOption) error {
 	if s.record == nil || s.record.Cancellation == nil {
 		return nil
 	}
@@ -251,7 +300,7 @@ func (h *handler) reconcileSharedCancellation(ctx context.Context, s *sharedSess
 	if agent_v2.IsNilAgent(ag) {
 		return errors.New("agui: AgentFactory returned nil agent")
 	}
-	return cancelSharedSession(ctx, s, ag, nil, "")
+	return cancelSharedSession(ctx, s, ag, nil, "", h.cancellationHistory, opts...)
 }
 
 func (s *sharedSession) accept(ctx context.Context, answers map[string]*schema.Message) (map[string]*schema.Message, error) {

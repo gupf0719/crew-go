@@ -48,7 +48,7 @@ http.Handle("/agui", h)
 
 每次实际执行使用独立的事件 adapter，`hook.Hooks` 在构造 agent 时注入。业务可在
 工厂闭包外预建 model、toolkit、skillbox，再在每次执行时构造带当前 adapter 的 agent。
-事件重放直接读日志，不调用工厂。
+后台取消补偿也使用工厂。工厂同步装配 agent，需要等待的 I/O 由支持 ctx 的接口承担。事件重放直接读日志。
 
 
 ---
@@ -134,11 +134,16 @@ sessions := crewsql.NewAGUISessionStore(cp)
 if err := sessions.Setup(ctx); err != nil {
     return err
 }
-mux.Handle("/agui", agui.Handler(build,
+h := agui.Handler(build,
     agui.WithOwnerResolver(resolveAuthenticatedOwner),
     agui.WithSessionStore(sessions),
-))
+)
+defer h.Close()
+mux.Handle("/agui", h)
 ```
+
+共享 Handler 构造后立即启动取消补偿。应用停止接收 HTTP 请求并等待在途请求结束后，调用 `Server.Close` 停止并等待后台退出，随后可关闭存储连接。
+自定义 `agui.SessionStore` 实现需提供 `ListCancellations`，以可续的游标枚举已持久化取消意图的会话键。
 
 会话记录由 Handler 在启动 Run 前写入，保存任务 ID、Run 时的调用方前文、临时送模数据和已采纳答复。
 根历史写入器在写入前登记实际历史分区，续跑和取消补偿复用这个分区。应用在各实例提供同一 HistoryStore 配置。
@@ -182,10 +187,16 @@ sequenceDiagram
 2. 存储在同一操作中删除原任务的存档子树并记录清档进度。若该任务有根历史，框架在原分区补齐尚无结果的工具调用。历史后端故障或缺少配置时会保留关闭记录供重试。
 3. 历史收尾成功后，存储在两把租约的保护下移除会话记录。持久历史与存档可使用不同后端，重试会跳过已有结果的调用。
 
-关闭期间续答返回 HTTP 409 `cleanup_pending`。同一取消批次可重试，挂起查询和同线程新 Run 也会尝试补偿。
-如果保留的原工作流工厂不可用，返回 `workflow_version_unavailable`，待该版本恢复后继续。
-进程崩溃留下的有效租约到期后，新实例即可接手。带持久回执时，用新的 `runId` 重试清理，原 `runId` 继续回放原请求的回执。
-取消意图写入失败且未提交时，任务仍可通过原请求重试取消。关闭记录依赖上述请求触发补偿。
+共享 Handler 启动时分页发现已落盘的取消意图，每轮结束后间隔五秒再检查。补偿在会话和任务的双租约下推进。
+即使重启后没有 HTTP 请求，新实例也能在旧租约到期和后端恢复后继续删档、收尾。普通挂起审批保持可续。
+SQL 按会话键顺序分页。Redis 按前缀扫描。两者均从原会话记录判断取消意图，无需修改现有表结构或重建索引。
+
+关闭期间续答返回 HTTP 409 `cleanup_pending`。同一取消批次可重试，挂起查询和同线程新 Run 也可参与补偿。
+如果保留的原工作流工厂不可用，后台保留进度，相关请求返回 `workflow_version_unavailable`。提供原版本后恢复。
+应用若只在 HTTP 中间件注入 HistoryStore，使用 `agui.WithCancellationHistory` 让补偿按已保存的 `HistoryKey` 取得相同逻辑存储。
+回调使用服务凭据。工厂自身提供 HistoryStore 时可直接使用该配置。后台补偿不会重新执行模型或工具。
+
+启用持久回执时，原 `runId` 继续回放原请求回执，手动重试使用新的 `runId`。取消意图写入失败且未提交时，可通过新请求重试取消。
 
 旧版进程内模式丢失的会话映射无法从 Checkpointer 还原。清理这类存量档时，应用需要用可核实的原任务 ID 确定范围。
 未带历史分区的旧共享记录按首次取消请求解析历史配置。旧版实例会把关闭标记当成普通执行收尾，
@@ -203,11 +214,13 @@ runs := crewsql.NewAGUIRunStore(cp)
 if err := runs.Setup(ctx); err != nil {
     return err
 }
-mux.Handle("/agui", agui.Handler(build,
+h := agui.Handler(build,
     agui.WithOwnerResolver(resolveAuthenticatedOwner),
     agui.WithSessionStore(sessions),
     agui.WithRunStore(runs, 2*time.Minute),
-))
+)
+defer h.Close()
+mux.Handle("/agui", h)
 ```
 
 - `GET /agui?threadId=t&runId=r` 查询回执。响应包含 `status`、`lastEventId`，收尾后有 `terminal`。

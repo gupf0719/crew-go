@@ -3,7 +3,9 @@ package redis_test
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -109,17 +111,98 @@ func TestRedisAGUISessionStoreFencesBothTasks(t *testing.T) {
 	}
 }
 
-func TestRedisAGUICancellationSurvivesProcessExit(t *testing.T) {
-	addr, dir := aguiRedisAddress(t), t.TempDir()
-	for _, phase := range []string{"cancel", "restart"} {
-		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
-		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRedisAGUICancelProcessWorker$")
-		cmd.Env = append(os.Environ(), "CREW_TEST_REDIS_CANCEL_ADDR="+addr, "CREW_TEST_REDIS_CANCEL_DIR="+dir, "CREW_TEST_REDIS_CANCEL_PHASE="+phase)
-		out, err := cmd.CombinedOutput()
-		cancel()
+func TestRedisAGUIRecoveryIgnoresNestedStorePrefix(t *testing.T) {
+	client := goredis.NewClient(&goredis.Options{Addr: aguiRedisAddress(t)})
+	t.Cleanup(func() { _ = client.Close() })
+	prefix := "agui-prefix:" + rand.Text()
+	outer := crewredis.NewAGUISessionStore(crewredis.NewCheckpointer(client, crewredis.WithCheckpointerPrefix(prefix)))
+	inner := crewredis.NewAGUISessionStore(crewredis.NewCheckpointer(client, crewredis.WithCheckpointerPrefix(prefix+":agui:session:inner")))
+	key := func(thread string) string {
+		return fmt.Sprintf("agui-thread:%x", sha256.Sum256([]byte("6:tenant"+thread)))
+	}
+	seed := func(store *crewredis.AGUISessionStore, key, task string) {
+		t.Helper()
+		ctx := compose_v2.WithCheckpointerCtx(t.Context(), store)
+		ctx, sessionLease, err := compose_v2.BeginTaskActivity(ctx, key, nil)
 		if err != nil {
-			t.Fatalf("%s worker: %v\n%s", phase, err, out)
+			t.Fatal(err)
 		}
+		defer sessionLease.Release()
+		ctx, taskLease, err := compose_v2.BeginTaskActivity(ctx, task, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer taskLease.Release()
+		if err := store.SaveNS(ctx, task, "", &compose_v2.Checkpoint{}); err != nil {
+			t.Fatal(err)
+		}
+		// 旧记录没有 thread ID，必须用存储键形状识别本实例的会话。
+		if _, err := store.SaveSession(ctx, key, &agui.SessionRecord{TaskID: task, Closing: true,
+			Cancellation: &agui.SessionCancellation{InterruptIDs: []string{"old"}}}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(inner, key("inner"), "inner-task")
+	seed(outer, key("outer"), "outer-task")
+	graph, err := compose_v2.NewBuilder().WithName("prefix-isolation").AddNode("work", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		return nil, errors.New("background recovery must never run the graph")
+	}).AddEdge(compose_v2.StartNode, "work").AddEdge("work", compose_v2.EndNode).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var factories atomic.Int32
+	candidate := "inner:agui:session:" + key("inner")
+	h := agui.Handler(func(hook.Hooks) agent_v2.Agent {
+		factories.Add(1)
+		return agent_v2.NewGraphAgent(graph, agent_v2.WithGraphAgentName("prefix-isolation"),
+			agent_v2.WithGraphOutputReader(func(compose_v2.Channels) *schema.Message { return schema.AssistantMessage("done") }))
+	}, agui.WithSessionStore(firstCancellationCandidate{AGUISessionStore: outer, key: candidate}),
+		agui.WithOwnerResolver(func(context.Context) string { return "tenant" }))
+	defer h.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	defer cancel()
+	waitRedisCancellation(t, ctx, outer, key("outer"))
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := inner.LoadSession(t.Context(), key("inner")); err != nil || rec == nil || factories.Load() != 1 {
+		t.Fatalf("outer recovery crossed the store prefix: record=%+v factory_calls=%d err=%v", rec, factories.Load(), err)
+	}
+	if ok, err := inner.ExistsNS(t.Context(), "inner-task", ""); err != nil || !ok {
+		t.Fatalf("inner checkpoint was lost: %v %v", ok, err)
+	}
+}
+
+type firstCancellationCandidate struct {
+	*crewredis.AGUISessionStore
+	key string
+}
+
+func (s firstCancellationCandidate) ListCancellations(ctx context.Context, cursor string, limit int) ([]string, string, error) {
+	keys, next, err := s.AGUISessionStore.ListCancellations(ctx, cursor, limit)
+	if cursor == "" {
+		// 固定 SCAN 无序候选的顺序，先让宿主碰到另一个存储的旧记录。
+		keys = append([]string{s.key}, keys...)
+	}
+	return keys, next, err
+}
+
+func TestRedisAGUICancellationSurvivesProcessExit(t *testing.T) {
+	addr := aguiRedisAddress(t)
+	for _, restart := range []string{"restart", "idle"} {
+		t.Run(restart, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, phase := range []string{"cancel", restart} {
+				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+				cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRedisAGUICancelProcessWorker$")
+				cmd.Env = append(os.Environ(), "CREW_TEST_REDIS_CANCEL_ADDR="+addr, "CREW_TEST_REDIS_CANCEL_DIR="+dir, "CREW_TEST_REDIS_CANCEL_PHASE="+phase)
+				out, err := cmd.CombinedOutput()
+				cancel()
+				if err != nil || !strings.Contains(string(out), "verified-"+phase) {
+					t.Fatalf("%s worker: %v\n%s", phase, err, out)
+				}
+			}
+		})
 	}
 }
 
@@ -144,6 +227,17 @@ func TestRedisAGUICancelProcessWorker(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 	cp := crewredis.NewCheckpointer(client, crewredis.WithCheckpointerPrefix(filepath.Base(dir)))
 	s := crewredis.NewAGUISessionStore(cp)
+	ref := filepath.Join(dir, "task.txt")
+	key := fmt.Sprintf("agui-thread:%x", sha256.Sum256([]byte("6:tenantshared")))
+	if phase == "idle" {
+		before, err := s.LoadSession(t.Context(), key)
+		if err != nil || before == nil || before.Cancellation == nil || before.Cancellation.CheckpointsDeleted {
+			t.Fatalf("fixture has no uncompleted cancellation: %+v %v", before, err)
+		}
+		if ok, err := cp.ExistsNS(t.Context(), before.TaskID, ""); err != nil || !ok {
+			t.Fatalf("fixture has no checkpoint: %v %v", ok, err)
+		}
+	}
 	var store agui.SessionStore = s
 	if phase == "cancel" {
 		store = failedRedisCancellation{s}
@@ -167,6 +261,11 @@ func TestRedisAGUICancelProcessWorker(t *testing.T) {
 			agent_v2.WithGraphInputWriter(func(*schema.Message) []compose_v2.ChannelWrite { return nil }),
 			agent_v2.WithGraphOutputReader(func(compose_v2.Channels) *schema.Message { return schema.AssistantMessage("done") }))
 	}, agui.WithOwnerResolver(func(context.Context) string { return "tenant" }), agui.WithSessionStore(store))
+	t.Cleanup(func() { _ = h.Close() })
+	if phase != "idle" {
+		// 请求路径仍可在后台补偿停用时接手。
+		_ = h.Close()
+	}
 	post := func(body string) string {
 		r := httptest.NewRecorder()
 		h.ServeHTTP(r, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/agui", strings.NewReader(body)))
@@ -175,7 +274,6 @@ func TestRedisAGUICancelProcessWorker(t *testing.T) {
 	cancelBody := func(id, status string) string {
 		return `{"threadId":"shared","resume":[{"interruptId":"` + id + `","status":"` + status + `","payload":"yes"}]}`
 	}
-	ref := filepath.Join(dir, "task.txt")
 	switch phase {
 	case "cancel":
 		post(`{"threadId":"shared","messages":[{"role":"user","content":"begin"}]}`)
@@ -194,8 +292,9 @@ func TestRedisAGUICancelProcessWorker(t *testing.T) {
 		if err := os.WriteFile(ref, []byte(task+"\n"+id), 0600); err != nil {
 			t.Fatal(err)
 		}
+		fmt.Println("verified-cancel")
 		os.Exit(0)
-	case "restart":
+	case "restart", "idle":
 		raw, err := os.ReadFile(ref)
 		if err != nil {
 			t.Fatal(err)
@@ -204,16 +303,43 @@ func TestRedisAGUICancelProcessWorker(t *testing.T) {
 		if !ok {
 			t.Fatal("missing task reference")
 		}
-		if got := post(cancelBody(id, "resolved")); !strings.Contains(got, "cleanup_pending") {
-			t.Fatalf("cancelled task remained executable: %s", got)
-		}
-		if got := post(cancelBody(id, "cancelled")); !strings.Contains(got, `"type":"cancelled"`) {
-			t.Fatalf("restart failed to clean up: %s", got)
+		if phase == "idle" {
+			ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+			defer cancel()
+			waitRedisCancellation(t, ctx, s, key)
+		} else {
+			if got := post(cancelBody(id, "resolved")); !strings.Contains(got, "cleanup_pending") {
+				t.Fatalf("cancelled task remained executable: %s", got)
+			}
+			if got := post(cancelBody(id, "cancelled")); !strings.Contains(got, `"type":"cancelled"`) {
+				t.Fatalf("restart failed to clean up: %s", got)
+			}
 		}
 		if exists, err := cp.ExistsNS(t.Context(), task, ""); err != nil || exists || executions.Load() != 0 {
 			t.Fatalf("cleanup failed: exists=%v executions=%d err=%v", exists, executions.Load(), err)
 		}
+		fmt.Println("verified-" + phase)
 	default:
 		t.Fatal("unknown worker phase")
+	}
+}
+
+func waitRedisCancellation(t *testing.T, ctx context.Context, s *crewredis.AGUISessionStore, key string) {
+	t.Helper()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		record, err := s.LoadSession(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("idle handler did not clear durable cancellation")
+		case <-ticker.C:
+		}
 	}
 }

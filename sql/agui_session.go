@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"crew-go/agui"
@@ -85,6 +86,50 @@ func (s *AGUISessionStore) LoadSession(ctx context.Context, key string) (*agui.S
 		stored.TaskID = stored.VersionedTaskID
 	}
 	return &stored.SessionRecord, nil
+}
+
+// ListCancellations 按会话键分页列举已写入取消意图的记录。游标为上一页最后扫描的键。
+func (s *AGUISessionStore) ListCancellations(ctx context.Context, cursor string, limit int) ([]string, string, error) {
+	if limit <= 0 {
+		return nil, "", errors.New("sql agui cancellation page size must be positive")
+	}
+	ph := s.dialect.Placeholder
+	query := fmt.Sprintf("SELECT sid, payload FROM %s WHERE sid > %s ORDER BY sid LIMIT %s",
+		s.sessionTable, ph(1), ph(2))
+	rows, err := s.db.QueryContext(ctx, query, cursor, limit)
+	if err != nil {
+		return nil, "", fmt.Errorf("sql agui list cancellations: %w", err)
+	}
+	defer rows.Close() // rows.Err 报告迭代及自动关闭时的错误。
+	var keys []string
+	var last string
+	count := 0
+	for rows.Next() {
+		var key string
+		var payload dbsql.RawBytes
+		if err := rows.Scan(&key, &payload); err != nil {
+			return nil, "", fmt.Errorf("sql agui read cancellation key: %w", err)
+		}
+		last = key
+		count++
+		var header struct {
+			Cancellation *json.RawMessage `json:"cancellation"`
+		}
+		if err := json.Unmarshal(payload, &header); err != nil {
+			slog.WarnContext(ctx, "sql: 无法识别待补偿会话的记录", "session", key, "err", err)
+			continue
+		}
+		if header.Cancellation != nil {
+			keys = append(keys, key)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("sql agui list cancellations: %w", err)
+	}
+	if count == limit {
+		return keys, last, nil
+	}
+	return keys, "", nil
 }
 
 // SaveSession 持有 key 的有效租约时整条替换，record 为 nil 时删除。

@@ -66,7 +66,7 @@ func capHandler(max int) *handler {
 		}),
 		WithCheckpointer(compose_v2.NewInMemoryCheckpointer()),
 		WithMaxSessions(max),
-	).(*handler)
+	).handler
 }
 
 // openSuspended 让 owner 开一个会话并停在 ask_user 中断上。

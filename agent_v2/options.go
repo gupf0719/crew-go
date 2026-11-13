@@ -406,9 +406,11 @@ type ResumeOption func(*resumeConfig)
 
 type resumeConfig struct {
 	action             ResumeAction
+	abortContext       context.Context
 	abortCleanup       func(context.Context, string, string, *HistoryKey) (int32, error)
 	abortFinalize      func(context.Context, string) error
 	abortHistoryKey    HistoryKey
+	abortHistoryStore  func(context.Context, HistoryKey) (HistoryStore, error)
 	useAbortHistoryKey bool
 	userInputs         map[string]*schema.Message // by InterruptID
 	userText           string                     // 非寻址型「用户这轮说了什么」
@@ -462,6 +464,17 @@ func WithResumeAbortHistoryKey(key *HistoryKey) ResumeOption {
 	return func(c *resumeConfig) {
 		c.abortHistoryKey, c.useAbortHistoryKey = saved, true
 	}
+}
+
+// WithResumeAbortHistoryStore 在存档清理后为宿主指定的历史分区取得 HistoryStore。
+// 用于独立于 HTTP 请求的补偿。解析失败时保留宿主的清档进度。
+func WithResumeAbortHistoryStore(resolve func(context.Context, HistoryKey) (HistoryStore, error)) ResumeOption {
+	return func(c *resumeConfig) { c.abortHistoryStore = resolve }
+}
+
+// WithResumeAbortContext 让 Abort 同时响应宿主的生命周期取消，保留 Resume 入参上的执行身份和租约。
+func WithResumeAbortContext(lifecycle context.Context) ResumeOption {
+	return func(c *resumeConfig) { c.abortContext = lifecycle }
 }
 
 // WithResumeUserInputs 用 map[InterruptID]Message 答多 pending interrupts。

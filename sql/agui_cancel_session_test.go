@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"crew-go/agent_v2"
 	"crew-go/agui"
 	"crew-go/compose_v2"
 	crewsql "crew-go/sql"
@@ -18,6 +19,76 @@ type failingCancelSessionStore struct {
 	*crewsql.AGUISessionStore
 	key    string
 	before func(context.Context, string, *agui.SessionRecord, string) error
+}
+
+func testIdleCancellationShutdown(t *testing.T, f aguiFixture) {
+	t.Helper()
+	history := agent_v2.NewInMemoryHistoryStore()
+	fixture := &questions{}
+	factory := fixture.factory(t)
+	store := &failingCancelSessionStore{AGUISessionStore: f.a}
+	store.before = func(_ context.Context, _ string, r *agui.SessionRecord, drop string) error {
+		if r != nil && r.Cancellation != nil && drop != "" {
+			return errors.New("delete unavailable")
+		}
+		return nil
+	}
+	base := sharedHandler(factory, store)
+	withHistory := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		base.ServeHTTP(w, r.WithContext(agent_v2.WithHistoryCtx(r.Context(), history, "history-tenant")))
+	})
+	aguiPost(t, withHistory, "tenant", aguiStart())
+	id := onlyAGUIQuestion(t, aguiPending(t, withHistory, "tenant"), "q1")
+	sid := fixture.id.Load().(string)
+	if r := aguiPost(t, withHistory, "tenant", aguiAnswer(id, "cancelled", nil)); !strings.Contains(r.Body.String(), "abort_failed") {
+		t.Fatal(r.Body)
+	}
+	store.before = nil
+	started := make(chan struct{}, 1)
+	released := make(chan struct{})
+	a := agui.Handler(factory, agui.WithSessionStore(f.a), agui.WithOwnerResolver(func(context.Context) string { return "tenant" }),
+		agui.WithCancellationHistory(func(ctx context.Context, _ agent_v2.HistoryKey) (agent_v2.HistoryStore, error) {
+			started <- struct{}{}
+			<-ctx.Done()
+			close(released)
+			return nil, ctx.Err()
+		}))
+	t.Cleanup(func() { _ = a.Close() })
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("idle recovery did not start history finalization")
+	}
+	checkCancelCheckpoint(t, f.b, sid, false)
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		_ = a.Close()
+	}()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("closing server did not cancel and join background recovery")
+	}
+	select {
+	case <-released:
+	default:
+		t.Fatal("close returned before the resolver exited")
+	}
+	saved, err := f.b.LoadSession(t.Context(), store.key)
+	if err != nil || saved == nil || saved.Cancellation == nil || !saved.Cancellation.CheckpointsDeleted {
+		t.Fatalf("close lost durable progress: %+v %v", saved, err)
+	}
+	b := agui.Handler(factory, agui.WithSessionStore(f.b), agui.WithOwnerResolver(func(context.Context) string { return "tenant" }),
+		agui.WithCancellationHistory(func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error) { return history, nil }))
+	defer b.Close()
+	waitIdleCancel(t, func() (bool, error) {
+		saved, err := f.b.LoadSession(t.Context(), store.key)
+		return saved == nil, err
+	})
+	if fixture.second.Load() != 0 {
+		t.Fatal("background recovery ran a suspended node")
+	}
 }
 
 func (s *failingCancelSessionStore) SaveSession(ctx context.Context, key string, record *agui.SessionRecord, drop string) (int32, error) {

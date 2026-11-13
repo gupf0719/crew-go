@@ -972,5 +972,12 @@ LangGraph `b4cb0f19e` 的 SQLite saver 按 thread ID 在同一 cursor 事务内�
 以及 LangGraph 的 SQLite saver 中的 delete_thread。
 
 AG-UI 在共享会话记录保存原任务的取消意图。删档和清档进度原子提交，历史收尾后再移除记录。
-会话和任务的租约在所有持久化状态转换中同时核对。匹配的取消请求、查询和新 Run 触发补偿。
+会话和任务的租约在所有持久化状态转换中同时核对。匹配的取消请求、查询和新 Run 均可触发补偿。
 进程内模式要求存档与任务映射同寿命，持久化 SQL 与 Redis 接入共享会话路径。
+
+### 2026-11-13 · 零请求重启补偿
+
+Kubernetes namespace controller 的 informer 启动时通过 reflector `ListAndWatch` 读回现有对象。
+带 deletionTimestamp 的对象在首次 Add 事件入队，worker 失败后重新排队，controller 随 stopCh 停止。
+AG-UI 的 SQL 和 Redis 没有统一 watch 接口，采用启动分页发现、定期重试的方式读取同一份取消意图。
+取得会话租约后重读当前记录，再用任务放弃许可复用删档与历史收尾。普通挂起会话继续等待业务答复。

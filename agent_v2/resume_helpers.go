@@ -126,6 +126,13 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
 		defer cancel()
+		if rcfg.abortContext != nil {
+			if err := rcfg.abortContext.Err(); err != nil {
+				return nil, ctx, err
+			}
+			stop := context.AfterFunc(rcfg.abortContext, cancel)
+			defer stop()
+		}
 		runID = ""
 		if sessionID != "" {
 			abandoned = []string{sessionID}
@@ -155,7 +162,9 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		var historyKey *HistoryKey
 		var hc *historyConfig
 		if ns == "" {
-			hc = resolveHistoryConfigForAbort(ctx, subs)
+			if !rcfg.useAbortHistoryKey {
+				hc = resolveHistoryConfigForAbort(ctx, subs)
+			}
 			if rcfg.useAbortHistoryKey {
 				if key := rcfg.abortHistoryKey; key != (HistoryKey{}) {
 					if key.Owner == "" || key.ConvID != compose_v2.GetThreadID(ctx) {
@@ -186,10 +195,24 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		}
 		if historyKey != nil {
 			// 已固定历史归属的取消可以先落盘并清档，历史后端不可用时保留进度。
-			if hc == nil || hc.store == nil {
+			var store HistoryStore
+			if rcfg.abortHistoryStore != nil {
+				store, err = rcfg.abortHistoryStore(ctx, *historyKey)
+				if err != nil {
+					return nil, ctx, fmt.Errorf("%s %q: resolve abort history store (sid=%q): %w", agentTypeName, agentName, sessionID, err)
+				}
+			} else {
+				if rcfg.useAbortHistoryKey {
+					hc = resolveHistoryConfigForAbort(ctx, subs)
+				}
+				if hc != nil {
+					store = hc.store
+				}
+			}
+			if isFrameworkNil(store) {
 				return nil, ctx, fmt.Errorf("%s %q: abort history store is unavailable (sid=%q)", agentTypeName, agentName, sessionID)
 			}
-			if err := closeUnansweredToolCalls(ctx, hc.store, *historyKey, sessionID); err != nil {
+			if err := closeUnansweredToolCalls(ctx, store, *historyKey, sessionID); err != nil {
 				if rcfg.abortFinalize != nil || errors.Is(err, compose_v2.ErrTaskLeaseLost) {
 					return nil, ctx, fmt.Errorf("%s %q: abort history (sid=%q): %w", agentTypeName, agentName, sessionID, err)
 				}

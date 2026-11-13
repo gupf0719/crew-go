@@ -216,10 +216,8 @@ type BasicAgentBuilder struct {
 	// finishToolResult 在 OnToolEnd 与批内裁决之后按大小处理还没处理的 tool_result（开了转存时设，见
 	// agent_v2/tool_render.go）；failed / code 是钩子之后的结论。nil = 没有要处理的。
 	finishToolResult func(ctx context.Context, toolName string, msg *schema.Message, failed bool, code string)
-	// finalizeToolMemo 在这一批处理完（OnToolEnd、批内裁决、按大小处理）之后把结果定进这次执行的工具账（见
-	// agent_v2 的 finalizeToolMemo）；hookSignals[i] 是第 i 个调用的 OnToolEnd 钩子做出的决定。nil = 不定（自写
-	// toolsFn 时没有框架的工具账）。
-	finalizeToolMemo func(ctx context.Context, toolCalls []schema.ToolCall, results []*schema.Message, hookSignals []compose_v2.Signals)
+	// useToolMemo 由 BasicAgent 启用。低阶 builder 的自定义 toolsFn 自行管理进度。
+	useToolMemo bool
 	// turnGates / turnGateMaxVetoes 见 WithTurnGates：回合结束闸门（空 = 不建闸门节点）。
 	turnGates         []TurnGateFunc
 	turnGateMaxVetoes int
@@ -354,7 +352,7 @@ const ToolOutcomeDenied = "denied"
 const ToolReplayedExtraKey = "replayed"
 
 // ToolRedispatchedExtraKey 标「这一批 tool_call 是续跑时再次派发的」（OnToolStart 的 `ToolInput.Extra`，值为 true）：这一批
-// 上次已经交给工具执行过（内容在那一次定下，见 fixToolCallContent），没整体成功、续跑重跑 tools 节点时同一批的每个调用
+// 上次已经交给工具执行过（内容在那一次定下，见 saveToolCallContent），没整体成功、续跑重跑 tools 节点时同一批的每个调用
 // 再触发一次 OnToolStart。把调用转发给前端的钩子据它不再重开同一个调用（agui：同一个 id 再发 TOOL_CALL_START 是重开、
 // 参数追加）。只看「是不是同一批的再次派发」，跟 toolCallId 无关——provider 在不同轮次复用同一个 ID 的不是重开。
 const ToolRedispatchedExtraKey = "redispatched"
@@ -928,7 +926,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	if name == "" {
 		name = "basic_agent"
 	}
-	backgroundNotes, finishToolResult, finalizeToolMemo := b.backgroundNotes, b.finishToolResult, b.finalizeToolMemo
+	backgroundNotes, finishToolResult, useToolMemo := b.backgroundNotes, b.finishToolResult, b.useToolMemo
 
 	modelNode := func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 		msgs, _ := compose_v2.Get(chs, basicMessagesCh)
@@ -1307,10 +1305,23 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// (retrieval / embedding / guardrail). lookup 返空字符串时业务
 		// 未实现 Categorizer, ti.Extra 不填, observability 走默认 tool kind.
 		categoryLookup := compose_v2.GetToolCategoryLookup(ctx)
-		// 这一批上一次已经处理完、只是那次执行在提交之前作废了的那几个调用（见 agent_v2 的 fixedToolResults）：续跑时不再
-		// 处理——工具不执行（工具账命中）、OnToolStart / OnToolEnd 都不触发，结论与钩子做出的决定用定下时那份。
-		fixedCalls, fixedHookSigs := fixedToolResults(ctx, toolCalls)
-		isFixed := func(i int) bool { return i < len(fixedCalls) && fixedCalls[i] }
+		// 定稿的调用跳过开始与结束钩子，复用原来的结果和信号。
+		batch := &toolBatch{messages: msgs}
+		fixedContent, redispatched := fixedToolCallContentOf(ctx, toolCalls)
+		if useToolMemo && redispatched {
+			var err error
+			batch.memo, err = loadToolMemo(ctx, fixedContent)
+			if err != nil {
+				return nil, err
+			}
+		}
+		isFixed := func(i int) bool {
+			if i >= len(batch.memo) || batch.memo[i] == nil {
+				return false
+			}
+			result := batch.memo[i].Result
+			return result != nil && result.ToolMsg != nil && result.Final
+		}
 		// unfixed 去掉定下了的那几个：它们的 OnToolStart 没触发，失败路径上也不补 OnToolEnd（见 endSettledToolCalls）
 		unfixed := func(ends []toolCallEnd) []toolCallEnd {
 			out := make([]toolCallEnd, len(ends))
@@ -1325,9 +1336,9 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 都从节点的 ctx 起算，看不到别的调用的钩子放的值；节点后面的工作用节点自己的 ctx（见 BasicAgentToolFn）。
 		callCtxs := make([]context.Context, len(toolCalls))
 		// 这一批上次已经派发过（内容已定下）：续跑时的再次派发，OnToolStart 带上标记（见 ToolRedispatchedExtraKey）
-		redispatched := toolCallsDispatchedBefore(ctx)
 		for i := range toolCalls {
 			if isFixed(i) {
+				toolCalls[i] = fixedContent[i]
 				callCtxs[i] = ctx
 				continue
 			}
@@ -1366,16 +1377,26 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			toolCalls[i].Function.Arguments = ti.ArgumentsJSON
 			callCtxs[i] = callCtx
 		}
-		// 改写只在这一批第一次交给工具执行时生效：之后的执行换回那一次定下的内容（见 fixToolCallContent）。下面的
+		// 改写只在这一批第一次交给工具执行时生效：之后的执行换回那一次定下的内容（见 saveToolCallContent）。下面的
 		// 工具执行、OnToolEnd、这批决定的裁决都用这一份。
-		fixToolCallContent(ctx, toolCalls, schema.GetToolCalls(last))
+		if redispatched {
+			copy(toolCalls, fixedContent)
+		} else {
+			saveToolCallContent(ctx, toolCalls, schema.GetToolCalls(last))
+			if useToolMemo {
+				var err error
+				batch.memo, err = loadToolMemo(ctx, toolCalls)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 
 		// 调用业务 tools fn。盖章：这里跑的工具的产出会被本节点记成 tool_result（见
 		// withToolResultRecorder）——AgentAsTool 据此不在边界补记历史。只盖在工具这一段上（这一批的 ctx 与
 		// 每个调用执行用的 ctx）：钩子里的调用不是工具本身，交给 OnToolEnd 的 callCtxs 不带章。
 		// 收集器：框架自己的 toolsFn 把每个调用收到的上行信号登记在这里，OnToolEnd 跑完之后再定（见
 		// tool_batch_signals.go）。
-		batch := &toolBatch{messages: msgs}
 		execCtxs := make([]context.Context, len(callCtxs))
 		for i, c := range callCtxs {
 			execCtxs[i] = withToolBatch(withToolResultRecorder(c), batch)
@@ -1429,7 +1450,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			}
 			// 定下了的不再处理（OnToolStart 也没触发，见上）：结论与钩子做出的决定用定下时那份。
 			if isFixed(i) {
-				hookSignals = append(hookSignals, fixedHookSigs[i])
+				hookSignals = append(hookSignals, batch.memo[i].Result.HookSignals)
 				failedAfterHook[i], codeAfterHook[i] = !before.Success, before.ErrorCode
 				continue
 			}
@@ -1521,8 +1542,8 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		}
 		// 这一批处理完了：结果定进工具账（见 agent_v2 的 finalizeToolMemo）。被裁决换掉的那几条定下的是替换后的失败结果——
 		// 不定的话账里留着它转存前、钩子脱敏前的原文，节点之后作废时随出口存档落盘（审计实测）。
-		if finalizeToolMemo != nil {
-			finalizeToolMemo(ctx, toolCalls, results, hookSignals)
+		if useToolMemo {
+			finalizeToolMemo(ctx, toolCalls, batch.memo, results, hookSignals)
 		}
 		// 钩子做出的决定排在这批调用的决定之后交，按钩子的先后（理由见循环里收的那一处）。
 		for _, s := range hookSignals {
@@ -1934,7 +1955,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 // （compose_v2.EnterPhase）——自己的私有态一格、自己的提问与嵌套调用计数、自己的相位名，名字是
 // 钩子名 + 工具名 + 所属 tool_call（工具名与 callID 为空、idx 为 -1 表示整批）。工具名在
 // OnToolStart 那里是它改写之前的名字（相位在钩子跑之前就定了），之后是实际执行的名字——这一批
-// 第一次交给工具执行时定下的那个（见 fixToolCallContent），续跑时不变。这一维让 OnToolEnd 记过的
+// 第一次交给工具执行时定下的那个（见 saveToolCallContent），续跑时不变。这一维让 OnToolEnd 记过的
 // 结果只认那个工具、不依赖那份记录：改写曾经在续跑时生效，那时新工具的结果读到旧工具的记录、没过
 // 审计就放行（实测）。现在它是冗余的第二道，没有测试覆盖。工具体的分域同样带工具名。
 //

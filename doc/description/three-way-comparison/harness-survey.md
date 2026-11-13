@@ -130,7 +130,7 @@ compaction 细节：前 `ContextWindowCompactionStrategy`（token 预算）+ 后
 属性，不该只在审批生效时固定。
 
 **决策**（已实现）：
-- 一批调用的内容在第一次交给工具执行时定下（`agent_v2.fixToolCallContent`，在 `OnToolStart` 改写被消费的那一处、
+- 一批调用的内容在第一次交给工具执行时定下（`agent_v2.saveToolCallContent`，在 `OnToolStart` 改写被消费的那一处、
   对所有调用、不看审批开没开；只另存被改写过的，没改写的那份本来就在存档的 assistant 消息上）。约定随之变成
   「`OnToolStart` 对 Name / ArgumentsJSON 的改写只在这一批第一次执行时生效」。
 - 审批问题在自己的相位里占提问序号（同 LangChain 的「审批与工具调用各是一个任务」），工具自己的提问不随审批问不问挪位。

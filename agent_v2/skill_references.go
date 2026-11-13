@@ -159,7 +159,7 @@ func skillReferenceTask(ctx context.Context) string {
 	return compose_v2.GetSessionID(ctx)
 }
 
-func newSkillReferenceReads(ctx context.Context, messages []*schema.Message, memo map[string]*toolMemoEntry) *skillReferenceReads {
+func newSkillReferenceReads(ctx context.Context, messages []*schema.Message, memo []*toolCallRecord) *skillReferenceReads {
 	reads := &skillReferenceReads{byKey: make(map[string]bool), annotation: skillReferenceReadKey + "." + skillReferenceTask(ctx)}
 	for _, message := range messages {
 		if message != nil {
@@ -168,9 +168,9 @@ func newSkillReferenceReads(ctx context.Context, messages []*schema.Message, mem
 			}
 		}
 	}
-	for _, entry := range memo {
-		if entry != nil && entry.ToolMsg != nil {
-			if key, _ := entry.ToolMsg.Annotations[skillReferenceReadKey].(string); key != "" {
+	for _, record := range memo {
+		if record != nil && record.Result != nil && record.Result.ToolMsg != nil {
+			if key, _ := record.Result.ToolMsg.Annotations[skillReferenceReadKey].(string); key != "" {
 				reads.byKey[key] = true
 			}
 		}

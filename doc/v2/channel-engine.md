@@ -715,6 +715,12 @@ fan-out 超步：frontier=["worker1", "worker2", "worker3"] → 并发执行 3 w
 聚合超步：frontier=["aggregator"]（所有 worker 写完 channel 后路由到 aggregator）
 ```
 
+用 `compose_v2.WithMaxConcurrentNodes(ctx, n)` 设置每张图每个超步的执行预算。默认 `0` 表示并发派发整批。
+开启预算后，调度器先等到空位再创建成员 goroutine，按 frontier 顺序派发，并在同一超步内汇合结果。
+调用方取消时，未派发的成员保留原身份，已开始的成员退出后照常提交成功进度。
+每张嵌套图继承配置并独立调度。父成员可以在预算为 1 时运行子图。
+`GraphBuilder.WithMaxFrontierWidth` 另行限制整个 frontier 的宽度，超宽仍以终局错误退出。
+
 ### 7.3 Per-branch delta + 仅重跑失败/中断分支
 
 v1 时代为支持"fan-out 部分失败 Resume 只重跑失败分支"加了 `superstep_snapshot` per-branch

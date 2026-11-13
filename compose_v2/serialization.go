@@ -279,6 +279,8 @@ func UnmarshalTagged(data []byte) (any, error) {
 //   - v20：部分提交保存 CompletedWriteOwners。含单写入者 channel 的部分提交需要该字段，
 //     空表表示没有这类写入。缺少归属时拒绝恢复并保留存档，避免成功兄弟的写入被覆盖。
 
+//   - v21：BasicAgent 将工具账按调用写入 NodeStates。恢复旧批次时迁移其审批、结果和信号。
+
 // CheckpointSchemaVer 是 Checkpoint 当前 schema 版本号, 仅供观测 / 业务 debug
 // 用 — 框架不在 Marshal/Unmarshal 路径校验.
 //
@@ -294,7 +296,7 @@ func UnmarshalTagged(data []byte) (any, error) {
 //   - 业务侧迁移逻辑负责按 cp.SchemaVer 分支决定 unmarshal 字段
 //   - framework 加 `Migrate(v Old, vNew int) (*Checkpoint, error)` 类工具
 //   - 不在 Unmarshal 路径加 fail-fast
-const CheckpointSchemaVer = 20
+const CheckpointSchemaVer = 21
 
 // checkpointSchemaVer (private alias 保 framework 内部 reference 兼容).
 const checkpointSchemaVer = CheckpointSchemaVer

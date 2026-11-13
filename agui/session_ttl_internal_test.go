@@ -50,6 +50,29 @@ func seedPending(t *testing.T, h *handler, cp compose_v2.Checkpointer, key sessi
 	return sess.RunID
 }
 
+func TestSessionRelease_OnlyReleasesClaimedEntry(t *testing.T) {
+	h, cp, _ := ttlFixture(t, 0)
+	key := sessionKey{owner: "owner", threadID: "thread"}
+	seedPending(t, h, cp, key, 0)
+	old, busy := h.acquireForResume(key)
+	if old == nil || busy {
+		t.Fatal("expected to claim the original session")
+	}
+	h.removeEntry(key)
+	_, _, next := h.acquireForRun(key)
+	if next == nil {
+		t.Fatal("expected to claim a replacement session")
+	}
+	h.releaseBusy(key, old)
+	if _, _, third := h.acquireForRun(key); third != nil {
+		t.Fatal("the previous request released the replacement's permit")
+	}
+	h.releaseBusy(key, next)
+	if _, _, third := h.acquireForRun(key); third == nil {
+		t.Fatal("the replacement did not release its own permit")
+	}
+}
+
 // TestSessionTTL_ReclaimsAbandonedAndDropsCP 钉住**正向**的那一半：过期的挂起会话真的被
 // 回收了，**而且它的 cp 真的被清了**。
 //
@@ -64,8 +87,8 @@ func TestSessionTTL_ReclaimsAbandonedAndDropsCP(t *testing.T) {
 	}
 
 	// 另一个人发请求 → 顺手扫
-	_, evicted, ok := h.acquireForRun(sessionKey{owner: "other", threadID: "t2"})
-	if !ok {
+	_, evicted, claimed := h.acquireForRun(sessionKey{owner: "other", threadID: "t2"})
+	if claimed == nil {
 		t.Fatalf("acquireForRun 应成功")
 	}
 	// caller 负责清 cp——这里手动走一遍它那段
@@ -240,9 +263,9 @@ func TestSessionTTL_BusyEarlyReturnStillReportsExpired(t *testing.T) {
 	target := sessionKey{owner: "o", threadID: "inflight"}
 	h.sessions[target] = &sessionEntry{busy: true, touchedAt: time.Now().UnixNano()}
 
-	_, evicted, ok := h.acquireForRun(target)
+	_, evicted, claimed := h.acquireForRun(target)
 	h.cleanupEvicted(t.Context(), evicted)
-	if ok {
+	if claimed != nil {
 		t.Fatalf("fixture 没搭对：目标键在途，应走 busy 早退")
 	}
 	if _, still := h.sessions[expired]; still {
@@ -323,12 +346,13 @@ func TestMaxSessions_LimitIsSoftAcrossTenants(t *testing.T) {
 	const tenants = 100
 	for i := 0; i < tenants; i++ {
 		key := sessionKey{owner: fmt.Sprintf("tenant-%03d", i), threadID: "t"}
-		if _, _, ok := h.acquireForRun(key); !ok {
+		_, _, claimed := h.acquireForRun(key)
+		if claimed == nil {
 			t.Fatalf("acquireForRun(%v) 失败", key)
 		}
 		// 挂起后释放 busy —— 模拟「用户关了页面，会话留在表里」
 		h.sessions[key].sess = agent_v2.NewRunSession()
-		h.releaseBusy(key)
+		h.releaseBusy(key, claimed)
 	}
 	if got := len(h.sessions); got < tenants {
 		t.Errorf("maxSessions=5、%d 个租户各挂 1 条，表里只剩 %d 条——"+
@@ -349,13 +373,13 @@ func TestSessionTTL_InFlightReclaimDoesNotCountForLRU(t *testing.T) {
 	seedPending(t, h, cp, expired, 2*time.Hour)
 	liveSID := seedPending(t, h, cp, live, 0)
 	h.sessions[busy] = &sessionEntry{busy: true, touchedAt: time.Now().UnixNano()}
-	_, first, ok := h.acquireForRun(busy)
-	if ok || len(first) != 1 || first[0].key != expired {
-		t.Fatalf("fixture: first request must claim expired cleanup only: ok=%v evictions=%+v", ok, first)
+	_, first, claimed := h.acquireForRun(busy)
+	if claimed != nil || len(first) != 1 || first[0].key != expired {
+		t.Fatalf("fixture: first request must claim expired cleanup only: claimed=%v evictions=%+v", claimed != nil, first)
 	}
 	t.Cleanup(func() { h.cleanupEvicted(t.Context(), first) })
-	_, second, ok := h.acquireForRun(newcomer)
-	if !ok {
+	_, second, claimed := h.acquireForRun(newcomer)
+	if claimed == nil {
 		t.Fatal("fixture: new request must start")
 	}
 	h.cleanupEvicted(t.Context(), second)
@@ -439,8 +463,8 @@ func TestSessionCapacity_SkipsRemoteBusyOldest(t *testing.T) {
 	busySID := seedPending(t, h, cp, busy, 2*time.Hour)
 	idleSID := seedPending(t, h, cp, idle, time.Hour)
 	h.cp = &remoteBusyCheckpointer{Checkpointer: cp, t: t, h: h, remoteSID: busySID, remoteBusy: true}
-	_, evicted, ok := h.acquireForRun(new1)
-	if !ok {
+	_, evicted, claimed := h.acquireForRun(new1)
+	if claimed == nil {
 		t.Fatal("fixture must reserve new run")
 	}
 	h.cleanupEvicted(t.Context(), evicted)

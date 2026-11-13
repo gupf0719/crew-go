@@ -15,7 +15,7 @@
 | F7 | P2 | interface channel 正常写入后，Restore 按精确类型拒绝恢复 |
 | F8 | P2 | LastValue 同一逻辑超步的写入者冲突跨部分 Resume 漏判 |
 
-摘要的控制错误传播已随 F2 修复。取消清理补偿与并发、记账优化仍在报告中跟踪。
+摘要的控制错误传播已随 F2 修复。取消清理补偿、并发预算与工具账编码已完成，见[优化复审](../review/agent-orchestration-audit-2026-11-12.md#2026-11-13-优化复审)。
 
 > 📌 **转交 / 控制信号 / 归属 / 写入所有权相关的 OPEN 项，先读
 > [issue-99-root-causes.md](../issue/issue-99-root-causes.md)**——那里按**根因**归并成

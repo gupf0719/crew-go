@@ -26,7 +26,7 @@ import (
 // 两个任务的第一个工具调用算出同一个 ID，照样命中。两份记忆当时都在泄漏。
 //
 // 现在两份各归各位：「本调用已批」搬进了 tools 节点的私有中断态
-// （`toolCallMemo.Approved`，新任务是新 cp、天然为空，隔离是结构性的，见
+// （`toolCallRecord.Approved`，新任务是新 cp、天然为空，隔离是结构性的，见
 // `TestApproval_PerCallMemoryStructurallyIsolated`）；规则集仍在 session KV，靠顶层 Run
 // 的清除点——但它的 key 是「工具名 + 参数指纹」纯内容键，那个清除点是**产品决策**
 // （授权该活多久）不是正确性补丁。
@@ -102,7 +102,7 @@ func TestApproval_ApproveAlwaysDoesNotLeakAcrossTasks(t *testing.T) {
 // `(graphNS, nodeID, visit, branchIdx, idx)` **在新的顶层调用里全部重置** ⟹ 任务 B 的
 // 第一个工具调用跟任务 A 的算出同一个 ID ⟹ 静默命中、不再询问。
 //
-// 现在它搬进了 tools 节点的**节点私有中断态**（`toolCallMemo.Approved`）：
+// 现在它搬进了 tools 节点的**节点私有中断态**（`toolCallRecord.Approved`）：
 // **新任务 = 新 cp = 无 NodeStates**，隔离是结构性的。
 //
 // ⚠️ 所以本用例**故意不依赖 `clearApprovalRulesForNewTask`**——那个清除点是给规则集

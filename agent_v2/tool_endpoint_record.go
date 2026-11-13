@@ -14,7 +14,7 @@ import (
 // 中间件链最内层的工具端点记下每一次执行的结果：中间件在 next 之后挂起（结果确认类中间件在 next 之后 Ask）时，续跑
 // 重跑这个 tool_call，next 拿回记下的那一份、工具不再执行。
 //
-// 不变量：一个 tool_call 里工具成功返回至多一次，跟这个 tool_call 被续跑几次无关。工具账（toolCallMemo）只在整个
+// 不变量：一个 tool_call 里工具成功返回至多一次，跟这个 tool_call 被续跑几次无关。工具账只在整个
 // tool_call 完成时记，覆盖不到「工具已经执行、中间件还没收尾就挂起」这一段——那里曾经每次续跑都把工具再执行一遍
 // （实测扣款两次）。中间件在一次执行里只能调一次 next（第二次被 guardControlFlow 拒），所以一个 tool_call 一条记录。
 //
@@ -50,7 +50,7 @@ type endpointRecord struct {
 }
 
 func init() {
-	// 随存档落盘 ⟹ 必须注册（同 toolCallMemo）
+	// 随存档落盘 ⟹ 必须注册（同 toolCallRecord）
 	compose_v2.RegisterValueType[*endpointRecord]("*agent_v2.endpointRecord")
 }
 

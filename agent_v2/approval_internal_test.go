@@ -3,7 +3,6 @@ package agent_v2
 import (
 	"context"
 	"strings"
-	"sync"
 	"testing"
 
 	"crew-go/schema"
@@ -124,9 +123,9 @@ func TestToolApprovedRule(t *testing.T) {
 // `(graphNS, nodeID, visit, branchIdx, idx)` **在新的顶层调用里全部重置** ⟹ 任务 B 的
 // 第一个工具调用跟任务 A 的算出同一个 ID ⟹ 任务 A 批过的在任务 B 里被静默命中。
 //
-// 现在它挪进了 tools 节点的**节点私有中断态**（`toolCallMemo.Approved`），
+// 现在它挪进了 tools 节点的**节点私有中断态**（`toolCallRecord.Approved`），
 // 由节点注入读写对。跨任务隔离**不再靠任何清除动作**——新任务是新 cp、NodeStates 为空。
-// 详见 `toolCallMemo.Approved` 的注释。
+// 详见 `toolCallRecord.Approved` 的注释。
 func TestCallApprovalFns(t *testing.T) {
 	// 没注入时不 panic、恒 false（业务直接调 checkToolApproval 而不经 tools 节点的形态）
 	if isCallApproved(context.Background()) {
@@ -134,18 +133,10 @@ func TestCallApprovalFns(t *testing.T) {
 	}
 	markCallApproved(context.Background()) // 不该 panic
 
-	memo := &toolCallMemo{}
-	var mu sync.Mutex
+	record := &toolCallRecord{}
 	ctx := withCallApproval(context.Background(), callApprovalFns{
-		is: func() bool { mu.Lock(); defer mu.Unlock(); return memo.Approved["k1"] },
-		mark: func() {
-			mu.Lock()
-			defer mu.Unlock()
-			if memo.Approved == nil {
-				memo.Approved = map[string]bool{}
-			}
-			memo.Approved["k1"] = true
-		},
+		is:   func() bool { return record.Approved },
+		mark: func() { record.Approved = true },
 	})
 
 	if isCallApproved(ctx) {

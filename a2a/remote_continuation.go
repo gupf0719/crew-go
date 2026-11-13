@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 
@@ -162,23 +163,40 @@ func getContinuationSet(session *agent_v2.RunSession, create bool) *continuation
 	return set
 }
 
-// questionChanged 判断 GetTask 是否看到了新的追问。即使远端没返回消息历史，已换题的
-// 答复也先走快照，授权或审批则交给宿主的真人路径。
+// questionChanged 用状态消息和挂起清单判断远端是否换题。
 func questionChanged(question gatePending, task *a2atypes.Task) bool {
 	if task == nil || !waitsForInput(task.Status.State) {
 		return false
 	}
-	if task.Status.State == a2atypes.TaskStateAuthRequired {
+	if (task.Status.State == a2atypes.TaskStateAuthRequired) != question.Auth {
 		return true
 	}
 	msg := task.Status.Message
 	if msg == nil {
 		return false
 	}
-	text := a2aPartsText(msg.Parts)
-	return (question.QuestionMsgID != "" && msg.ID != "" && msg.ID != question.QuestionMsgID) ||
-		(strings.TrimSpace(text) != "" && text != question.Question) ||
-		anyApproval(PendingQuestionsFromParts(msg.Parts))
+	if question.QuestionMsgID != "" && msg.ID != "" && msg.ID != question.QuestionMsgID {
+		return true
+	}
+	if !question.Auth {
+		if items := PendingQuestionsFromParts(msg.Parts); len(items) > 0 {
+			return !slices.EqualFunc(items, question.Items, samePendingQuestion)
+		}
+		if len(question.Items) > 0 {
+			return false // 快照可以省略挂起清单。
+		}
+	}
+	body := question.Question
+	if question.Auth {
+		body, _ = strings.CutSuffix(body, "\n("+authAnswerHint+")")
+	}
+	text := strings.TrimSpace(a2aPartsText(msg.Parts))
+	return body != "" && text != "" && text != strings.TrimSpace(body)
+}
+
+func samePendingQuestion(a, b PendingQuestion) bool {
+	return a.InterruptID == b.InterruptID && a.Question == b.Question && a.Approval == b.Approval &&
+		a.ToolCallID == b.ToolCallID && slices.Equal(a.Options, b.Options)
 }
 
 func (a *RemoteAgent) askForContinuation(session *agent_v2.RunSession, question gatePending) *schema.Message {

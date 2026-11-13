@@ -6,6 +6,8 @@ package a2a
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -120,6 +122,105 @@ func TestReattach_StalledTaskIsAnErrorNotAnEmptyAnswer(t *testing.T) {
 	}
 	if m := agent_v2.FinalMessage(evs); m == nil || m.Content != "done:more" {
 		t.Fatalf("应拿到原任务续上之后的答复 done:more，实际 %+v", m)
+	}
+}
+
+func TestReattach_SubscriptionFallback(t *testing.T) {
+	oldGrace, oldPoll := stalledSubscribeGrace, authPollInterval
+	stalledSubscribeGrace, authPollInterval = 40*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { stalledSubscribeGrace, authPollInterval = oldGrace, oldPoll })
+
+	for _, tc := range []struct {
+		name           string
+		fallback       string
+		callerDeadline bool
+	}{
+		{name: "next_question", fallback: "TASK_STATE_INPUT_REQUIRED"},
+		{name: "completion", fallback: "TASK_STATE_COMPLETED"},
+		{name: "unknown_state", fallback: "TASK_STATE_PAUSED"},
+		{name: "local_grace"},
+		{name: "caller_deadline", callerDeadline: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deadline := 600 * time.Millisecond
+			stalledSubscribeGrace = 40 * time.Millisecond
+			if tc.callerDeadline {
+				deadline = 200 * time.Millisecond
+				stalledSubscribeGrace = time.Second
+			}
+			var subscribed, fallbackCalled atomic.Bool
+			canceled := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request struct {
+					ID     json.RawMessage
+					Method string
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Errorf("解码远端请求：%v", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				switch request.Method {
+				case "SubscribeToTask":
+					subscribed.Store(true)
+					fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32004,"message":"subscription unavailable"}}`, request.ID)
+				case "GetTask":
+					state := "TASK_STATE_WORKING"
+					if subscribed.Load() {
+						fallbackCalled.Store(true)
+						state = tc.fallback
+						if state == "" {
+							<-r.Context().Done()
+							close(canceled)
+							return
+						}
+					}
+					fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"id":"t1","contextId":"c1","status":{"state":%q}}}`, request.ID, state)
+				default:
+					t.Errorf("重挂只应查询或订阅，收到 %q", request.Method)
+					w.WriteHeader(http.StatusBadRequest)
+				}
+			}))
+			defer srv.Close()
+			card := &a2atypes.AgentCard{Name: "reattach", Description: "reattach fixture",
+				SupportedInterfaces: []*a2atypes.AgentInterface{a2atypes.NewAgentInterface(srv.URL, a2atypes.TransportProtocolJSONRPC)},
+				DefaultInputModes:   []string{"text"}, DefaultOutputModes: []string{"text"},
+				Capabilities: a2atypes.AgentCapabilities{Streaming: true}}
+			ag, err := NewRemoteAgentFromCard(t.Context(), card)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), deadline)
+			defer cancel()
+			var task *a2atypes.Task
+			initial := &a2atypes.Task{ID: "t1", Status: a2atypes.TaskStatus{State: a2atypes.TaskStateWorking}}
+			for ev, e := range ag.reattach(ctx, "t1", initial, nil) {
+				task, _ = ev.(*a2atypes.Task)
+				err = e
+			}
+			if !fallbackCalled.Load() {
+				t.Fatalf("应在订阅失败后回查，实际 %v", err)
+			}
+			if tc.fallback != "" {
+				if err != nil || task == nil || task.ID != "t1" || task.Status.State != a2atypes.TaskStateFromString(tc.fallback) {
+					t.Fatalf("应交出回查快照，实际 task=%+v err=%v", task, err)
+				}
+				return
+			}
+			if tc.callerDeadline {
+				if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() == nil {
+					t.Fatalf("应保留调用方超时，实际 %v", err)
+				}
+			} else if err == nil || ctx.Err() != nil {
+				t.Fatalf("回查应在局部宽限期内结束，外层 deadline 仍有效，实际 err=%v ctx=%v", err, ctx.Err())
+			}
+			select {
+			case <-canceled:
+			case <-time.After(time.Second):
+				t.Fatal("阻塞的 HTTP 回查没有收到取消")
+			}
+		})
 	}
 }
 

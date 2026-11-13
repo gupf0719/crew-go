@@ -43,7 +43,7 @@ import (
 // 授权」时不发消息、重新挂上那个任务（见 reattach）。在节点执行里被调起时这次调用在它自己的相位里问，不占调用它
 // 的那段代码的提问序号（见 callPhase）。引擎钩子与条件边里不能问人、不在任何节点执行里时句柄记在 session 上（见
 // WithHumanGate）。续一个远端任务之前先查它此刻的状态（见 reconcileTask）：上一次续它时响应在路上丢了、远端其实已经
-// 办完或换了一问的，不再去续一个已结束的任务、不把旧答复再发一次。
+// 办完或换了一问时按快照继续。已尝试发送的答复在历史缺失时保留待答记录，等待下一次对账。
 //
 // 普通请求只沿用远端会话的 contextId。默认模式的普通追问通过 [Continuation] 返回续接句柄，
 // 同一个 Run 内经 [WithContinuation] 或工具的 continuation 参数补答。各次委派的待答任务独立，
@@ -274,7 +274,7 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 			v, _ := session.GetValue(a.pendingKey(session))
 			sessionQuestion, _ = v.(gatePending)
 			if sessionQuestion.TaskID != taskID {
-				sessionQuestion = gatePending{}
+				return nil, fmt.Errorf("a2a: remote agent %q: missing question record for task %s", a.card.Name, taskID)
 			}
 			contextID = firstNonEmpty(sessionQuestion.ContextID, contextID)
 		}
@@ -360,11 +360,13 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 		result       = newRemoteOutput(a.name) // 远程应答的文本与非文本 part（raw/url/data → File/Data block）
 		lastState    a2atypes.TaskState
 		sawState     bool // 流里给过任务状态（Task / 状态更新事件），区分「状态认不出」与「远端只回了消息」
+		sawMessage   bool
 		newTaskID    string
 		newContextID string
 		statusMsg    string
 		statusMsgID  string                // 最后一条状态消息的 ID（记进在等的那一问，对账时据它认出远端回应了没有）
 		statusParts  a2atypes.ContentParts // 最后一条状态消息的 parts（input-required 时从里面取挂起清单）
+		askSnapshot  *a2atypes.Task        // 完整的待答快照已经带有问题当时的 artifacts。
 	)
 	// 事件从哪来：续一个在等带外授权的任务、人说已经授权 ⟹ 重新挂上它；否则发一条消息（完整多模态：sendMsg 的
 	// Content + ContentBlocks → A2A parts（text/raw/url/data））。
@@ -387,8 +389,14 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 		defer func() { cliSpan.End(ctx, retErr) }()
 	}
 	recovered := false
+	resuming := reattach || explicit || pend.TaskID != "" || handleWaiting
 	if reattach {
-		source, method, recovered = a.reattach(ctx, taskID), "subscribe_task", true
+		question := sessionQuestion
+		if pend.TaskID != "" {
+			question = pend
+		}
+		question.Auth = true // 顶层旧记录的授权标记在 session 上单独存储。
+		source, method, recovered = a.reattach(ctx, taskID, nil, &question), "subscribe_task", true
 	} else {
 		parts := sendParts
 		if parts == nil {
@@ -406,20 +414,35 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 			} else if explicit {
 				questionPos = "continuation:" + continuation
 			}
-			sentID := ""
-			if question.TaskID == taskID {
-				sentID = gateMessageID(questionPos, taskID, question.Round)
-				msg.ID = sentID
-			}
+			sentID := gateMessageID(questionPos, taskID, question.Round)
+			msg.ID = sentID
 			attemptKey := "a2a.answer-attempt\x00" + sentID
 			if explicit && byPosition {
 				attempted, _ := compose_v2.GetStepResult[bool](ctx, attemptKey)
 				question.AnswerUnsent = question.AnswerUnsent && !attempted
 			}
-			snap, how, rerr := a.reconcileTask(ctx, taskID, sentID, question)
-			if explicit && how == reconcileSend && questionChanged(question, snap) {
-				how = reconcileSnapshot
+			// 进入发送路径或看到远端已在处理时，后续不能再把答复当成确定未发送。
+			markDeliveryUncertain := func() error {
+				if !question.AnswerUnsent {
+					return nil
+				}
+				question.AnswerUnsent = false
+				switch {
+				case answering:
+					return compose_v2.SaveStepResult(ctx, gateStepKey(pos), question)
+				case explicit:
+					if byPosition {
+						if err := compose_v2.SaveStepResult(ctx, attemptKey, true); err != nil {
+							return err
+						}
+					}
+					explicitAttempted = true
+				case sessionHandles:
+					session.SetValue(a.pendingKey(session), question)
+				}
+				return nil
 			}
+			snap, how, rerr := a.reconcileTask(ctx, taskID, sentID, question)
 			switch how {
 			case reconcileSend:
 				switch items := question.Items; {
@@ -439,30 +462,18 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 				if err := ctx.Err(); err != nil {
 					return nil, context.Cause(ctx)
 				}
-				if sentID != "" && question.AnswerUnsent {
-					question.AnswerUnsent = false
-					switch {
-					case answering:
-						if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), question); err != nil {
-							return nil, fmt.Errorf("a2a: record answer attempt: %w", err)
-						}
-					case explicit:
-						if byPosition {
-							if err := compose_v2.SaveStepResult(ctx, attemptKey, true); err != nil {
-								return nil, fmt.Errorf("a2a: record continuation answer attempt: %w", err)
-							}
-						}
-						explicitAttempted = true
-					case sessionHandles:
-						session.SetValue(a.pendingKey(session), question)
-					}
+				if err := markDeliveryUncertain(); err != nil {
+					return nil, fmt.Errorf("a2a: record pending answer delivery: %w", err)
 				}
 			case reconcileSnapshot:
 				msg, method, recovered = nil, "get_task", true
 				source = func(yield func(a2atypes.Event, error) bool) { yield(snap, nil) }
 			case reconcileResubscribe:
+				if err := markDeliveryUncertain(); err != nil {
+					return nil, fmt.Errorf("a2a: record pending answer delivery: %w", err)
+				}
 				msg, recovered = nil, true
-				source, method = a.reattach(ctx, taskID), "subscribe_task"
+				source, method = checkRecoveredQuestion(a.reattach(ctx, taskID, snap, nil), taskID, question, sentID), "subscribe_task"
 			case reconcileGone:
 				retireContinuation = true
 				// 远端没有这个任务了：清掉句柄与在等的那一问，之后再跑发原始请求（同远端任务失败）
@@ -477,10 +488,10 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 				return nil, fmt.Errorf("a2a: remote agent %q no longer has task %s; the request starts a new task when run again", a.card.Name, taskID)
 			case reconcileInFlight:
 				// 不重发（远端收下了）、不当成新的一问；记录留着，再跑时接着对账。等的时候调用方停下了就交出它的错
-				if cerr := ctx.Err(); cerr != nil {
-					return nil, fmt.Errorf("a2a: remote agent %q: waiting for task %s to respond: %w", a.card.Name, taskID, context.Cause(ctx))
+				if err := markDeliveryUncertain(); err != nil {
+					rerr = errors.Join(rerr, fmt.Errorf("record pending answer delivery: %w", err))
 				}
-				return nil, fmt.Errorf("a2a: remote agent %q received the answer for task %s but has not responded yet; run again to pick up its response", a.card.Name, taskID)
+				return nil, fmt.Errorf("a2a: remote agent %q: waiting for task %s to respond: %w", a.card.Name, taskID, rerr)
 			case reconcileUnknown:
 				// 查不到远端此刻的状态，又是在答人那一问：不盲发（远端可能已经收下、改问了别的，旧答复会被当成新那一问的
 				// 答复），记录留着，再跑时接着对账
@@ -520,10 +531,14 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 stream:
 	for ev, e := range source {
 		if e != nil {
+			if resuming {
+				result.retract(ctx)
+			}
 			return nil, fmt.Errorf("a2a: send to remote agent %q: %w", a.card.Name, e)
 		}
 		switch v := ev.(type) {
 		case *a2atypes.Message:
+			sawMessage = true
 			result.add(ctx, v.Parts, true)
 			if v.TaskID != "" {
 				newTaskID = string(v.TaskID)
@@ -552,6 +567,7 @@ stream:
 				result.taskArtifact(ctx, art.ID, art.Parts)
 			}
 			if waitsForInput(lastState) {
+				askSnapshot = v
 				break stream
 			}
 		case *a2atypes.TaskStatusUpdateEvent:
@@ -579,9 +595,18 @@ stream:
 	}
 
 	if lastState == a2atypes.TaskStateUnspecified && sawState {
+		if resuming {
+			result.retract(ctx)
+			return nil, a.unknownTaskStateError(firstNonEmpty(newTaskID, taskID))
+		}
 		// 流里给过任务状态、SDK 却认不出（规范后来加的、厂商扩展的状态值都映射成 Unspecified）：按「流停在中间状态上」处理
 		// （下面 default 那一档），不跟「远端只回了一条消息、没有任务」混成已完成。
 		lastState = unrecognizedTaskState
+	}
+	if resuming && !lastState.Terminal() && !waitsForInput(lastState) &&
+		(lastState != a2atypes.TaskStateUnspecified || !sawMessage) {
+		result.retract(ctx)
+		return nil, fmt.Errorf("a2a: remote agent %q stream ended while task %s was still running; retry the continuation", a.card.Name, taskID)
 	}
 	auth := lastState == a2atypes.TaskStateAuthRequired
 	if sessionHandles && !auth {
@@ -601,10 +626,7 @@ stream:
 	if auth {
 		q = firstNonEmpty(statusMsg, "the remote agent needs authorization to proceed") + "\n(" + authAnswerHint + ")"
 	}
-	// 记录只描述「这一位上远端有一问在等真人答」。这次没有再交给真人（远端给了结局、转成交给宿主模型的普通追问、
-	// 流意外结束）就清掉，之后再跑发原始请求；交给真人时下面按新的一问重记。只在收到远端的回应之后清——发送在网络层
-	// 失败时（上面早退）记录留着，续跑拿回同一个答案续同一个任务。曾经只在「远端不再等人」时清：批准之后远端改问
-	// 一个交给宿主模型的普通追问，记录还在，节点再跑时把人的批准又发给了远端、被当成那个追问的答复（实测）
+	// 远端给出结局时清除旧问题。新的普通追问或真人提问各自覆盖记录，发送或读取失败时保留原问题供续跑。
 	if byPosition && pend.TaskID != "" && !waitsForInput(lastState) {
 		if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), gatePending{}); err != nil {
 			return nil, fmt.Errorf("a2a: remote agent %q: clear the answered question: %w", a.card.Name, err)
@@ -620,13 +642,20 @@ stream:
 			// 缺少任务句柄会让下一次调用重发原始请求，反复问同一个问题。
 			return nil, fmt.Errorf("a2a: remote agent %q asked for input without a task id, the answer could not be routed back to it", a.card.Name)
 		}
+		var artifacts []seenArtifact
+		switch {
+		case askSnapshot != nil:
+			artifacts = snapshotArtifactStates(askSnapshot)
+		case !toHuman || byPosition || !inNode:
+			artifacts = a.artifactStates(ctx, askTask)
+		}
 		if !toHuman {
 			if sessionHandles {
 				a.clearIDs(session)
 			}
 			rec := gatePending{
 				TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: 1,
-				Question: q, QuestionMsgID: statusMsgID, Items: items, SeenArtifacts: a.artifactStates(ctx, askTask),
+				Question: q, QuestionMsgID: statusMsgID, Items: items, SeenArtifacts: artifacts,
 				Binding: a.binding, AnswerUnsent: true,
 			}
 			out := a.askForContinuation(session, rec)
@@ -647,10 +676,11 @@ stream:
 				round = sessionQuestion.Round + 1
 			}
 			session.SetValue(a.pendingKey(session), gatePending{
-				TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, QuestionMsgID: statusMsgID, Items: items, AnswerUnsent: true,
+				TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round,
+				Question: q, QuestionMsgID: statusMsgID, Items: items, Auth: auth, AnswerUnsent: true,
 			})
 			a.storeAuthWait(session, auth)
-			a.storeHandleWaiting(session, true, a.artifactStates(ctx, askTask))
+			a.storeHandleWaiting(session, true, artifacts)
 		}
 		if !inNode {
 			retireContinuation = true
@@ -681,7 +711,7 @@ stream:
 		}
 		// 记的是已经发生的事：远端这个任务在等人答这一问
 		rec := gatePending{TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, Question: q, Items: items, Auth: auth,
-			QuestionMsgID: statusMsgID, SeenArtifacts: a.artifactStates(ctx, askTask), AnswerUnsent: true}
+			QuestionMsgID: statusMsgID, SeenArtifacts: artifacts, AnswerUnsent: true}
 		if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), rec); err != nil {
 			return nil, fmt.Errorf("a2a: remote agent %q: record the pending question: %w", a.card.Name, err)
 		}
@@ -709,10 +739,7 @@ stream:
 		}
 		return nil, fmt.Errorf("a2a: remote agent %q task ended %s: %s", a.card.Name, lastState, firstNonEmpty(statusMsg, "(no detail)"))
 	default:
-		if explicit {
-			return nil, fmt.Errorf("a2a: remote agent %q stream ended while task %s was still running; retry the continuation", a.card.Name, taskID)
-		}
-		// 普通请求遇到未结束的流时交出已收内容，并记录远端状态。顶层真人续接保留原来的任务句柄。
+		// 首次委派遇到未结束的流时交出已收内容，并记录远端状态。
 		slog.WarnContext(ctx, "a2a: remote stream ended on non-terminal state (partial content returned)",
 			"agent", a.card.Name, "state", string(lastState))
 		if sessionHandles && taskID != "" {
@@ -721,6 +748,10 @@ stream:
 		}
 		return assistantWithBlocks(result.String(), result.Blocks()), nil
 	}
+}
+
+func (a *RemoteAgent) unknownTaskStateError(taskID string) error {
+	return fmt.Errorf("a2a: remote agent %q reported an unrecognized state for task %q", a.card.Name, taskID)
 }
 
 // reconcileOutcome 是续远端任务之前对账的结论。
@@ -741,56 +772,92 @@ const (
 //
 //   - 已结束：不发，按快照收尾——完成就取回结果，失败、取消、拒绝同直接收到那个结局。
 //   - 在办（submitted / working）：它在等人时不会自己动起来，只能是收下了答复：不重发，重新挂上读结果。
-//   - 在等人且状态消息 ID 已变：直接交出新的问题，即使快照不含历史。状态消息 ID 未变时，历史里有这次答复、且后面还有消息，
-//     也按快照重新提问。历史里有答复但还没回应时轮询，最多 authReattachGrace；超时报 reconcileInFlight。
-//   - 在等人且未发现已接收的答复或新的问题：可以发。已知 interruptId 时，发送的答复绑定到已展示的问题。
+//   - 远端换题或切到授权时按快照交出新问题。历史里的答复后已有后续消息时，也按快照重新提问。
+//   - 历史里有答复但还没回应时轮询，最多 authReattachGrace；超时报 reconcileInFlight。
+//   - 仍在等原问题时，首次可发。已尝试发送的答复须有可用历史用于对账。已知 interruptId 时绑定答复到已展示的问题。
 //   - 远端说没有这个任务：reconcileGone。
 //   - 查不到状态：确定不支持查询且记录表明尚未尝试答复时允许发送，其余查询失败保留挂起。
 func (a *RemoteAgent) reconcileTask(ctx context.Context, taskID, sentID string, question gatePending) (*a2atypes.Task, reconcileOutcome, error) {
 	id := a2atypes.TaskID(taskID)
-	task, err := a.client.GetTask(ctx, &a2atypes.GetTaskRequest{ID: id})
+	queryCtx, cancel := context.WithTimeout(ctx, authReattachGrace)
+	defer cancel()
+	task, err := a.client.GetTask(queryCtx, &a2atypes.GetTaskRequest{ID: id})
 	if err != nil {
 		switch {
+		case ctx.Err() != nil:
+			return nil, reconcileUnknown, context.Cause(ctx)
 		case errors.Is(err, a2atypes.ErrTaskNotFound):
 			return nil, reconcileGone, nil
-		case sentID != "" && (!question.AnswerUnsent || !deterministicTaskQueryErr(err)):
+		case !question.AnswerUnsent || !deterministicTaskQueryErr(err):
 			return nil, reconcileUnknown, err
 		}
 		return nil, reconcileSend, nil
 	}
 	if task == nil {
-		if sentID != "" && !question.AnswerUnsent {
-			return nil, reconcileUnknown, fmt.Errorf("get task returned no snapshot for an answer with unknown delivery")
-		}
-		return nil, reconcileSend, nil
+		return nil, reconcileUnknown, errors.New("get task returned no snapshot for the pending answer")
 	}
-	at := slices.IndexFunc(task.History, func(m *a2atypes.Message) bool { return m != nil && m.ID == sentID })
-	if !waitsForInput(task.Status.State) || sentID == "" {
+	if task.Status.State == a2atypes.TaskStateUnspecified {
+		return nil, reconcileUnknown, a.unknownTaskStateError(taskID)
+	}
+	if !waitsForInput(task.Status.State) {
 		return task, settledOutcome(task), nil
 	}
-	responded := func(t *a2atypes.Task) bool {
-		if current := statusMessageID(t); question.QuestionMsgID != "" && current != "" && current != question.QuestionMsgID {
-			return true
-		}
-		i := slices.IndexFunc(t.History, func(m *a2atypes.Message) bool { return m != nil && m.ID == sentID })
-		return i >= 0 && i < len(t.History)-1
+	if questionChanged(question, task) {
+		return task, reconcileSnapshot, nil
 	}
-	if responded(task) {
+	at := answerHistoryIndex(task, sentID)
+	if answerHasFollowup(task, at) {
 		return task, reconcileSnapshot, nil
 	}
 	if at < 0 {
+		if !question.AnswerUnsent && !slices.ContainsFunc(task.History, func(m *a2atypes.Message) bool { return m != nil && m.ID != "" }) {
+			return nil, reconcileUnknown, errors.New("get task did not include history for an answer with unknown delivery")
+		}
 		return task, reconcileSend, nil
 	}
-	task, err = a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
-		return !waitsForInput(t.Status.State) || responded(t)
-	}, authReattachGrace)
-	if err != nil || (waitsForInput(task.Status.State) && !responded(task)) {
-		return nil, reconcileInFlight, nil
+	advanced := func(t *a2atypes.Task) bool {
+		return !waitsForInput(t.Status.State) || questionChanged(question, t) || answerHasFollowup(t, answerHistoryIndex(t, sentID))
+	}
+	task, err = a.pollTask(queryCtx, id, advanced, 0)
+	if err != nil {
+		if ctx.Err() == nil && queryCtx.Err() != nil {
+			err = errors.New("the answer was received but the remote task has not responded yet")
+		}
+		return nil, reconcileInFlight, err
+	}
+	if task.Status.State == a2atypes.TaskStateUnspecified {
+		return nil, reconcileUnknown, a.unknownTaskStateError(taskID)
 	}
 	if waitsForInput(task.Status.State) {
 		return task, reconcileSnapshot, nil
 	}
 	return task, settledOutcome(task), nil
+}
+
+func answerHistoryIndex(task *a2atypes.Task, sentID string) int {
+	return slices.IndexFunc(task.History, func(m *a2atypes.Message) bool { return m != nil && m.ID == sentID })
+}
+
+func answerHasFollowup(task *a2atypes.Task, at int) bool {
+	return at >= 0 && slices.ContainsFunc(task.History[at+1:], func(m *a2atypes.Message) bool {
+		return m != nil && m.Role == a2atypes.MessageRoleAgent
+	})
+}
+
+// checkRecoveredQuestion 保留普通补答的原问题，直到回查快照有换题证据或订阅收到新的状态事件。
+func checkRecoveredQuestion(source iter.Seq2[a2atypes.Event, error], taskID string, question gatePending, sentID string) iter.Seq2[a2atypes.Event, error] {
+	return func(yield func(a2atypes.Event, error) bool) {
+		for event, err := range source {
+			if task, ok := event.(*a2atypes.Task); err == nil && ok && waitsForInput(task.Status.State) &&
+				!questionChanged(question, task) && !answerHasFollowup(task, answerHistoryIndex(task, sentID)) {
+				yield(nil, fmt.Errorf("remote task %s returned the previous question while recovering its answer", taskID))
+				return
+			}
+			if !yield(event, err) {
+				return
+			}
+		}
+	}
 }
 
 // deterministicTaskQueryErr 判 GetTask 的错误是不是「再查也一样」：远端不支持这个操作、请求本身被拒（参数、鉴权、版本）。
@@ -822,14 +889,6 @@ func settledOutcome(task *a2atypes.Task) reconcileOutcome {
 		return reconcileResubscribe
 	}
 	return reconcileSend
-}
-
-// statusMessageID 取任务当前状态消息的 ID（没有状态消息时为空）。
-func statusMessageID(t *a2atypes.Task) string {
-	if t.Status.Message == nil {
-		return ""
-	}
-	return t.Status.Message.ID
 }
 
 // gateMessageID 是答复人那一问（位置 pos、远端任务 taskID、第几问 round，见 gateQuestionID）的那条消息的 ID：重发同一个
@@ -900,38 +959,48 @@ var authPollInterval = 500 * time.Millisecond
 // unrecognizedTaskState 标记流里给过、但 SDK 认不出的任务状态（consume 按流停在中间状态上处理）。
 const unrecognizedTaskState a2atypes.TaskState = "unrecognized"
 
-// stalledSubscribeGrace 是订阅在任务还没结束、也不在等人时就关了流之后，再轮询多久看它有没有动。
+// stalledSubscribeGrace 约束订阅失败或在任务仍运行时关流后的回查。
 var stalledSubscribeGrace = 30 * time.Second
 
-// reattach 重新挂上一个在等带外授权的远端任务，事件交给 consume 的读流循环（规范 §7.6.2：客户端订阅或轮询 GetTask
-// 取后续，不需要再发消息）：
+// reattachSettled 报快照可以交给 consume，由它处理终态、新问题或未知状态。
+func reattachSettled(state a2atypes.TaskState) bool {
+	return state.Terminal() || waitsForInput(state) || state == a2atypes.TaskStateUnspecified
+}
+
+// reattach 通过订阅或 GetTask 继续读取远端任务。普通补答恢复复用对账的快照，授权恢复传入已确认的问题。
 //
-//  1. 轮询到任务离开 AUTH_REQUIRED，最多等 authReattachGrace；到时仍停在那儿就交出它（consume 据此再问一次人）。
+//  1. 授权恢复等待远端离开原授权问题，最多等 authReattachGrace。届时仍停在原问题就交给 consume 再问一次。
 //  2. 已经结束、或停在别的等人状态上：交出它。
 //  3. 还在跑：远端支持流式就订阅、从它当时的快照接着读（规范 §3.1.6）；不支持就接着轮询，到结束或停在等人状态上为止。
 //  4. 订阅在任务没结束、也不在等人时关了流：远端没有执行在跑这个任务（重启之后持久 store 里留着的 working 任务——
 //     a2a-go 自 v2.7.0、a2a-js 的服务端这时交出快照就正常关流）。再轮询 stalledSubscribeGrace，动了就交出它，
 //     没动就报错、句柄留着。不当成结束：consume 会把已聚合的内容（往往是空的）当成功答复交出去（审计实测）。
-//
-// 先轮询再订阅：订阅的第一个事件是任务当时的快照，订阅时它还停在 AUTH_REQUIRED 上的话分不清是旧的还是新的一次要授权。
-func (a *RemoteAgent) reattach(ctx context.Context, taskID string) iter.Seq2[a2atypes.Event, error] {
+func (a *RemoteAgent) reattach(ctx context.Context, taskID string, initial *a2atypes.Task, authorization *gatePending) iter.Seq2[a2atypes.Event, error] {
 	return func(yield func(a2atypes.Event, error) bool) {
 		id := a2atypes.TaskID(taskID)
-		task, err := a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
-			return t.Status.State != a2atypes.TaskStateAuthRequired
-		}, authReattachGrace)
-		if err != nil {
-			yield(nil, err)
+		task := initial
+		if authorization != nil {
+			var err error
+			task, err = a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
+				return t.Status.State != a2atypes.TaskStateAuthRequired || questionChanged(*authorization, t)
+			}, authReattachGrace)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+		}
+		if task == nil {
+			yield(nil, errors.New("cannot reattach without a task snapshot"))
 			return
 		}
 		st := task.Status.State
-		if st.Terminal() || waitsForInput(st) {
+		if reattachSettled(st) {
 			yield(task, nil)
 			return
 		}
 		if !a.card.Capabilities.Streaming {
-			task, err = a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
-				return t.Status.State.Terminal() || waitsForInput(t.Status.State)
+			task, err := a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
+				return reattachSettled(t.Status.State)
 			}, 0)
 			if err != nil {
 				yield(nil, err)
@@ -945,11 +1014,17 @@ func (a *RemoteAgent) reattach(ctx context.Context, taskID string) iter.Seq2[a2a
 		for ev, e := range a.client.SubscribeToTask(ctx, &a2atypes.SubscribeToTaskRequest{ID: id}) {
 			if e != nil {
 				if !got {
-					// 取状态之后、订阅之前任务结束了：订阅对已结束的任务报错，再取一次终态
-					if t, gerr := a.client.GetTask(ctx, &a2atypes.GetTaskRequest{ID: id}); gerr == nil && t.Status.State.Terminal() {
+					// 查询和订阅之间任务可能已结束或停下来问人。
+					queryCtx, cancel := context.WithTimeout(ctx, stalledSubscribeGrace)
+					t, gerr := a.client.GetTask(queryCtx, &a2atypes.GetTaskRequest{ID: id})
+					cancel()
+					if gerr == nil && t != nil && reattachSettled(t.Status.State) {
 						yield(t, nil)
 						return
 					}
+				}
+				if ctx.Err() != nil {
+					e = context.Cause(ctx)
 				}
 				yield(nil, e)
 				return
@@ -965,18 +1040,18 @@ func (a *RemoteAgent) reattach(ctx context.Context, taskID string) iter.Seq2[a2a
 				return
 			}
 		}
-		if last.Terminal() || waitsForInput(last) {
+		if reattachSettled(last) {
 			return
 		}
 		// 第 4 条：流关了、任务还停在中间状态上
-		task, err = a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
-			return t.Status.State.Terminal() || waitsForInput(t.Status.State)
+		task, err := a.pollTask(ctx, id, func(t *a2atypes.Task) bool {
+			return reattachSettled(t.Status.State)
 		}, stalledSubscribeGrace)
 		if err != nil {
 			yield(nil, err)
 			return
 		}
-		if st := task.Status.State; st.Terminal() || waitsForInput(st) {
+		if reattachSettled(task.Status.State) {
 			yield(task, nil)
 			return
 		}
@@ -985,29 +1060,45 @@ func (a *RemoteAgent) reattach(ctx context.Context, taskID string) iter.Seq2[a2a
 	}
 }
 
-// pollTask 每隔 authPollInterval 取一次远端任务（第一次立刻取），直到 done 对它为真、或过了 limit（0 不限，只受
-// ctx 约束），返回最后一次取到的任务。
+// pollTask 立即查询，之后每隔 authPollInterval 重查。limit 同时约束在途请求和等待。
+// 局部宽限耗尽时返回最后一份快照，尚无快照时返回超时。limit 为 0 时沿用调用方 ctx。
 func (a *RemoteAgent) pollTask(ctx context.Context, id a2atypes.TaskID, done func(*a2atypes.Task) bool, limit time.Duration) (*a2atypes.Task, error) {
-	var deadline time.Time
+	pollCtx := ctx
 	if limit > 0 {
-		deadline = time.Now().Add(limit)
+		var cancel context.CancelFunc
+		pollCtx, cancel = context.WithTimeout(ctx, limit)
+		defer cancel()
 	}
-	for {
-		task, err := a.client.GetTask(ctx, &a2atypes.GetTaskRequest{ID: id})
+	var last *a2atypes.Task
+	for pollCtx.Err() == nil {
+		task, err := a.client.GetTask(pollCtx, &a2atypes.GetTaskRequest{ID: id})
+		if pollCtx.Err() != nil {
+			break
+		}
 		if err != nil {
 			return nil, err
 		}
-		if done(task) || (limit > 0 && !time.Now().Before(deadline)) {
+		if task == nil {
+			return nil, errors.New("get task returned no snapshot")
+		}
+		last = task
+		if done(task) {
 			return task, nil
 		}
 		timer := time.NewTimer(authPollInterval)
 		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
+		case <-pollCtx.Done():
 		case <-timer.C:
 		}
+		timer.Stop()
 	}
+	if ctx.Err() != nil {
+		return nil, context.Cause(ctx)
+	}
+	if last != nil {
+		return last, nil
+	}
+	return nil, context.Cause(pollCtx)
 }
 
 // authAnswerHint 告诉人怎么答一次授权请求。
@@ -1308,6 +1399,10 @@ func (a *RemoteAgent) artifactStates(ctx context.Context, taskID string) []seenA
 		}
 		return nil
 	}
+	return snapshotArtifactStates(task)
+}
+
+func snapshotArtifactStates(task *a2atypes.Task) []seenArtifact {
 	seen := make([]seenArtifact, 0, len(task.Artifacts))
 	for _, art := range task.Artifacts {
 		if art == nil || art.ID == "" {
@@ -1421,7 +1516,7 @@ type gatePending struct {
 	// QuestionMsgID 是远端问这一问的那条状态消息的 ID：续任务之前对账时，远端的状态消息还是它就是还没回应这次的答复
 	// （见 reconcileTask）。
 	QuestionMsgID string `json:"question_msg_id,omitempty"`
-	// AnswerUnsent 表示记录确认这份答复尚未尝试投递。旧存档缺失该字段时按投递状态未知处理。
+	// AnswerUnsent 表示尚未进入发送路径，也未看到远端处理该答复的证据。旧档缺失时按投递状态未知处理。
 	AnswerUnsent bool `json:"answer_unsent,omitempty"`
 	// SeenArtifacts 是问这一问的那一刻，这个远端任务里各 artifact 的状态：对账取回快照、或重新挂上任务时，那时已有的内容不算
 	// 回应这一问的产出（正常续任务的流里只有这一轮的，见 seenArtifact）。

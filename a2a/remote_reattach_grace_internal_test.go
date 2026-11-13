@@ -2,11 +2,14 @@ package a2a
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"iter"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,5 +125,94 @@ func TestReattach_StillAuthRequiredAfterGrace_AsksAgain(t *testing.T) {
 	defer exec.mu.Unlock()
 	if len(exec.conts) != 0 {
 		t.Errorf("远端任务不该收到消息，收到 %q", exec.conts)
+	}
+}
+
+func TestReattach_AuthorizationReusesPendingSnapshot(t *testing.T) {
+	oldGrace, oldPoll := authReattachGrace, authPollInterval
+	authReattachGrace, authPollInterval = 40*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { authReattachGrace, authPollInterval = oldGrace, oldPoll })
+	for _, next := range []bool{false, true} {
+		name := "same_question"
+		if next {
+			name = "next_authorization"
+		}
+		t.Run(name, func(t *testing.T) {
+			var stage, sends, artifactQueries atomic.Int32
+			const first = `{"state":"TASK_STATE_AUTH_REQUIRED","message":{"messageId":"a1","role":"ROLE_AGENT","parts":[{"text":"授权读取"}]}}`
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					ID     json.RawMessage
+					Method string
+					Params struct{ HistoryLength *int }
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("解析请求：%v", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				switch req.Method {
+				case "SendStreamingMessage":
+					sends.Add(1)
+					w.Header().Set("Content-Type", "text/event-stream")
+					fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"statusUpdate\":{\"taskId\":\"t1\",\"contextId\":\"c1\",\"status\":%s}}}\n\n", req.ID, first)
+				case "GetTask":
+					current := stage.Load()
+					if current == 1 && req.Params.HistoryLength != nil && *req.Params.HistoryLength == 0 {
+						artifactQueries.Add(1)
+						<-r.Context().Done()
+						return
+					}
+					status := first
+					if current == 1 && next {
+						status = `{"state":"TASK_STATE_AUTH_REQUIRED","message":{"messageId":"a2","role":"ROLE_AGENT","parts":[{"text":"授权导出"}]}}`
+					} else if current == 2 {
+						status = `{"state":"TASK_STATE_COMPLETED","message":{"messageId":"done","role":"ROLE_AGENT","parts":[{"text":"完成"}]}}`
+					}
+					w.Header().Set("Content-Type", "application/json")
+					fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"id":"t1","contextId":"c1","status":%s}}`, req.ID, status)
+				default:
+					t.Errorf("意外的远端请求 %q", req.Method)
+					w.WriteHeader(http.StatusBadRequest)
+				}
+			}))
+			defer srv.Close()
+			card := &a2atypes.AgentCard{Name: "authorization", Description: "authorization fixture",
+				SupportedInterfaces: []*a2atypes.AgentInterface{a2atypes.NewAgentInterface(srv.URL, a2atypes.TransportProtocolJSONRPC)},
+				DefaultInputModes:   []string{"text"}, DefaultOutputModes: []string{"text"},
+				Capabilities: a2atypes.AgentCapabilities{Streaming: true}}
+			ctx, cancel := context.WithTimeout(t.Context(), 600*time.Millisecond)
+			defer cancel()
+			ra, err := NewRemoteAgentFromCard(ctx, card)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx = compose_v2.WithCheckpointerCtx(ctx, compose_v2.NewInMemoryCheckpointer())
+			host := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("authorization_host")).AddStep("remote", ra)
+			session := agent_v2.NewRunSession()
+			_, err = host.Run(ctx, session, schema.UserMessage("生成报表"))
+			one, ok := compose_v2.IsInterrupt(err)
+			if !ok || one.Query == nil || !strings.Contains(one.Query.Question, "授权读取") {
+				t.Fatalf("应停在第一次授权，实际 %v", err)
+			}
+			answers := map[string]*schema.Message{one.Query.InterruptID: schema.UserMessage("已授权")}
+			stage.Store(1)
+			_, err = host.Resume(ctx, session.RunID, agent_v2.WithResumeUserInputs(answers))
+			two, ok := compose_v2.IsInterrupt(err)
+			want := "授权读取"
+			if next {
+				want = "授权导出"
+			}
+			if !ok || two.Query == nil || two.Query.InterruptID == one.Query.InterruptID || !strings.Contains(two.Query.Question, want) ||
+				ctx.Err() != nil || artifactQueries.Load() != 0 {
+				t.Fatalf("应在请求期限内交出授权问题 %q，额外查询 %d 次，ctx=%v err=%v", want, artifactQueries.Load(), ctx.Err(), err)
+			}
+			stage.Store(2)
+			answers[two.Query.InterruptID] = schema.UserMessage("已授权")
+			events, err := host.Resume(ctx, session.RunID, agent_v2.WithResumeUserInputs(answers))
+			if final := agent_v2.FinalMessage(events); err != nil || final == nil || final.Content != "完成" || sends.Load() != 1 {
+				t.Fatalf("授权恢复应读取原任务结果，实际发送 %d 次，final=%v err=%v", sends.Load(), final, err)
+			}
+		})
 	}
 }

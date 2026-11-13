@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -262,6 +263,64 @@ func TestHumanGate_LostResponse_WorkingTaskResubscribed(t *testing.T) {
 	}
 	if len(asked) != 1 || final != "续任务办了:答#1" {
 		t.Errorf("应只问一次、重新挂上取回结果：问过 %q，final=%q", asked, final)
+	}
+}
+
+func TestHumanGate_TruncatedReplyResumesOriginalTask(t *testing.T) {
+	for _, mode := range []string{"top_level", "host_resume"} {
+		t.Run(mode, func(t *testing.T) {
+			remote := &gateRemote{}
+			var cut atomic.Bool
+			url := interceptServer(t, fnExec(remote.exec), func(w http.ResponseWriter, req *http.Request, body []byte, mux http.Handler) bool {
+				var rpc struct {
+					ID     json.RawMessage
+					Method string
+					Params struct{ Message a2atypes.Message }
+				}
+				if json.Unmarshal(body, &rpc) != nil || rpc.Method != "SendStreamingMessage" || rpc.Params.Message.TaskID == "" || !cut.CompareAndSwap(false, true) {
+					return false
+				}
+				mux.ServeHTTP(httptest.NewRecorder(), req) // 远端办完，客户端只收到 working。
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"statusUpdate\":{\"taskId\":%q,\"contextId\":%q,\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n\n",
+					rpc.ID, rpc.Params.Message.TaskID, rpc.Params.Message.ContextID)
+				return true
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			ra, err := a2a.NewRemoteAgent(ctx, url, a2a.WithHumanGate())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var host agent_v2.Agent = ra
+			if mode == "host_resume" {
+				ctx = compose_v2.WithCheckpointerCtx(ctx, compose_v2.NewInMemoryCheckpointer())
+				host = agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("reply_host")).AddStep("remote", ra)
+			}
+			sess := agent_v2.NewRunSession()
+			_, err = host.Run(ctx, sess, schema.UserMessage("原始请求"))
+			first, ok := compose_v2.IsInterrupt(err)
+			if !ok || first.Query == nil {
+				t.Fatalf("应先挂起一问，实际 %v", err)
+			}
+			answer := schema.UserMessage("答复")
+			resume := func() ([]*agent_v2.AgentEvent, error) {
+				if mode == "top_level" {
+					return host.Run(ctx, sess, answer)
+				}
+				return host.Resume(ctx, sess.RunID, agent_v2.WithResumeUserInputs(map[string]*schema.Message{first.Query.InterruptID: answer}))
+			}
+			if _, err := resume(); err == nil || !cut.Load() {
+				t.Fatalf("流停在 working 时应保留待答现场，实际 %v", err)
+			}
+			events, err := resume()
+			if final := agent_v2.FinalMessage(events); err != nil || final == nil || final.Content != "续任务办了:答复" {
+				t.Fatalf("应取回原任务的结果，实际 final=%+v err=%v", final, err)
+			}
+			if got := remote.snapshot(); !slices.Equal(got, []string{"new:原始请求", "cont:答复"}) {
+				t.Fatalf("远端应只收到一次答复，实际 %v", got)
+			}
+		})
 	}
 }
 

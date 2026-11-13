@@ -460,7 +460,7 @@ func (b *GraphBuilder) WithMaxVisit(n int) *GraphBuilder {
 	return b
 }
 
-// WithMaxFrontierWidth 设单个超步的最大并发成员数（默认 10000）。
+// WithMaxFrontierWidth 设单个超步的最大成员数（默认 10000）。限制同时执行数用 [WithMaxConcurrentNodes]。
 //
 // 触顶时返的是 `%w [MaxWidthError]`（`Width` = 触顶那一刻的宽度）——**不是**
 // [MaxIterationsError]，那个只装迭代深度。宽度与深度是两个正交维度，各有自己的类型。

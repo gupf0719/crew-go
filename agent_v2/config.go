@@ -226,6 +226,9 @@ type Config struct {
 	// ToolTimeout 是**单个业务工具**调用的 deadline（0 = 不设，默认）。见 [WithToolTimeout]。
 	ToolTimeout time.Duration
 
+	// MaxConcurrentTools 限制 BasicAgent 每个工具批次同时派发的调用数。见 [WithMaxConcurrentTools]。
+	MaxConcurrentTools int
+
 	// ModelRetry 是一次模型调用失败时整次重来的策略（零值 = 不重试，默认）。见 [WithModelRetry]。
 	ModelRetry compose_v2.RetryConfig
 

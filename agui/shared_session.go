@@ -108,14 +108,14 @@ func sharedSessionFrom(ctx context.Context) *sharedSession {
 }
 
 func (s *sharedSession) save(ctx context.Context, record *SessionRecord, dropTask string) error {
+	// SSE 断开时仍需收尾。原租约令牌保留在 ctx，由后端在写入时核对。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropCPTimeout)
+	defer cancel()
 	_, err := s.write(ctx, record, dropTask)
 	return err
 }
 
 func (s *sharedSession) write(ctx context.Context, record *SessionRecord, dropTask string) (int32, error) {
-	// SSE 断开时仍需收尾。原租约令牌保留在 ctx，由后端在写入时核对。
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropCPTimeout)
-	defer cancel()
 	deleted, err := s.store.SaveSession(ctx, s.key, record, dropTask)
 	if err == nil {
 		s.record = record

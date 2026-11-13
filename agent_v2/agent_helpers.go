@@ -161,7 +161,7 @@ func enterRunTask(ctx context.Context, session *RunSession) context.Context {
 	// 同一刻丢弃这个 RunID 名下的 don't-ask-again 规则——「上一个任务结束了」这句话对存档和
 	// 对授权必须同时成立（规则按 RunID 分，换了 RunID 本来就是一套新的；这里管的是业务复用同一个
 	// RunID 开新任务的写法）。**只清规则集**——「这次调用批过没有」那份已搬进 tools 节点的私有
-	// 中断态（见 `toolCallMemo.Approved`），跨任务隔离靠容器不靠这里。
+	// 中断态（见 `toolCallRecord.Approved`），跨任务隔离靠容器不靠这里。
 	clearApprovalRulesForNewTask(session)
 	return stampTask(ctx, session.RunID, true)
 }

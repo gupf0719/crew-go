@@ -7,10 +7,10 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"crew-go/internal/fanout"
 	"crew-go/internal/panicerr"
 	"crew-go/schema"
 )
@@ -2193,8 +2193,12 @@ func (r frontierResult) exitErr() error {
 //   - first error 仍返出（caller 决定是否中断 Run）
 func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, cm *ChannelManager, hooks OrchestrationHooks) frontierResult {
 	writeOwners := cm.completedWriteOwnersSnapshot()
+	limit, _ := ctx.Value(maxConcurrentNodesKey{}).(int)
 	// fast path: 单节点顺序
 	if len(frontier) == 1 {
+		if err := ctx.Err(); limit > 0 && err != nil {
+			return frontierResult{FailedBranches: frontier, FirstErr: err, WriteOwners: writeOwners}
+		}
 		id := frontier[0].NodeID
 		fn, ok := g.nodes[id]
 		if !ok {
@@ -2271,88 +2275,84 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 		err        error
 	}
 	results := make([]branchOutput, len(frontier))
-	var wg sync.WaitGroup
-	for i, m := range frontier {
+	started := fanout.Run(ctx, len(frontier), limit, func(i int) {
+		m := frontier[i]
 		fn, ok := g.nodes[m.NodeID]
 		if !ok {
 			results[i] = branchOutput{member: m, err: fmt.Errorf("node %q not registered", m.NodeID)}
-			continue
+			return
 		}
-		// 同 NodeID 多次出现按出现顺序分 branch idx 0,1,2...（首次=0）
-		i, m, fn := i, m, fn
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// **本 goroutine 顶上必须自带 recover**：`runNodeWithHooks` 那道随它 return 就
-			// 结束，而下面的 `evalOutEdges` 在它**之外**（`safeCondRun` 只裹 cond 的函数体，
-			// 框架对业务 error 的链式 unwrap 是裸的）。跨 goroutine 的 panic 谁都接不到，
-			// 不自己兜就 **crash 整进程**——业务给一个 `Unwrap()` 会 panic 的 error 即可。
-			//
-			// 见 panic_recovery.go。
-			//
-			// **`normalReturn` 守的是第三条出路**：goroutine 既没正常返回、也没 panic
-			// ——`runtime.Goexit`。它**会**跑 defer，但 `recover()` 返 nil，所以上面那支
-			// 接不住；而 `results[i]` 是预分配的零值 ⟹ `err == nil` ⟹ **被当成功**，
-			// 且 `member` 也是零值 ⟹ 一个 `NodeID:""` 的幽灵成员进 `CompletedFrontier`
-			//（那个集合的语义是「已成功、永不重跑」）⟹ 这条分支连同下游跨 Run + Resume
-			// **永久消失**，最后存档被当成功清掉，全程 `err == nil`。实测过。
-			//
-			// **不罕见**：`zap` 的 godoc 主动推荐在 `zap.WithFatalHook` 里调 `runtime.Goexit`
-			//（「Fatal 别杀进程、只结束当前 goroutine」是服务端常见诉求）；`os/user` 在
-			// Windows 上有一条（`user.Current()` 走得到）；testify 的 `require.*` 全系同理。
-			//
-			// **不转发 Goexit**：实测在主 goroutine 上转发会
-			// `fatal error: no goroutines (main called runtime.Goexit) - deadlock!`。
-			// 标准库 testing.tRunner（errNilPanicOrGoexit）与 iter.Pull（seqDone）
-			// 各有一份同款 flag，也都是**转成错误**而不是转发。
-			//
-			// **`member: m` 两支都要带**——身份跟结果是同一次赋值写的（`:1639`），零值
-			// 连身份都没有，那正是幽灵成员的根因。
-			normalReturn := false
-			defer func() {
-				if r := recover(); r != nil {
-					pe := panicerr.New(r)
-					perr := panicerr.Wrap(fmt.Sprintf("node %q out-edge panic recovered", m.NodeID), pe)
-					panicerr.Log(ctx, slog.LevelError, "compose_v2: 出边计算 panic，已转成该成员失败", pe, panicerr.KeyError, perr.Error())
-					results[i] = branchOutput{member: m, err: perr}
-					return // panic 已归档，别让下面那支拿 Goexit 的说法盖掉它
-				}
-				if !normalReturn {
-					// **不 wrap `ErrRunAborted`**：那个哨兵的判据是「重跑必然一样」，而这里
-					// 确定的只是 `runtime.Goexit` 这个**机制**——触发它的是业务条件
-					//（`logger.Fatal` 可能因为下游挂了而走到），框架判不出它是瞬时还是确定性。
-					// 按框架一贯的原则「分不出瞬时故障还是确定性错误，那是业务的知识」，
-					// 这里返普通业务错：留 Failed 档 ⟹ 业务可 Resume 重试**这一个**失败分支
-					//（成功兄弟不重放）。确定性的话重跑还是同样报错，偶发的话重跑就过了；
-					// 清掉档则两种都不给选。
-					results[i] = branchOutput{member: m, err: fmt.Errorf(
-						"node %q (ns=%q instance=%q) 的 goroutine 异常终止：既没正常返回也没 panic"+
-							"（runtime.Goexit——典型来源是 zap 的 WithFatalHook、testify 的 require.*、t.FailNow）",
-						m.NodeID, GetGraphNS(ctx), m.InstanceID)}
-				}
-			}()
-			chs := cm.channelsForMember(m)
-			ws, directives, consumed, signals, err := runNodeWithHooks(ctx, m.NodeID, fn, g.nodeComponents[m.NodeID], g.nodePolicies[m.NodeID], chs, hooks, cm, m.InstanceID)
-			var targets []NodeID
-			if err == nil {
-				// **每个实例各算各的出边**，视图只含它自己的写入——兄弟实例的写入看不见。
-				// 这是「路由归成员」的直接后果，也让 cond 失败能精确归因到某一个实例
-				//（先前 cond 读合并后的 channel、按 NodeID 只算一次，无从归因是哪个实例）。
-				var condSignals []SignalRecord
-				targets, condSignals, err = evalMemberOutEdges(ctx, g, cm, m, ws)
-				for _, sg := range condSignals {
-					signals = putSignal(signals, sg)
-				}
-				if err == nil {
-					err = validateSendDirectives(g, cm, m.NodeID, directives)
-				}
+		// **本 goroutine 顶上必须自带 recover**：`runNodeWithHooks` 那道随它 return 就
+		// 结束，而下面的 `evalOutEdges` 在它**之外**（`safeCondRun` 只裹 cond 的函数体，
+		// 框架对业务 error 的链式 unwrap 是裸的）。跨 goroutine 的 panic 谁都接不到，
+		// 不自己兜就 **crash 整进程**——业务给一个 `Unwrap()` 会 panic 的 error 即可。
+		//
+		// 见 panic_recovery.go。
+		//
+		// **`normalReturn` 守的是第三条出路**：goroutine 既没正常返回、也没 panic
+		// ——`runtime.Goexit`。它**会**跑 defer，但 `recover()` 返 nil，所以上面那支
+		// 接不住；而 `results[i]` 是预分配的零值 ⟹ `err == nil` ⟹ **被当成功**，
+		// 且 `member` 也是零值 ⟹ 一个 `NodeID:""` 的幽灵成员进 `CompletedFrontier`
+		//（那个集合的语义是「已成功、永不重跑」）⟹ 这条分支连同下游跨 Run + Resume
+		// **永久消失**，最后存档被当成功清掉，全程 `err == nil`。实测过。
+		//
+		// **不罕见**：`zap` 的 godoc 主动推荐在 `zap.WithFatalHook` 里调 `runtime.Goexit`
+		//（「Fatal 别杀进程、只结束当前 goroutine」是服务端常见诉求）；`os/user` 在
+		// Windows 上有一条（`user.Current()` 走得到）；testify 的 `require.*` 全系同理。
+		//
+		// **不转发 Goexit**：实测在主 goroutine 上转发会
+		// `fatal error: no goroutines (main called runtime.Goexit) - deadlock!`。
+		// 标准库 testing.tRunner（errNilPanicOrGoexit）与 iter.Pull（seqDone）
+		// 各有一份同款 flag，也都是**转成错误**而不是转发。
+		//
+		// **`member: m` 两支都要带**——身份跟结果是同一次赋值写的（`:1639`），零值
+		// 连身份都没有，那正是幽灵成员的根因。
+		normalReturn := false
+		defer func() {
+			if r := recover(); r != nil {
+				pe := panicerr.New(r)
+				perr := panicerr.Wrap(fmt.Sprintf("node %q out-edge panic recovered", m.NodeID), pe)
+				panicerr.Log(ctx, slog.LevelError, "compose_v2: 出边计算 panic，已转成该成员失败", pe, panicerr.KeyError, perr.Error())
+				results[i] = branchOutput{member: m, err: perr}
+				return // panic 已归档，别让下面那支拿 Goexit 的说法盖掉它
 			}
-			applyNestedEntryRejections(ctx, cm, m, err)
-			results[i] = branchOutput{member: m, writes: ws, directives: directives, targets: targets, consumed: consumed, signals: signals, err: err}
-			normalReturn = true
+			if !normalReturn {
+				// **不 wrap `ErrRunAborted`**：那个哨兵的判据是「重跑必然一样」，而这里
+				// 确定的只是 `runtime.Goexit` 这个**机制**——触发它的是业务条件
+				//（`logger.Fatal` 可能因为下游挂了而走到），框架判不出它是瞬时还是确定性。
+				// 按框架一贯的原则「分不出瞬时故障还是确定性错误，那是业务的知识」，
+				// 这里返普通业务错：留 Failed 档 ⟹ 业务可 Resume 重试**这一个**失败分支
+				//（成功兄弟不重放）。确定性的话重跑还是同样报错，偶发的话重跑就过了；
+				// 清掉档则两种都不给选。
+				results[i] = branchOutput{member: m, err: fmt.Errorf(
+					"node %q (ns=%q instance=%q) 的 goroutine 异常终止：既没正常返回也没 panic"+
+						"（runtime.Goexit——典型来源是 zap 的 WithFatalHook、testify 的 require.*、t.FailNow）",
+					m.NodeID, GetGraphNS(ctx), m.InstanceID)}
+			}
 		}()
+		chs := cm.channelsForMember(m)
+		ws, directives, consumed, signals, err := runNodeWithHooks(ctx, m.NodeID, fn, g.nodeComponents[m.NodeID], g.nodePolicies[m.NodeID], chs, hooks, cm, m.InstanceID)
+		var targets []NodeID
+		if err == nil {
+			// **每个实例各算各的出边**，视图只含它自己的写入——兄弟实例的写入看不见。
+			// 这是「路由归成员」的直接后果，也让 cond 失败能精确归因到某一个实例
+			//（先前 cond 读合并后的 channel、按 NodeID 只算一次，无从归因是哪个实例）。
+			var condSignals []SignalRecord
+			targets, condSignals, err = evalMemberOutEdges(ctx, g, cm, m, ws)
+			for _, sg := range condSignals {
+				signals = putSignal(signals, sg)
+			}
+			if err == nil {
+				err = validateSendDirectives(g, cm, m.NodeID, directives)
+			}
+		}
+		applyNestedEntryRejections(ctx, cm, m, err)
+		results[i] = branchOutput{member: m, writes: ws, directives: directives, targets: targets, consumed: consumed, signals: signals, err: err}
+		normalReturn = true
+	})
+	for i := started; i < len(frontier); i++ {
+		results[i] = branchOutput{member: frontier[i], err: ctx.Err()}
 	}
-	wg.Wait()
 
 	// 收集 per-branch delta：
 	// - 成功分支 → SuccessWrites + SendDirectives

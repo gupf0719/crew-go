@@ -10,7 +10,7 @@
 //     多轮追问天然支持（每次 input-required → 续发 = 一轮 Resume）。
 //   - **流式**：agent 的 LLM chunk（OrchestrationHooks.OnNodeEvent Type="chunk"）实时
 //     桥接为 A2A TaskArtifactUpdateEvent（首 chunk 建 artifact，后续 append）。
-//   - Cancel：取消挂起 task → 清映射 + abort 清 cp 子树 + canceled 状态。
+//   - Cancel：取消任务，等执行退出后清理存档子树。清理失败时保留取消记录供重试。
 //
 // **可观测（对齐 CLAUDE.md observability 协议）**：
 //   - 业务级 AgentHooks：构造被服务的 agent 时照常 `agent_v2.WithHooks(obs.AgentHooks())`——
@@ -198,6 +198,7 @@ type bridgeArtifact struct {
 }
 
 var _ a2asrv.AgentExecutor = (*Executor)(nil)
+var _ a2asrv.AgentExecutionCleaner = (*Executor)(nil)
 
 // NewExecutor 包装一个 agent_v2.Agent 成 A2A executor。
 //
@@ -310,84 +311,105 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 	}
 }
 
-// Cancel 取消 task：发 canceled 状态 + 清 cp。
-//
-// **与在途 run 的协调（修 audit MED：Cancel vs 在途 Resume 并发跑同 sid abort 的 cp 损坏）**：
-//   - 有在途 run（busy）：只打 canceled tombstone + cr() 取消在途 run 的 ctx，**不**自己跑
-//     abort——让在途 run 的 conclude 在其 Resume 返回**之后**独占清 cp。保证任一 sid 同时
-//     至多一个 agent.Resume，杜绝并发 abort/continue 的 cp 逻辑损坏。
-//   - 无在途 run：删条目 + 直接 abort 清 cp（独占）。
+// Cancel 取消任务。空闲任务立即尝试清档；在途任务由持有执行许可的请求在 Run 或
+// Resume 退出后清档。canceled 表示任务取消，清档失败由 Cleanup 补偿。
 func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2atypes.Event, error] {
 	return func(yield func(a2atypes.Event, error) bool) {
-		// Cancel 也是 wire 入口——同样按 (owner, taskID) 寻址，否则知道 taskId 就能
-		// 取消别人的在途任务（那也是一种拒绝服务）。
-		owner := compose_v2.GetOwner(ctx)
-		if owner == "" {
-			owner = e.ownerResolver(ctx)
-		}
-		tkey := taskKey{owner: owner, taskID: execCtx.TaskID}
+		ctx, key := e.cancelContext(ctx, execCtx)
 		e.mu.Lock()
-		st, ok := e.tasks[tkey]
-		var (
-			busy   bool
-			stopFn context.CancelFunc
-			sid    string
-		)
-		if ok {
-			st.canceled = true
-			busy, stopFn, sid = st.busy, st.cancelRun, st.sess.RunID
-			if !busy {
-				delete(e.tasks, tkey) // 无在途，立即清条目
+		st := e.tasks[key]
+		if st != nil {
+			busy, stopFn := st.busy, st.cancelRun
+			st.canceled, st.busy = true, true
+			e.mu.Unlock()
+			switch {
+			case stopFn != nil:
+				stopFn()
+			case !busy:
+				e.cleanupCanceled(ctx, key, st)
 			}
-		}
-		e.mu.Unlock()
-
-		if ok {
-			if busy {
-				// 停在途 run；其 conclude 见 canceled → 独占清 cp + 清条目（见 conclude）
-				if stopFn != nil {
-					stopFn()
-				}
-			} else {
-				// 无在途 → 独占清理（见 discardCanceled）。
-				e.discardCanceled(ctx, string(execCtx.TaskID), sid)
-			}
+		} else {
+			e.mu.Unlock()
 		}
 		yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateCanceled, nil), nil)
 	}
 }
 
-// discardCanceled 清掉一个已取消、没有在途 run 的任务留下的存档与观测会话：abort 清 cp（detached ctx：取消请求
-// 本身的 ctx 可能已随客户端断开取消；push sid 让 abort Resume 的 OnAgentStart 复用本 task 的 session，不漏建
-// sid-less "" session），再清 session——不经 conclude 的路径（空闲时 Cancel、请重答期间来了 Cancel）由它释放，
-// 不清的话 input-required 留下的 session 永久泄漏。框架编排会报告在途任务冲突，后端删档失败在 helper 内告警。
-// 取消本身照常完成，清理报错时在这里记日志。
-func (e *Executor) discardCanceled(ctx context.Context, taskID, sid string) {
-	rctx := compose_v2.WithSessionIDCtx(compose_v2.WithCheckpointerCtx(context.WithoutCancel(ctx), e.cp), sid)
-	if _, err := e.agent.Resume(rctx, sid, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
-		slog.WarnContext(ctx, "a2a server: cancel abort cleanup failed (cp/session 可能残留)", "task", taskID, "err", err)
+func (e *Executor) cancelContext(ctx context.Context, execCtx *a2asrv.ExecutorContext) (context.Context, taskKey) {
+	owner := compose_v2.GetOwner(ctx)
+	if owner == "" {
+		owner = e.ownerResolver(ctx)
+		ctx = compose_v2.WithOwner(ctx, owner)
 	}
+	if compose_v2.GetThreadID(ctx) == "" {
+		ctx = compose_v2.WithThreadIDCtx(ctx, execCtx.ContextID)
+	}
+	return ctx, taskKey{owner: owner, taskID: execCtx.TaskID}
+}
+
+// Cleanup 是 SDK 的结束回调。SDK 对已取消任务跳过 Executor.Cancel，仍调用 Cleanup。
+// 在途取消清档失败时，这里补偿一次，后续 CancelTask 也经过同一回调。
+func (e *Executor) Cleanup(ctx context.Context, execCtx *a2asrv.ExecutorContext, result a2atypes.SendMessageResult, _ error) {
+	task, ok := result.(*a2atypes.Task)
+	if execCtx.Message != nil || !ok || task == nil || task.Status.State != a2atypes.TaskStateCanceled {
+		return
+	}
+	ctx, key := e.cancelContext(ctx, execCtx)
+	e.mu.Lock()
+	st := e.tasks[key]
+	if st == nil || !st.canceled || st.busy {
+		e.mu.Unlock()
+		return
+	}
+	st.busy = true
+	e.mu.Unlock()
+	// cleanupCanceled 记录错误并保留任务，下一次取消可再试。
+	e.cleanupCanceled(ctx, key, st)
+}
+
+// cleanupCanceled 由持有 busy 的请求独占。失败时归还许可，保留禁止续跑的任务记录。
+func (e *Executor) cleanupCanceled(ctx context.Context, key taskKey, st *taskState) {
+	cleaned := false
+	defer func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.tasks[key] != st {
+			return
+		}
+		if cleaned {
+			delete(e.tasks, key)
+		} else {
+			st.busy = false
+		}
+	}()
+	sid := st.sess.RunID
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	ctx = compose_v2.WithCheckpointerCtx(ctx, e.cp)
+	ctx = compose_v2.WithSessionIDCtx(ctx, sid)
+	if _, err := e.agent.Resume(ctx, sid, agent_v2.WithResumeSession(st.sess), agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
+		slog.WarnContext(ctx, "a2a server: 已取消任务的存档清理失败", "task", key.taskID, "err", err)
+		return
+	}
+	cleaned = true
 	if e.obs != nil {
 		e.obs.CleanupSession(sid)
 	}
 }
 
 // releaseAfterReask 在请对端重答之后放掉 busy。期间来过 Cancel 的话（busy 时 Cancel 只打标记、把清理留给在途的
-// 那次），这里就是那次：删条目、清存档与观测会话，不再发 input-required（Cancel 已经发了 canceled）——曾经
-// 直接放掉 busy，条目、存档、观测会话一直留着，之后的续发拿到「已取消」，再来的 Cancel 被 SDK 短路，再也
-// 没有路径清掉它们（审计实测）。返回 false 表示任务已经取消。
+// 那次），由当前请求继续持有 busy 清理，禁止再发 input-required。返回 false 表示任务已经取消。
 func (e *Executor) releaseAfterReask(ctx context.Context, k taskKey, st *taskState) bool {
 	e.mu.Lock()
 	canceled := st.canceled
-	st.busy = false
-	if canceled {
-		delete(e.tasks, k)
+	if !canceled {
+		st.busy = false
 	}
 	e.mu.Unlock()
 	if !canceled {
 		return true
 	}
-	e.discardCanceled(ctx, string(k.taskID), st.sess.RunID)
+	e.cleanupCanceled(ctx, k, st)
 	return false
 }
 
@@ -574,24 +596,20 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		st.pending = qs
 		st.busy = false
 		st.cancelRun = nil
-	} else {
+	} else if !canceled {
 		delete(e.tasks, tkey)
+	} else {
+		st.cancelRun = nil
 	}
 	e.mu.Unlock()
 	// 最终态（完成/失败/取消/空中断）清 session；input-required（keepPending）留待续发 Resume 复用同 session
-	cleanupSession = !keepPending
+	cleanupSession = !keepPending && !canceled
 
 	// 被取消：在途 Resume 此刻已返回 → 独占 abort 清 cp（detached ctx：runCtx 可能已被 Cancel 取消），
 	// 不发终态（Cancel 已发 canceled）。
 	if canceled {
 		spanStatus = observability.OutcomeCancelled
-		// push sid 让 abort Resume 的 OnAgentStart 复用本 task session（不漏建 sid-less "" session）；
-		// 本 task 的 session 由下面 cleanupSession defer 清（canceled → keepPending=false → cleanupSession=true）。
-		rctx := compose_v2.WithSessionIDCtx(compose_v2.WithCheckpointerCtx(context.WithoutCancel(ctx), e.cp), st.sess.RunID)
-		if _, err := e.agent.Resume(rctx, st.sess.RunID, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
-			// 同 Cancel 路径：清理报错时记日志。
-			slog.WarnContext(ctx, "a2a server: post-cancel abort cleanup failed (cp/session 可能残留)", "task", string(execCtx.TaskID), "err", err)
-		}
+		e.cleanupCanceled(ctx, tkey, st)
 		return
 	}
 

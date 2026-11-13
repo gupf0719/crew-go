@@ -36,7 +36,7 @@ var configurableExecutionCtxKeys = []any{softCancelCtxKey{}}
 // environmentCtxKeys 是 DetachExecution 留下的 key：调用方给整个请求配的环境（isConfigurableKey）。
 var environmentCtxKeys = []any{
 	checkpointerKey{}, orchHooksKey{}, ownerKey{},
-	durabilityCtxKey{}, staleGuardCtxKey{}, emitCpEventCtxKey{},
+	durabilityCtxKey{}, staleGuardCtxKey{}, emitCpEventCtxKey{}, maxConcurrentNodesKey{},
 	checkpointRestoreObserverKey{},
 }
 

@@ -430,6 +430,8 @@ func (c resumeConfig) overrides() runOverrides {
 }
 
 // WithResumeAction 设置 Resume 三态：Continue (默认) / Replan / Abort。
+// Abort 在独立的清理期限内删除当前任务的存档子树。无档时幂等成功，清理失败时返回错误，
+// 调用方可保留任务标识并重试 Abort。
 func WithResumeAction(a ResumeAction) ResumeOption {
 	return func(c *resumeConfig) {
 		c.action = a
@@ -568,6 +570,16 @@ func applyResumeOptions(opts []ResumeOption) resumeConfig {
 // 信号（调用方的 ctx 没死），所以按普通工具错处理：转成 tool_result 给模型看，让它换条路。
 func WithToolTimeout(d time.Duration) Option {
 	return func(c *Config) { c.ToolTimeout = d }
+}
+
+// WithMaxConcurrentTools 限制 BasicAgent 同一批次同时派发的工具调用数。
+// 0 为不设上限（默认），负数会 panic。等待空位时响应取消，工具超时从执行时开始计算。
+// 批次独立调度，已转入后台的工具任务由 [BackgroundTaskManager] 管理。
+func WithMaxConcurrentTools(limit int) Option {
+	if limit < 0 {
+		panic("agent_v2: max concurrent tools must be non-negative")
+	}
+	return func(c *Config) { c.MaxConcurrentTools = limit }
 }
 
 // WithModelRetry 设一次模型调用失败时整次重来的策略（默认不重试）。

@@ -61,7 +61,7 @@ const (
 // # 每次工具调用只判一次，判的就是执行的
 //
 // 一次工具调用的内容（`OnToolStart` 改写之后的工具名与参数）在这一批第一次交给工具执行时定下，之后的每次
-// 执行都按这份内容（见 fixToolCallContent）；审批结论在第一次形成时随这次调用的审批记录进存档，中断续跑、
+// 执行都按这份内容（见 saveToolCallContent）；审批结论在第一次形成时随这次调用的审批记录进存档，中断续跑、
 // 失败续跑时原样沿用、不再调启发式（需要配 checkpointer；没配时重试是从头跑的新调用）。所以：
 //   - 启发式判过的、用户在审批问题里看到并批过的，就是实际执行的那一份——续跑时 `OnToolStart` 再改写
 //     （注入时间戳、请求号，或改了工具名）对这次调用不生效；
@@ -245,7 +245,7 @@ func markToolApproved(s *RunSession, cfg *Config, tc schema.ToolCall, scope stri
 // **复用同一个 RunID 开新任务**的写法（顶层 Run 被判成新任务，而 session 没换 RunID）。
 //
 // 「这次调用批过没有」那份**不在这里**：它已经搬进 tools 节点的私有中断态
-// （`toolCallMemo.Approved`），新任务是新 cp、天然为空，**隔离不依赖这个函数**
+// （`toolCallRecord.Approved`），新任务是新 cp、天然为空，**隔离不依赖这个函数**
 // （有专门的用例把清除点删掉仍绿）。它原先在这里，而那时这个函数是正确性补丁
 // ——谁忘了调、或判据跟别处走岔，跨任务泄漏立刻静默复现。
 //
@@ -291,8 +291,8 @@ func ClearApprovalRules(s *RunSession) { clearApprovalRulesForNewTask(s) }
 //
 // **为什么不再自己读写 session KV**：「批过没有」原先按位置 ID 存在 session 上，而位置 ID
 // 跨任务重复、session 又活得比任务长 ⟹ 跨任务泄漏。现在两样都在 tools 节点的
-// **节点私有中断态**里（`toolCallMemo.Approved` / `Decided`），键跟 tool memo 同一把——那个容器
-// 新任务就是空的，泄漏结构上不可能。详见 `toolCallMemo.Approved` 的注释。
+// **节点私有中断态**里（每个调用自己的账项），这个容器
+// 新任务就是空的，泄漏结构上不可能。见 `toolCallRecord`。
 //
 // 这里做成回调而不是直接引用 memo，是为了让 `checkToolApproval` 保持只依赖入参、
 // 不反向依赖 tools 节点的内部结构。
@@ -347,7 +347,7 @@ func markCallApproved(ctx context.Context) {
 //
 // 结论记下之后不再看配置，这几件一起消失。RoutingAgent 的升级链是同一个做法（`routeStageMemo`）。
 //
-// 重放的前提是这次调用的内容没变：内容在这一批第一次交给工具执行时定下（fixToolCallContent），续跑时按定下的
+// 重放的前提是这次调用的内容没变：内容在这一批第一次交给工具执行时定下（saveToolCallContent），续跑时按定下的
 // 内容执行，不按 `OnToolStart` 这一次的改写。不固定的话，两种做法各有一个反例（均审计实测）：只按调用重放，
 // 续跑时被改写成 1000 的参数沿用了启发式对 100 的放行；按内容重判，钩子每次注入新值时每次续跑都重判，
 // 启发式一改口，用户的拒绝就被推翻。
@@ -429,12 +429,12 @@ type approvalResult struct {
 // **准入只发生一次**：一次调用经任何一条路被准入（结论是 Allow、用户批准、approve_always 规则放行）之后，续跑都
 // 不再问、不再被推翻——调用方续跑时对同一个审批 ID 改答 deny 不推翻，不带原 session 续跑、规则丢了也不再问；
 // 结论是 Deny 或用户拒绝时，拒绝结果记进工具账，同样不再变。判的、问的、执行的是同一份内容（一批调用的内容在
-// 第一次执行时定下，见 fixToolCallContent；启发式拿到的是参数的拷贝）。
+// 第一次执行时定下，见 saveToolCallContent；启发式拿到的是参数的拷贝）。
 //
 // Ask 决策且未 Resume → 抛 InterruptError（审批问题在自己的相位里取提问序号，见 NextAnswerSlot），骑现有 cp
 // 挂起；Resume 后按答案 approve / approve_always（记规则）/ deny（拒绝，工具级 error 不 abort）。
 // **三样状态、两个载体**：「这次调用的审批结论」与「这次调用已批过」记在 tools 节点的私有中断态里
-// （`toolCallMemo.Decided` / `Approved`，与 tool memo 同一把键、随 cp 走）——跨 Resume 自动带着。
+// （`toolCallRecord` 的审批字段随 cp 保存）——跨 Resume 自动带着。
 // `approve_always` / `approve_always_tool` 的**规则集**存 RunSession KV、按任务（RunID）分
 // （不走 cp），规则只对答应它的那个 agent 实例生效（键带构造时铸的身份，见 approvedToolsKey），跨 Resume 持久需
 // caller 传 `WithResumeSession` 复用同一 session（默认 Resume 新建空 session，规则丢失会重新询问）。

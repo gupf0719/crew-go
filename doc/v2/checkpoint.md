@@ -47,7 +47,7 @@ type Checkpoint struct {
     NS        string           // 本 cp 的 ns 路径（嵌套寻址用）
     ParentNS  string           // 父 ns（O(1) 反查祖先）
     Status    CheckpointStatus // Unset / Pending / Failed —— **只是报告位**，不参与控制流，见 §3.1
-    SchemaVer int              // 当前 CheckpointSchemaVer = 20
+    SchemaVer int              // 当前 CheckpointSchemaVer = 21
     GraphID   string           // 防 cp 串台（§4.3）
     CreatedAt int64            // UnixNano，Cleanup 按它排序；框架只在 caller 没给时盖
     Epoch     string           // 写代：每次 SaveNS 换一枚（§2.2）
@@ -594,15 +594,11 @@ ctx 已经死了）不算否决，中断、失败之后的续跑也照常拿回�
 **分域**：同一次节点执行名下还有几块互不相干的地方，各有自己的一格（`SaveNodeState` /
 `GetNodeState`）和自己的步骤记录：
 
-- **工具函数里**按 tool_call 分域（`WithCurrentToolCallContext` 派生；BasicAgent 另按工具名再分一层）：
-  并发的 tool_call 各记各的，也碰不到 tools 节点自己那一格——它记着哪些 tool_call 已经做完，没分域时
-  工具里一次 `SaveNodeState` 就把那份账覆盖了、已执行过的工具在续跑时再执行一遍（实测）。工具名那一层
-  让不同工具的记录互不相认：`OnToolStart` 能改写工具名，但改写只在这一批第一次执行时生效、续跑沿用定下的
-  内容（`fixToolCallContent`），同一个 tool_call 正常情况下不会两次执行之间换工具；这一维让「换了工具就不认旧
-  记录」不依赖那份记录；BasicAgent 的**工具钩子**（`OnToolStart` /
-  `OnToolEnd`）每次调用是一个相位（`compose_v2.EnterPhase`，按钩子名 + 工具名 + 所属 tool_call 命名）：自己的
-  一格、自己的提问与嵌套调用计数（两个 tool_call 的钩子带同一个 call key 调同一个 agent 不再撞），采纳钩子
-  返回的 ctx 时框架把节点体那一套连同其余执行状态取回来（`compose_v2.CallHook`）；
+- **BasicAgent 工具账**按调用 ID、批内下标及首次派发后的工具名分域，各自保存审批和结果。
+  每次保存仅编码该调用的账项，仍随图的存档提交。v20 的旧批次账首次恢复时转换为独立账项。
+- **工具函数和工具钩子**各有独立分域。工具体通过 `WithCurrentToolCallContext` 按调用分域，BasicAgent
+  另按工具名区分。工具钩子经 `compose_v2.EnterPhase` 按钩子名、工具名和调用分域，各有自己的私有态、
+  提问和嵌套调用计数。`compose_v2.CallHook` 采纳钩子返回值后恢复节点体的执行状态。
 - **图的钩子相位与条件边**（`OnNodeStart` / `OnNodeEnd` / `OnNodeEvent` / cond）记在那个节点这次
   执行名下、按相位分域；嵌套图的 `OnGraphStart` / `OnGraphEnd` 与入口条件边记在承载它的外层节点
   执行名下；

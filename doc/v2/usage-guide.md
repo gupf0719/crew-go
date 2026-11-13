@@ -369,13 +369,19 @@ if ie, ok := compose_v2.IsInterrupt(err); ok {
 | `deny`（或空 / 未识别）| 拒绝执行，返工具级 `[tool_denied]` 给 LLM 继续 ReAct（**不 abort 整 Run**）|
 
 **关键**：
-- **三样状态、两个载体**：`approve` 的「这次调用已批过」与这次调用的审批结论记在 tools 节点的**私有中断态**里（`toolCallMemo.Approved` / `Decided`，与 tool memo 同一把键、随 cp 走）——跨 Resume 自动带着，不需要额外配置。`approve_always` / `approve_always_tool` 的**规则集**存 RunSession KV（不走 cp），跨 Resume 持久**需 caller 传 `WithResumeSession(sess)` 复用同一 session**——默认 Resume 新建空 session，规则会丢、重新询问。规则集**按任务（RunID）分**：`sess.NextTask()` 换了 RunID 就是新的一套，复用同一个 RunID 开新任务时由编排入口清掉。规则**只对答应它的那个 agent 实例生效**：编排的其他成员、嵌套调用的被调方或调用方同名的工具是另一个工具，照样要问（沙箱子 agent 里答的「一直允许」曾放行父 agent 的同名生产工具，实测）；agent 被重建（每个请求经工厂重建的接入如 agui、每次 fork 都新建实例的 skill resolver）就是新的身份，再问一次。
+- **三样状态、两个载体**：`approve` 的「这次调用已批过」与这次调用的审批结论记在 tools 节点的**私有中断态**里（每个调用自己的工具账项，随 cp 保存）——跨 Resume 自动带着，不需要额外配置。`approve_always` / `approve_always_tool` 的**规则集**存 RunSession KV（不走 cp），跨 Resume 持久**需 caller 传 `WithResumeSession(sess)` 复用同一 session**——默认 Resume 新建空 session，规则会丢、重新询问。规则集**按任务（RunID）分**：`sess.NextTask()` 换了 RunID 就是新的一套，复用同一个 RunID 开新任务时由编排入口清掉。规则**只对答应它的那个 agent 实例生效**：编排的其他成员、嵌套调用的被调方或调用方同名的工具是另一个工具，照样要问（沙箱子 agent 里答的「一直允许」曾放行父 agent 的同名生产工具，实测）；agent 被重建（每个请求经工厂重建的接入如 agui、每次 fork 都新建实例的 skill resolver）就是新的身份，再问一次。
 - **启发式 seam 不内置策略**：框架只给机制 + `WithApprovalHeuristic` 回调，shell allowlist 等具体安全策略业务自负。
 - **每次工具调用只判一次，判的就是执行的**：一批工具调用的内容（`OnToolStart` 改写之后的工具名与参数）在这一批第一次交给工具执行时定下，中断续跑、失败续跑时按定下的内容执行（不论审批开没开）；审批结论在第一次形成时记下，续跑原样重放、不再调启发式（需要配 checkpointer）。所以启发式判过的、用户在审批问题里看到并批过的，就是实际执行的那一份——续跑时 `OnToolStart` 再改写（注入时间戳、请求号，或改了工具名）对这次调用不生效；启发式也可以调模型判断、按时间或额度判断，用户的答复不会被一次重新判定推翻。判断本身失败时返回 `ApprovalDecisionAsk` 交给人。结论不会过期：额度用完了，这次调用先前的 Allow 照样作数。启发式拿到的 args 是拷贝，就地改了不影响执行（要改参数用 `OnToolStart`）。例外是工具中间件：它在审批之后、每次执行都跑，它改的参数不经审批（见下方「包装工具调用」那条）。
 - **一次调用只准入一次**：经启发式 / 模式默认判 Allow、用户批准、approve_always 规则放行，任何一条路准入之后，续跑都不再问、不再被推翻——调用方续跑时对同一个审批 ID 改答 deny 不推翻（工具可能已经开始执行，推翻就只执行了一半），不带原 session 续跑、规则丢了也不再问。
 - **审批配置在 Run 与 Resume 之间变了**（滚动发布时加上或去掉启发式、换 `ApprovalMode`、开关审批）：已经形成结论的调用沿用它——用户答过的拒绝照样作数，判过 Allow、批准过的不会被重新拦下；新配置只管还没形成结论的调用。审批关着时不形成结论：续跑时打开审批，这次调用按新配置要审批，工具体若已开始执行、被拒时就只执行了一半。审批问题在自己的相位里占提问序号，工具自己的提问不随审批问不问挪位，两边的答复不会串。
 - **业务工具与 skill action 受审批**。`run_skill_action` 按当前审批模式处理，工具级长期放行只覆盖同一个 skill/action。框架的 `ask_user`、`activate_skill`、`tool_search`、`transfer_to_agent`、`route_to` 和结构化输出的 `final_output` 按实例豁免。业务注册的同名工具照常审批。框架工具的中间件、超时、截断和工具账规则继续按实例判定。
 - fanout 多工具同需审批 → `MergeInterrupts` 一次问完；`ApprovalAuto`（默认）且没配启发式时，还没形成结论的调用直接放行、零开销。
+
+### 工具执行并发
+
+`agent_v2.WithMaxConcurrentTools(n)` 控制一个 BasicAgent 工具批次同时派发的调用数。默认 `0` 表示并发派发整批。
+排队时响应调用方取消，工具超时从执行时开始计算。开始和结束钩子仍各自串行，工具结果保持模型声明的顺序。
+子 agent 的图与工具批次各自调度。已经转入后台的工具任务由 `BackgroundTaskManager` 管理。
 
 ### 包装工具调用（观测 / 短路 / 挂起）
 

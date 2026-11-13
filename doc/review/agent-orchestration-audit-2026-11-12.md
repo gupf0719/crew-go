@@ -180,4 +180,60 @@ git apply -R doc/review/agent-orchestration-audit-2026-11-12-probes.patch
 
 已通过 `make test-all`、`make vet`、`go test -race ./agent_v2 ./compose_v2 ./hook ./a2a/... ./agui ./observability`，以及嵌套 12/12、Channel 5/5、Plan Web SSE 和 A2A HITL 冒烟。实际 PostgreSQL 三种驱动模式、MySQL 两种参数模式、Redis 7.4.2 和默认 SQLite Checkpointer conformance 均通过。真实模型冒烟因缺少 `QWEN_API_KEY` 未执行模型调用。
 
-升级涉及存档格式 v20。含单写入者 channel 的旧部分提交如果缺少 `CompletedWriteOwners`，恢复会拒绝并保留原档。摘要终局错误传播已随 F2 完成。取消后的补偿清理、并发预算和工具账成本仍由待办跟踪。
+本轮 8 项修复引入存档格式 v20。含单写入者 channel 的旧部分提交如果缺少 `CompletedWriteOwners`，恢复会拒绝并保留原档。摘要终局错误传播已随 F2 完成。
+
+## 2026-11-13 优化复审
+
+### 取消与清理补偿
+
+存储故障注入复现了 AG-UI 返回 `cancelled` 后丢失任务入口的行为。重试返回 `404 no_session`，存档仍存在。
+显式 Abort 现在上报删除错误。进程内 AG-UI 在清档前保留原任务及取消请求的身份，拒绝送回答案，
+并由重复取消、同线程新 Run 或容量和 TTL 回收完成清档和历史收尾。
+跨租户 TTL 探针使用独立的 `agent_v2.WithHistoryOwnerFunc`，验证补写落在原任务的历史分区，工具体执行数为零。
+旧请求的释放按其领取的条目核对。共享 AG-UI 继续通过存储事务原子删除会话与存档。
+
+A2A SDK v2.7.0 实测会绕过已取消任务的 Executor.Cancel，仍调用结束回调。
+Executor 以取消记录独占存档清理。首次失败后结束回调补偿，后续 `CancelTask` 也能重试。
+实测涵盖在途 Resume 退出后才清档、错误续答被拒、请求已取消时清理期限和身份仍有效。
+持续故障下清理依赖下一次重试或回收，默认进程内记录随进程结束。
+
+### 执行并发预算
+
+图超步与 BasicAgent 原先按成员或工具数量创建 goroutine。改后分别用
+`compose_v2.WithMaxConcurrentNodes` 和 `agent_v2.WithMaxConcurrentTools` 设置独立预算，默认值均为 0。
+限额 2 的屏障探针确认两项真重叠，取消后其余项没有执行。该探针的 Resume 只执行未完成项，输出保持声明顺序。
+独立探针覆盖同 NodeID 多实例的输入恢复、限额 1 嵌套图、Goexit 后继续派发及排队工具的取消 span。
+已经派发的执行按协作取消收尾。各层预算独立，应用可以按实际嵌套深度估算总并发。
+
+### 工具账编码成本
+
+每完成一项便编码逐渐增大的整批工具账，使固定大小结果的累计编码量按批宽近似二次增长。
+改后审批、原始结果和定稿各自更新其调用的账项，保留原有的持久化边界。
+v21 首次读取 v20 批次账时迁移。真实 BasicAgent 的 v20 JSON 恢复回归确认已完成的副作用执行一次，
+暂停工具复用已批准状态，模型收到两项正确结果。独立复审还覆盖空 ID、工具改名、钩子定稿和信号，
+并修复技能参考文档在兄弟工具中断后重复读取的问题。
+
+Apple M1、Go 1.26.4、`GOMAXPROCS=8`，真实 BasicAgent、桩模型及每项 4 KiB 的内存工具输出。
+同一基准每档运行三次，表中为中位数。分配列是累计分配字节折算的 MB。
+
+```bash
+GOMAXPROCS=8 go test ./agent_v2 -run '^$' -bench '^BenchmarkBasicAgentToolLedger$' -benchmem -benchtime=400ms -count=3
+```
+
+| 批宽 | 变更前 ms/op | 变更后 ms/op | 变更前 MB/op | 变更后 MB/op |
+|---:|---:|---:|---:|---:|
+| 8 | 0.90 | 0.28 | 0.66 | 0.27 |
+| 32 | 6.43 | 0.75 | 6.23 | 0.94 |
+| 64 | 21.80 | 1.35 | 21.17 | 1.82 |
+| 128 | 76.54 | 2.91 | 78.06 | 3.61 |
+
+该基准测量批次执行及内存编码，无外部模型或持久化后端 I/O。
+工具体有外部副作用且进程在存档前退出时，业务仍需幂等。
+
+### 交付检查
+
+- `make test-all`、`make vet` 和核心包 `go test -race` 通过。
+- 嵌套冒烟 12/12、Channel 冒烟 5/5、Plan Web SSE 和 A2A HITL 冒烟通过。
+- SQLite、实际 PostgreSQL、MySQL 和 Redis 的存档 conformance 通过。PostgreSQL 和 MySQL 同时运行共享 AG-UI 会话用例。
+- 独立复审后分别关闭六处关键行为进行对照。预算旁路、旧账迁移、A2A 结束回调、回收历史收尾和旧请求释放保护均触发对应失败。
+- 本机缺少 Qwen 和 DeepSeek 凭据，教学与 A2A 的真实模型调用未验证。

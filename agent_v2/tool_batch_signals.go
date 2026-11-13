@@ -41,6 +41,8 @@ type toolBatch struct {
 	// ends：各调用的结局，成不成都填。这一批整体成功时 tools 节点据它给重放的调用标上 ToolReplayedExtraKey，没整体
 	// 成功时据它给已经有结局的调用触发 OnToolEnd（见 endSettledToolCalls）。
 	ends []toolCallEnd
+	// memo 与工具调用逐项对应。并发期间每项只由该调用读写。
+	memo []*toolCallRecord
 	// references 在 OnToolEnd 之后读取已经接受的激活所选中的参考文档。
 	references *Config
 	messages   []*schema.Message

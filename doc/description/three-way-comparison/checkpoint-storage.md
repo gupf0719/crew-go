@@ -813,7 +813,7 @@ MAF 的 hosting 层实测在用：cp 路径是 `<root>/<user_id>/<context_id>`
 | 同维度上有个大一个数量级、且已被接受的重放 | `asyncCpWriterBuffer = 8` ⟹ 恢复点最多陈旧 8~9 个超步。为亚超步那一格立项而接受 8 超步，不自洽 |
 
 **另：LangGraph 的粒度是 task = 一个节点，覆盖不到我们最贵的那格**——一个 tools 节点内的
-N 个 tool_call（下单 / 扣款 / 发消息）。那格我们有 `SaveNodeState` / `toolCallMemo`，中断
+N 个 tool_call（下单 / 扣款 / 发消息）。那格我们有 `compose_v2.SaveNodeState` 的工具调用账项，中断
 路径有效、硬崩路径失效，而**他们在这格同样失效**。
 
 **非崩溃路径我们已经等价了**：部分失败时 `CompletedFrontier` + `CompletedTargets` 让已成功
@@ -1082,3 +1082,10 @@ ns LIKE 'prefix<sep>%'`。而段里可以合法出现 LIKE 的 `_` / `%`（校�
 当初那条「backend 源码里有没有手抄分隔符集」的扫描随之删除（只剩一个分隔符，「同一行列出
 ≥2 个」的判据不再有意义；新增实例段也不再需要 backend 跟进）；回归改由 conformance 的
 `DeleteSubtree_Sibling_Executions_Survive` 在各后端实跑兜住。
+
+### 2026-11-13 · 工具账的记录粒度
+
+本地 LangGraph `b4cb0f19e` 在 checkpoint saver 的 `put_writes` 中按 task 保存 `pending_writes`，可独立更新完成项。
+crew-go 仍在图边界写存档，采用独立记录的粒度，每个工具调用通过 `compose_v2.SaveNodeState` 保存审批、结果和信号。
+这样既能在中断后重放单项，也省去其他已完成结果的重复编码。v20 批次账在恢复入口迁移，v21 写逐调用账项。
+实测对比见[审计复核](../../review/agent-orchestration-audit-2026-11-12.md#2026-11-13-优化复审)。

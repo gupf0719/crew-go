@@ -30,6 +30,7 @@ package agent_v2
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -851,10 +852,29 @@ func WithoutHistoryCtx(ctx context.Context) context.Context {
 // 写入 / 读取入口（供 BasicAgent 调用）
 // ---------------------------------------------------------------------------
 
-// startHistory 在 Run / Resume 入口装配本次调用的历史写入器，返回 (新 ctx, 收尾函数)。
+type taskHistoryBindingKey struct{}
+
+// ErrTaskHistoryBinding 表示执行前无法确认宿主保存的任务历史分区。
+// 已挂起的任务可以在恢复历史配置后重试，宿主应保留其存档和答复。
+var ErrTaskHistoryBinding = errors.New("task history binding failed")
+
+type taskHistoryBinding struct {
+	task string
+	key  HistoryKey
+	bind func(context.Context, HistoryKey) error
+}
+
+// WithTaskHistoryBinding 让宿主在任务开始写历史前固定写入分区。
+// key 非零时使用已有分区；bind 在创建写入器前持久化新分区，失败时停止执行。
+// 绑定只作用于指定 task，子 agent 沿用原写入器，脱离执行时清除绑定。
+func WithTaskHistoryBinding(ctx context.Context, task string, key HistoryKey, bind func(context.Context, HistoryKey) error) context.Context {
+	return context.WithValue(ctx, taskHistoryBindingKey{}, taskHistoryBinding{task: task, key: key, bind: bind})
+}
+
+// startHistory 在 Run / Resume 入口装配本次调用的历史写入器。
 //
 // 收尾函数必须 defer 调用（drain 完 pending 写 + 等 worker 退出）——"谁启动谁负责退出"。
-// 没开历史 / 会话身份缺失时返原 ctx + no-op，调用方不必分情况处理。
+// 没开历史或缺少会话身份时返回原 ctx 和空收尾函数。宿主绑定失败时返回 ErrTaskHistoryBinding。
 //
 // **身份缺失就整个不启**：没有 ConvID 或 owner 就没有「这是哪个会话的、谁的」，写下去
 // 也无从取回。这里 warn 一次然后不建 writer——后续所有 recordHistory 天然变成 no-op，
@@ -863,15 +883,29 @@ func WithoutHistoryCtx(ctx context.Context) context.Context {
 // **嵌套沿用父的**：ctx 里已有写入器时直接复用。一场会话只该有一条流——子 agent 的
 // 产出照样进同一个 (Owner, ConvID)，靠 HistoryAgentAnnotation 区分是谁说的。另起一个
 // 会让同一场对话的写入分散到两个 worker，顺序就不再有保证了。
-func startHistory(ctx context.Context, hc *historyConfig, agentName string) (context.Context, func()) {
+func startHistory(ctx context.Context, hc *historyConfig, agentName string) (context.Context, func(), error) {
 	noop := func() {}
 	if historyWriterFrom(ctx) != nil || historySuppressed(ctx) {
-		return ctx, noop
+		return ctx, noop, nil
+	}
+	binding, _ := ctx.Value(taskHistoryBindingKey{}).(taskHistoryBinding)
+	_, nested := enclosingTask(ctx)
+	if nested || binding.task != compose_v2.GetSessionID(ctx) {
+		binding = taskHistoryBinding{}
 	}
 	if hc == nil || hc.store == nil {
-		return ctx, noop
+		if binding.key != (HistoryKey{}) {
+			return ctx, noop, fmt.Errorf("agent %q: %w: history store is unavailable", agentName, ErrTaskHistoryBinding)
+		}
+		return ctx, noop, nil
 	}
-	key, ok := historyKeyFrom(ctx, hc)
+	key, ok := binding.key, binding.key != (HistoryKey{})
+	if ok && (key.Owner == "" || key.ConvID != compose_v2.GetThreadID(ctx)) {
+		return ctx, noop, fmt.Errorf("agent %q: %w: invalid destination", agentName, ErrTaskHistoryBinding)
+	}
+	if !ok {
+		key, ok = historyKeyFrom(ctx, hc)
+	}
 	if !ok {
 		slog.WarnContext(ctx, "agent_v2: 开了会话历史但没拿到会话身份，本次调用不写历史——"+
 			"会话 ID 用 compose_v2.WithThreadIDCtx(ctx, convID) 声明"+
@@ -879,7 +913,12 @@ func startHistory(ctx context.Context, hc *historyConfig, agentName string) (con
 			"agent", agentName,
 			"conv_id", compose_v2.GetThreadID(ctx),
 			"owner", hc.resolveOwner(ctx))
-		return ctx, noop
+		return ctx, noop, nil
+	}
+	if binding.bind != nil {
+		if err := binding.bind(ctx, key); err != nil {
+			return ctx, noop, fmt.Errorf("agent %q: %w: %w", agentName, ErrTaskHistoryBinding, err)
+		}
 	}
 	w := newHistoryWriter(ctx, hc.store, key)
 	// 调用方提供了前文时定下这次运行以谁为准（见 caller_history.go）。拥有者 = 建写入器时还不在任何正在执行的任务里：
@@ -891,7 +930,7 @@ func startHistory(ctx context.Context, hc *historyConfig, agentName string) (con
 			w.clientPrior = !seedCallerPrior(ctx, w, prior)
 		}
 	}
-	return withHistoryWriter(ctx, w), w.closeAndJoin
+	return withHistoryWriter(ctx, w), w.closeAndJoin, nil
 }
 
 // markFromAgent 返回一份带 from_agent 标注的浅拷贝（Raw 视图用，保留原 role）。

@@ -324,6 +324,9 @@ func runAGUISessionScenarios(t *testing.T, dialect crewsql.Dialect, open func() 
 	t.Helper()
 	checkRunJournal(t, dialect, open)
 	checkWorkflowVersions(t, dialect, open)
+	fixture := func(t *testing.T) aguiFixture { return setupAGUI(t, dialect, open) }
+	t.Run("cancel_recovery_with_old_workflow", func(t *testing.T) { testDurableCancelWorkflowRecovery(t, fixture) })
+	t.Run("cancel_transitions_require_both_fences", func(t *testing.T) { testDurableCancelFences(t, fixture) })
 	t.Run("restart_disconnect_busy_owner_stale", func(t *testing.T) {
 		f := setupAGUI(t, dialect, open)
 		reached, proceed := make(chan struct{}), make(chan struct{})

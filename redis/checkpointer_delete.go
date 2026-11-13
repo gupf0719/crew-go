@@ -3,14 +3,13 @@ package redis
 import (
 	"context"
 	"fmt"
-	"strconv"
 
 	"crew-go/compose_v2"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// deleteSubtreeScript 是 DeleteSubtree 的 Lua 脚本 — 服务端原子完成:
+// deleteSubtreeLua 由独立删除和会话存储共用，调用方在同一个脚本中先核对租约。
 //   - SMEMBERS nsidx + Lua 内段级前缀匹配 (判据同 [compose_v2.IsNSInSubtree])
 //   - 对每 matched ns: DEL item + DEL meta → SREM nsidx + SREM pending
 //   - SCARD nsidx 验空 → 条件 SREM sids
@@ -30,7 +29,21 @@ import (
 //	[4] = meta_key_prefix
 //	[5] = 层级分隔符 (compose_v2.NSSubtreeSeparator(), 划定子树用)
 //	[6] = 任务租约 token（空表示调用方直接操作）
-var deleteSubtreeScript = redis.NewScript(`
+const deleteSubtreeLua = `
+local function check_set(key)
+    local kind = redis.call("TYPE", key).ok
+    if kind ~= "none" and kind ~= "set" then
+        error("checkpoint index must be a set: " .. key)
+    end
+end
+
+local function check_command(command, ...)
+    if redis.acl_check_cmd and not redis.acl_check_cmd(command, ...) then
+        error("checkpoint cleanup command is not permitted: " .. command)
+    end
+end
+
+local function delete_subtree()
 local nsidx_key   = KEYS[1]
 local pending_key = KEYS[2]
 local sids_key    = KEYS[3]
@@ -39,11 +52,11 @@ local sid               = ARGV[1]
 local ns_prefix         = ARGV[2]
 local item_key_prefix   = ARGV[3]
 local meta_key_prefix   = ARGV[4]
-local owner             = ARGV[6]
 
-if owner ~= "" and redis.call("GET", KEYS[4]) ~= owner then
-    return -1
-end
+-- Lua 命令失败不会回滚已执行的命令。变更前验证后续 SREM/SCARD 访问的索引。
+check_set(nsidx_key)
+check_set(pending_key)
+check_set(sids_key)
 
 -- 判据的单一真相源是 compose_v2.IsNSInSubtree：前缀自身 + 经层级分隔符往下的后代；
 -- 同一个节点的 fan-out 实例 / 重访实例段是兄弟执行，不删。此处是它的 Lua 复刻，两边
@@ -74,6 +87,16 @@ if #matched == 0 then
     return 0
 end
 
+-- Redis 7 以上可在写入前检查该用户对动态键的权限。
+check_command("SCARD", nsidx_key)
+check_command("SREM", sids_key, sid)
+for i, ns in ipairs(matched) do
+    check_command("DEL", item_key_prefix .. ns)
+    check_command("DEL", meta_key_prefix .. ns)
+    check_command("SREM", nsidx_key, ns)
+    check_command("SREM", pending_key, ns)
+end
+
 local deleted = 0
 for i, ns in ipairs(matched) do
     local item_key = item_key_prefix .. ns
@@ -92,6 +115,15 @@ if remaining == 0 then
 end
 
 return deleted
+end
+`
+
+var deleteSubtreeScript = redis.NewScript(deleteSubtreeLua + `
+local owner = ARGV[6]
+if owner ~= "" and redis.call("GET", KEYS[4]) ~= owner then
+    return -1
+end
+return delete_subtree()
 `)
 
 // DeleteSubtree 实现 compose_v2.Checkpointer.DeleteSubtree.
@@ -105,6 +137,18 @@ return deleted
 //
 // **iter-5-K**: 全 Lua 原子, 不依赖 cjson 解析整 payload.
 func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix string) (int32, error) {
+	keys, args := c.subtreeDeleteArgs(ctx, sessionID, nsPrefix)
+	n, err := deleteSubtreeScript.Run(ctx, c.rdb, keys, args...).Int64()
+	if err != nil {
+		return 0, fmt.Errorf("redis cp DeleteSubtree eval: %w", err)
+	}
+	if n == -1 {
+		return 0, fmt.Errorf("redis cp DeleteSubtree: %w", compose_v2.ErrTaskLeaseLost)
+	}
+	return int32(n), nil
+}
+
+func (c *Checkpointer) subtreeDeleteArgs(ctx context.Context, sessionID, nsPrefix string) ([]string, []any) {
 	keys := []string{
 		cpNSIndexKey(c.prefix, sessionID),
 		cpPendingKey(c.prefix) + ":" + sessionID,
@@ -117,30 +161,5 @@ func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix st
 		c.cpItemKeyPrefix(sessionID),
 		cpMetaKeyPrefix(c.prefix, sessionID),
 	}
-	args = append(args, compose_v2.NSSubtreeSeparator(), compose_v2.CheckpointTaskLeaseToken(ctx, c.CheckpointTaskLeases(), sessionID))
-
-	result, err := deleteSubtreeScript.Run(ctx, c.rdb, keys, args...).Result()
-	if err != nil {
-		return 0, fmt.Errorf("redis cp DeleteSubtree eval: %w", err)
-	}
-
-	n, ok := result.(int64)
-	if !ok {
-		if s, ok2 := result.(string); ok2 {
-			parsed, err := strconv.ParseInt(s, 10, 32)
-			if err != nil {
-				return 0, fmt.Errorf("redis cp DeleteSubtree parse result: %w", err)
-			}
-			n = parsed
-		} else {
-			return 0, fmt.Errorf("redis cp DeleteSubtree: unexpected result type %T", result)
-		}
-	}
-	if n == -1 {
-		return 0, fmt.Errorf("redis cp DeleteSubtree: %w", compose_v2.ErrTaskLeaseLost)
-	}
-	return int32(n), nil
+	return keys, append(args, compose_v2.NSSubtreeSeparator(), compose_v2.CheckpointTaskLeaseToken(ctx, c.CheckpointTaskLeases(), sessionID))
 }
-
-// 编译期 IsNSInSubtree 协议引用.
-var _ = compose_v2.IsNSInSubtree

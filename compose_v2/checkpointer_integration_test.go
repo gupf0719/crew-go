@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"crew-go/compose_v2"
 )
@@ -76,6 +77,45 @@ func TestCheckpointer_NotInjected_ReturnsNil(t *testing.T) {
 	}
 	if nodeSawSid != "" {
 		t.Fatalf("未注入时应返空字符串，实际 %q", nodeSawSid)
+	}
+}
+
+func TestBoundCheckpointerControlsGraphAndDetaches(t *testing.T) {
+	selected, alternative := compose_v2.NewInMemoryCheckpointer(), compose_v2.NewInMemoryCheckpointer()
+	b := compose_v2.NewBuilder()
+	b.AddNode("ask", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		_, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "继续吗"})
+		return nil, err
+	}).AddEdge(compose_v2.StartNode, "ask").AddEdge("ask", compose_v2.EndNode)
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	ctx = compose_v2.WithBoundCheckpointerCtx(ctx, selected)
+	ctx = compose_v2.WithCheckpointerCtx(ctx, alternative)
+	if got := compose_v2.GetCheckpointer(ctx); got != selected {
+		t.Fatalf("want the host checkpointer, got %v", got)
+	}
+	for _, tc := range []struct {
+		sid  string
+		ctx  context.Context
+		want compose_v2.Checkpointer
+	}{
+		{"host", ctx, selected},
+		{"detached", compose_v2.DetachExecution(ctx), alternative},
+	} {
+		err := compose_v2.Run(tc.ctx, g, compose_v2.NewChannelManager(), compose_v2.WithSessionID(tc.sid), compose_v2.WithCheckpointer(alternative))
+		if _, ok := compose_v2.IsInterrupt(err); !ok {
+			t.Fatalf("%s: want a suspended graph, got %v", tc.sid, err)
+		}
+		for _, cp := range []compose_v2.Checkpointer{selected, alternative} {
+			pending, err := cp.ListPending(t.Context(), tc.sid)
+			if err != nil || (len(pending) == 1) != (cp == tc.want) {
+				t.Fatalf("%s: checkpoint written outside the selected backend: %v %v", tc.sid, pending, err)
+			}
+		}
 	}
 }
 

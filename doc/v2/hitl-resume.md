@@ -583,6 +583,8 @@ const (
 执行与放弃在登记或申请租约时冲突，后到的调用返回 `compose_v2.ErrTaskBusy`。调用方可在在途操作结束后重试。
 显式 Abort 独立于请求取消，清理期限至多 10 秒，并沿用仍有效且更早的调用方截止时间。
 删除失败时保留任务 ID 供下一次 Abort 重试。清档成功后才补写悬空的工具调用历史。
+宿主可用 `agent_v2.WithResumeAbortCleanup` 接管删档与完成确认。两个阶段都持有任务的放弃许可。
+提供完成回调时，历史补写失败也会向上返回。跨进程补偿可传 `agent_v2.WithResumeAbortHistoryKey` 复用已保存的历史归属。
 
 **Abort 清理范围 (review-v6 H-03 fix 后行为)**：DeleteSubtree 用 `compose_v2.GetGraphNS(ctx)` 作 nsPrefix——
 - **顶层调用** (ctx 无父 graphNS, e.g. 业务直接调 `agent.Resume(ctx, sid, Abort)`): nsPrefix="" 清整 sid 所有 ns

@@ -277,7 +277,10 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	ctx = withRunOverrides(ctx, cfg.overrides())
 	// 会话历史（opt-in）：起写入器 + 出口 drain。ctx 里已有写入器时（嵌套在另一个
 	// 开了历史的 agent 下）沿用父的，不另起——同一场会话只该有一条流。
-	ctx, stopHistory := startHistory(ctx, a.historyCfgFor(ctx), a.config.Name)
+	ctx, stopHistory, err := startHistory(ctx, a.historyCfgFor(ctx), a.config.Name)
+	if err != nil {
+		return nil, err
+	}
 	warnUnnamedAgentInHistory(ctx, &a.config)
 	defer stopHistory()
 	startOffset := len(session.Events())
@@ -452,7 +455,10 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	ctx = withRunOverrides(ctx, rcfg.overrides())
 	// 会话历史（opt-in）：Resume 同款起写入器——续跑产生的轮次照样进历史（HITL 答完
 	// 之后的对话跟答之前是同一场）。
-	ctx, stopHistory := startHistory(ctx, a.historyCfgFor(ctx), a.config.Name)
+	ctx, stopHistory, err := startHistory(ctx, a.historyCfgFor(ctx), a.config.Name)
+	if err != nil {
+		return nil, err
+	}
 	warnUnnamedAgentInHistory(ctx, &a.config)
 	defer stopHistory()
 

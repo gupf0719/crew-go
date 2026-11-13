@@ -1039,7 +1039,7 @@ server.Handler(ag, baseURL, server.WithOwnerResolver(func(ctx context.Context) s
     return "" // 匿名——所有匿名请求共享一个分区
 }))
 
-// agui：同款
+// agui：进程内会话使用易失 Checkpointer，持久化用 WithSessionStore。
 agui.Handler(factory, agui.WithOwnerResolver(resolveTenant), agui.WithCheckpointer(cp))
 ```
 

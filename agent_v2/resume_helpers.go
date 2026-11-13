@@ -2,7 +2,9 @@ package agent_v2
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"crew-go/compose_v2"
@@ -150,24 +152,54 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		// review-v6 H-03 fix: forward 父 graphNS 让 Abort 只删本 sub-agent 子树
 		// 不误删父 cp / sibling sub-agent / 其他业务在同 sid 下的 cp.
 		ns := compose_v2.GetGraphNS(ctx)
-		// **先删 cp、删成功才补历史**（给悬空的 tool_call 补一条「被放弃」）：「历史里写了被放弃」要推得出「档已删」——
-		// 删失败时任务还能续，补了的话续跑执行之后真结果排在「被放弃」之后、按先到的配对被当成多余的。反过来档删了、补
-		// 结果失败只留下悬空的调用，读侧兜得住。
-		delStart := time.Now()
-		cleanup := cper.DeleteSubtree
-		if rcfg.abortCleanup != nil {
-			cleanup = rcfg.abortCleanup
+		var historyKey *HistoryKey
+		var hc *historyConfig
+		if ns == "" {
+			hc = resolveHistoryConfigForAbort(ctx, subs)
+			if rcfg.useAbortHistoryKey {
+				if key := rcfg.abortHistoryKey; key != (HistoryKey{}) {
+					if key.Owner == "" || key.ConvID != compose_v2.GetThreadID(ctx) {
+						return nil, ctx, fmt.Errorf("%s %q: invalid abort history destination", agentTypeName, agentName)
+					}
+					historyKey = &key
+				}
+			} else if hc != nil {
+				if key, ok := historyKeyFrom(ctx, hc); ok {
+					historyKey = &key
+				}
+			}
 		}
-		delCount, dErr := cleanup(ctx, sessionID, ns)
+		// 先删档，成功后才为悬空工具调用补写放弃结果。
+		delStart := time.Now()
+		var delCount int32
+		var dErr error
+		if rcfg.abortCleanup != nil {
+			delCount, dErr = rcfg.abortCleanup(ctx, sessionID, ns, historyKey)
+		} else {
+			delCount, dErr = cper.DeleteSubtree(ctx, sessionID, ns)
+		}
 		// reason="resume_abort"：业务主动弃单（WithResumeAction(Abort)）——跟引擎的
 		// "abort"（ErrRunAborted 终局失败，graph_loop Run 出口 purge）不同源，别混成一个值
 		compose_v2.EmitCpCleanupHelper(ctx, sessionID, ns, "resume_abort", delCount, time.Since(delStart).Milliseconds(), dErr)
 		if dErr != nil {
 			return nil, ctx, fmt.Errorf("%s %q: abort cleanup (sid=%q ns=%q): %w", agentTypeName, agentName, sessionID, ns, dErr)
 		}
-		if ns == "" {
-			// 历史按整个任务查，只有清完整个任务才可补写放弃结果。
-			closeUnansweredToolCallsOnAbort(ctx, resolveHistoryConfigForAbort(ctx, subs), agentName, sessionID)
+		if historyKey != nil {
+			// 已固定历史归属的取消可以先落盘并清档，历史后端不可用时保留进度。
+			if hc == nil || hc.store == nil {
+				return nil, ctx, fmt.Errorf("%s %q: abort history store is unavailable (sid=%q)", agentTypeName, agentName, sessionID)
+			}
+			if err := closeUnansweredToolCalls(ctx, hc.store, *historyKey, sessionID); err != nil {
+				if rcfg.abortFinalize != nil || errors.Is(err, compose_v2.ErrTaskLeaseLost) {
+					return nil, ctx, fmt.Errorf("%s %q: abort history (sid=%q): %w", agentTypeName, agentName, sessionID, err)
+				}
+				slog.WarnContext(ctx, "agent_v2: 放弃任务的历史收尾失败", "agent", agentName, "task", sessionID, "err", err)
+			}
+		}
+		if rcfg.abortFinalize != nil {
+			if err := rcfg.abortFinalize(ctx, sessionID); err != nil {
+				return nil, ctx, fmt.Errorf("%s %q: confirm abort cleanup (sid=%q): %w", agentTypeName, agentName, sessionID, err)
+			}
 		}
 		activity.FinishAbandon()
 

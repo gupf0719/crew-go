@@ -9,10 +9,20 @@ import (
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/hook"
 	"crew-go/schema"
 	a2atypes "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 )
+
+type checkpointOverrideHook struct {
+	hook.NoOpHooks
+	cp compose_v2.Checkpointer
+}
+
+func (h checkpointOverrideHook) OnAgentStart(ctx context.Context, _ *hook.AgentInfo, _ *hook.AgentInput) (context.Context, error) {
+	return compose_v2.WithCheckpointerCtx(ctx, h.cp), nil
+}
 
 type cancelFailCP struct {
 	compose_v2.Checkpointer
@@ -49,7 +59,11 @@ func TestCancelTask_RetriesFailedCleanupAfterTerminalStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ag := agent_v2.NewGraphAgent(g, agent_v2.WithGraphAgentName("cancel-retry"), agent_v2.WithGraphInputWriter(func(*schema.Message) []compose_v2.ChannelWrite { return nil }), agent_v2.WithGraphOutputReader(func(compose_v2.Channels) *schema.Message { return schema.AssistantMessage("done") }))
+	alternate := compose_v2.NewInMemoryCheckpointer()
+	ag := agent_v2.NewGraphAgent(g, agent_v2.WithGraphAgentName("cancel-retry"),
+		agent_v2.WithGraphAgentHooks(checkpointOverrideHook{cp: alternate}),
+		agent_v2.WithGraphInputWriter(func(*schema.Message) []compose_v2.ChannelWrite { return nil }),
+		agent_v2.WithGraphOutputReader(func(compose_v2.Channels) *schema.Message { return schema.AssistantMessage("done") }))
 	e := NewExecutor(ag, WithOwnerResolver(func(context.Context) string { return "owner" }))
 	cp := &cancelFailCP{Checkpointer: compose_v2.NewInMemoryCheckpointer()}
 	e.cp = cp
@@ -68,6 +82,9 @@ func TestCancelTask_RetriesFailedCleanupAfterTerminalStatus(t *testing.T) {
 	st := e.tasks[taskKey{owner: "owner", taskID: task.ID}]
 	sid := st.sess.RunID
 	e.mu.Unlock()
+	if exists, err := alternate.ExistsNS(ctx, sid, ""); err != nil || exists {
+		t.Fatalf("hook wrote outside the executor's backend, exists=%v err=%v", exists, err)
+	}
 	cp.thread.Store(task.ContextID)
 	cp.fail.Store(true)
 	cancelReq := &a2atypes.CancelTaskRequest{ID: task.ID}

@@ -668,6 +668,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// `ctxNS/...`——根不是子的 ns 祖先，树自身错位。
 	if checkpointingDisabled(ctx) {
 		cfg.checkpointer = nil
+	} else if binding, ok := boundCheckpointerFrom(ctx); ok {
+		cfg.checkpointer = binding.cp
 	} else if cfg.checkpointer == nil {
 		cfg.checkpointer = GetCheckpointer(ctx)
 	}

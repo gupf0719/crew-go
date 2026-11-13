@@ -237,3 +237,33 @@ GOMAXPROCS=8 go test ./agent_v2 -run '^$' -bench '^BenchmarkBasicAgentToolLedger
 - SQLite、实际 PostgreSQL、MySQL 和 Redis 的存档 conformance 通过。PostgreSQL 和 MySQL 同时运行共享 AG-UI 会话用例。
 - 独立复审后分别关闭六处关键行为进行对照。预算旁路、旧账迁移、A2A 结束回调、回收历史收尾和旧请求释放保护均触发对应失败。
 - 本机缺少 Qwen 和 DeepSeek 凭据，教学与 A2A 的真实模型调用未验证。
+
+## 2026-11-13 取消补偿重启复审
+
+真实 SQLite 文件保留存档。第一个子进程触发审批，用数据库触发器使删档失败，然后直接退出。
+第二个子进程恢复删除能力并尝试续答或取消。原版的两种配置均复现异常：
+
+| 配置 | 重启后实测 | 根因 |
+|---|---|---|
+| 进程内 AG-UI 会话配 SQLite Checkpointer | 取消返回 404，根存档仍在 | 任务 ID 映射与存档的生命周期不同 |
+| 共享 SQL 会话 | 原题可继续回答，任务推进到下一问 | 同一删除事务失败时，取消意图随之丢失 |
+
+参考本地 Kubernetes 的删除标记与 finalizer，将取消确认拆成有持久状态的三阶段。
+在会话租约和任务放弃许可内先保存取消批次，随后原子删除子树并记下清档进度。
+历史收尾使用执行时绑定的分区，成功后移除会话记录。续答无法通过关闭状态。
+进程内模式要求易失 Checkpointer，SQL 和 Redis 提供共享会话接入。宿主在执行范围内绑定同一个后端。
+请求中间件和开始钩子替换 Checkpointer 的路径均用真实 SQLite 验证。AG-UI 的图选项和嵌套执行沿用宿主后端。
+A2A 同样复现取消成功后 SQL 档仍存在。Executor 绑定内存 Checkpointer 后，挂起档与任务映射一起随进程退出。
+
+`TestSQLiteAGUICancelSurvivesProcessExit` 验证删档失败、意图提交后回执丢失、落盘后进程退出、历史写入失败和最终确认失败。
+实际工具执行数为零，历史只补一条且落在原分区。原回执保持可重放。另有双租约接管、缺旧工作流工厂、旧取消与新任务隔离测试。
+历史配置缺失时，取消保留关闭记录等待补写，普通续答保留存档和已采纳的答复。移除取消意图持久化、
+历史分区绑定、续答存档保护的三个对照均触发对应回归。
+Redis 7.4.2 开启 AOF，使用两个宿主子进程验证补偿。索引类型错误和拒绝 `SREM` 的权限探针均在删除前保留原档。
+
+- `make test-all`、`make vet` 与 `agent_v2`、`agui`、`compose_v2`、`a2a`、`observability`、`sql`、`redis` 的竞态检查通过。
+- SQLite、实际 PostgreSQL、MySQL 和 Redis 的 Checkpointer conformance 通过，PostgreSQL 和 MySQL 的共享会话用例同时通过。
+- 嵌套冒烟 12/12、Channel 冒烟 5/5、Plan Web SSE 和 A2A HITL 通过。AG-UI 真实模型冒烟遇到 DashScope 401，A2A 真实模型冒烟缺少 `QWEN_API_KEY`。
+
+重启补偿在租约可接管后由匹配的取消重试、同线程查询或新 Run 驱动。旧进程内模式已经丢失映射的存量存档，
+只能使用可核实的原任务 ID 定位。历史 Store 自身的写入与会话事务分别提交。

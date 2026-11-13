@@ -636,6 +636,12 @@ func (e *StaleWriteError) Unwrap() error { return ErrCheckpointStale }
 
 // ── InMemoryCheckpointer 实现 ──
 
+// VolatileCheckpointer 的存档与持有它的进程同寿命。宿主可以在进程内保存任务与存档的映射。
+type VolatileCheckpointer interface {
+	Checkpointer
+	IsVolatile() bool
+}
+
 // InMemoryCheckpointer 内存实现——测试 + 单进程场景。
 type InMemoryCheckpointer struct {
 	mu sync.RWMutex
@@ -647,6 +653,9 @@ type InMemoryCheckpointer struct {
 func NewInMemoryCheckpointer() *InMemoryCheckpointer {
 	return &InMemoryCheckpointer{data: make(map[string]map[string]*Checkpoint)}
 }
+
+// IsVolatile 表示进程退出后这份内存存档随之消失。
+func (*InMemoryCheckpointer) IsVolatile() bool { return true }
 
 // SaveNS 按 (sid, ns) 存 cp。
 //
@@ -830,9 +839,13 @@ var _ Checkpointer = (*InMemoryCheckpointer)(nil)
 // ── ctx 协议 ──
 
 type checkpointerKey struct{}
+type boundCheckpointerKey struct{}
 type checkpointingDisabledKey struct{}
 
+func (boundCheckpointerKey) ExecutionState()     {}
 func (checkpointingDisabledKey) ExecutionState() {}
+
+type boundCheckpointer struct{ cp Checkpointer }
 
 // WithoutCheckpointing 关闭当前执行范围内图的存档。显式放弃操作仍使用原后端，独立任务可照常存档。
 func WithoutCheckpointing(ctx context.Context) context.Context {
@@ -873,9 +886,27 @@ func WithCheckpointerCtx(ctx context.Context, cp Checkpointer) context.Context {
 	return withCheckpointer(ctx, cp)
 }
 
+// WithBoundCheckpointerCtx 将宿主选定的存档后端绑定到当前执行范围。
+// 范围内的 hook 和图选项沿用该后端，nil 表示无存档后端。[DetachExecution] 解除绑定。
+func WithBoundCheckpointerCtx(ctx context.Context, cp Checkpointer) context.Context {
+	if isFrameworkNil(cp) {
+		cp = nil
+	}
+	ctx = context.WithValue(ctx, checkpointerKey{}, cp)
+	return context.WithValue(ctx, boundCheckpointerKey{}, boundCheckpointer{cp: cp})
+}
+
+func boundCheckpointerFrom(ctx context.Context) (boundCheckpointer, bool) {
+	binding, ok := ctx.Value(boundCheckpointerKey{}).(boundCheckpointer)
+	return binding, ok
+}
+
 // GetCheckpointer 从 ctx 取 Checkpointer——节点函数 / 子图节点可调用。
 // nil 表示业务未注入——子图嵌套场景下中断会丢失嵌套 cp（必须显式注入）。
 func GetCheckpointer(ctx context.Context) Checkpointer {
+	if binding, ok := boundCheckpointerFrom(ctx); ok {
+		return binding.cp
+	}
 	if cp, ok := ctx.Value(checkpointerKey{}).(Checkpointer); ok {
 		return cp
 	}

@@ -17,6 +17,10 @@
 
 摘要的控制错误传播已随 F2 修复。取消清理补偿、并发预算与工具账编码已完成，见[优化复审](../review/agent-orchestration-audit-2026-11-12.md#2026-11-13-优化复审)。
 
+持久化 AG-UI 的取消意图与清档进度已写入共享会话，见[重启复审](../review/agent-orchestration-audit-2026-11-12.md#2026-11-13-取消补偿重启复审)。
+Redis Checkpointer 已有的复合键问题单独跟踪：外部自定义 SID 含冒号时，`("task", "child:")` 与 `("task:child", "")`
+实测共用存档键。AG-UI 的任务 SID 由框架生成，走 UUID 形状。基础键编码变更需同时处理存量 Redis 键。
+
 > 📌 **转交 / 控制信号 / 归属 / 写入所有权相关的 OPEN 项，先读
 > [issue-99-root-causes.md](../issue/issue-99-root-causes.md)**——那里按**根因**归并成
 > 三簇（控制信号载体 / 跨 Run 持久态归属 / 写入者身份），每簇一条判别式 + 方案 + 代价。

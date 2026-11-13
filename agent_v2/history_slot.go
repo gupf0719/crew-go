@@ -654,8 +654,7 @@ func startHistoryForOrchestration(ctx context.Context, subs []Agent, name string
 	// 运行入口声明优先——它更靠近这次运行，也是唯一能覆盖「编排里一个 BasicAgent 都
 	// 没有」那种形状的声明方式。见 WithHistoryCtx。
 	if hc := historyCfgFromCtx(ctx); hc != nil {
-		c, stop := startHistory(ctx, hc, name)
-		return c, stop, nil
+		return startHistory(ctx, hc, name)
 	}
 
 	chosen, conflict := borrowHistoryConfig(subs)
@@ -665,11 +664,7 @@ func startHistoryForOrchestration(ctx context.Context, subs []Agent, name string
 			"请让同一编排下（含嵌套的编排）的子 agent 用同一个 WithHistory 配置（同一个 store 实例、同一个 owner 或同一个 owner 函数）",
 			name, conflict.Error())
 	}
-	if chosen == nil {
-		return ctx, noop, nil
-	}
-	c, stop := startHistory(ctx, chosen, name)
-	return c, stop, nil
+	return startHistory(ctx, chosen, name)
 }
 
 // sameHistoryConfig 判两个子的历史配置是不是同一套。
@@ -749,50 +744,11 @@ func resolveHistoryConfigForAbort(ctx context.Context, subs []Agent) *historyCon
 	return chosen
 }
 
-// closeUnansweredToolCallsOnAbort 在**用户放弃任务**（`ResumeActionAbort`）那一刻，
-// 给历史里没有配对结果的 tool_call 补上一条工具结果。
-//
-// # 为什么补在写侧而不是读侧
-//
-// 不补的话，历史（append-only）里**永久**留着一条 `assistant tool_calls=1 content=""`
-// ——tools 节点是原子的，审批中断时结果那半根本没写过，而放弃之后也不会再有人写。
-// 实测复现：审批中断 → `WithResumeAction(Abort)` → 历史停在 `[user, assistant(tc=1)]`。
-//
-// 框架下游对这种残缺**已经有一整套读侧修补**（`dropDanglingToolCalls` + 合成一条记账
-// 文本），而那条记账文本是 **assistant + 零 tool_call**、正好长得像一条最终答复，于是
-// 凡是「挑一条消息代表某件事」的地方都得记得跳过它。**在洞产生的那一刻把它填上，
-// 上面整串防护就都不必存在。**
-//
-// # 文案不声称执行与否
-//
-// 只说「任务被放弃、这个调用没有结果」。中止发生在审批闸上时工具确实没跑，但这条路
-// 是通用的（别的中断点也能走到 Abort），**框架在这一层不知道跑没跑**——写一句会被后来
-// 的人当事实读的猜测，比不写更糟。
-//
-// # 失败只 warn
-//
-// 历史是旁路：写不进去不该让「用户放弃任务」这个操作失败（cp 已经删了，返错会让调用方
-// 以为没放弃成功而重试）。
-//
-// # 只补被放弃的这个任务的
-//
-// 悬空的 tool_call 是这个任务在中断那一刻留下的，只在这个任务写下的记录里找（按任务章查，task 是被放弃
-// 任务的 RunID）——任务挂着期间同一会话里别的任务写了多少都不用翻过去。补上的结果盖上声明它的那条
-// assistant 的归属与任务章：归属对上了，那个 agent 的视图里配对才是完整的。
-func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, agentName, task string) {
-	if task == "" {
-		return
-	}
-	if hc == nil || hc.store == nil {
-		return
-	}
-	closeUnansweredToolCalls(ctx, hc.store, HistoryKey{Owner: hc.resolveOwner(ctx), ConvID: compose_v2.GetThreadID(ctx)}, agentName, task)
-}
-
-// closeUnansweredToolCalls 是 closeUnansweredToolCallsOnAbort 的本体：在 store 的 key 那场对话里给任务 task 没有结果的工具调用补一条。
-func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key HistoryKey, agentName, task string) {
+// closeUnansweredToolCalls 按任务扫描历史，为尚无结果的工具调用补齐放弃结果。
+// 只在根存档删除后调用，重试时会跳过已有结果的调用。
+func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key HistoryKey, task string) error {
 	if task == "" || store == nil || key.Owner == "" || key.ConvID == "" {
-		return
+		return nil
 	}
 	src := historySource{store: store, key: key, task: task}
 	var msgs []*schema.Message // 新 → 旧
@@ -801,12 +757,7 @@ func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key Histo
 		return false
 	}, nil)
 	if err != nil {
-		slog.WarnContext(ctx, "agent_v2: abort 收尾读历史失败，悬空 tool_call 未补",
-			"agent", agentName, "key", key.String(), "err", err)
-		return
-	}
-	if len(msgs) == 0 {
-		return
+		return err
 	}
 
 	slices.Reverse(msgs) // 历史扫描从新到旧，配对需要追加顺序。
@@ -822,12 +773,12 @@ func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key Histo
 		closers = append(closers, stampHistoryAgent(closer, owner, display, task))
 	}
 	if len(closers) == 0 {
-		return
+		return nil
 	}
-	if err := store.Append(ctx, key, closers); err != nil {
-		slog.WarnContext(ctx, "agent_v2: abort 收尾补记失败，历史里留着悬空 tool_call",
-			"agent", agentName, "key", key.String(), "count", len(closers), "err", err)
+	if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
+		return err
 	}
+	return store.Append(ctx, key, closers)
 }
 
 // beginRunActivity 校验放弃声明，再原子登记本次执行和要放弃的任务。排在建历史写入器和盖章之前。
@@ -883,7 +834,9 @@ func abandonTasksAtEntry(ctx context.Context, ids []string, agentName string) {
 			}
 		}
 		if w != nil {
-			closeUnansweredToolCalls(sctx, w.store, w.key, agentName, id)
+			if err := closeUnansweredToolCalls(sctx, w.store, w.key, id); err != nil {
+				slog.WarnContext(ctx, "agent_v2: 放弃任务的历史收尾失败", "agent", agentName, "task", id, "err", err)
+			}
 		}
 	}
 }

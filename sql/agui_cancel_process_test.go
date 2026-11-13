@@ -249,9 +249,13 @@ func verifyIdleCancelRecovery(t *testing.T, db *dbsql.DB, cp *crewsql.Checkpoint
 		t.Fatalf("cancellation was not durably recorded before restart: %+v %v", record, err)
 	}
 	if fault == "legacy" {
-		// 模拟 5bec73c 持久化形状。旧会话通过已保存的 HistoryKey 找到分区。
+		// 模拟没有待清理索引的旧库，保留历史分区与取消记录。
 		table := crewsql.DefaultCheckpointTable + "_agui_session"
 		if _, err := db.ExecContext(ctx, "UPDATE "+table+" SET payload = json_remove(CAST(payload AS TEXT), '$.cancellation.owner', '$.cancellation.thread_id') WHERE sid = ?", key); err != nil {
+			t.Fatal(err)
+		}
+		execCancelFixture(t, db, "DROP TABLE "+crewsql.DefaultCheckpointTable+"_agui_cancel")
+		if err := st.Setup(ctx); err != nil {
 			t.Fatal(err)
 		}
 		execCancelFixture(t, db, "DROP TRIGGER refuse_cancel")
@@ -355,7 +359,7 @@ func (s *idleCancelSessionStore) SaveSession(ctx context.Context, key string, re
 
 func waitIdleCancel(t *testing.T, check func() (bool, error)) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()

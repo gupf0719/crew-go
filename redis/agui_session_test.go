@@ -230,6 +230,10 @@ func TestRedisAGUICancelProcessWorker(t *testing.T) {
 	ref := filepath.Join(dir, "task.txt")
 	key := fmt.Sprintf("agui-thread:%x", sha256.Sum256([]byte("6:tenantshared")))
 	if phase == "idle" {
+		// 模拟升级前仅有持久会话，要求首次发现能重建候选索引。
+		if err := client.Del(t.Context(), filepath.Base(dir)+":agui:cancel").Err(); err != nil {
+			t.Fatal(err)
+		}
 		before, err := s.LoadSession(t.Context(), key)
 		if err != nil || before == nil || before.Cancellation == nil || before.Cancellation.CheckpointsDeleted {
 			t.Fatalf("fixture has no uncompleted cancellation: %+v %v", before, err)

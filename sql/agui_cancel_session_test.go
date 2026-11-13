@@ -2,16 +2,20 @@ package sql_test
 
 import (
 	"context"
+	dbsql "database/sql"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/agui"
 	"crew-go/compose_v2"
+	"crew-go/hook"
 	crewsql "crew-go/sql"
 )
 
@@ -243,4 +247,61 @@ func testDurableCancelFences(t *testing.T, fixture func(*testing.T) aguiFixture)
 			})
 		}
 	}
+}
+
+func TestSQLiteAGUIRecoveryLeaderYieldsAndSlowItemDoesNotBlockPeer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "leadership.db")
+	fixture := setupAGUI(t, crewsql.SQLite{}, func() *dbsql.DB {
+		db, err := dbsql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_txlock=immediate")
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.SetMaxOpenConns(1)
+		return db
+	})
+	q := &questions{}
+	factory := q.factory(t)
+	makeIntent := func(owner, version string) string {
+		t.Helper()
+		store := &failingCancelSessionStore{AGUISessionStore: fixture.a, before: func(_ context.Context, _ string, _ *agui.SessionRecord, drop string) error {
+			if drop != "" {
+				return errors.New("hold cancellation")
+			}
+			return nil
+		}}
+		h := sharedHandler(factory, store, agui.WithWorkflowVersions(version, nil))
+		aguiPost(t, h, owner, aguiStart())
+		id := onlyAGUIQuestion(t, aguiPending(t, h, owner), "q1")
+		if r := aguiPost(t, h, owner, aguiAnswer(id, "cancelled", nil)); !strings.Contains(r.Body.String(), "abort_failed") {
+			t.Fatal(r.Body)
+		}
+		return store.key
+	}
+	unavailable := makeIntent("legacy", "v1")
+	slow := makeIntent("slow", "slow")
+	peer := makeIntent("peer", "v2")
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	primary := agui.Handler(factory, agui.WithSessionStore(fixture.a), agui.WithOwnerResolver(func(context.Context) string { return "unused" }),
+		agui.WithWorkflowVersions("v2", map[string]agui.AgentFactory{"slow": func(h hook.Hooks) agent_v2.Agent {
+			close(reached)
+			<-release
+			return factory(h)
+		}}))
+	defer func() { once.Do(func() { close(release) }); _ = primary.Close() }()
+	select {
+	case <-reached:
+	case <-time.After(3 * time.Second):
+		t.Fatal("primary did not start slow cancellation")
+	}
+	waitIdleCancel(t, func() (bool, error) { r, e := fixture.b.LoadSession(t.Context(), peer); return r == nil, e })
+	if r, e := fixture.b.LoadSession(t.Context(), slow); e != nil || r == nil {
+		t.Fatalf("slow fixture unexpectedly finished: %v %v", r, e)
+	}
+	follower := agui.Handler(factory, agui.WithSessionStore(fixture.b), agui.WithOwnerResolver(func(context.Context) string { return "unused" }),
+		agui.WithWorkflowVersions("v2", map[string]agui.AgentFactory{"v1": factory, "slow": factory}))
+	defer follower.Close()
+	once.Do(func() { close(release) })
+	waitIdleCancel(t, func() (bool, error) { r, e := fixture.b.LoadSession(t.Context(), unavailable); return r == nil, e })
 }

@@ -983,3 +983,10 @@ Kubernetes namespace controller 的 informer 启动时通过 reflector `ListAndW
 带 deletionTimestamp 的对象在首次 Add 事件入队，worker 失败后重新排队，controller 随 stopCh 停止。
 AG-UI 的 SQL 和 Redis 没有统一 watch 接口，采用启动分页发现、定期重试的方式读取同一份取消意图。
 取得会话租约后重读当前记录，再用任务放弃许可复用删档与历史收尾。普通挂起会话继续等待业务答复。
+
+### 2026-11-13 · 取消发现的索引与协调
+
+本地 Kubernetes `d5e5f48b880` 的 namespace controller 只把带删除标记的对象入工作队列，worker 按键处理失败与重试。
+同一 controller 的重复部署可以用 client-go leader election 协调，领导权丢失会取消工作上下文。
+AG-UI 以共享存储中的待清理索引发现候选，以会话记录和原任务租约判断能否执行。
+轮询使用同一存储域的租约，单项失败不阻塞同页其他并发项。缺工作流或历史后端时让位。

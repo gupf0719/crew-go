@@ -42,7 +42,7 @@ func setupAGUI(t *testing.T, dialect crewsql.Dialect, open func() *dbsql.DB) agu
 	table := "agui_" + strings.ToLower(rand.Text())
 	dbA, dbB := open(), open()
 	t.Cleanup(func() {
-		for _, tbl := range []string{table + "_agui_events", table + "_agui_runs", table + "_agui_session", table + "_task_lease", table} {
+		for _, tbl := range []string{table + "_agui_events", table + "_agui_runs", table + "_agui_session", table + "_agui_cancel", table + "_task_lease", table} {
 			if _, err := dbB.Exec("DROP TABLE IF EXISTS " + tbl); err != nil {
 				t.Error(err)
 			}
@@ -601,9 +601,9 @@ func testListAGUICancellations(t *testing.T, f aguiFixture) {
 	write("c", &agui.SessionRecord{TaskID: "task-c", Closing: true})
 	write("d", &agui.SessionRecord{TaskID: "task-d", Closing: true, Cancellation: &agui.SessionCancellation{CheckpointsDeleted: true}})
 	var cursor string
-	for i, want := range []string{"", "b", "", "d", ""} {
+	for i, want := range []string{"b", "d", ""} {
 		keys, next, err := f.b.ListCancellations(ctx, cursor, 1)
-		if err != nil || strings.Join(keys, ",") != want || (next == "") != (i == 4) {
+		if err != nil || strings.Join(keys, ",") != want || (next == "") != (i == 2) {
 			t.Fatalf("page %d: keys=%v cursor=%q err=%v", i, keys, next, err)
 		}
 		if want == "b" {

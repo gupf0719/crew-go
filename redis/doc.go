@@ -36,7 +36,7 @@
 //     round-trip 走 replica 时 replica lag 导致拿到 nil cp, HITL Resume 断裂
 //
 // AG-UI 持久化会话使用 [NewAGUISessionStore]。Redis 账号须能访问存档、租约和会话前缀内的键，
-// 并执行脚本使用的 GET、SET、DEL、TYPE、SMEMBERS、SCARD 和 SREM 等命令。后台发现取消意图还需要 SCAN。
+// 并执行脚本使用的 GET、SET、DEL、TYPE、SMEMBERS、SCARD 和 SREM 等命令。取消索引需要 ZADD、ZREM、ZRANGEBYLEX，首次导入旧记录还需要 SCAN 和 EXISTS。
 // Redis 7 及以上
 // 在清档写入前校验这些命令的权限。Redis 6 缺少此预检。Lua 运行时错误不会回滚已执行的命令。
 //

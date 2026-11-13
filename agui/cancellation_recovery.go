@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"crew-go/agent_v2"
@@ -61,23 +63,63 @@ const (
 	cancellationPageSize     = 64
 )
 
+// 租约随 Checkpointer 的存储域隔离，跨轮保留以免多个实例串行重复扫描。
+const cancellationWorkerID = "agui:cancel-recovery"
+
 func (h *handler) runCancellationRecovery(ctx context.Context) {
-	timer := time.NewTimer(0)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			if err := h.recoverCancellationPass(ctx); err != nil && ctx.Err() == nil {
-				slog.WarnContext(ctx, "agui: 列举待补偿的取消任务失败", "err", err)
+	ctx = compose_v2.WithBoundCheckpointerCtx(ctx, h.cp)
+	for ctx.Err() == nil {
+		leaderCtx, lease, err := compose_v2.BeginTaskActivity(ctx, cancellationWorkerID, nil)
+		if err == nil {
+			h.runCancellationLeader(leaderCtx, lease)
+			// 交还后给候补至少一个轮询周期，避免原持有者立即重新抢占。
+			if !waitCancellationPoll(ctx) {
+				return
 			}
-			timer.Reset(cancellationPollInterval)
+		} else if ctx.Err() == nil && !errors.Is(err, compose_v2.ErrTaskBusy) {
+			slog.WarnContext(ctx, "agui: 申请取消补偿租约失败", "err", err)
+		}
+		if !waitCancellationPoll(ctx) {
+			return
 		}
 	}
 }
 
+func (h *handler) runCancellationLeader(ctx context.Context, lease *compose_v2.TaskActivity) {
+	defer lease.Release()
+	for ctx.Err() == nil {
+		if err := h.recoverCancellationPass(ctx); err != nil && ctx.Err() == nil {
+			if !errors.Is(err, errCancellationIncomplete) {
+				slog.WarnContext(ctx, "agui: 列举待补偿的取消任务失败", "err", err)
+			}
+			// 本实例缺旧工厂或后端配置时，让其他实例接手。
+			return
+		}
+		if !waitCancellationPoll(ctx) {
+			return
+		}
+	}
+}
+
+func waitCancellationPoll(ctx context.Context) bool {
+	timer := time.NewTimer(cancellationPollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+var errCancellationIncomplete = errors.New("agui: some cancellations could not be recovered")
+
 func (h *handler) recoverCancellationPass(ctx context.Context) error {
+	var incomplete atomic.Bool
+	// 慢项有独立的清理时限。分页之间共用并发预算，失败项留到下一轮。
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 4)
+	defer wg.Wait()
 	for cursor := ""; ctx.Err() == nil; {
 		pageCtx, cancel := context.WithTimeout(ctx, dropCPTimeout)
 		keys, next, err := h.listCancellations(pageCtx, cursor)
@@ -86,14 +128,27 @@ func (h *handler) recoverCancellationPass(ctx context.Context) error {
 			return err
 		}
 		for _, key := range keys {
-			if ctx.Err() != nil {
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
 				return ctx.Err()
 			}
-			if err := h.recoverCancellation(ctx, key); err != nil && ctx.Err() == nil && !errors.Is(err, compose_v2.ErrTaskBusy) {
-				slog.WarnContext(ctx, "agui: 后台取消补偿未完成", "session", key, "err", err)
-			}
+			wg.Go(func() {
+				defer func() { <-slots }()
+				if ctx.Err() != nil {
+					return
+				}
+				if err := h.recoverCancellation(ctx, key); err != nil && ctx.Err() == nil && !errors.Is(err, compose_v2.ErrTaskBusy) {
+					incomplete.Store(true)
+					slog.WarnContext(ctx, "agui: 后台取消补偿未完成", "session", key, "err", err)
+				}
+			})
 		}
 		if next == "" {
+			wg.Wait()
+			if incomplete.Load() {
+				return errCancellationIncomplete
+			}
 			return nil
 		}
 		if next == cursor {

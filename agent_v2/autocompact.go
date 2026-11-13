@@ -358,10 +358,14 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		defer cfg.breakers.release(sessionID, entry)
 	}
 
-	// 保留调用方相位和同相位内的调用次序。跳过压缩时也保留位置，后续提问的 ID 才能稳定。
-	phaseKey := identityString("auto_compact", compose_v2.SubCallScope(ctx))
-	index := compose_v2.NextSubCallIndex(ctx, phaseKey)
-	phase := identityString(phaseKey, strconv.Itoa(index))
+	// BasicAgent 每次执行 model 节点只做一次内置摘要，沿用已有挂起问题的相位。
+	phase := "auto_compact"
+	if cut == nil {
+		// 公开入口可能在同一节点调用多次，按调用方相位和调用次序寻址。跳过压缩时也保留位置。
+		phaseKey := identityString(phase, compose_v2.SubCallScope(ctx))
+		index := compose_v2.NextSubCallIndex(ctx, phaseKey)
+		phase = identityString(phaseKey, strconv.Itoa(index))
+	}
 	phaseCtx := compose_v2.EnterPhase(ctx, phase)
 	stateCtx := compose_v2.WithNodeStateSealed(phaseCtx, autoCompactAsked)
 

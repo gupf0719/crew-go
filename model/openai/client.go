@@ -137,6 +137,10 @@ func (c *Client) ModelName() string { return c.model }
 
 // WithTools 返回与给定工具绑定的新客户端。
 func (c *Client) WithTools(tools []*schema.ToolInfo) (model.ChatModel, error) {
+	return c.withTools(tools), nil
+}
+
+func (c *Client) withTools(tools []*schema.ToolInfo) *Client {
 	cp := *c
 	cp.tools = make([]openaiTool, 0, len(tools))
 	for _, t := range tools {
@@ -149,7 +153,7 @@ func (c *Client) WithTools(tools []*schema.ToolInfo) (model.ChatModel, error) {
 			},
 		})
 	}
-	return &cp, nil
+	return &cp
 }
 
 // providerName 返回结构化错误（model.APIError）里的 provider 标识——优先 c.system
@@ -267,6 +271,49 @@ func (c *Client) buildRequest(messages []*schema.Message, o *model.Options, stre
 		req.StreamOptions = &openaiStreamOptions{IncludeUsage: true}
 	}
 
+	req.Tools = c.toolsFor(o)
+
+	if o.Temperature != nil {
+		req.Temperature = o.Temperature
+	}
+	if o.MaxTokens != nil {
+		req.MaxTokens = o.MaxTokens
+	}
+	if o.TopP != nil {
+		req.TopP = o.TopP
+	}
+	if o.Stop != nil {
+		req.Stop = o.Stop
+	}
+	// response_format（结构化输出路径 1）：映射 model.ResponseFormat → wire。
+	if o.ResponseFormat != nil {
+		rf := &openaiResponseFormat{Type: o.ResponseFormat.Type}
+		if js := o.ResponseFormat.JSONSchema; js != nil {
+			rf.JSONSchema = &openaiResponseFormatJSONSchema{
+				Name:   js.Name,
+				Strict: js.Strict,
+				Schema: js.Schema,
+			}
+		}
+		req.ResponseFormat = rf
+	}
+
+	// per-request ExtraBody 叠在构造期 c.extraBody 之上（同 key per-request 赢、不同 key
+	// 保留），存到 req 由 newHTTPRequest 顶层 merge 进 wire body。业务按次控制 provider
+	// 专属参数（thinking / reasoning 等）经 model.WithExtraBody / 各 provider 便利包装。
+	req.extraBody = c.requestExtra(o)
+
+	// tool_choice 只在这次请求真有工具时发：没有工具时 provider 拒绝（required 配零工具返 400）。AllowedTools
+	// 可能把工具滤光，调用方也可能带着 tool_choice 调一个没绑工具的 client——省掉，不报错。「有没有工具」看的是
+	// 最终请求体：ExtraBody 带了 tools 时合并会整个替换绑定的工具（provider 内置工具常走这条），以它为准。
+	if o.ToolChoice != nil && wireHasTools(req.Tools, req.extraBody) {
+		req.ToolChoice = string(*o.ToolChoice)
+	}
+
+	return req, nil
+}
+
+func (c *Client) toolsFor(o *model.Options) []openaiTool {
 	// 合并工具：绑定工具 + 每请求工具
 	// 深拷贝避免并发调用时修改共享的 c.tools backing array
 	allTools := make([]openaiTool, len(c.tools), len(c.tools)+len(o.Tools))
@@ -297,38 +344,10 @@ func (c *Client) buildRequest(messages []*schema.Message, o *model.Options, stre
 		}
 		allTools = kept
 	}
-	if len(allTools) > 0 {
-		req.Tools = allTools
-	}
+	return allTools
+}
 
-	if o.Temperature != nil {
-		req.Temperature = o.Temperature
-	}
-	if o.MaxTokens != nil {
-		req.MaxTokens = o.MaxTokens
-	}
-	if o.TopP != nil {
-		req.TopP = o.TopP
-	}
-	if o.Stop != nil {
-		req.Stop = o.Stop
-	}
-	// response_format（结构化输出路径 1）：映射 model.ResponseFormat → wire。
-	if o.ResponseFormat != nil {
-		rf := &openaiResponseFormat{Type: o.ResponseFormat.Type}
-		if js := o.ResponseFormat.JSONSchema; js != nil {
-			rf.JSONSchema = &openaiResponseFormatJSONSchema{
-				Name:   js.Name,
-				Strict: js.Strict,
-				Schema: js.Schema,
-			}
-		}
-		req.ResponseFormat = rf
-	}
-
-	// per-request ExtraBody 叠在构造期 c.extraBody 之上（同 key per-request 赢、不同 key
-	// 保留），存到 req 由 newHTTPRequest 顶层 merge 进 wire body。业务按次控制 provider
-	// 专属参数（thinking / reasoning 等）经 model.WithExtraBody / 各 provider 便利包装。
+func (c *Client) requestExtra(o *model.Options) map[string]any {
 	if len(c.extraBody) > 0 || len(o.ExtraBody) > 0 {
 		eb := make(map[string]any, len(c.extraBody)+len(o.ExtraBody))
 		for k, v := range c.extraBody {
@@ -337,24 +356,16 @@ func (c *Client) buildRequest(messages []*schema.Message, o *model.Options, stre
 		for k, v := range o.ExtraBody {
 			eb[k] = v
 		}
-		req.extraBody = eb
+		return eb
 	}
-
-	// tool_choice 只在这次请求真有工具时发：没有工具时 provider 拒绝（required 配零工具返 400）。AllowedTools
-	// 可能把工具滤光，调用方也可能带着 tool_choice 调一个没绑工具的 client——省掉，不报错。「有没有工具」看的是
-	// 最终请求体：ExtraBody 带了 tools 时合并会整个替换绑定的工具（provider 内置工具常走这条），以它为准。
-	if o.ToolChoice != nil && wireHasTools(req) {
-		req.ToolChoice = string(*o.ToolChoice)
-	}
-
-	return req, nil
+	return nil
 }
 
 // wireHasTools 判断合并 ExtraBody 之后的请求体里有没有非空的 tools。
-func wireHasTools(req *openaiRequest) bool {
-	v, ok := req.extraBody["tools"]
+func wireHasTools(tools []openaiTool, extra map[string]any) bool {
+	v, ok := extra["tools"]
 	if !ok {
-		return len(req.Tools) > 0
+		return len(tools) > 0
 	}
 	if v == nil {
 		return false
@@ -409,7 +420,11 @@ func (c *Client) newHTTPRequest(ctx context.Context, req *openaiRequest) (*http.
 		}
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewReader(body))
+	return c.newJSONRequest(ctx, "/chat/completions", body)
+}
+
+func (c *Client) newJSONRequest(ctx context.Context, path string, body []byte) (*http.Request, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}

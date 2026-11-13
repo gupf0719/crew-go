@@ -295,7 +295,7 @@ func isExecutionKey(key any) bool {
 func isConfigurableKey(key any) bool {
 	switch key.(type) {
 	case checkpointerKey, orchHooksKey, ownerKey, durabilityCtxKey, staleGuardCtxKey, emitCpEventCtxKey,
-		softCancelCtxKey:
+		softCancelCtxKey, maxConcurrentNodesKey:
 		return true
 	}
 	_, ok := key.(EnvironmentKey)

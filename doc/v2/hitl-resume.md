@@ -577,11 +577,15 @@ const (
 |---|---|---|
 | `Continue` | LoadNS 恢复 cm，UserInputs 配 lastInterruptID 答 ask_user 工具，从中断节点续跑 | 标准 HITL：user 答完 ask_user 继续 |
 | `Replan` | 用户指示走 `WithResumeUserText`（**非寻址通道**），下游 Planner 用 `GetResumeUserText` 取出重规划 | PlanAgent 用户中途说"换个方向" |
-| `Abort` | DeleteSubtree 清 cp 退出，Resume 返 (nil, nil) 让 caller 区分于"自然跑完"（caller 显式发 aborted 事件）| 用户主动取消任务 |
+| `Abort` | 删除任务存档子树，成功或已无存档时返回 `(nil, nil)`，删除失败时返回原错误链 | 用户主动取消任务 |
 
 内建 Agent 的 `Run`、`Resume` 和图执行按任务 ID 登记。显式 `Abort` 与 `WithAbandonedTasks` 在删档及补历史期间占用放弃许可。
 共享 Redis 或内建 SQL Checkpointer 时，这些入口同时使用 [存储端任务租约](checkpoint.md#61-共享存档的任务租约)。
 执行与放弃在登记或申请租约时冲突，后到的调用返回 `compose_v2.ErrTaskBusy`。调用方可在在途操作结束后重试。
+显式 Abort 独立于请求取消，清理期限至多 10 秒，并沿用仍有效且更早的调用方截止时间。
+删除失败时保留任务 ID 供下一次 Abort 重试。清档成功后才补写悬空的工具调用历史。
+宿主可用 `agent_v2.WithResumeAbortCleanup` 接管删档与完成确认。两个阶段都持有任务的放弃许可。
+提供完成回调时，历史补写失败也会向上返回。跨进程补偿可传 `agent_v2.WithResumeAbortHistoryKey` 复用已保存的历史归属。
 
 **Abort 清理范围 (review-v6 H-03 fix 后行为)**：DeleteSubtree 用 `compose_v2.GetGraphNS(ctx)` 作 nsPrefix——
 - **顶层调用** (ctx 无父 graphNS, e.g. 业务直接调 `agent.Resume(ctx, sid, Abort)`): nsPrefix="" 清整 sid 所有 ns
@@ -678,7 +682,7 @@ toolsNode := func(ctx context.Context, chs Channels) ([]ChannelWrite, error) {
 - toolsNode 失败时 channel writes **全部作废**（BSP barrier 原则不变）——cp.Channels 里是上轮 modelNode 写的
   messages（assistant + N tool_calls），**不含任何 tool_result**
 - 但**已成功 tool_call 的产出不丢**：每个 tool_call 成功那一刻就记进 tools 节点的私有 memo
-  （`toolCallMemo.Done`，键 `(tc.ID, 批内下标, 工具名)`，载体 `compose_v2.SaveNodeState` → cp 的 `NodeStates`；
+  （每个 `(tc.ID, 批内下标, 实际工具名)` 各有一条 `compose_v2.SaveNodeState` 记录，随 cp 的 `NodeStates` 保存；
   **每成功一个存一次**、不等节点 return——中断是 error 路径，等不到）。记的是整条 tool_result Message（4 层压缩
   marker / return-direct 标记 / 失败 code 都在）+ inline skill body + 这次调用做出的转交 / 路由决定
   （上行信号，见 [handoff.md](./handoff.md) §6.3）
@@ -690,13 +694,12 @@ toolsNode := func(ctx context.Context, chs Channels) ([]ChannelWrite, error) {
 - `OnToolStart/End` hook 对这一批没处理完的 tool_call 仍各 fire 一次（这一批中断之后续跑，命中 memo 的也 fire：
   OnToolEnd 还没处理过它们）——观测口径的重复计数是既有行为，memo 只消掉「工具函数被重复调用」这一半。这一批处理完
   之后才作废的不再 fire（§6.5）
-- 进不进 memo 的判据是「这次调用的副作用能不能重放」（`shouldMemoize` = 做出了上行信号 **或** 不是框架元工具）：
-  没做出信号的框架元工具刻意不进、靠函数体重跑补回那半（`tool_search` 的解锁写 channel 那一步在工具体里，
-  跳过函数体就没人写——理由见 `tool_memo.go` godoc，动名单前先看 `tool_search_resume_test.go`）；审批记录
-  （`Approved`：批过的不重复问；`Decided`：这次调用的审批结论，续跑重放、不看当时的配置）也在同一份 memo 里。
-  调用内容另有一份步骤记录（`fixToolCallContent`）：一批调用在第一次交给工具执行时定下 `OnToolStart` 改写之后的内容，
-  续跑按它执行、不按那一次的改写——memo 的命中、审批、工具自己的提问都是对这份内容做的。判据与代码注释见 `agent_v2/basic_agent.go` 的 `memoKey` /
-  `rememberDone` 段与 `agent_v2/tool_memo.go`
+- 业务工具、技能参考文档读取以及产生上行信号的框架工具可以重放。依赖工具体重新写入 channel 的框架工具
+  在续跑时照常执行，例如 `tool_search`。审批结论和用户批准状态也保存在各自调用的账项内。
+- 首次派发时在步骤记录中定下 `OnToolStart` 改写后的工具名和参数。续跑复用这份内容执行并查账，
+  审批与工具内提问也使用同一份内容。
+- 恢复 v20 挂起任务时会先迁移旧工具账。迁移使用首次派发的工具名，保留审批、原始结果、定稿和信号。
+  v21 已写入的逐调用账项需要 v21 或更高版本恢复。
 
 ### 6.3 幂等要求缩到 memo 覆盖不到的地方
 
@@ -737,7 +740,7 @@ Run 2 Resume: askUserToolFunc 入口 → GetResumeAnswer(stableID) hit → 直�
 
 - ✨ toolsNode 任一 tool_call 失败/中断 → 整节点失败，channel writes 全部作废；**已成功 tool_call 的产出在节点 memo 里不丢**（随 cp 走）
 - ✨ Resume 重跑 toolsNode → memo 命中的**不调函数体**、重放产出（含当时做出的转交 / 路由决定）；未命中的执行；`OnToolStart/End` 照常 fire（这一批处理完之后才作废的除外，见下一条）
-- ✨ 这一批处理完（`OnToolEnd`、批内裁决、按大小处理）之后结果**定下**：这次执行之后在提交之前作废（节点成功之后的钩子 Goexit、提交出错）时，续跑**不再处理**这几个调用——工具不执行，`OnToolStart` / `OnToolEnd` 都不触发，交出定下的结果与钩子当时做出的转交 / 路由决定。再交给钩子的只能是处理完的那份（转存说明、钩子改写过的结果），不幂等的钩子在它上面报错或叠加改写，续跑就过不去或结论跟着变（审计实测）；两个钩子一起不触发，钩子开的 span 也不落单。被批内裁决换掉的那几条定下的是替换后的失败结果（续跑时它按失败判、决定作废，生效的仍是首跑那个）；没处理完就停下的照常重新处理、改写照常生效（`agent_v2/tool_memo.go` 的 `finalizeToolMemo` / `fixedToolResults`，哨兵 `tool_memo_fixed_test.go` 六条）
+- ✨ 这一批处理完（`OnToolEnd`、批内裁决、按大小处理）之后结果**定下**：这次执行之后在提交之前作废（节点成功之后的钩子 Goexit、提交出错）时，续跑**不再处理**这几个调用——工具不执行，`OnToolStart` / `OnToolEnd` 都不触发，交出定下的结果与钩子当时做出的转交 / 路由决定。再交给钩子的只能是处理完的那份（转存说明、钩子改写过的结果），不幂等的钩子在它上面报错或叠加改写，续跑就过不去或结论跟着变（审计实测）；两个钩子一起不触发，钩子开的 span 也不落单。被批内裁决换掉的那几条定下的是替换后的失败结果（续跑时它按失败判、决定作废，生效的仍是首跑那个）；没处理完就停下的照常重新处理、改写照常生效（`agent_v2/tool_memo.go` 的 `finalizeToolMemo` 和 `loadToolMemo`，哨兵 `tool_memo_fixed_test.go` 六条）
 - ✨ model 节点同一条规矩（`agent_v2/model_call_record.go`）：这一轮处理完（`OnModelEnd` 之后）定下，之后作废续跑时不再处理——不调模型，`OnModelStart` / `OnModelEnd` 都不触发，不重记会话历史。模型答复之后、处理完之前停下的看原因：因为等人或被叫停（中断、取消）停下的，续跑沿用这次调用的答复、不再调模型（钩子问过人的，用户答的就是这一份），也不再带用量（一次调用只报一次）——这一遍 `ModelInput.Extra` / `ModelOutput.Extra` 标着 `hook.ModelResponseReusedKey`，观测不再记一次模型调用、agui 适配层不再把答复发一遍（哨兵 `TestModelResponseReused_RecordedOnce` / `TestHandler_ReusedModelResponse_NotResent`）；钩子报错拒掉、把答复置空、panic 的续跑重新调模型换一份——内容触发的钩子 panic 留着原样的话续跑永远过不去；重新调模型时推进 `OnModelEnd` 那一格的重做代际（模型钩子各在自己的相位里跑，`compose_v2.AdvanceRerunGeneration`，同条件边否决那一格）：对新答复的提问换新 ID，累积传的旧批准不会兑付给新的一份；那一格里与答复无关的普通记录（扣费这类嵌套调用）照常拿回、不重做；`OnModelStart` 问的是输入、它那一格不推进，答过的不再问（哨兵 `TestModelCall_RegeneratedAfter*_AsksAgain` / `TestModelCall_RegeneratedAfterVoid_NormalNestedCallRecalled` / `TestModelCall_Regenerated_StartQuestionNotReasked`）。沿用标记只对排在会停下的钩子前面的钩子成立，按调用计数、往外发的钩子要排在前面。作为编排成员时，重放那一轮照首跑那样登记成「这次调用里记过」，边界补记不替它再记一份（`TestHistory_MemberModelVoidedAfterProcessing_FinalRecordedOnce`）。tools 节点这一批已记过会话历史的，重放时不再记（哨兵 `history_voided_window_test.go`）
 - ✨ ask_user 二阶段语义自动幂等（GetResumeAnswer 命中即返）
 - ✨ 同节点多次 ask_user 用 `NextInterruptIndex` 自管 idx（业务工具）
@@ -909,16 +912,15 @@ b.AddSubgraphNode("planner", planGraph,
 )
 ```
 
-AutoCompact 用 `compose_v2.WithAddressedResumeOnly` 传递恢复数据。摘要可以经 `Ask` 或
-`NextAnswerSlot` 按执行位置接收答复。直接读取恢复 map、指定任意 ID 或读取非寻址文本会返回无数据。
-子调用继承该限制。摘要相位及续跑顺序见 [上下文压缩](context-compaction.md#第-2-层autocompact-自动压缩)。
-
-### 8.3 框架 auto-ID 与答复隔离
+### 8.3 保留按执行位置投递的答复
 
 框架 auto-ID 算法把 `graphNS` 编入 InterruptID——父子 ID 不冲突（不同 ns 哈希不同）。
 
-默认的框架寻址按执行位置区分父子问题。`WithAddressedResumeOnly` 保留位置寻址，
-`StripResumeContext` 会移除全部恢复答复，包括按框架 ID 寻址的答复。
+需要让被调方继续用 `Ask` 时，用 `compose_v2.WithAddressedResumeOnly` 隐藏任意 ID 查询和非寻址续跑文本。
+同一节点内的独立调用可经 `compose_v2.EnterPhase` 分配自己的提问序号。AutoCompact 的摘要模型采用这一组合。
+`StripResumeContext` 会移除全部答复，也会使 `Ask` 无法读到答案。
+
+摘要的相位与续跑顺序见 [上下文压缩](context-compaction.md#第-2-层autocompact-自动压缩)。
 
 ### 8.4 关于"子图想 opt-in 继承父答案"
 

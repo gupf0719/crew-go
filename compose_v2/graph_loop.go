@@ -7,10 +7,10 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"crew-go/internal/fanout"
 	"crew-go/internal/panicerr"
 	"crew-go/schema"
 )
@@ -668,6 +668,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// `ctxNS/...`——根不是子的 ns 祖先，树自身错位。
 	if checkpointingDisabled(ctx) {
 		cfg.checkpointer = nil
+	} else if binding, ok := boundCheckpointerFrom(ctx); ok {
+		cfg.checkpointer = binding.cp
 	} else if cfg.checkpointer == nil {
 		cfg.checkpointer = GetCheckpointer(ctx)
 	}
@@ -901,6 +903,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// cleanup defer: SaveNS/DeleteSubtree 根 cp。**别在注释里数「注册 N / 跑 M」**——这个
 	// 函数里的 defer 不止表面这几道（顶部还有 outer recover 与兑付上冒），每加一道那些
 	// 数字就全错一遍，本文件为此错过一次。要判先后直接看注册位置。
+	// 恢复被拒时还没有接管存档。即使调用方传入已有值的 ChannelManager，出口也不得改写原档。
+	var restoreRejected bool
 	defer func() {
 		// **F4 修复**（Phase 5.1.a Step 5）：Run 出口自动持久化根 graph cp，
 		// 让根 graph cp 协议与子图 cp 协议对称（之前只有子图 cp 自动 SaveNS，
@@ -918,6 +922,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		}
 		if err := CheckCheckpointTaskLease(ctx); err != nil {
 			runErr = err
+			return
+		}
+		if restoreRejected {
 			return
 		}
 		// 出口的每一次存储读写都经 exitStorageOp：不跟着调用方取消（调用方结束之后再给一段宽限），后端
@@ -1426,6 +1433,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 上次也不是停在它的断点上」才要（软取消 / ctx 取消停在边界、崩溃恢复）——见 breakpointStop。
 	judgeStart := false
 	if cfg.resumeFrom != nil {
+		restoreRejected = true
 		judgeStart = !cfg.resumeFrom.FrontierStarted && !hasBreakpointStop(cfg.resumeFrom.PendingInterrupts)
 		// audit follow-up: 显式 WithResumeFrom 路径 fire cp.load event (Source=explicit)
 		// 之前只 auto-load 路径 fire, 业务统计 "Resume 次数" 时漏算显式路径.
@@ -1469,32 +1477,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			return fmt.Errorf("%w: WithResumeFrom cp.GraphID=%q vs g.ID()=%q: caller 跨 graph mix cp 拒绝静默 restore",
 				ErrGraphIDConflict, cfg.resumeFrom.GraphID, g.ID())
 		}
-		// **续跑之前先问一句：这份档里有东西可跑吗**。
-		//
-		// 位置是承重的：**必须在 `cm.Restore` 之前**。Restore 会把存档里的挂起提问灌回
-		// cm，之后再报错的话，Run 出口那条「没 frontier 也没挂起就不写档」的早退不再成立
-		// ⟹ 照常 SaveNS ⟹ **把这份不自洽的原始现场覆盖掉**，覆盖出来的那份**自己就是
-		// 矛盾档**（frontier 抹平、Status 仍 Pending）⟹ 此后每次续跑都被这同一道守卫
-		// 拒死，而它在业务的待处理列表里看着一切正常。
-		//
-		// ⚠️ 但真正承重的是「**cm 是空的**」——cm 由调用方给，它先 Restore 过再进来时
-		// 这个前提就没了（那是文档化支持的幂等用法）。完整说明见 ErrCheckpointNotResumable
-		// godoc「现场保留（有一个前提）」那节。
-		//
-		// 判据是**自相矛盾**，不是「frontier 空」：这份档说有人在等回答
-		// （`PendingInterrupts` 非空），却没有任何地方能跑到那个提问（frontier 空）。
-		//
-		//   - **frontier 空 + 没有挂起 = 跑完了**，那是合法的：对一份已完成的快照续跑
-		//     返成功、不重跑，是幂等语义（有专门用例钉着）。**不能一并拒掉。**
-		//   - **frontier 空 + 有挂起 = 不可能自然产生**。引擎存档时两者一起写，一个在
-		//     另一个没了只能是外部原因——最隐蔽的那类是**业务自研 backend 漏序列化
-		//     `CurrentFrontier`**：一次真 HITL 中断的档，挂起提问还在、Status 还是
-		//     Pending，只有起跑地址没了。放它过去的表现是 Resume 返 nil、一个节点都没跑、
-		//     用户的答案没送达、存档还被当成功清掉——四件事全静默。
-		//   - **不看 Status**：`WithResumeFrom` 这条路根本不校验 Status，拿 `Resumable()`
-		//     当门槛会被 Unset 的档绕过去。矛盾本身不需要 Status 来判定。
+		// 有待回答问题时必须有对应的 frontier。已完成且无挂起的存档仍支持幂等恢复。
 		if len(cfg.resumeFrom.CurrentFrontier) == 0 && len(cfg.resumeFrom.PendingInterrupts) > 0 {
-			return fmt.Errorf("%w: sid=%q ns=%q graph=%q status=%s pending_interrupts=%d channels=%d",
+			return fmt.Errorf("%w: pending interrupts but no frontier: sid=%q ns=%q graph=%q status=%s pending_interrupts=%d channels=%d",
 				ErrCheckpointNotResumable, cfg.sessionID, cfg.graphNS, cfg.resumeFrom.GraphID,
 				cfg.resumeFrom.Status, len(cfg.resumeFrom.PendingInterrupts), len(cfg.resumeFrom.Channels))
 		}
@@ -1505,6 +1490,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		if err := cm.Restore(cfg.resumeFrom); err != nil {
 			return fmt.Errorf("auto-restore: %w", err)
 		}
+		restoreRejected = false
 		// 从存档续跑：已提交的进度原样拿回、不重新交出流，所在那段执行取代的东西一个都不撤（见 stream_attempt.go）
 		markStreamsUncertain(ctx)
 		// import baseline 已在 OnGraphStart 之前摆好（F5 不变量：续跑读到父图**最新**值——
@@ -1713,24 +1699,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		cm.markFrontierStarted()
 		res := executeFrontier(ctx, g, frontier, cm, cfg.hooks)
 
-		// **单写入者冲突：在任何提交之前拦下。**
-		//
-		// 用 `%w ErrRunAborted`：不重试（`IsRetryable` 已排除它）+ Run 出口清 cp 子树。
-		//
-		// ⚠️ **理由不是「重跑必然一样」**——独立审计实测证伪过两次：(a) 写入是不是发生
-		// 取决于运行时数据（条件写），同一张图换批数据就 `err == nil`；(b) 冲突方之一
-		// 第一次恰好失败时守卫压根看不到它（失败分支的 writes 在检测前就丢了），
-		// Resume 只重跑那一个 ⟹ 同一个接线错误整个逃逸。
-		//
-		// 真正的理由是**这个矛盾会随存档反复复现**：留 Pending 档 ⟹ auto-load 捡起 ⟹
-		// 再撞同一个矛盾，而单槽覆盖式下它还占着位置。加上赢家由 frontier 索引序决定、
-		// 跟业务意图无关，所以任何一次「侥幸没撞上」都不代表修好了。
-		//
-		// ⚠️ **代价要认**：清子树会把该 (sid,ns) 下**已经问过人、人也答了**的挂起档
-		// 一并清掉，之前超步的副作用在重跑时会重放。撞上它就是得改图重跑，没有原地续。
-		//
-		// 位置在 recordInterrupt 之前：既然整个 Run 终局，挂起清单没有存在的意义——
-		// 存了反而让业务看到一份「答了也没用」的提问。
+		// 同一逻辑超步的单写入者冲突在提交前终止。恢复时也要检查此前已提交的成员。
 		if res.SingleWriterConflictErr != nil {
 			return res.SingleWriterConflictErr
 		}
@@ -1750,6 +1719,13 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		}
 		if res.SignalConflictErr != nil {
 			return res.SignalConflictErr
+		}
+
+		// 待发 payload 与成员写入共享 channel。已成功成员形成的冲突在部分提交前也能判定。
+		completedEarlier, deferredSends, completedTargets := cm.peekCompletedSiblings()
+		sends := append(deferredSends, res.SendDirectives...)
+		if err := cm.checkPayloadWriteOwners(res.WriteOwners, sends); err != nil {
+			return err
 		}
 
 		// **audit Round 10 Bug D-N1 修复**：先 record AllInterrupts 再尝试 ApplyAll——
@@ -1825,42 +1801,13 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			isEnd        bool
 			dirWrites    []ChannelWrite
 			nextInputs   map[string][]ChannelWrite
-			// completedEarlier：部分失败续跑时，这个超步先前已成功的成员（after 断点要算上它们）
-			completedEarlier []FrontierMember
 		)
 		if res.FirstErr == nil {
-			// PA-H1：读取上次部分失败超步的成功成员及其**当时就算好的出边目标**。
-			//
-			// 它们的出边**不在这里重算**——出边是「那个成员成功」的一部分，在它成功的那一刻
-			// 就随它的执行算完了（算不出来的话它当时根本不算成功）。重算的话读到的是**它跑完
-			// 之后**的状态（含兄弟与重跑成员的产出），跟它自己当时看到的不是一份东西。
-			// audit² H1：peek 非破坏性读——本超步后续失败时记录原样留 cm 进 cp。
-			var deferredSends []SendDirective
-			var completedTargets []NodeID
-			completedEarlier, deferredSends, completedTargets = cm.peekCompletedSiblings()
-
 			nextFrontier, isEnd = assembleFrontier(append(append([]NodeID{}, res.Targets...), completedTargets...))
-
-			// PA-H1：重放成功成员的 SendDirectives——**前置**合并（audit² L1：deferred
-			// 属更早成员，无中断执行时其 sends 先于本超步新 sends 进流，保 Append 等
-			// 顺序敏感 reducer 与无中断路径顺序一致）。
-			if len(deferredSends) > 0 {
-				res.SendDirectives = append(deferredSends, res.SendDirectives...)
-			}
-
-			// **SendFrom 动态投递**：合并 directives 的 Targets 进 next frontier，
-			// Payload 通过 apply 注入 channel state（在下一超步入口可见）。
-			// 重复 Target 不去重——caller 想 N 个并发 worker 时按 N 次调用。
-			//
-			// **audit Bug A 修复**：仅当至少有一个 valid Target 时才设 isEnd=false——
-			// 之前循环内每条 directive 都设（即使 Target 被 filter 掉），导致 caller
-			// 错调 SendFrom([Target=EndNode]) 时 nextFrontier 空 + isEnd=false →
-			// "frontier is empty but isEnd was false" 错。
-			// payloadOwners: channel 名 → 第一条写它的 directive 下标。
-			var payloadOwners map[string]int
-			for di, d := range res.SendDirectives {
+			// 先前已提交的成员先投递，按已经校验的顺序折叠共享 payload。
+			for _, d := range sends {
 				if d.Target == "" || d.Target == EndNode {
-					continue // 防御：不投递空/终止节点
+					continue
 				}
 				nextFrontier = append(nextFrontier, FrontierMember{NodeID: d.Target, InstanceID: d.instanceID})
 				if len(d.Input) > 0 {
@@ -1869,63 +1816,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 					}
 					nextInputs[d.instanceID] = d.Input
 				}
-				// **payload 灌的是共享 channel，不是「这条 directive 的私有入参」。**
-				//
-				// N 条 directive 的 payload 在下一超步开始前一次性归并进同一个格子，
-				// 所以它们写同一个单写入者 channel 时**只剩最后一条**，N 个 target
-				// 全看到同一个值。这正是本包 godoc 一度教的 map-reduce 写法
-				// （每条 `Write(workerInputCh, t)` + 一句「如 LastValue 单实例」），
-				// 实测三个 worker 全看到第三个 task 而 err == nil。
-				//
-				// 跟成员间那道检测是两件事：那道按「谁写的」分组，而 N 条 directive
-				// 常常出自**同一个**节点（map-reduce 就是），按成员分组一条都抓不到。
-				for _, w := range d.Payload {
-					if w == nil {
-						continue
-					}
-					name := w.channelName()
-					// **成员写 vs payload 写**：本超步某成员写了 name，而这条指令的 payload 也写它
-					// ——payload 走第二次 apply，会静默盖掉成员的写（LastValue 下）。发指令的
-					// 成员自己既写又发 payload 是它自己的显式意图，不算。
-					if m, wrote := res.WriteOwners[name]; wrote && res.SingleWriterConflictErr == nil &&
-						m != (FrontierMember{NodeID: d.owner, InstanceID: d.ownerInstanceID}) &&
-						cm.isSingleWriterChannel(name) {
-						res.SingleWriterConflictErr = fmt.Errorf(
-							"channel %q 是单写入者（LastValue），本超步成员 %s 写了它，第 %d 条 SendFrom "+
-								"指令（%s → %s）的 payload 也写它。payload 在成员写入之后归并，会静默盖掉成员"+
-								"的写、赢家由 apply 顺序决定。要么别让 payload 碰这个 channel，要么换能合并的"+
-								"channel（Append / Sum / 自定义 reducer）: %w",
-							name, formatFrontierMember(m), di, formatFrontierMember(FrontierMember{NodeID: d.owner, InstanceID: d.ownerInstanceID}),
-							d.Target, ErrRunAborted)
-					}
-					prev, seen := payloadOwners[name]
-					if !seen {
-						if payloadOwners == nil {
-							payloadOwners = map[string]int{}
-						}
-						payloadOwners[name] = di
-						continue
-					}
-					if prev == di || res.SingleWriterConflictErr != nil {
-						continue // 同一条 directive 内连写两次是它自己的显式意图
-					}
-					if !cm.isSingleWriterChannel(name) {
-						continue
-					}
-					res.SingleWriterConflictErr = fmt.Errorf(
-						"channel %q 是单写入者（LastValue），却被同一超步的两条 SendFrom "+
-							"指令的 payload 写了（第 %d 条 → %s、第 %d 条 → %s）。"+
-							"payload 灌的是**共享** channel 不是每条指令的私有入参，"+
-							"N 条一起归并进同一个格子后只剩最后一条，N 个目标会全看到同一个值。"+
-							"想给每个目标不同的入参：给它们**不同的 target**（同 target 扇出的实例"+
-							"拿不到自己是第几个，没法各取各的；见 SendDirective godoc）: %w",
-						name, prev, res.SendDirectives[prev].Target, di, d.Target, ErrRunAborted)
-				}
 				dirWrites = append(dirWrites, d.Payload...)
-				isEnd = false // 有 valid directive 就不是 end（continue 保证只 valid 生效）
-			}
-			if res.SingleWriterConflictErr != nil {
-				return res.SingleWriterConflictErr
+				isEnd = false
 			}
 		}
 
@@ -1933,7 +1825,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			var commitErr error
 			if res.FirstErr != nil {
 				commitErr = cm.commitSuperstepPartial(res.SuccessWrites, narrowFrontierTo,
-					res.SucceededBranches, res.ConsumedAnswers, res.Signals, res.SendDirectives, res.Targets)
+					res.SucceededBranches, res.ConsumedAnswers, res.Signals, res.SendDirectives, res.Targets, res.WriteOwners)
 			} else {
 				commitErr = cm.commitSuperstepAdvance(res.SuccessWrites,
 					res.SucceededBranches, res.ConsumedAnswers, res.Signals, nextFrontier, dirWrites, nextInputs)
@@ -2065,28 +1957,11 @@ type frontierResult struct {
 	// FailedBranches 失败分支 ID（含 InterruptError + 业务错 + hook 错）
 	// 仅 Resume 时用——下次 Run 从这些分支重跑（不重跑成功分支）
 	FailedBranches []FrontierMember
-	// SingleWriterConflictErr 是「两个成员在同一超步写了同一个单写入者 channel」的
-	// 检测结果（`LastValue` 家族）。非 nil 时**整超步不提交**——这是图接线上的矛盾，
-	// 重跑必然一样，故 wrap ErrRunAborted。检测点在这儿而不是归并处：归并那层拿到的
-	// writes 已经扁平化，看不见谁写的，而错误正文没有「是哪两个成员」就没法排查。
-	//
-	// **覆盖边界**（如实写，别假装全覆盖）：
-	//   - 只看**跨成员**。同一个成员在自己的 []ChannelWrite 里连写两次是有序且确定的，
-	//     那是它的显式意图。
-	//   - 宽度 1 的超步整个不检测（executeFrontier 有 fast path）。那里只有一个成员，
-	//     跨成员冲突不可能发生，跳过是对的——但写测试时**必须用宽度 ≥2 的 fixture**，
-	//     否则测的是快路径、守卫改没改都绿（实测栽过）。
-	//   - `SendDirective.Payload` 现在**也在检测范围内**，两条：directive 之间（按 directive
-	//     分组——N 条常出自同一个节点，按成员分组一条都抓不到）、以及成员写 vs payload 写
-	//     （payload 走第二次 apply，会静默盖掉成员的写）。三段检测的豁免键各不相同，
-	//     因为它们守的不是同一件事：前者守「并发赢家不确定」，后两者守「payload 不是
-	//     per-directive 私有入参」——`Channel.single` 这一位被两种语义共用。
+	// SingleWriterConflictErr 表示同一逻辑超步有不同成员写入单写入者 channel。
+	// 含恢复前已提交的成员。出现冲突时终止运行，当前未提交的写入不生效。
 	SingleWriterConflictErr error
 
-	// WriteOwners 是本超步**每个被成员写过的 channel → 第一个写它的成员**（只在扇出路径填，
-	// 宽度 1 的 fast path 为 nil）。给后面 payload 那道检测用：成员写与某条 SendFrom
-	// 指令的 payload 写同一个单写入者 channel 时，payload 在第二次 apply 里**静默盖掉**
-	// 成员的写——那也是「两个写入者、赢家由 apply 顺序决定」。
+	// WriteOwners 包含本逻辑超步已经提交与本次执行成功的单写入者归属。
 	WriteOwners map[string]FrontierMember
 
 	// ConsumedAnswers 是本超步全体成功成员**兑付掉的答案位**（见 answer_consumption.go）。
@@ -2318,38 +2193,21 @@ func (r frontierResult) exitErr() error {
 //   - 成功分支 writes 收集到 SuccessWrites
 //   - 失败分支 ID 收集到 FailedBranches（让 Resume 只重跑这些）
 //   - first error 仍返出（caller 决定是否中断 Run）
-//
-// recordWriteOwners 把一个成员的写登记进「channel 名 → 第一个写它的成员」——**首写者胜**。
-//
-// 两条执行路径共用（扇出的收集循环、宽度 1 的 fast path）：这张表喂的是下游「成员写 vs
-// payload 写」那道检测，而那道检测的对手可能是上个超步存档、本超步重放的 payload，
-// 跟本超步有几个成员无关。分成两处写过一次，fast path 那半忘了填（实测漏检）。
-func recordWriteOwners(owners map[string]FrontierMember, m FrontierMember, ws []ChannelWrite) map[string]FrontierMember {
-	for _, w := range ws {
-		if w == nil {
-			continue
-		}
-		name := w.channelName()
-		if _, seen := owners[name]; seen {
-			continue
-		}
-		if owners == nil {
-			owners = map[string]FrontierMember{}
-		}
-		owners[name] = m
-	}
-	return owners
-}
-
 func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, cm *ChannelManager, hooks OrchestrationHooks) frontierResult {
+	writeOwners := cm.completedWriteOwnersSnapshot()
+	limit, _ := ctx.Value(maxConcurrentNodesKey{}).(int)
 	// fast path: 单节点顺序
 	if len(frontier) == 1 {
+		if err := ctx.Err(); limit > 0 && err != nil {
+			return frontierResult{FailedBranches: frontier, FirstErr: err, WriteOwners: writeOwners}
+		}
 		id := frontier[0].NodeID
 		fn, ok := g.nodes[id]
 		if !ok {
 			return frontierResult{
 				FailedBranches: []FrontierMember{frontier[0]},
 				FirstErr:       fmt.Errorf("node %q not registered", id),
+				WriteOwners:    writeOwners,
 			}
 		}
 		chs := cm.channelsForMember(frontier[0])
@@ -2373,6 +2231,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 			res := frontierResult{
 				FailedBranches: []FrontierMember{frontier[0]},
 				FirstErr:       err,
+				WriteOwners:    writeOwners,
 			}
 			if errors.Is(err, ErrRunAborted) {
 				res.AbortErr = err
@@ -2392,20 +2251,16 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 			}
 			return res
 		}
+		owners, conflict := cm.recordMemberWrites(writeOwners, frontier[0], ws)
 		return frontierResult{
-			SuccessWrites:     ws,
-			SendDirectives:    directives,
-			SucceededBranches: []FrontierMember{frontier[0]},
-			Targets:           targets,
-			ConsumedAnswers:   consumed,
-			Signals:           signals,
-			// **宽度 1 也要填**：跨成员冲突在这里确实不可能，但 `WriteOwners` 还喂着
-			// 下游「成员写 vs payload 写」那道检测——那道检测的对手是**上个超步**存进
-			// DeferredSends、本超步重放的 payload，跟本超步有几个成员无关。
-			// 漏填的后果实测过：兄弟恰好失败过一次 ⟹ 续跑时 frontier 缩成 1 ⟹ 走这条
-			// fast path ⟹ 检测失效、成员的写被 payload 静默盖掉且 err == nil。
-			// 守卫的结论取决于「兄弟是不是恰好失败过」，正是它要消灭的那种侥幸。
-			WriteOwners: recordWriteOwners(nil, frontier[0], ws),
+			SuccessWrites:           ws,
+			SendDirectives:          directives,
+			SucceededBranches:       []FrontierMember{frontier[0]},
+			Targets:                 targets,
+			ConsumedAnswers:         consumed,
+			Signals:                 signals,
+			WriteOwners:             owners,
+			SingleWriterConflictErr: conflict,
 		}
 	}
 
@@ -2422,88 +2277,84 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 		err        error
 	}
 	results := make([]branchOutput, len(frontier))
-	var wg sync.WaitGroup
-	for i, m := range frontier {
+	started := fanout.Run(ctx, len(frontier), limit, func(i int) {
+		m := frontier[i]
 		fn, ok := g.nodes[m.NodeID]
 		if !ok {
 			results[i] = branchOutput{member: m, err: fmt.Errorf("node %q not registered", m.NodeID)}
-			continue
+			return
 		}
-		// 同 NodeID 多次出现按出现顺序分 branch idx 0,1,2...（首次=0）
-		i, m, fn := i, m, fn
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// **本 goroutine 顶上必须自带 recover**：`runNodeWithHooks` 那道随它 return 就
-			// 结束，而下面的 `evalOutEdges` 在它**之外**（`safeCondRun` 只裹 cond 的函数体，
-			// 框架对业务 error 的链式 unwrap 是裸的）。跨 goroutine 的 panic 谁都接不到，
-			// 不自己兜就 **crash 整进程**——业务给一个 `Unwrap()` 会 panic 的 error 即可。
-			//
-			// 见 panic_recovery.go。
-			//
-			// **`normalReturn` 守的是第三条出路**：goroutine 既没正常返回、也没 panic
-			// ——`runtime.Goexit`。它**会**跑 defer，但 `recover()` 返 nil，所以上面那支
-			// 接不住；而 `results[i]` 是预分配的零值 ⟹ `err == nil` ⟹ **被当成功**，
-			// 且 `member` 也是零值 ⟹ 一个 `NodeID:""` 的幽灵成员进 `CompletedFrontier`
-			//（那个集合的语义是「已成功、永不重跑」）⟹ 这条分支连同下游跨 Run + Resume
-			// **永久消失**，最后存档被当成功清掉，全程 `err == nil`。实测过。
-			//
-			// **不罕见**：`zap` 的 godoc 主动推荐在 `zap.WithFatalHook` 里调 `runtime.Goexit`
-			//（「Fatal 别杀进程、只结束当前 goroutine」是服务端常见诉求）；`os/user` 在
-			// Windows 上有一条（`user.Current()` 走得到）；testify 的 `require.*` 全系同理。
-			//
-			// **不转发 Goexit**：实测在主 goroutine 上转发会
-			// `fatal error: no goroutines (main called runtime.Goexit) - deadlock!`。
-			// 标准库 testing.tRunner（errNilPanicOrGoexit）与 iter.Pull（seqDone）
-			// 各有一份同款 flag，也都是**转成错误**而不是转发。
-			//
-			// **`member: m` 两支都要带**——身份跟结果是同一次赋值写的（`:1639`），零值
-			// 连身份都没有，那正是幽灵成员的根因。
-			normalReturn := false
-			defer func() {
-				if r := recover(); r != nil {
-					pe := panicerr.New(r)
-					perr := panicerr.Wrap(fmt.Sprintf("node %q out-edge panic recovered", m.NodeID), pe)
-					panicerr.Log(ctx, slog.LevelError, "compose_v2: 出边计算 panic，已转成该成员失败", pe, panicerr.KeyError, perr.Error())
-					results[i] = branchOutput{member: m, err: perr}
-					return // panic 已归档，别让下面那支拿 Goexit 的说法盖掉它
-				}
-				if !normalReturn {
-					// **不 wrap `ErrRunAborted`**：那个哨兵的判据是「重跑必然一样」，而这里
-					// 确定的只是 `runtime.Goexit` 这个**机制**——触发它的是业务条件
-					//（`logger.Fatal` 可能因为下游挂了而走到），框架判不出它是瞬时还是确定性。
-					// 按框架一贯的原则「分不出瞬时故障还是确定性错误，那是业务的知识」，
-					// 这里返普通业务错：留 Failed 档 ⟹ 业务可 Resume 重试**这一个**失败分支
-					//（成功兄弟不重放）。确定性的话重跑还是同样报错，偶发的话重跑就过了；
-					// 清掉档则两种都不给选。
-					results[i] = branchOutput{member: m, err: fmt.Errorf(
-						"node %q (ns=%q instance=%q) 的 goroutine 异常终止：既没正常返回也没 panic"+
-							"（runtime.Goexit——典型来源是 zap 的 WithFatalHook、testify 的 require.*、t.FailNow）",
-						m.NodeID, GetGraphNS(ctx), m.InstanceID)}
-				}
-			}()
-			chs := cm.channelsForMember(m)
-			ws, directives, consumed, signals, err := runNodeWithHooks(ctx, m.NodeID, fn, g.nodeComponents[m.NodeID], g.nodePolicies[m.NodeID], chs, hooks, cm, m.InstanceID)
-			var targets []NodeID
-			if err == nil {
-				// **每个实例各算各的出边**，视图只含它自己的写入——兄弟实例的写入看不见。
-				// 这是「路由归成员」的直接后果，也让 cond 失败能精确归因到某一个实例
-				//（先前 cond 读合并后的 channel、按 NodeID 只算一次，无从归因是哪个实例）。
-				var condSignals []SignalRecord
-				targets, condSignals, err = evalMemberOutEdges(ctx, g, cm, m, ws)
-				for _, sg := range condSignals {
-					signals = putSignal(signals, sg)
-				}
-				if err == nil {
-					err = validateSendDirectives(g, cm, m.NodeID, directives)
-				}
+		// **本 goroutine 顶上必须自带 recover**：`runNodeWithHooks` 那道随它 return 就
+		// 结束，而下面的 `evalOutEdges` 在它**之外**（`safeCondRun` 只裹 cond 的函数体，
+		// 框架对业务 error 的链式 unwrap 是裸的）。跨 goroutine 的 panic 谁都接不到，
+		// 不自己兜就 **crash 整进程**——业务给一个 `Unwrap()` 会 panic 的 error 即可。
+		//
+		// 见 panic_recovery.go。
+		//
+		// **`normalReturn` 守的是第三条出路**：goroutine 既没正常返回、也没 panic
+		// ——`runtime.Goexit`。它**会**跑 defer，但 `recover()` 返 nil，所以上面那支
+		// 接不住；而 `results[i]` 是预分配的零值 ⟹ `err == nil` ⟹ **被当成功**，
+		// 且 `member` 也是零值 ⟹ 一个 `NodeID:""` 的幽灵成员进 `CompletedFrontier`
+		//（那个集合的语义是「已成功、永不重跑」）⟹ 这条分支连同下游跨 Run + Resume
+		// **永久消失**，最后存档被当成功清掉，全程 `err == nil`。实测过。
+		//
+		// **不罕见**：`zap` 的 godoc 主动推荐在 `zap.WithFatalHook` 里调 `runtime.Goexit`
+		//（「Fatal 别杀进程、只结束当前 goroutine」是服务端常见诉求）；`os/user` 在
+		// Windows 上有一条（`user.Current()` 走得到）；testify 的 `require.*` 全系同理。
+		//
+		// **不转发 Goexit**：实测在主 goroutine 上转发会
+		// `fatal error: no goroutines (main called runtime.Goexit) - deadlock!`。
+		// 标准库 testing.tRunner（errNilPanicOrGoexit）与 iter.Pull（seqDone）
+		// 各有一份同款 flag，也都是**转成错误**而不是转发。
+		//
+		// **`member: m` 两支都要带**——身份跟结果是同一次赋值写的（`:1639`），零值
+		// 连身份都没有，那正是幽灵成员的根因。
+		normalReturn := false
+		defer func() {
+			if r := recover(); r != nil {
+				pe := panicerr.New(r)
+				perr := panicerr.Wrap(fmt.Sprintf("node %q out-edge panic recovered", m.NodeID), pe)
+				panicerr.Log(ctx, slog.LevelError, "compose_v2: 出边计算 panic，已转成该成员失败", pe, panicerr.KeyError, perr.Error())
+				results[i] = branchOutput{member: m, err: perr}
+				return // panic 已归档，别让下面那支拿 Goexit 的说法盖掉它
 			}
-			applyNestedEntryRejections(ctx, cm, m, err)
-			results[i] = branchOutput{member: m, writes: ws, directives: directives, targets: targets, consumed: consumed, signals: signals, err: err}
-			normalReturn = true
+			if !normalReturn {
+				// **不 wrap `ErrRunAborted`**：那个哨兵的判据是「重跑必然一样」，而这里
+				// 确定的只是 `runtime.Goexit` 这个**机制**——触发它的是业务条件
+				//（`logger.Fatal` 可能因为下游挂了而走到），框架判不出它是瞬时还是确定性。
+				// 按框架一贯的原则「分不出瞬时故障还是确定性错误，那是业务的知识」，
+				// 这里返普通业务错：留 Failed 档 ⟹ 业务可 Resume 重试**这一个**失败分支
+				//（成功兄弟不重放）。确定性的话重跑还是同样报错，偶发的话重跑就过了；
+				// 清掉档则两种都不给选。
+				results[i] = branchOutput{member: m, err: fmt.Errorf(
+					"node %q (ns=%q instance=%q) 的 goroutine 异常终止：既没正常返回也没 panic"+
+						"（runtime.Goexit——典型来源是 zap 的 WithFatalHook、testify 的 require.*、t.FailNow）",
+					m.NodeID, GetGraphNS(ctx), m.InstanceID)}
+			}
 		}()
+		chs := cm.channelsForMember(m)
+		ws, directives, consumed, signals, err := runNodeWithHooks(ctx, m.NodeID, fn, g.nodeComponents[m.NodeID], g.nodePolicies[m.NodeID], chs, hooks, cm, m.InstanceID)
+		var targets []NodeID
+		if err == nil {
+			// **每个实例各算各的出边**，视图只含它自己的写入——兄弟实例的写入看不见。
+			// 这是「路由归成员」的直接后果，也让 cond 失败能精确归因到某一个实例
+			//（先前 cond 读合并后的 channel、按 NodeID 只算一次，无从归因是哪个实例）。
+			var condSignals []SignalRecord
+			targets, condSignals, err = evalMemberOutEdges(ctx, g, cm, m, ws)
+			for _, sg := range condSignals {
+				signals = putSignal(signals, sg)
+			}
+			if err == nil {
+				err = validateSendDirectives(g, cm, m.NodeID, directives)
+			}
+		}
+		applyNestedEntryRejections(ctx, cm, m, err)
+		results[i] = branchOutput{member: m, writes: ws, directives: directives, targets: targets, consumed: consumed, signals: signals, err: err}
+		normalReturn = true
+	})
+	for i := started; i < len(frontier); i++ {
+		results[i] = branchOutput{member: frontier[i], err: ctx.Err()}
 	}
-	wg.Wait()
 
 	// 收集 per-branch delta：
 	// - 成功分支 → SuccessWrites + SendDirectives
@@ -2514,8 +2365,6 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 	//   → fan-out 多 worker 同时抛 ask_user 时 N-1 条 query 永久丢失，Resume
 	//   只能配第 1 条答案，其它 worker 重跑时再次抛中断（但 caller 看不到 question）
 	var out frontierResult
-	// writeOwners: channel 名 → 第一个写它的成员。懒建——多数超步宽度为 1，不会用到。
-	var writeOwners map[string]FrontierMember
 	// sigBranches：成功成员各自做出的信号，按 frontier 顺序，循环之后一并合并。
 	var sigBranches []signalBranch
 	for _, r := range results {
@@ -2552,42 +2401,9 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 			}
 			continue
 		}
-		// **单写入者冲突**：`LastValue` 的 reducer 是 `return next`，两个成员在同一
-		// 超步写同一个 channel 时静默丢一个，赢家由 frontier 索引序决定。签名正是
-		// 「N=1 正确、N≥2 静默错、err == nil」——所以在这儿拦下，趁还知道是谁写的。
-		//
-		// 只看**跨成员**：同一个成员在自己的 []ChannelWrite 里连写两次是有序且确定的，
-		// 那是它自己的显式意图，不算冲突。
-		for _, w := range r.writes {
-			if w == nil {
-				continue
-			}
-			name := w.channelName()
-			prev, seen := writeOwners[name]
-			if !seen {
-				continue // 登记统一在循环之后做（见 recordWriteOwners）
-			}
-			if prev == r.member || out.SingleWriterConflictErr != nil {
-				// 同一成员连写两次是它自己的显式意图；已报过一条就不再覆盖——
-				// 正文里点出**头两个**冲突者足够定位，全列出来会让错误正文随并发
-				// 宽度膨胀。修掉头两个之后第三个会在下一次跑时接着报。
-				continue
-			}
-			if !cm.isSingleWriterChannel(name) {
-				continue
-			}
-			out.SingleWriterConflictErr = fmt.Errorf(
-				"channel %q 是单写入者（LastValue），却被同一超步的两个成员写了：%s 与 %s。"+
-					"LastValue 的 reducer 是「后写的赢」，并发写时会静默丢一个——赢家由 frontier "+
-					"索引序决定（确定，但跟你的意图无关：声明在后的那个赢）。"+
-					"出路二选一：改用能合并的 channel（Append / Sum / 自定义 reducer），"+
-					"或确认这两个成员本就不该同时写它。真想要「谁最后写谁赢、我不在乎是谁」，"+
-					"用 Custom(name, func(_, next T) T { return next }, zero) 显式声明: %w",
-				name, formatFrontierMember(prev), formatFrontierMember(r.member), ErrRunAborted)
+		if out.SingleWriterConflictErr == nil {
+			writeOwners, out.SingleWriterConflictErr = cm.recordMemberWrites(writeOwners, r.member, r.writes)
 		}
-		// 登记本成员的写——**唯一一处**。放在检测之后：同一成员连写两次时第二条看到
-		// `seen == false`、走不到冲突分支，与「同成员豁免」等价。
-		writeOwners = recordWriteOwners(writeOwners, r.member, r.writes)
 
 		out.SuccessWrites = append(out.SuccessWrites, r.writes...)
 		out.SendDirectives = append(out.SendDirectives, r.directives...)

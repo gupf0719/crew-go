@@ -249,7 +249,7 @@ func (h *renamingHook) OnToolStart(ctx context.Context, _ *hook.AgentInfo, in *s
 // TestToolMemoFw_ToolRenamedOnResume_KeepsFirstTool 续跑时改名不生效的哨兵（工具账那一侧）。
 //
 // 两次 Resume 之间 hook 的改写逻辑变了：首跑时 tc_x 走 pay 并成功，续跑时钩子把它改名成 refund。
-// 这次调用的内容在这一批第一次执行时就定下了（fixToolCallContent）⟹ 续跑仍是 pay，工具账命中，
+// 这次调用的内容在这一批第一次执行时就定下了（saveToolCallContent）⟹ 续跑仍是 pay，工具账命中，
 // pay 不重跑，refund 一次都不跑。改名生效的话 refund 会被执行——一笔已经付过的款被退掉。
 func TestToolMemoFw_ToolRenamedOnResume_KeepsFirstTool(t *testing.T) {
 	var payRan, refundRan atomic.Int32

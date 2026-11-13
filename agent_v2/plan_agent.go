@@ -887,7 +887,7 @@ func (p *PlanAgent) buildPlanGraph(ctx context.Context, session *RunSession, gra
 				// 真实已执行步数、跨步严格递增）；归属用注册名并**剔掉序号**——它被
 				// 调度到第 2 步还是第 5 步，说的话归属都该是它自己。
 				nsSuffix:    fmt.Sprintf("%s_step_%d", name, globalIdx),
-				historySlot: name,
+				historySlot: namedHistorySegment(name),
 				retryCfg:    retryCfg,
 			})
 			if err != nil {
@@ -916,11 +916,9 @@ func (p *PlanAgent) buildPlanGraph(ctx context.Context, session *RunSession, gra
 			agent: ag,
 			sess:  session,
 			input: input,
-			// TmpSubAgent 是 planner 临时造的、**没有注册名**，ns 和归属只能都用步序号。
-			// 代价：replan 后同一个临时 agent 落到不同步序时归属会变——但临时 agent 本就
-			// 一次性（每次 plan 重新生成），没有「跨 Run 读回自己历史」的诉求。
+			// 临时成员读取本步输入和自己的历史，生命周期为当前任务的这一步。
 			nsSuffix:    fmt.Sprintf("tmp_step_%d", globalIdx),
-			historySlot: fmt.Sprintf("tmp_step_%d", globalIdx),
+			historySlot: temporaryHistorySegment(session.RunID, globalIdx),
 			retryCfg:    retryCfg,
 		})
 		if err != nil {
@@ -947,7 +945,7 @@ func (p *PlanAgent) buildPlanGraph(ctx context.Context, session *RunSession, gra
 				// "executor" 的 sub-agent 时两者会撞、两个不同 agent 的历史合并成一条流
 				// ——正是这套改动要消灭的形状。同款做法见 RoutingAgent 对 __fallback__ 的处理。
 				nsSuffix:    fmt.Sprintf("exec_step_%d", globalIdx),
-				historySlot: string(executorDispatchWorker),
+				historySlot: namedHistorySegment(string(executorDispatchWorker)),
 				retryCfg:    retryCfg,
 			})
 			if err != nil {

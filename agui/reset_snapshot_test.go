@@ -235,13 +235,21 @@ func TestResetSnapshot_DiscardedAttemptRetracted(t *testing.T) {
 }
 
 // redactHook 在 OnModelEnd 里换上一条新消息（复制一份、改正文，标注照留）——业务做脱敏的典型写法。
-type redactHook struct{ hook.NoOpHooks }
+type redactHook struct {
+	hook.NoOpHooks
+	inPlace bool
+}
 
-func (redactHook) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
+func (h redactHook) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
 	if out.Message != nil && len(schema.GetToolCalls(out.Message)) == 0 {
-		cp := *out.Message
-		cp.Content = "REDACTED"
-		out.Message = &cp
+		if !h.inPlace {
+			cp := *out.Message
+			out.Message = &cp
+		}
+		out.Message.Content = "REDACTED"
+		if h.inPlace {
+			delete(out.Message.Annotations, compose_v2.RunIDAnnotationKey)
+		}
 	}
 	return ctx, nil
 }
@@ -264,10 +272,13 @@ func TestResetSnapshot_HookReplacedAnswerShown(t *testing.T) {
 		name        string
 		streaming   bool
 		bizBeforeUI bool
+		inPlace     bool
 	}{
-		{"流式/适配层在前", true, false},
-		{"流式/业务钩子在前", true, true},
-		{"非流式/业务钩子在前", false, true},
+		{"流式/适配层在前", true, false, false},
+		{"流式/业务钩子在前", true, true, false},
+		{"非流式/业务钩子在前", false, true, false},
+		{"流式/原地改写/适配层在前", true, false, true},
+		{"流式/原地改写/业务钩子在前", true, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var m model.ChatModel = genOnly{}
@@ -275,9 +286,10 @@ func TestResetSnapshot_HookReplacedAnswerShown(t *testing.T) {
 				m = &scriptStream{script: func(_ int, send func(*schema.Message)) error { send(text("secret")); return nil }}
 			}
 			h := ownedHandler(func(ui hook.Hooks) agent_v2.Agent {
-				chain := hook.NewChainHooks(ui, redactHook{})
+				redact := redactHook{inPlace: tc.inPlace}
+				chain := hook.NewChainHooks(ui, redact)
 				if tc.bizBeforeUI {
-					chain = hook.NewChainHooks(redactHook{}, ui)
+					chain = hook.NewChainHooks(redact, ui)
 				}
 				return agent_v2.NewBasicAgent(agent_v2.WithName("b"), agent_v2.WithModel(m), agent_v2.WithHooks(chain), agent_v2.WithMaxRounds(2))
 			})

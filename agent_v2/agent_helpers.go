@@ -161,7 +161,7 @@ func enterRunTask(ctx context.Context, session *RunSession) context.Context {
 	// 同一刻丢弃这个 RunID 名下的 don't-ask-again 规则——「上一个任务结束了」这句话对存档和
 	// 对授权必须同时成立（规则按 RunID 分，换了 RunID 本来就是一套新的；这里管的是业务复用同一个
 	// RunID 开新任务的写法）。**只清规则集**——「这次调用批过没有」那份已搬进 tools 节点的私有
-	// 中断态（见 `toolCallMemo.Approved`），跨任务隔离靠容器不靠这里。
+	// 中断态（见 `toolCallRecord.Approved`），跨任务隔离靠容器不靠这里。
 	clearApprovalRulesForNewTask(session)
 	return stampTask(ctx, session.RunID, true)
 }
@@ -385,8 +385,7 @@ func CallAgentStart(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo,
 // `IsInterrupt=true` 但挂起档为 0，前端照常渲染问题，用户答完 Resume 撞
 // `ErrNoPendingCheckpoint`——被误导到最后一步才失败。
 //
-// 「落一份初始档」试过：引擎自己的不变量当场拒绝（`checkpoint has pending interrupts
-// but no frontier to run them`）——那条防线是对的（挂起没人能跑），绕它等于对抗自己。
+// 构造一份仅含问题的初始档也无法恢复：引擎会拒绝缺少 frontier 的挂起存档。
 // 同类产品的同名机制也一致：中断原语第一行就取节点运行时上下文，图外调用直接崩。
 //
 // # 判据：引擎盖的「在节点执行范围内」章，不是 ns 字符串

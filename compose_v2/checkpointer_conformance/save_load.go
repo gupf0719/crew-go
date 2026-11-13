@@ -16,6 +16,22 @@ type confChannelVal struct{ V string }
 
 // testSaveLoad 验证 SaveNS / LoadNS round-trip + 自动填 ID/NS.
 func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
+	t.Run("SaveNS_Preserves_Known_Empty_Write_Owners", func(t *testing.T) {
+		cper := factory()
+		cp := &compose_v2.Checkpoint{
+			CurrentFrontier:      []compose_v2.FrontierMember{{NodeID: "pending"}},
+			CompletedFrontier:    []compose_v2.FrontierMember{{NodeID: "done"}},
+			CompletedWriteOwners: map[string]compose_v2.FrontierMember{},
+		}
+		if err := cper.SaveNS(t.Context(), "empty-owners", "", cp); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := cper.LoadNS(t.Context(), "empty-owners", "")
+		if err != nil || loaded == nil || loaded.CompletedWriteOwners == nil || len(loaded.CompletedWriteOwners) != 0 {
+			t.Fatalf("空归属表应保留，与缺少归属信息的 nil 区分，cp=%+v err=%v", loaded, err)
+		}
+	})
+
 	t.Run("SaveNS_Then_LoadNS_Roundtrip", func(t *testing.T) {
 		cp := factory()
 		ctx := context.Background()
@@ -193,6 +209,9 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 				{NodeID: "done_a"},                   // 静态边成员：身份空
 				{NodeID: "done_b", InstanceID: "i9"}, // fan-out 实例：带 token
 			},
+			CompletedWriteOwners: map[string]compose_v2.FrontierMember{
+				"ch1": {NodeID: "done_b", InstanceID: "i9"},
+			},
 			// **承载后继的是这个字段**（出边计算归成员之后）：成功成员当时算好的出边目标。
 			// 漏了不报错——只是它们的后继在 Resume 后静默不跑、graph 假成功。
 			CompletedTargets: []compose_v2.NodeID{"succ_x", "succ_y"},
@@ -332,6 +351,9 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 				"  → 漏这一段：发散 fan-out HITL Resume 后成功分支后继静默丢；\n"+
 				"    漏 InstanceID：重跑成员的旧记录按 {NodeID,\"\"} 匹配不上带身份的重跑成员 → 清不掉 → Target 双发",
 				loaded.CompletedFrontier)
+		}
+		if want := (compose_v2.FrontierMember{NodeID: "done_b", InstanceID: "i9"}); len(loaded.CompletedWriteOwners) != 1 || loaded.CompletedWriteOwners["ch1"] != want {
+			t.Errorf("CompletedWriteOwners round-trip: got %+v, want ch1=%+v", loaded.CompletedWriteOwners, want)
 		}
 		// Epoch 世代标记——漏了不报错，只是 WithStaleWriteGuard 静默失效
 		//（守卫读到空 Epoch 就跳过比对，业务以为开了保护其实没有）

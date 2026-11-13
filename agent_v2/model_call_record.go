@@ -29,7 +29,7 @@ const basicToolsHistoryStep = "crew_tools_history_recorded"
 //     处理时做出的上行信号原样交出，这一轮的会话历史不重记、但照首跑那样登记成「这次调用里记过」（编排边界补记据此
 //     不再替它记一份，见 noteHistoryRecorded）。再交给钩子的只能是处理完的那份：不幂等的钩子（解析
 //     答复里的 JSON、给答复打序号）在它上面报错或叠加改写，续跑就永远过不去、或结果跟着变（审计实测）；两个钩子
-//     一起不触发，钩子开的 span 也不落单。同 tools 节点的工具账（见 fixedToolResults）。
+//     一起不触发，钩子开的 span 也不落单。同 tools 节点的工具账的定稿逻辑。
 //   - **模型答复之后、这一轮处理完之前停下的，原样只在等人或被叫停时留着**：钩子因为要等人或被叫停（中断、取消
 //     ——compose_v2.MustPropagate 为真）停下时，续跑沿用这次调用的原样答复、不再调模型，把这一轮处理完——钩子问过
 //     人的话，用户答的就是这一份。别的结局一律作废、续跑重新调模型换一份：钩子报错拒掉（业务拒掉不合格的答复时，
@@ -74,7 +74,7 @@ type modelCallRecord struct {
 }
 
 func init() {
-	// 随存档落盘 ⟹ 必须注册（同 toolCallMemo）
+	// 随存档落盘 ⟹ 必须注册（同 toolCallRecord）
 	compose_v2.RegisterValueType[*modelCallRecord]("*agent_v2.modelCallRecord")
 }
 

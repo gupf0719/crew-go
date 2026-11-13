@@ -339,7 +339,7 @@ Run(ctx, g, cm, opts...) {
 
         res := executeFrontier(ctx, g, frontier, cm, hooks) // 并发执行 frontier（per-branch delta）
 
-        if res.SingleWriterConflictErr != nil { return ... } // 单写入者冲突：**任何提交之前**拦下
+        if res.SingleWriterConflictErr != nil { return ... } // 核对本逻辑超步的所有成员，包括已部分提交者
 
         if res.FirstErr != nil {                          // 失败/中断：先整批 record（撞 ID 当场拒）
             cm.recordInterruptBatch(allQueriesOf(res.AllInterrupts))
@@ -715,6 +715,12 @@ fan-out 超步：frontier=["worker1", "worker2", "worker3"] → 并发执行 3 w
 聚合超步：frontier=["aggregator"]（所有 worker 写完 channel 后路由到 aggregator）
 ```
 
+用 `compose_v2.WithMaxConcurrentNodes(ctx, n)` 设置每张图每个超步的执行预算。默认 `0` 表示并发派发整批。
+开启预算后，调度器先等到空位再创建成员 goroutine，按 frontier 顺序派发，并在同一超步内汇合结果。
+调用方取消时，未派发的成员保留原身份，已开始的成员退出后照常提交成功进度。
+每张嵌套图继承配置并独立调度。父成员可以在预算为 1 时运行子图。
+`GraphBuilder.WithMaxFrontierWidth` 另行限制整个 frontier 的宽度，超宽仍以终局错误退出。
+
 ### 7.3 Per-branch delta + 仅重跑失败/中断分支
 
 v1 时代为支持"fan-out 部分失败 Resume 只重跑失败分支"加了 `superstep_snapshot` per-branch
@@ -731,7 +737,11 @@ v2 channel-based 模型下**这是天然能力**——每个分支只写自己�
 **发散 fan-out 的补充（PA-H1）**：当成功分支与失败分支走【不同出边】（A→X、B→Y）时，仅
 "成功分支 writes 在 cp.Channels" 不够——Resume 重跑失败成员 B 成功后，成功成员 A 的后继 X
 会永久丢失。故 cp 额外记 `CompletedFrontier`（成功成员 ID）+ `DeferredSends`（其 SendFrom），
-Resume 时这些成员参与同超步**出边计算**但不重跑 NodeFunc（见 §5.1）。
+Resume 合并这些成员已确定的出边与投递，成功成员无需重跑（见 §5.1）。
+
+`CompletedWriteOwners` 同时保存这些成员对单写入者 channel 的写入归属。续跑的成员与原成功成员仍处于同一逻辑超步，
+成员写入和共享 `SendDirective.Payload` 均按这份归属核对。归属随部分提交一起保存，推进到下一超步时清空。
+确认冲突后返回 `ErrRunAborted`，引擎停止剩余提交并清理本次执行的存档子树。
 
 ### 7.4 Fan-out 失败语义表
 

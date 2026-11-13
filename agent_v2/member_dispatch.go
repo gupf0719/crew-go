@@ -37,10 +37,8 @@ import (
 
 // memberSpec 是「编排调用它的一个成员」这件事的全部可变部分。
 //
-// 用结构体而不是位置参数，是因为 nsSuffix 和 historySlot 都是 string 却语义相反，
-// 位置参数下写反了不报错——而它们**本来就经常不相等**（Loop 的 ns 带 round_N、位置
-// 固定 "body"；Plan 的 ns 带 _step_N、位置是裸注册名），所以「两个值看着不一样」不能
-// 当作写错的信号。具名字段让写反在字面上就不成立。
+// nsSuffix 标识一次执行，historySlot 标识成员的历史归属。Loop 的执行位置带轮次，
+// 历史归属始终为 body。Plan 的注册成员同样跨步保持历史归属。
 type memberSpec struct {
 	// agent 是被调用的成员。
 	agent Agent
@@ -61,7 +59,7 @@ type memberSpec struct {
 	nsSuffix string
 	// historySlot 是成员在会话历史里的归属位置。**跟 nsSuffix 是相反的要求**：ns 要逐次
 	// 唯一，归属要**跨次稳定**——带上轮次的话同一个成员每轮归属都变，跨轮读不回自己的历史。
-	historySlot string
+	historySlot historySegment
 	// retryCfg 是这次调用的重试策略。零值 = 不重试（见 compose_v2.RunWithRetry）。
 	retryCfg compose_v2.RetryConfig
 }
@@ -90,7 +88,7 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 		return nil, fmt.Errorf("runMember: nil member agent (含 Go typed nil interface 陷阱)")
 	}
 	subCtx := compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), m.nsSuffix))
-	subCtx = WithHistorySlot(subCtx, m.historySlot)
+	subCtx = pushHistorySegment(subCtx, m.historySlot)
 	// 标记「这次调用发生在成员位置上」。框架自己不读它（防重复写靠写入者维进 ns），
 	// 留给业务的 store 后端按需区分（见 WithSubAgentStoreScope）。
 	subCtx = WithSubAgentStoreScope(subCtx, true)
@@ -140,9 +138,8 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 //
 // 它跟 [runMember] 的三处差别都是同一个原因——**它的产出是控制信号不是对话**：
 //
-//   - 不进会话历史（WithoutHistoryCtx）：下游只需要那个判定结论，把评审全文灌进历史
-//     会让下一轮模型把内部审议当成对话内容。这是「禁止」不是「当前没有」——嵌套的
-//     agent 自配 WithHistory 也绕不过去。
+//   - 决策使用独立会话事件和 [WithoutHistoryCtx]。决策读显式输入并返回结果，父会话只保留
+//     对话成员的事件。业务 KV 与父会话共享，钩子仍能观测决策过程。
 //   - 永不拿转交能力：一个负责「判断该走哪个分支」的模型没有资格改写「这场对话归谁」。
 //     编排收到的路由能力也不转给它；route 只是 RoutingAgent 给自己的分类器**新铸**的那一份
 //     （地址是这个 RoutingAgent 自己的收件人），评估器 / 反馈教练传 nil。参数类型就是
@@ -173,7 +170,8 @@ func runDecisionAgent(ctx context.Context, nsSuffix string, ag Agent, sess *RunS
 	// 同 runMember：决策 LLM 的执行交给它、它的 agent 级钩子有自己的相位
 	subCtx = compose_v2.HandOver(subCtx, nsSuffix)
 	subCtx = shadowNodeGrants(subCtx)
-	return ag.Run(subCtx, sess, cloneCalleeInput(input), withRouteGrant(route))
+	decisionSession := NewSharedChildSession(sess)
+	return ag.Run(WithSession(subCtx, decisionSession), decisionSession, cloneCalleeInput(input), withRouteGrant(route))
 }
 
 // decisionCtx 是框架调**内部决策方**时给的 ctx：编排的决策 agent（分类器、评审 / 评估 agent、反馈教练，见

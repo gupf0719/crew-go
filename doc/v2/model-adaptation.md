@@ -158,7 +158,31 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 
 单测（`model/anthropic/*_test.go`）用 httptest 桩断言请求体；真 API 冒烟 `example/model/anthropic_smoke`（`//go:build integration`，需 `ANTHROPIC_API_KEY`），全部用例都在 `prefix_mismatch_behavior: "error"` 下跑：BasicAgent 跨两次 Run 的多轮工具调用、中途 system 消息、prompt cache 命中、并行工具结果合并、服务端压缩。压缩用例 2026-10-23 实跑（`claude-haiku-5-5`、阈值 5 万、自定义 instructions）：第一轮约 7.5 万 token 的输入触发压缩，响应带 compaction 块、`Compactions` 记下一项；第二轮原样回放它（连同第一轮的 thinking），没有 400，计费输入只剩一两千 token（两次实跑 655 / 1221），模型凭摘要答出开头埋的暗号。
 
-## 六、相关 commit
+## 六、OpenAI Responses 原生客户端
+
+`openai.NewResponsesClient(apiKey, modelName, opts...)` 实现 `model.ChatModel`。使用 `/responses`，
+可在 BasicAgent 上绑定本地函数工具，通过 `call_id` 传递结果。客户端映射文本、拒答、推理摘要、工具调用和用量。
+流式请求实时交付文本与推理摘要，完整的函数调用和用量在 `response.completed` 到达后交付。
+流提前关闭、`response.failed` 或 `response.incomplete` 都会返回错误。
+
+```go
+llm := openai.NewResponsesClient(apiKey, modelName)
+agent := agent_v2.NewBasicAgent(agent_v2.WithModel(llm), agent_v2.WithToolkit(kit))
+```
+
+请求使用 `store: false` 和 `reasoning.encrypted_content`。完整响应上的原生项随 assistant 消息存入
+annotations，供同请求模型、同端点及同凭据的下一轮或 Resume 回传。消息正文、推理摘要、拒答或工具调用被改写后，
+按当前消息重新构造输入。工具结果保持与原 `call_id` 配对。
+[OpenAI Responses API 文档](https://developers.openai.com/api/reference/resources/responses/methods/create)
+
+`model.WithMaxTokens` 映射到 `max_output_tokens`，`model.WithJSONSchema` 映射到 `text.format`。
+`WithAllowedTools`、`WithToolChoice` 和调用级 `WithModel` 沿用模型选项。
+`WithExtraBody` 可设置推理与服务层参数，由客户端持有的输入、模型、流式和存储参数由上述接口决定。
+支持文本、图片和 PDF 输入，本地函数工具覆盖了审批和续跑路径。
+[OpenAI 冒烟命令](../description/smoke-test-recipes.md#11-openai-流式与工具调用)
+
+
+## 七、相关 commit
 
 | commit | 内容 |
 |---|---|

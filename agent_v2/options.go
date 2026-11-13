@@ -405,12 +405,15 @@ func extractOrchHooksOrCtx(ctx context.Context, optsHooks OrchestrationHooks) co
 type ResumeOption func(*resumeConfig)
 
 type resumeConfig struct {
-	action       ResumeAction
-	abortCleanup func(context.Context, string, string) (int32, error)
-	userInputs   map[string]*schema.Message // by InterruptID
-	userText     string                     // 非寻址型「用户这轮说了什么」
-	orchHooks    OrchestrationHooks
-	session      *RunSession // 续传给 framework 让事件累积到同一对象
+	action             ResumeAction
+	abortCleanup       func(context.Context, string, string, *HistoryKey) (int32, error)
+	abortFinalize      func(context.Context, string) error
+	abortHistoryKey    HistoryKey
+	useAbortHistoryKey bool
+	userInputs         map[string]*schema.Message // by InterruptID
+	userText           string                     // 非寻址型「用户这轮说了什么」
+	orchHooks          OrchestrationHooks
+	session            *RunSession // 续传给 framework 让事件累积到同一对象
 
 	// per-call 覆盖（对齐 eino/langgraph：resume 本身是一次正常调用，能重传 per-call；
 	// 仅本次 Resume 生效、不进 cp）。无则回退构造期默认（不继承上次 Run 的覆盖）。
@@ -430,17 +433,35 @@ func (c resumeConfig) overrides() runOverrides {
 }
 
 // WithResumeAction 设置 Resume 三态：Continue (默认) / Replan / Abort。
+// Abort 在独立的清理期限内删除当前任务的存档子树。无档时幂等成功，清理失败时返回错误，
+// 调用方可保留任务标识并重试 Abort。
 func WithResumeAction(a ResumeAction) ResumeOption {
 	return func(c *resumeConfig) {
 		c.action = a
 	}
 }
 
-// WithResumeAbortCleanup 让宿主在同一原子操作中清理存档和外部任务记录。
-// Abort 取得任务的放弃许可后，调用 cleanup(ctx, sessionID, namespace) 代替 Checkpointer.DeleteSubtree。
-// cleanup 返回已删除的存档数量。失败时返回错误并保留历史，成功后仍走正常的历史与钩子收尾。
-func WithResumeAbortCleanup(cleanup func(ctx context.Context, sessionID, namespace string) (int32, error)) ResumeOption {
-	return func(c *resumeConfig) { c.abortCleanup = cleanup }
+// WithResumeAbortCleanup 由宿主接管 Abort 的删档和确认。两次调用均在任务放弃许可内。
+// cleanup 在删档前可记录已解析的 historyKey，返回删除数量。finalize 在成功删档和补齐历史后确认收尾。
+// historyKey 为 nil 表示无需补写历史。提供 finalize 时，历史补写失败也返回错误供宿主重试。
+func WithResumeAbortCleanup(
+	cleanup func(ctx context.Context, sessionID, namespace string, historyKey *HistoryKey) (int32, error),
+	finalize func(ctx context.Context, sessionID string) error,
+) ResumeOption {
+	return func(c *resumeConfig) { c.abortCleanup, c.abortFinalize = cleanup, finalize }
+}
+
+// WithResumeAbortHistoryKey 使用原执行或先前取消时记录的历史归属，适用于跨进程补偿。
+// key 为 nil 表示原取消无需补写历史。HistoryStore 仍来自这次 Resume 的配置，
+// 缺失时仍清理存档，随后返回错误并等待补写。
+func WithResumeAbortHistoryKey(key *HistoryKey) ResumeOption {
+	var saved HistoryKey
+	if key != nil {
+		saved = *key
+	}
+	return func(c *resumeConfig) {
+		c.abortHistoryKey, c.useAbortHistoryKey = saved, true
+	}
 }
 
 // WithResumeUserInputs 用 map[InterruptID]Message 答多 pending interrupts。
@@ -568,6 +589,16 @@ func applyResumeOptions(opts []ResumeOption) resumeConfig {
 // 信号（调用方的 ctx 没死），所以按普通工具错处理：转成 tool_result 给模型看，让它换条路。
 func WithToolTimeout(d time.Duration) Option {
 	return func(c *Config) { c.ToolTimeout = d }
+}
+
+// WithMaxConcurrentTools 限制 BasicAgent 同一批次同时派发的工具调用数。
+// 0 为不设上限（默认），负数会 panic。等待空位时响应取消，工具超时从执行时开始计算。
+// 批次独立调度，已转入后台的工具任务由 [BackgroundTaskManager] 管理。
+func WithMaxConcurrentTools(limit int) Option {
+	if limit < 0 {
+		panic("agent_v2: max concurrent tools must be non-negative")
+	}
+	return func(c *Config) { c.MaxConcurrentTools = limit }
 }
 
 // WithModelRetry 设一次模型调用失败时整次重来的策略（默认不重试）。

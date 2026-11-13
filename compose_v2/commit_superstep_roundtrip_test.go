@@ -4,10 +4,10 @@ import (
 	"testing"
 )
 
-// commitSuperstepPartial 写的五样必须原样过 Snapshot → Restore。
+// commitSuperstepPartial 一并提交的状态必须原样过 Snapshot → Restore。
 //
-// 这五样是**同一个提交点一起生效**的：channel 值、frontier、代际、答案账本、成功成员先记在一边的
-// 上行信号。少存哪一样，恢复出来的状态就自相矛盾——少了代际，续跑时同一个节点的新提问会算出
+// 同一个提交点保存 channel 值、frontier、代际、答案账本、成功成员的写入归属和上行信号。
+// 少了代际，续跑时同一个节点的新提问会算出
 // 跟上一轮相同的中断身份，用户答过的旧答案把它静默满足；少了答案账本，同一个答案能
 // 兑付两次；少了成功成员的上行信号，它做出的转交 / 路由决定续跑后丢失（它不再执行）。都是
 // err==nil 的静默失效。
@@ -18,18 +18,19 @@ import (
 // ⚠️ 前置那条 Fatal（「快照里有空项」）是**正向断言**，不是防御：没有它的话，
 // 一旦 fixture 腐化到「五样压根没写进去」，下面那些比对在「都是零值」的状态上恒真。
 func TestCommitSuperstep_AllFieldsRoundTrip(t *testing.T) {
-	ch := Sum("rt_acc")
+	ch := LastValue[int]("rt_acc")
+	owner := FrontierMember{NodeID: "nX"}
 	cm := NewChannelManager()
 	if err := RegisterChannel(cm, ch); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	if err := cm.commitSuperstepPartial(
 		[]ChannelWrite{Write(ch, 42)},
-		[]FrontierMember{{NodeID: "nX"}},
-		[]FrontierMember{{NodeID: "nX"}},
+		[]FrontierMember{{NodeID: "nY"}},
+		[]FrontierMember{owner},
 		[]string{"ans-1", "ans-2"},
 		[]SignalRecord{{Kind: "k", Dest: "d", Value: "billing", Origin: "call_1#0"}},
-		nil, nil,
+		nil, nil, map[string]FrontierMember{"rt_acc": owner},
 	); err != nil {
 		t.Fatalf("commitSuperstepPartial: %v", err)
 	}
@@ -62,11 +63,14 @@ func TestCommitSuperstep_AllFieldsRoundTrip(t *testing.T) {
 	if got, _ := cm2.values["rt_acc"]; got != 42 {
 		t.Errorf("channel 值没过来: %v 期望 42", got)
 	}
-	if len(cm2.frontierAtExit) != 1 || cm2.frontierAtExit[0].NodeID != "nX" {
+	if len(cm2.frontierAtExit) != 1 || cm2.frontierAtExit[0].NodeID != "nY" {
 		t.Errorf("frontier 没过来: %+v", cm2.frontierAtExit)
 	}
 	if cm2.visitCount["nX"] != 1 {
 		t.Errorf("代际没过来: %v 期望 1", cm2.visitCount["nX"])
+	}
+	if got := cm2.completedWriteOwners["rt_acc"]; got != owner {
+		t.Errorf("恢复后的 channel 写入归属 = %v, want %v", got, owner)
 	}
 	if len(cm2.consumedAnswers) != 2 {
 		t.Errorf("答案账本没过来: %v 期望 2 条", cm2.consumedAnswers)

@@ -110,7 +110,7 @@ func TestAgentAsTool_ArgsRewritten_CallKeyConverges(t *testing.T) {
 
 // TestAgentAsTool_OnToolStartInjection_ConvergesWithoutCallKey：OnToolStart 往参数里注入每次都变的 trace_id，
 // 不声明 WithAgentToolCallKey 也一次续跑收敛——一批调用的内容在第一次交给工具执行时定下、续跑沿用（见
-// fixToolCallContent），交给被调方的输入续跑不变。中间件的注入在内容定下之后、每次执行都跑，仍要声明 key（上一条）。
+// saveToolCallContent），交给被调方的输入续跑不变。中间件的注入在内容定下之后、每次执行都跑，仍要声明 key（上一条）。
 func TestAgentAsTool_OnToolStartInjection_ConvergesWithoutCallKey(t *testing.T) {
 	firsts := &countLog{}
 	callee := newTwoNodeAgent(t, "approver",

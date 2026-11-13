@@ -42,7 +42,8 @@ func (s *projSideEffects) snapshot() []string {
 // 要求的顺序，也让「memo 丢了」直接表现为副作用重放。
 func buildProjGraph(t *testing.T, se *projSideEffects) *Graph {
 	t.Helper()
-	ch := LastValue[string]("proj_out")
+	// 两个成员都提交结果。用可合并的 channel 保留它们各自的产出，测试仍聚焦私有态投影。
+	ch := Append[string]("proj_out")
 	b := NewBuilder().WithName("proj_graph")
 	b = WithChannel(b, ch)
 
@@ -66,7 +67,7 @@ func buildProjGraph(t *testing.T, se *projSideEffects) *Graph {
 					}
 				}
 			}
-			return []ChannelWrite{Write(ch, name+":done")}, nil
+			return []ChannelWrite{Write(ch, []string{name + ":done"})}, nil
 		}
 	}
 	b.AddNode("okNode", mk("ok", false))

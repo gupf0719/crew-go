@@ -1,0 +1,4 @@
+{"name":"approved_lookup","input":"lookup oak","answers":[{"tool":"lookup_asset","value":"approve"}],"expect":{"route":"lookup","outcome":"success","calls":[{"name":"lookup_asset","args":{"key":"oak"}}],"approvals":["lookup_asset"],"finalContains":"asset oak=ready"}}
+{"name":"denied_lookup","input":"lookup elm","answers":[{"tool":"lookup_asset","value":"deny"}],"expect":{"route":"lookup","outcome":"success","calls":[],"approvals":["lookup_asset"],"finalContains":"denied"}}
+{"name":"pending_lookup","input":"lookup ash","expect":{"route":"lookup","outcome":"interrupt","calls":[],"approvals":["lookup_asset"]}}
+{"name":"help_route","input":"help","expect":{"route":"help","outcome":"success","calls":[],"approvals":[],"finalContains":"use lookup <key>"}}

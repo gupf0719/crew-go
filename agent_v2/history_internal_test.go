@@ -77,7 +77,11 @@ func newTestHistoryCtx(t *testing.T, st HistoryStore, convID string) (context.Co
 	if convID != "" {
 		ctx = compose_v2.WithThreadIDCtx(ctx, convID)
 	}
-	return startHistory(ctx, hc, "test-agent")
+	ctx, stop, err := startHistory(ctx, hc, "test-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ctx, stop
 }
 
 // TestHistoryWriter_FIFOOrder：异步写必须保住产生顺序。
@@ -237,7 +241,10 @@ func TestWithoutHistoryCtx_BlocksNestedStart(t *testing.T) {
 	ctx := compose_v2.WithThreadIDCtx(context.Background(), "conv-1")
 
 	inner := WithoutHistoryCtx(ctx)
-	innerCtx, stop := startHistory(inner, hc, "classifier") // 内层自带 history 配置
+	innerCtx, stop, err := startHistory(inner, hc, "classifier")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer stop()
 	if historyWriterFrom(innerCtx) != nil {
 		t.Fatal("被摘除的分支下不该再开出写入器 —— 否则内部决策 agent 只要自己配了 " +
@@ -321,7 +328,10 @@ func TestRecordHistory_NoOwner_Skips(t *testing.T) {
 	st := &recordingHistoryStore{}
 	hc := &historyConfig{store: st, ownerFunc: func(context.Context) string { return "" }}
 	ctx := compose_v2.WithThreadIDCtx(context.Background(), "conv-1")
-	ctx, stop := startHistory(ctx, hc, "a")
+	ctx, stop, err := startHistory(ctx, hc, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer stop()
 
 	recordHistory(ctx, "a", "a", []*schema.Message{schema.UserMessage("x")})
@@ -765,7 +775,10 @@ func TestWarnUnnamedAgentInHistory(t *testing.T) {
 		t.Helper()
 		hc := &historyConfig{store: &recordingHistoryStore{}, owner: "tenant-a"}
 		ctx := compose_v2.WithThreadIDCtx(context.Background(), "conv-1")
-		ctx, stop := startHistory(ctx, hc, "parent")
+		ctx, stop, err := startHistory(ctx, hc, "parent")
+		if err != nil {
+			t.Fatal(err)
+		}
 		t.Cleanup(stop)
 		return ctx
 	}

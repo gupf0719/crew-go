@@ -14,7 +14,7 @@ import (
 // resumePrep 是 commonResumePrep 的返回, 各编排 Resume 共享 boilerplate 的输出.
 //
 // **AbortDone 协议**: 为 true 时 caller 直接 `return nil, nil` (helper 已处理
-// abort 路径含 DeleteSubtree + cp.cleanup event + slog.Warn). caller 不再做
+// abort 路径含删档、cp.cleanup 事件、历史和钩子收尾). caller 不再做
 // 后续 Run / hook fire 等业务逻辑.
 type resumePrep struct {
 	Cper      compose_v2.Checkpointer  // 已从 ctx 取出, caller build Run opts 时复用
@@ -31,8 +31,7 @@ type resumePrep struct {
 //     （[rejectCall]，排在一切之前——Abort 分支会删存档）
 //  1. cper := compose_v2.GetCheckpointer(ctx) + nil check + fail-fast
 //  2. rcfg := applyResumeOptions(opts)；WithResumeSession 的 session.RunID 为空或 ≠ sessionID → 拒
-//  3. ResumeActionAbort 分支: forward graphNS + DeleteSubtree + EmitCpCleanupHelper +
-//     slog.Warn (cper backend 失败时业务可订阅) + 标 AbortDone=true 返
+//  3. ResumeActionAbort 分支在放弃许可内按 graphNS 删档并上报清理事件，成功后标 AbortDone。
 //  4. GA-M2 fail-fast: (sid, graphNS) 没有存档、或存档里没有可续的内容（LoadNS +
 //     HasResumableWork，与引擎 auto-load 同一个谓词）→ 返 wrap 的 compose_v2.ErrNoPendingCheckpoint
 //     （Abort 豁免——步骤 3 已返回）
@@ -118,6 +117,15 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 	runID := sessionID
 	var abandoned []string
 	if rcfg.action == ResumeActionAbort {
+		// 清理独立于请求取消，沿用仍有效且更早的截止时间。
+		now := time.Now()
+		deadline := now.Add(10 * time.Second)
+		if prior, ok := ctx.Deadline(); ok && prior.After(now) && prior.Before(deadline) {
+			deadline = prior
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
+		defer cancel()
 		runID = ""
 		if sessionID != "" {
 			abandoned = []string{sessionID}
@@ -140,43 +148,60 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 
 	// 3. ResumeActionAbort: helper 处理整路径
 	if rcfg.action == ResumeActionAbort {
+		ctx = compose_v2.WithSessionIDCtx(ctx, sessionID)
 		// review-v6 H-03 fix: forward 父 graphNS 让 Abort 只删本 sub-agent 子树
 		// 不误删父 cp / sibling sub-agent / 其他业务在同 sid 下的 cp.
 		ns := compose_v2.GetGraphNS(ctx)
-		// review-v6 M-08 fix: cper backend (Redis/PG/S3) 失败时 silent → 业务以为
-		// abort 成功 cp 清掉但实际 persist → 多租户场景泄漏 sensitive context.
-		// slog.Warn 让业务订阅 handler 转告警 (非 fail-fast 因业务可能批量 abort
-		// 容忍部分失败).
-		// **先删 cp、删成功才补历史**（给悬空的 tool_call 补一条「被放弃」）：「历史里写了被放弃」要推得出「档已删」——
-		// 删失败时任务还能续，补了的话续跑执行之后真结果排在「被放弃」之后、按先到的配对被当成多余的。反过来档删了、补
-		// 结果失败只留下悬空的调用，读侧兜得住。
-		delStart := time.Now()
-		cleanup := cper.DeleteSubtree
-		if rcfg.abortCleanup != nil {
-			cleanup = rcfg.abortCleanup
+		var historyKey *HistoryKey
+		var hc *historyConfig
+		if ns == "" {
+			hc = resolveHistoryConfigForAbort(ctx, subs)
+			if rcfg.useAbortHistoryKey {
+				if key := rcfg.abortHistoryKey; key != (HistoryKey{}) {
+					if key.Owner == "" || key.ConvID != compose_v2.GetThreadID(ctx) {
+						return nil, ctx, fmt.Errorf("%s %q: invalid abort history destination", agentTypeName, agentName)
+					}
+					historyKey = &key
+				}
+			} else if hc != nil {
+				if key, ok := historyKeyFrom(ctx, hc); ok {
+					historyKey = &key
+				}
+			}
 		}
-		delCount, dErr := cleanup(ctx, sessionID, ns)
+		// 先删档，成功后才为悬空工具调用补写放弃结果。
+		delStart := time.Now()
+		var delCount int32
+		var dErr error
+		if rcfg.abortCleanup != nil {
+			delCount, dErr = rcfg.abortCleanup(ctx, sessionID, ns, historyKey)
+		} else {
+			delCount, dErr = cper.DeleteSubtree(ctx, sessionID, ns)
+		}
 		// reason="resume_abort"：业务主动弃单（WithResumeAction(Abort)）——跟引擎的
 		// "abort"（ErrRunAborted 终局失败，graph_loop Run 出口 purge）不同源，别混成一个值
 		compose_v2.EmitCpCleanupHelper(ctx, sessionID, ns, "resume_abort", delCount, time.Since(delStart).Milliseconds(), dErr)
 		if dErr != nil {
-			if rcfg.abortCleanup != nil || errors.Is(dErr, compose_v2.ErrTaskLeaseLost) {
-				return nil, ctx, dErr
+			return nil, ctx, fmt.Errorf("%s %q: abort cleanup (sid=%q ns=%q): %w", agentTypeName, agentName, sessionID, ns, dErr)
+		}
+		if historyKey != nil {
+			// 已固定历史归属的取消可以先落盘并清档，历史后端不可用时保留进度。
+			if hc == nil || hc.store == nil {
+				return nil, ctx, fmt.Errorf("%s %q: abort history store is unavailable (sid=%q)", agentTypeName, agentName, sessionID)
 			}
-			slog.WarnContext(ctx, "agent resume abort: cper.DeleteSubtree failed (cp 可能未清)，悬空的 tool_call 不补",
-				"agent", agentName, "sessionID", sessionID, "ns", ns, "err", dErr)
-		} else if ns == "" {
-			// 历史按整个任务查，只有清完整个任务才可补写放弃结果。
-			closeUnansweredToolCallsOnAbort(ctx, resolveHistoryConfigForAbort(ctx, subs), agentName, sessionID)
+			if err := closeUnansweredToolCalls(ctx, hc.store, *historyKey, sessionID); err != nil {
+				if rcfg.abortFinalize != nil || errors.Is(err, compose_v2.ErrTaskLeaseLost) {
+					return nil, ctx, fmt.Errorf("%s %q: abort history (sid=%q): %w", agentTypeName, agentName, sessionID, err)
+				}
+				slog.WarnContext(ctx, "agent_v2: 放弃任务的历史收尾失败", "agent", agentName, "task", sessionID, "err", err)
+			}
+		}
+		if rcfg.abortFinalize != nil {
+			if err := rcfg.abortFinalize(ctx, sessionID); err != nil {
+				return nil, ctx, fmt.Errorf("%s %q: confirm abort cleanup (sid=%q): %w", agentTypeName, agentName, sessionID, err)
+			}
 		}
 		activity.FinishAbandon()
-
-		// **audit MED fix**：补 push sid——Abort 分支在下方 WithSession（step 6）之前就
-		// return，不在此 push 则下面 OnAgentStart/End 的 ctx 无 sid → observability 的 span
-		// 缺 crew.run.id（无法 join 回原 run），按 (sid, ns, agent) 记的挂起记录也取不到（等待时长
-		// 不记、记录留到过期）。用 WithSessionIDCtx 而非 WithSession：此处
-		// session 尚未初始化（step 5）可能 nil。全 9 编排共用本 helper，单一根因。
-		ctx = compose_v2.WithSessionIDCtx(ctx, sessionID)
 
 		// P0 observability: Abort 路径 fire OnAgentStart + OnAgentEnd 让
 		// observability 完整记录 (含 action=abort counter + 之前 InterruptError 的

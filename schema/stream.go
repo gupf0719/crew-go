@@ -33,6 +33,10 @@ type StreamReader[T any] struct {
 	heldErr   error
 	terminal  error
 	observers []func(error)
+
+	// 预读队列仅由串行的流消费者访问。
+	prefetched    []T
+	prefetchedEnd error
 }
 
 // ErrStreamCanceled 表示消费者主动调 Close 中止了流（Recv 应返此错给生产者）。
@@ -104,32 +108,86 @@ func NewStreamReaderWithCancel[T any](bufSize int, cancel context.CancelFunc) (*
 // 等 ch 里错误之前的项交完再交错误。
 func (sr *StreamReader[T]) Recv(ctx context.Context) (T, error) {
 	var zero T
-	// 优先非阻塞地排空 ch 中已有的消息（不被 ctx cancel 影响——已收到的 chunk
-	// 应让 caller 看到，避免末尾几条丢失）
+	sr.mu.Lock()
+	if len(sr.prefetched) != 0 {
+		item := sr.prefetched[0]
+		sr.prefetched[0] = zero
+		sr.prefetched = sr.prefetched[1:]
+		if len(sr.prefetched) == 0 {
+			sr.prefetched = nil
+		}
+		sr.mu.Unlock()
+		return item, nil
+	}
+	end := sr.prefetchedEnd
+	sr.prefetchedEnd = nil
+	sr.mu.Unlock()
+	if end != nil {
+		return zero, sr.observeTerminal(end)
+	}
+	item, err, terminal := sr.receive(ctx)
+	if terminal {
+		err = sr.observeTerminal(err)
+	}
+	return item, err
+}
+
+// ReadAhead 读到 ready 匹配的第一项或流结束，返回已暂存的项数与读错误。已读项和生产方
+// 的结局留给后续 Recv；预读本身不触发 ObserveEnd。由同一个消费者与 Recv 串行调用。
+func (sr *StreamReader[T]) ReadAhead(ctx context.Context, ready func(T) bool) (int, error) {
+	for _, item := range sr.prefetched {
+		if ready(item) {
+			return len(sr.prefetched), nil
+		}
+	}
+	if sr.prefetchedEnd != nil {
+		return len(sr.prefetched), sr.prefetchedEnd
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return len(sr.prefetched), err
+		}
+		item, err, terminal := sr.receive(ctx)
+		if err != nil {
+			if terminal {
+				sr.prefetchedEnd = err
+			}
+			return len(sr.prefetched), err
+		}
+		sr.prefetched = append(sr.prefetched, item)
+		if ready(item) {
+			return len(sr.prefetched), nil
+		}
+	}
+}
+
+func (sr *StreamReader[T]) receive(ctx context.Context) (T, error, bool) {
+	var zero T
+	// 先排空 ch 中已有的片段，保持已交付片段优先于取消或后续错误。
 	select {
 	case item, ok := <-sr.ch:
 		if ok {
-			return item, nil
+			return item, nil, false
 		}
-		return zero, sr.endErr()
+		return zero, sr.endErr(), true
 	default:
 	}
 	if err := sr.takeHeldErr(); err != nil {
-		return zero, sr.observeTerminal(err)
+		return zero, err, true
 	}
-	// ch 为空时同时监听 done / errCh / ctx
 	select {
 	case item, ok := <-sr.ch:
 		if ok {
-			return item, nil
+			return item, nil, false
 		}
-		return zero, sr.endErr()
+		return zero, sr.endErr(), true
 	case err := <-sr.errCh:
-		return sr.deliverErr(err)
+		item, err := sr.deliverErr(err)
+		return item, err, err != nil
 	case <-sr.done:
-		return zero, ErrStreamCanceled
+		return zero, ErrStreamCanceled, false
 	case <-ctx.Done():
-		return zero, ctx.Err()
+		return zero, ctx.Err(), false
 	}
 }
 
@@ -147,22 +205,22 @@ func (sr *StreamReader[T]) deliverErr(err error) (T, error) {
 	default:
 	}
 	var zero T
-	return zero, sr.observeTerminal(err)
+	return zero, err
 }
 
 // endErr 是 ch 已关闭时的结论：暂缓的错误 > errCh 里的错误 > io.EOF。
 func (sr *StreamReader[T]) endErr() error {
 	if err := sr.takeHeldErr(); err != nil {
-		return sr.observeTerminal(err)
+		return err
 	}
 	select {
 	case err := <-sr.errCh:
 		if err == nil {
 			err = io.EOF
 		}
-		return sr.observeTerminal(err)
+		return err
 	default:
-		return sr.observeTerminal(io.EOF)
+		return io.EOF
 	}
 }
 

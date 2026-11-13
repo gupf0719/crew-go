@@ -288,7 +288,7 @@ func TestHandler_Resume_NotResumableKeepsOpenSet(t *testing.T) {
 		return agent_v2.NewBasicAgent(agent_v2.WithName("not_resumable"), agent_v2.WithModel(&callToolsOnce{names: []string{"refund"}}),
 			agent_v2.WithToolkit(tk), agent_v2.WithApprovalMode(agent_v2.ApprovalAsk),
 			agent_v2.WithHooks(hooks), agent_v2.WithMaxRounds(4))
-	}, agui.WithCheckpointer(&dropFrontierOnLoad{Checkpointer: compose_v2.NewInMemoryCheckpointer()}))
+	}, agui.WithCheckpointer(&dropFrontierOnLoad{InMemoryCheckpointer: compose_v2.NewInMemoryCheckpointer()}))
 	const thread = "t-nr"
 	its := interruptsIn(parseSSE(postAGUI(h, `{"threadId":"t-nr","runId":"r1","messages":[{"role":"user","content":"go"}]}`).Body.String()))
 	if len(its) != 1 {

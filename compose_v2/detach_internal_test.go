@@ -21,7 +21,7 @@ import (
 var executionCtxKeys = []any{
 	sessionIDKey{}, runTaskIDKey{}, currentTaskIDKey{}, freshRunCtxKey{}, resumeCtxKey{}, answerLedgerKey{},
 	graphNSKey{}, nodeIDKey{}, nodeVisitKey{}, nodeInstanceIDKey{}, nodeInterruptCounterKey{},
-	checkpointingDisabledKey{},
+	boundCheckpointerKey{}, checkpointingDisabledKey{},
 	taskCommitBarrierKey{}, taskCommitContextKey{}, replayedResumeAnswersKey{},
 	toolCallIdxKey{}, currentToolCallIDKey{}, toolCallInstanceKey{}, inToolCallKey{}, withinNodeScopeKey{},
 	nodeStateAccessorKey{}, subCallCounterKey{}, subCallScopeKey{}, abnormalNodeExitKey{},
@@ -36,7 +36,7 @@ var configurableExecutionCtxKeys = []any{softCancelCtxKey{}}
 // environmentCtxKeys 是 DetachExecution 留下的 key：调用方给整个请求配的环境（isConfigurableKey）。
 var environmentCtxKeys = []any{
 	checkpointerKey{}, orchHooksKey{}, ownerKey{},
-	durabilityCtxKey{}, staleGuardCtxKey{}, emitCpEventCtxKey{},
+	durabilityCtxKey{}, staleGuardCtxKey{}, emitCpEventCtxKey{}, maxConcurrentNodesKey{},
 	checkpointRestoreObserverKey{},
 }
 

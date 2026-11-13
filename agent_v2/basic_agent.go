@@ -14,11 +14,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/internal/fanout"
 	"crew-go/internal/panicerr"
 	"crew-go/internal/streamdelta"
 	"crew-go/model"
@@ -289,7 +289,10 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	ctx = withRunOverrides(ctx, cfg.overrides())
 	// 会话历史（opt-in）：起写入器 + 出口 drain。ctx 里已有写入器时（嵌套在另一个
 	// 开了历史的 agent 下）沿用父的，不另起——同一场会话只该有一条流。
-	ctx, stopHistory := startHistory(ctx, a.historyCfgFor(ctx), a.config.Name)
+	ctx, stopHistory, err := startHistory(ctx, a.historyCfgFor(ctx), a.config.Name)
+	if err != nil {
+		return nil, err
+	}
 	warnUnnamedAgentInHistory(ctx, &a.config)
 	defer stopHistory()
 	startOffset := len(session.Events())
@@ -464,7 +467,10 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	ctx = withRunOverrides(ctx, rcfg.overrides())
 	// 会话历史（opt-in）：Resume 同款起写入器——续跑产生的轮次照样进历史（HITL 答完
 	// 之后的对话跟答之前是同一场）。
-	ctx, stopHistory := startHistory(ctx, a.historyCfgFor(ctx), a.config.Name)
+	ctx, stopHistory, err := startHistory(ctx, a.historyCfgFor(ctx), a.config.Name)
+	if err != nil {
+		return nil, err
+	}
 	warnUnnamedAgentInHistory(ctx, &a.config)
 	defer stopHistory()
 
@@ -957,14 +963,7 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	}
 	prior, fromHistory := historyPrior(ctx, a.historyCfgFor(ctx), historyOwner(ctx, a.config.Name), mode, need)
 	if !fromHistory {
-		switch mode {
-		case HandoffHistoryRaw:
-			prior = session.HistoryForRaw(a.config.Name)
-		case HandoffHistoryRewrite:
-			prior = session.HistoryFor(a.config.Name)
-		default: // HandoffHistorySelfOnly（含非 handoff 场景缺省）——只自己，零回归
-			prior = session.SelfHistoryCompacted(a.config.Name)
-		}
+		prior = session.modelHistory(a.config.Name, HistorySlot(ctx), mode)
 		// 调用方提供的前文排在最前：events 只有这个进程里发生的，更早的轮次在调用方手里（见 caller_history.go）
 		if turns := callerHistory(ctx); len(turns) > 0 {
 			prior = append(turns, prior...)
@@ -2394,7 +2393,7 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 		}
 	}
 	// 这一批处理完之后把结果定进工具账（见 finalizeToolMemo）——跟配没配转存无关。
-	bld.finalizeToolMemo = finalizeToolMemo
+	bld.useToolMemo = true
 	if len(a.config.TurnGates) > 0 {
 		bld = bld.WithTurnGates(a.config.TurnGates, a.config.TurnGateMaxVetoes)
 	}
@@ -2823,7 +2822,8 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 		memoCtx := compactionMemoFrom(ctx)
 		origMsgs := msgs
 		memoUpto, memoHead := 0, 0
-		if memoCtx != nil && cfg.AutoCompact != nil && cfg.AutoCompact.Enabled {
+		if memoCtx != nil && memoCtx.in != nil && memoCtx.in.Transient == memoCtx.transient &&
+			cfg.AutoCompact != nil && cfg.AutoCompact.Enabled {
 			msgs, memoUpto, memoHead = memoCtx.in.apply(msgs)
 		}
 
@@ -2846,8 +2846,11 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 			// 模型调用失败 / 中断时这份结果随节点作废，续跑重做——跟消息流同生共死）。
 			if ccErr == nil && cut.tailLen >= 0 && memoCtx != nil {
 				memoCtx.out = nextCompactionMemo(origMsgs, memoUpto, memoHead, inputLen, compacted, cut.tailLen)
+				if memoCtx.out != nil {
+					memoCtx.out.Transient = memoCtx.transient
+				}
 			}
-			// 中断和终局错误由引擎处理。普通摘要失败时主模型继续使用原消息。
+			// 摘要是可选优化，只有普通模型错误回退到原消息。任务控制错误由执行引擎处理。
 			if ccErr != nil {
 				if compose_v2.MustPropagate(ctx, ccErr) {
 					return nil, ccErr
@@ -3363,119 +3366,25 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			replayed bool
 		}
 
-		// ── 已跑成功的 tool_call 不重跑（节点私有中断态，见 compose_v2/node_state.go）──
-		//
-		// tools 节点是原子的：一个 tc 抛中断 → 整节点 writes 作废 → Resume 时 N 个 tc
-		// **全部**从头再跑。已成功的那几个被重执行——下单 / 发消息 / 扣款各来第二遍。
-		// 框架此前的说法是「业务工具自负幂等」，那是把框架能解的问题推给每个业务工具，
-		// 而 HTTP 调用 / 写库 / 发消息天然不幂等。
-		//
-		// memo 存「本轮哪些 tc 已跑完、产出是什么」，键是节点执行身份（NodeID+实例+visit，
-		// 框架算，见 node_state.go）⟹ 跨中断稳定、成功后自然不可达、不需要清除点。
-		//
-		// ⚠️ **hook 行为不变**：`OnToolStart/End` 仍对全部 tc 各 fire 一次（它们在
-		// basic_builder.go 的 toolsFn 外层、看不到 memo）。Resume 时 hook 重复 fire 是
-		// **既有行为**（今天所有 tc 都重跑、hook 也都重 fire），memo 只把「工具函数被重
-		// 调用」这半消掉。重放的那几个在 OnToolEnd 的 `ToolOutput.Extra` 上标
-		// [ToolReplayedExtraKey]（经 toolBatch.ends 交给 tools 节点）：它们在上一次没整体成功
-		// 的那一批里已经收过尾（见 endSettledToolCalls），按调用计数或计时的钩子据它跳过。这一批处理完之后定下的
-		// 那几个（见 finalizeToolMemo）例外：续跑时不再处理，钩子也不触发（见 fixedToolResults）。
-		//
-		// ⚠️ **判据是「这次调用的副作用能不能重放」，不是工具名字**（见 shouldMemoize）：
-		// memo 的契约原本是「重放产出、不重放副作用」，可有些工具的产出**不止 tool_result**
-		// ——`tool_search` 把解锁记在这一批的解锁记录上（tools 节点成功后才写进 channel），那**不进 cp**
-		// ⟹ memo 覆盖不到，命中跳过工具体的后果是**静默**的：err=nil、tool_result 齐全，只是这一批
-		// 什么都没解锁。这类没做出上行信号的框架元工具仍被排除在 memo 外，靠函数体重跑把那半补回来。
-		//
-		// `transfer_to_agent` / `route_to` **不在此列**：它们做出的决定是上行信号，每个 tool_call
-		// 期间收到的信号随 memo 进 cp、命中时原样交出，于是可以进 memo（契约扩成「重放产出 +
-		// 交出当时做出的决定」，见 toolMemoEntry.Signals）。
-		// `activate_skill` 不进这份账；它 fork 出去的 sub-agent 已完成的那次，由嵌套调用自己的
-		// 完成记录挡住重跑（见 agent_v2.runNestedCall），没完成的续自己的子存档。
-		memo := &toolCallMemo{Done: map[string]*toolMemoEntry{}}
-		// **只判 prev != nil，不再附加 `prev.Done != nil`**：memo 现在还装着审批记录
-		// （`Approved`），而审批发生在工具跑完**之前**——那一刻 `Done` 恰好是空的。
-		// 加那个条件会把「只批过、还没跑完」的那份整个丢掉，于是 Resume 时重新要审批
-		// （实测：`TestApproval_SelfInterruptingTool_NoReapproval` 直接红）。
-		if prev, ok := compose_v2.GetNodeState[*toolCallMemo](ctx); ok && prev != nil {
-			memo = prev
-			if memo.Done == nil {
-				memo.Done = map[string]*toolMemoEntry{}
+		// 每个调用独占自己的账项。工具返回时立即保存产出，兄弟调用中断时仍可重放。
+		var records []*toolCallRecord
+		batch := toolBatchFrom(ctx)
+		if batch != nil {
+			records = batch.memo
+			if references {
+				batch.references = &cfg
+				batch.refReads = newSkillReferenceReads(ctx, batch.messages, records)
 			}
-		}
-		if batch := toolBatchFrom(ctx); references && batch != nil {
-			batch.references = &cfg
-			batch.refReads = newSkillReferenceReads(ctx, batch.messages, memo.Done)
-		}
-		// memoKey 三维：`(tc.ID, 批内下标, 工具名)`。
-		//
-		//   - **下标**：框架别处不假设 tc.ID 唯一（同批两个 tc 用同一个 ID 时，只按 ID 记
-		//     会让后跑的命中前一个的条目、静默不执行——业务以为发了两条实际一条，而
-		//     tool_result 条数 / 配对 / err 全部正常）。下标的跨 Resume 稳定性有两重依据：
-		//     (1) `WithCurrentToolCallContext(ctx, tc.ID, i)` 拿同一个 i 算 InterruptID，
-		//     不稳的话 HITL 答案早就配不上了；(2) toolCalls 取自 `basicMessagesCh` 里那条
-		//     assistant 消息，而 channel state 就是 cp 的内容——Resume 从 cp 恢复的是同一
-		//     条消息、同一个顺序。
-		//   - **工具名**：`OnToolStart` 能改写工具名，改写只在这一批第一次交给工具执行时生效、
-		//     续跑沿用（见 fixToolCallContent），同一个 (ID, 下标) 在几次执行之间不换工具。名字
-		//     仍进键，让「A 的产出不被当成 B 的返回值贴回去」不依赖那份记录——改写曾经在续跑时
-		//     生效，那时这一维是唯一的防线（命中就把 A 的产出贴给 B，带上名字后退化成**不命中**、
-		//     重跑，错在安全侧）。现在它是冗余的第二道：固定内容之下走不到，没有测试覆盖。
-		memoKey := toolMemoKey
-		// fanout 下 N 个 goroutine 并发写 memo——map 写必须串行（cm 那侧自己有锁，
-		// 这里保护的是 map 本身 + 「改完立刻存」这两步的原子性）。
-		//
-		// ⚠️ **它实际保护的范围比「这张 map」大**：持锁期间会 `json.Marshal(memo)`
-		// （SaveNodeState 内），而那会遍历**整棵对象图**。于是有一条隐式不变量——
-		// **凡是被 memo 引用的 *schema.Message，都不许在 fanout 窗口里、memoMu 之外被改**。
-		// memo 引用的就是交出去的那条（下面命中分支 → outcomes[i] → 下游），tools 节点在这一批都返回之后会
-		// 就地改它（钩子改写、按大小处理，见 basic_builder.go）——那时 fanout 已经结束、没有并发的
-		// SaveNodeState，存下的字节也是改之前当场序列化的。哪天有人在 fanout 窗口内给 tool_result 补个
-		// annotation（markToolFailure / ReturnDirectAnnotation / SkillBodyAnnotation 都是这种形状），就是一条真 race。
-		var memoMu sync.Mutex
-		rememberDone := func(tc schema.ToolCall, idx int, oc outcome) {
-			// tc.ID 为空（有的 provider 不回 tool_call ID）照样记：memoKey 带批内下标，同一批两个
-			// 空 ID 的 tool_call 不会撞，续跑时从存档恢复的是同一批、同一个顺序。
-			if oc.err != nil || oc.toolMsg == nil {
-				return // 只记产出了 tool_result 的：失败/中断的要重跑
-			}
-			// **判据是「这次调用的副作用能不能重放」，不是「工具叫什么名字」。**
-			//
-			// 做出了上行信号的（转交 / 路由决定）：那半随记账进 cp，命中时原样交出 ⟹ 可以进
-			// 记账，函数体不必重跑。
-			//
-			// 没做出上行信号的框架元工具：产出不止 tool_result 而框架无从重放（如 tool_search
-			// 把解锁记在这一批的解锁记录上，那不进 cp）⟹ 排除在记账外，靠函数体重跑补回来。
-			// 命中跳过的后果是**静默**的：err=nil、tool_result 齐全，只是事没发生。
-			//
-			// 业务工具一律进记账：它里面经嵌套调用做出的决定随账走；它在工具体外留下的、
-			// 不进 cp 的副作用，命中时同样不会再做一次（那正是记账的目的）。
-			_, referenceRead := dispatchToolkit.Get(tc.Function.Name).(*skillReferenceTool)
-			if !referenceRead && !shouldMemoize(isFrameworkMintedIn(dispatchToolkit, tc.Function.Name), oc.signals) {
-				return
-			}
-			memoMu.Lock()
-			defer memoMu.Unlock()
-			memo.Done[memoKey(tc.ID, idx, tc.Function.Name)] = &toolMemoEntry{
-				ToolMsg: oc.toolMsg, BodyMsg: oc.bodyMsg, Signals: oc.signals,
-			}
-			// **每成功一个就存**，不等整节点 return——中断是 error 路径，等不到。
-			if err := compose_v2.SaveNodeState(ctx, memo); err != nil {
-				slog.WarnContext(ctx, "agent_v2: 存 tool_call 进度失败，该工具 Resume 时会重跑",
-					"tool_call_id", tc.ID, "err", err)
+		} else {
+			var err error
+			records, err = loadToolMemo(ctx, toolCalls)
+			if err != nil {
+				return nil, err
 			}
 		}
 
-		runOne := func(callCtx context.Context, tc schema.ToolCall, idx int) (oc outcome) {
-			// **上次已跑成功的直接返产出，不再调工具**——这是整套 memo 的目的：
-			// 不重放副作用。放在最前面（连 panic recover 都不需要，因为不执行任何业务代码）。
-			// tc 的内容在这一批第一次执行时就定下了（tools 节点交进来之前，见 fixToolCallContent），
-			// 工具账、审批、执行用的都是这一份。
-			memoMu.Lock()
-			hit := memo.Done[memoKey(tc.ID, idx, tc.Function.Name)]
-			memoMu.Unlock()
-			if hit != nil && hit.ToolMsg != nil {
-				// 函数体被跳过 ⟹ 它当时做出的决定也不会再做一次，这里原样交出。
+		runOne := func(callCtx context.Context, tc schema.ToolCall, idx int, record *toolCallRecord, save func()) (oc outcome) {
+			if hit := record.Result; hit != nil && hit.ToolMsg != nil {
 				compose_v2.EmitSignals(callCtx, hit.Signals)
 				return outcome{toolMsg: hit.ToolMsg, bodyMsg: hit.BodyMsg, replayed: true}
 			}
@@ -3546,60 +3455,27 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			// 或有 heuristic 时才有实际开销，默认 Auto 路径零开销）。Ask 未 resume → InterruptError
 			// （下方 fanout 收集 + MergeInterrupts 多工具一次问完）；拒绝 → 工具级 error 回 LLM
 			// （复用 tool_denied 范式，不 abort 整 Run）。
-			// 「这次调用的审批结论」与「批过没有」都在本节点的私有中断态里（与 tool memo 同一个
-			// 载体、同一把键）——原先「批过没有」按位置 ID 存 session 上，而位置 ID 跨任务重复、
-			// session 又活得比任务长 ⟹ 跨任务泄漏。详见 `toolCallMemo.Approved` 的注释。
-			//
-			// **RMW 必须在 memoMu 里**：fanout 下多 goroutine 并发读改写同一个 memo，
-			// 「读 map → 加一项 → 写回」跨 goroutine 会丢条目（跟 memo.Done 同一个理由）。
-			ak := memoKey(tc.ID, idx, tc.Function.Name)
-			// 同工具钩子的相位名（toolHookCtx）：带工具名、tool_call ID 与批内下标，在这次执行里唯一。
+			// 审批结论与批准状态也随单次调用保存。审批之后工具仍可能挂起。
 			phaseOf := func(kind string) string {
 				return kind + "\x00" + tc.Function.Name + "\x00" + tc.ID + "\x00" + strconv.Itoa(idx)
 			}
 			callCtx = withCallApproval(callCtx, callApprovalFns{
 				heuristicPhase: phaseOf("approval_heuristic"),
 				askPhase:       phaseOf("approval_ask"),
-				is: func() bool {
-					memoMu.Lock()
-					defer memoMu.Unlock()
-					return memo.Approved[ak]
-				},
+				is:             func() bool { return record.Approved },
 				mark: func() {
-					memoMu.Lock()
-					defer memoMu.Unlock()
-					if memo.Approved == nil {
-						memo.Approved = map[string]bool{}
-					}
-					memo.Approved[ak] = true
-					// **立刻落盘**，不等整节点 return——审批之后工具自身还可能再抛中断，
-					// 那是 error 路径、等不到节点成功。同 memo.Done 的理由。
-					// 存不下只 warn：退化成「Resume 时重新问一次」，安全侧。
-					if err := compose_v2.SaveNodeState(ctx, memo); err != nil {
-						slog.WarnContext(ctx, "agent_v2: 存审批记录失败，该工具 Resume 时会重新要审批",
-							"tool_call_id", tc.ID, "err", err)
-					}
+					record.Approved = true
+					save()
 				},
 				decided: func() (ApprovalDecision, bool) {
-					memoMu.Lock()
-					defer memoMu.Unlock()
-					d, ok := memo.Decided[ak]
-					return d, ok
+					if record.Decision == nil {
+						return ApprovalDecisionDefault, false
+					}
+					return *record.Decision, true
 				},
 				decide: func(d ApprovalDecision) {
-					memoMu.Lock()
-					defer memoMu.Unlock()
-					if memo.Decided == nil {
-						memo.Decided = map[string]ApprovalDecision{}
-					}
-					memo.Decided[ak] = d
-					// **立刻落盘**：结论是 Ask 时接下来就抛审批中断，是 error 路径、等不到节点成功；
-					// 是 Allow 时工具自己也可能中断或失败。存不下只 warn：退化成续跑时按那时的配置
-					// 重新形成结论（它若翻转，就是 approvalDecisionOf 注释里那几种事）。
-					if err := compose_v2.SaveNodeState(ctx, memo); err != nil {
-						slog.WarnContext(ctx, "agent_v2: 存审批结论失败，该工具续跑时会重新形成审批结论",
-							"tool_call_id", tc.ID, "err", err)
-					}
+					record.Decision = &d
+					save()
 				},
 			})
 			// 只读放行档要知道这次派发的那件工具有没有声明只读——按实例认（tool.IsReadOnly），不按名字
@@ -3616,8 +3492,8 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				return outcome{toolMsg: ar.denyMsg}
 			}
 			// 工具体的私有态按工具名再分一层（tool_call 的分域只有 (tc.ID, 批内下标)）：工具名在这一批
-			// 第一次执行时定下、续跑不变（见 fixToolCallContent），这一层让「新工具不读旧工具的记录」
-			// 不依赖那份记录，跟工具账（memoKey 带名字）同一个理由。改写曾经在续跑时生效，那时新工具
+			// 第一次执行时定下、续跑不变（见 saveToolCallContent），这一层让「新工具不读旧工具的记录」
+			// 不依赖那份记录，跟工具账（toolMemoContext 带名字）同一个理由。改写曾经在续跑时生效，那时新工具
 			// 读到旧工具记的「做过了」，事没做（实测）。现在同样是冗余的第二道，没有测试覆盖。
 			callCtx = compose_v2.WithNodeStateSealed(callCtx, "tool\x00"+tc.Function.Name)
 			// invoke 跑这次调用：中间件链 + 工具。中间件链在这儿——memo / 渐进披露 / 审批**之内**，工具**之外**（理由见
@@ -3819,74 +3695,82 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			return outcome{toolMsg: toolMsg}
 		}
 
-		// runCall 跑一个 tool_call，并收下它这段执行做出的上行信号（转交 / 路由决定，见
-		// side_signal.go）：调用成功时随产出一起记账、批末登记给 builder 的收集器；失败或中断时随它
-		// 作废。命中记账时 runOne 交出当时记下的那些，同样在这里收下。
-		//
-		// 结果是失败的（超时、工具声明的 tool.Failure、中间件改成失败）也照收、不在这里作废：模型最后
-		// 看到的是 OnToolEnd 改写之后的结果，作废按那个判（钩子把失败改成成功，决定就算数），见
-		// tool_batch_signals.go。超时也不例外——工具调用是同步的，走到超时收尾时工具已经返回，这次
-		// 调用期间做出的决定已经收全。记账里记的也是这一份原始的：这一批没处理完就停下、续跑命中时钩子
-		// 照样 fire、按同一套规则重判；处理完之后定下的不再交给钩子（见 fixedToolResults）。
-		runCall := func(callCtx context.Context, tc schema.ToolCall, idx int) outcome {
-			batch := toolBatchFrom(ctx)
+		// 收齐调用期间的信号，再保存这次调用的产出。信号由批末按钩子改写后的结果裁决。
+		runCall := func(idx int) outcome {
+			tc := toolCalls[idx]
+			callCtx := compose_v2.WithCurrentToolCallContext(callCtxs[idx], tc.ID, idx)
 			callCtx = compose_v2.WithToolCallInstanceID(callCtx, tc.ID, batch.callInstanceID(idx))
+			record := records[idx]
+			if record == nil {
+				record = &toolCallRecord{}
+			}
+			memoCtx := toolMemoContext(ctx, tc, idx)
+			save := func() {
+				if err := compose_v2.SaveNodeState(memoCtx, record); err != nil {
+					slog.WarnContext(ctx, "agent_v2: 存工具调用账项失败", "tool_call_id", tc.ID, "err", err)
+					return
+				}
+				records[idx] = record
+			}
 			var oc outcome
 			sigs, _ := compose_v2.CaptureSignals(callCtx, func(c context.Context) error {
-				oc = runOne(c, tc, idx)
+				oc = runOne(c, tc, idx, record, save)
 				return oc.err
 			})
 			oc.signals = sigs
+			// 参考文档的读取标记随结果重放，供续跑时的去重读取使用。
+			_, referenceRead := dispatchToolkit.Get(tc.Function.Name).(*skillReferenceTool)
+			if oc.err == nil && oc.toolMsg != nil && !oc.replayed &&
+				(referenceRead || shouldMemoize(isFrameworkMintedIn(dispatchToolkit, tc.Function.Name), oc.signals)) {
+				record.Result = &toolMemoEntry{ToolMsg: oc.toolMsg, BodyMsg: oc.bodyMsg, Signals: oc.signals}
+				save()
+			}
 			return oc
 		}
 
 		outcomes := make([]outcome, len(toolCalls))
 		if len(toolCalls) == 1 {
 			// 单 tc inline 跑——零 goroutine 开销
-			callCtx := compose_v2.WithCurrentToolCallContext(callCtxs[0], toolCalls[0].ID, 0)
-			outcomes[0] = runCall(callCtx, toolCalls[0], 0)
-			rememberDone(toolCalls[0], 0, outcomes[0])
-		} else {
-			// **ISSUE-81 fanout**：N>=2 goroutine 并发——各 tc 走独立 ctx 协议
-			// （tc.ID 维度 NS + tc 下标维度 InterruptID + 独立 counter）
-			var wg sync.WaitGroup
-			for i, tc := range toolCalls {
-				wg.Add(1)
-				go func(i int, tc schema.ToolCall) {
-					defer wg.Done()
-					// **第三条出路守卫**：`runtime.Goexit` 会跑 defer 但不是 panic——
-					// runOne 的 recover（H-02）接不住，`outcomes[i]` 留在零值 ⟹ 收集
-					// 循环 `err==nil && toolMsg==nil` 静默跳过 ⟹ 这个 tc **没有配对的
-					// tool_result**（下一轮消息流对真 provider 是 400/422），而 Run
-					// 报完全成功。旗必须由普通语句置位（defer 里置位 Goexit 也会跑）。
-					// 归节点失败档，跟 tool panic 同一路：Resume 重试整轮，memo 保
-					// 已成功的不重放。
-					//
-					// ⚠️ **这一支刻意不先判 panic，跟 compose_v2 那两支不一样**——那边
-					// 「写结论前先 recover」是对的（三方一致规律），这里不加是权衡后的：
-					// 若 panic 发生在 `runOne` 之外（`rememberDone` 内部），这支会先写一句
-					// 「Goexit」误标，然后 panic 继续传播。但**这个 goroutine 之上没有任何
-					// recover**（`defer wg.Done()` 只是计数），所以那种 panic 在 Go 里是
-					// **进程级 fatal**——`outcomes[i]` 那句误标没有任何读者。
-					// 而加 `recover()` 会吞掉 panic（改变行为）或 re-panic（**截断真实的
-					// panic 堆栈**，那是唯一的诊断信息）。用一句没人读的误标换掉堆栈，
-					// 不划算。实测两版差异确认过：误标存在但不可观测。
-					finished := false
-					defer func() {
-						if !finished {
-							outcomes[i] = outcome{err: fmt.Errorf(
-								"tool %q (id=%s) 异常终止：既没正常返回也没 panic"+
-									"（runtime.Goexit——典型来源是 zap.WithFatalHook、testify 的 require.*）",
-								tc.Function.Name, tc.ID)}
-						}
-					}()
-					callCtx := compose_v2.WithCurrentToolCallContext(callCtxs[i], tc.ID, i)
-					outcomes[i] = runCall(callCtx, tc, i)
-					rememberDone(tc, i, outcomes[i])
-					finished = true
-				}(i, tc)
+			if err := ctx.Err(); cfg.MaxConcurrentTools > 0 && err != nil {
+				outcomes[0].err = err
+			} else {
+				outcomes[0] = runCall(0)
 			}
-			wg.Wait()
+		} else {
+			started := fanout.Run(ctx, len(toolCalls), cfg.MaxConcurrentTools, func(i int) {
+				tc := toolCalls[i]
+				// **第三条出路守卫**：`runtime.Goexit` 会跑 defer 但不是 panic——
+				// runOne 的 recover（H-02）接不住，`outcomes[i]` 留在零值 ⟹ 收集
+				// 循环 `err==nil && toolMsg==nil` 静默跳过 ⟹ 这个 tc **没有配对的
+				// tool_result**（下一轮消息流对真 provider 是 400/422），而 Run
+				// 报完全成功。旗必须由普通语句置位（defer 里置位 Goexit 也会跑）。
+				// 归节点失败档，跟 tool panic 同一路：Resume 重试整轮，memo 保
+				// 已成功的不重放。
+				//
+				// ⚠️ **这一支刻意不先判 panic，跟 compose_v2 那两支不一样**——那边
+				// 「写结论前先 recover」是对的（三方一致规律），这里不加是权衡后的：
+				// 若 panic 发生在 `runOne` 之外（保存工具账时），这支会先写一句
+				// 「Goexit」误标，然后 panic 继续传播。但**这个 goroutine 之上没有任何
+				// recover**（`defer wg.Done()` 只是计数），所以那种 panic 在 Go 里是
+				// **进程级 fatal**——`outcomes[i]` 那句误标没有任何读者。
+				// 而加 `recover()` 会吞掉 panic（改变行为）或 re-panic（**截断真实的
+				// panic 堆栈**，那是唯一的诊断信息）。用一句没人读的误标换掉堆栈，
+				// 不划算。实测两版差异确认过：误标存在但不可观测。
+				finished := false
+				defer func() {
+					if !finished {
+						outcomes[i] = outcome{err: fmt.Errorf(
+							"tool %q (id=%s) 异常终止：既没正常返回也没 panic"+
+								"（runtime.Goexit——典型来源是 zap.WithFatalHook、testify 的 require.*）",
+							tc.Function.Name, tc.ID)}
+					}
+				}()
+				outcomes[i] = runCall(i)
+				finished = true
+			})
+			for i := started; i < len(toolCalls); i++ {
+				outcomes[i].err = ctx.Err()
+			}
 		}
 
 		// 收集 results + 每个分支的原始错——按 idx 顺序遍历保 tool_result 配对顺序。

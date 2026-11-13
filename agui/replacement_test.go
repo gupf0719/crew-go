@@ -17,14 +17,14 @@ import (
 )
 
 type replacementDeleteFailure struct {
-	compose_v2.Checkpointer
+	*compose_v2.InMemoryCheckpointer
 	lastRoot string
 	failTask string
 	failures int
 }
 
 func (cp *replacementDeleteFailure) SaveNS(ctx context.Context, sid, ns string, value *compose_v2.Checkpoint) error {
-	if err := cp.Checkpointer.SaveNS(ctx, sid, ns, value); err != nil {
+	if err := cp.InMemoryCheckpointer.SaveNS(ctx, sid, ns, value); err != nil {
 		return err
 	}
 	if ns == "" {
@@ -38,11 +38,11 @@ func (cp *replacementDeleteFailure) DeleteSubtree(ctx context.Context, sid, ns s
 		cp.failures++
 		return 0, errors.New("checkpoint storage unavailable")
 	}
-	return cp.Checkpointer.DeleteSubtree(ctx, sid, ns)
+	return cp.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
 }
 
 func TestHandler_ReplacementDeleteFailureKeepsPendingTask(t *testing.T) {
-	cp := &replacementDeleteFailure{Checkpointer: compose_v2.NewInMemoryCheckpointer()}
+	cp := &replacementDeleteFailure{InMemoryCheckpointer: compose_v2.NewInMemoryCheckpointer()}
 	var executions atomic.Int32
 	kit := tool.NewToolkit()
 	kit.Register(tool.NewFuncTool("write_sample", "写入样本", map[string]any{"type": "object"},

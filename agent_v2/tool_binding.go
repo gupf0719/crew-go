@@ -35,7 +35,7 @@ type toolBinding struct {
 }
 
 func init() {
-	// 随存档落盘 ⟹ 必须注册（同 toolCallMemo）
+	// 随存档落盘 ⟹ 必须注册（同 toolCallRecord）
 	compose_v2.RegisterValueType[*toolBinding]("*agent_v2.toolBinding")
 }
 

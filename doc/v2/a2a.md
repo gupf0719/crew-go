@@ -86,6 +86,11 @@ baseURL := "http://10.0.0.12:8080"
 go http.ListenAndServe(":8080", server.Handler(ag, baseURL))
 ```
 
+A2A 的 `canceled` 状态表示任务已取消。在途 Run 或 Resume 退出后，由其持有者尝试清理存档。
+遇到暂时性错误，Executor 保留取消记录，SDK 完成回调补偿一次，后续同一任务的 `CancelTask` 也会重试清理。
+取消记录与用于续跑的存档同属 Executor 的进程内状态。
+配置持久协议 TaskStore 会保存 A2A 状态与任务历史。Executor 为任务及其嵌套执行绑定内存 Checkpointer，进程退出时释放存档。
+
 ### 服务注册发现（跨进程 / 跨语言）
 
 ```go

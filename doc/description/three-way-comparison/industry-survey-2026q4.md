@@ -287,3 +287,17 @@ go run ./sql/example/checkpoint_profile -samples 30 -rounds 12
 本组负载转存后存档字节约少 88%。挂起耗时已计入转存写入，表中存档字节只计 checkpoint。
 下一步用业务会话测同一组指标，依实际剩余瓶颈决定是否引入增量存档。
 [测量入口](../../../sql/example/checkpoint_profile/main.go) · [存档取舍](checkpoint-storage.md)
+
+## 十、运行时和评测跟进
+
+- **AG-UI** 用 SQL Run 日志保存幂等回执和事件游标。共享会话负责当前挂起任务，Run 日志负责单次 HTTP
+  执行的查询和回放。SQLite 的双实例回归覆盖断线、同 ID 重试、跨租户读取和提交审批。
+  [接入说明](../../v2/agui.md#持久回执与断线续传) · [LangGraph 事件流](https://docs.langchain.com/langsmith/event-streaming#join-an-active-run)
+- **任务版本** 随共享会话记录持久化，按已登记的工厂处理旧任务。用同名图改后继边验证旧审批仍走旧图。
+  [发布接入](../../v2/agui.md#挂起任务的工作流版本) · [Temporal Worker Versioning](https://docs.temporal.io/best-practices/worker#use-worker-versioning-to-safely-deploy-new-workflow-code)
+- **OpenAI Responses** 在本地持有历史与加密推理项。真 BasicAgent 的 mock 协议用例覆盖工具审批、
+  存档恢复与 `call_id` 往返。[模型接入](../../v2/model-adaptation.md#六openai-responses-原生客户端)
+- **流式故障切换** 预读至首个有效片段。首片段前的错误交给候选重试策略，已选流的终结由真实消费者观察。
+  [Fallback 流式语义](../../v2/model-fallback.md#6-stream-的硬约束)
+- **行为评测** 通过真实 RoutingAgent 和 BasicAgent 跑 JSONL 用例，断言工具体的实际执行、参数、审批和终态。
+  [评测示例](../../../example/README.md#agent-行为评测) · [ADK 工具轨迹评测](https://github.com/google/adk-docs/blob/main/docs/evaluate/criteria.md#tool_trajectory_avg_score)

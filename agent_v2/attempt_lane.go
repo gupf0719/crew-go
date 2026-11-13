@@ -54,6 +54,7 @@ func (a *attemptLanes) run(ctx context.Context, fn func(context.Context, *RunSes
 	var lane *RunSession
 	if a.sess != nil {
 		lane = a.sess.ForkLane()
+		lane.historySlot = HistorySlot(ctx)
 	}
 	// fn 没正常返回（panic）时当场提交。不 recover：兜住 panic、留下 panic 现场的栈归引擎的节点兜底，在这里
 	// recover 再 panic 会把栈换成这一行。

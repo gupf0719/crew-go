@@ -95,7 +95,7 @@ func (h *renameOnResumeHook) OnToolStart(ctx context.Context, _ *hook.AgentInfo,
 }
 
 // TestBasicAgent_ToolRenamedOnResume_KeepsFirstTool_StepRecords：同一个 tool_call 续跑时被钩子改名到另一个
-// 工具。这次调用的内容在这一批第一次执行时就定下了（fixToolCallContent），改名不生效：续跑的仍是 send_sms，
+// 工具。这次调用的内容在这一批第一次执行时就定下了（saveToolCallContent），改名不生效：续跑的仍是 send_sms，
 // 它记的「发过了」读得回来、不再发第二条，send_email 一次都不跑——用户回答的是短信的回执问题，改名生效的话
 // 这个回答会落到发邮件上。
 func TestBasicAgent_ToolRenamedOnResume_KeepsFirstTool_StepRecords(t *testing.T) {
@@ -297,7 +297,7 @@ func (h *renameAndAuditHook) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, o
 }
 
 // TestBasicAgent_ToolRenamedOnResume_KeepsFirstTool_ToolEndRecords：同一个 tool_call 在续跑时被 OnToolStart
-// 改名到另一个工具。改名不生效（fixToolCallContent）：c1 仍是 send_sms，结果是首跑那份，OnToolEnd 在首跑时对它
+// 改名到另一个工具。改名不生效（saveToolCallContent）：c1 仍是 send_sms，结果是首跑那份，OnToolEnd 在首跑时对它
 // 记的「审过了」读得回来，不重审；新工具一次都不跑、没有要审的新结果。改名生效的话，新工具的结果要经 OnToolEnd
 // 的另一个分域重审（审过的里出现 c1:email ok）。
 func TestBasicAgent_ToolRenamedOnResume_KeepsFirstTool_ToolEndRecords(t *testing.T) {

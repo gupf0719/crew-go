@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"reflect"
 	"strconv"
 
 	"crew-go/compose_v2"
@@ -220,10 +221,8 @@ type BasicAgentBuilder struct {
 	// finishToolResult 在 OnToolEnd 与批内裁决之后按大小处理还没处理的 tool_result（开了转存时设，见
 	// agent_v2/tool_render.go）；failed / code 是钩子之后的结论。nil = 没有要处理的。
 	finishToolResult func(ctx context.Context, toolName string, msg *schema.Message, failed bool, code string)
-	// finalizeToolMemo 在这一批处理完（OnToolEnd、批内裁决、按大小处理）之后把结果定进这次执行的工具账（见
-	// agent_v2 的 finalizeToolMemo）；hookSignals[i] 是第 i 个调用的 OnToolEnd 钩子做出的决定。nil = 不定（自写
-	// toolsFn 时没有框架的工具账）。
-	finalizeToolMemo func(ctx context.Context, toolCalls []schema.ToolCall, results []*schema.Message, hookSignals []compose_v2.Signals)
+	// useToolMemo 由 BasicAgent 启用。低阶 builder 的自定义 toolsFn 自行管理进度。
+	useToolMemo bool
 	// turnGates / turnGateMaxVetoes 见 WithTurnGates：回合结束闸门（空 = 不建闸门节点）。
 	turnGates         []TurnGateFunc
 	turnGateMaxVetoes int
@@ -358,7 +357,7 @@ const ToolOutcomeDenied = "denied"
 const ToolReplayedExtraKey = "replayed"
 
 // ToolRedispatchedExtraKey 标「这一批 tool_call 是续跑时再次派发的」（OnToolStart 的 `ToolInput.Extra`，值为 true）：这一批
-// 上次已经交给工具执行过（内容在那一次定下，见 fixToolCallContent），没整体成功、续跑重跑 tools 节点时同一批的每个调用
+// 上次已经交给工具执行过（内容在那一次定下，见 saveToolCallContent），没整体成功、续跑重跑 tools 节点时同一批的每个调用
 // 再触发一次 OnToolStart。把调用转发给前端的钩子据它不再重开同一个调用（agui：同一个 id 再发 TOOL_CALL_START 是重开、
 // 参数追加）。只看「是不是同一批的再次派发」，跟 toolCallId 无关——provider 在不同轮次复用同一个 ID 的不是重开。
 const ToolRedispatchedExtraKey = "redispatched"
@@ -918,11 +917,16 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	if isFrameworkNil(hooks) {
 		hooks = hook.NoOpHooks{}
 	}
+	hasModelHooks := true
+	switch hooks.(type) {
+	case hook.NoOpHooks, *hook.NoOpHooks:
+		hasModelHooks = false
+	}
 	name := b.name
 	if name == "" {
 		name = "basic_agent"
 	}
-	backgroundNotes, finishToolResult, finalizeToolMemo := b.backgroundNotes, b.finishToolResult, b.finalizeToolMemo
+	backgroundNotes, finishToolResult, useToolMemo := b.backgroundNotes, b.finishToolResult, b.useToolMemo
 
 	modelNode := func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 		msgs, _ := compose_v2.Get(chs, basicMessagesCh)
@@ -1023,6 +1027,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		sysPre, _ := compose_v2.Get(chs, basicSysPreambleCh)
 
 		modelIn := &schema.ModelInput{Preamble: sysPre, Messages: msgs}
+		if hasModelHooks {
+			// 钩子持有本轮可改写的视图。channel 与历史保留原始消息，供后续轮次、续跑和压缩边界使用。
+			modelIn.Preamble = cloneMessageList(sysPre)
+			modelIn.Messages = cloneMessageList(msgs)
+		}
 		if modelConfig != nil {
 			modelIn.Config = modelConfig(ctx)
 		}
@@ -1030,7 +1039,6 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			// 沿用原样：这一遍没有模型调用，按调用计数、计时的钩子据此不再记一次（见 hook.ModelResponseReusedKey）
 			modelIn.Extra = map[string]any{hook.ModelResponseReusedKey: true}
 		}
-		streamMsgs := msgs // 钩子改写之前的消息流——压缩边界只在钩子没动它时写（见下）
 		// 上一次摘要的结果（见 basicCompactionCh）；modelFn 这一轮又摘要了就填 out。
 		memoIn, _ := compose_v2.Get(chs, basicCompactionCh)
 		memo := &compactionMemoCtx{in: memoIn}
@@ -1062,7 +1070,9 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			// 钩子可能留下 nil（往末尾 append 一个零值、整段换成含 nil 的切片）：压缩层分组时跳过 nil、按条数算位置的
 			// 地方就差一位（备忘的 Upto 会多算一条，之后模型输入里出现找不到声明者的 tool_result），provider 的消息
 			// 转换遇到 nil 也会 panic。在这里去掉，下面每一层都不必再防。
-			msgs = dropNilMessages(modelIn.Messages)
+			view := dropNilMessages(modelIn.Messages)
+			memo.transient = hasModelHooks && !reflect.DeepEqual(msgs, view)
+			msgs = view
 			// hook 可能往 Preamble 里塞 nil（`append` 一个零值、或整段换成含 nil 的切片）。
 			// 它会一路走到 provider 的消息转换里——实测真 openai client 在那里 panic。
 			modelIn.Preamble = dropNilMessages(modelIn.Preamble)
@@ -1106,13 +1116,8 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 					hooks.OnError(callCtx, info, &schema.CommError{Code: "model_nil_output", Message: err.Error()})
 					return err
 				}
-				// 压缩边界在这一刻定（它只看这一轮的摘要与 OnModelStart 钩子动没动消息列表）：沿用原样续跑时 OnModelStart
-				// 再触发一次，它这次动没动跟那次答复无关。
-				//
-				// **只在 OnModelStart 钩子没动消息列表时写**：压缩是在钩子改写之后的那份上做的，钩子插进来的、
-				// 改写过的消息会跟着进替代历史、在下一次 Run 里当成历史重放（每轮插一条「当前时间」的钩子，
-				// 下一次 Run 就看到两条）。钩子动了就不写，下一次 Run 照旧读全量。
-				if memo.out != nil && sameMessageSlice(streamMsgs, msgs) {
+				// 只有源自原始消息流的摘要能成为跨 Run 历史。恢复时沿用当次答复确定的边界。
+				if memo.out != nil && !memo.out.Transient {
 					boundary = buildCompactionBoundary(memo.out, msgs, GetHandoffHistoryMode(ctx))
 				}
 				// 模型调用成功那一刻记下原样：OnModelEnd 因为要等人或被叫停停下时，续跑沿用这一份（见 modelCallRecord）。
@@ -1130,21 +1135,27 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			// mock 模式 + Sub-5c 单测直接构造 ModelOutput{Usage:...} 绕开此真实路径未暴露 —
 			// 8 轮 audit + 单测全绿没抓到, 真 LLM 端到端集成验证才暴露 (印证 CLAUDE.md
 			// "mock 闭包绕开真实路径不算端到端覆盖").
-			modelOut := &schema.ModelOutput{Message: out}
+			originalText := out.Content
+			runID, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string)
+			hookMessage := out
+			if hasModelHooks {
+				hookMessage = cloneCalleeInput(out)
+			}
+			modelOut := &schema.ModelOutput{Message: hookMessage}
 			if hasRec {
 				modelOut.Extra = map[string]any{hook.ModelResponseReusedKey: true}
 			}
 			// 这是哪次模型调用（见 hook.ModelRunIDKey）：钩子可能换掉 Message，按消息标注就认不出了
-			if rid, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string); rid != "" {
+			if runID != "" {
 				if modelOut.Extra == nil {
 					modelOut.Extra = map[string]any{}
 				}
-				modelOut.Extra[hook.ModelRunIDKey] = rid
+				modelOut.Extra[hook.ModelRunIDKey] = runID
 			}
 			// 一次模型调用的用量只交给 OnModelEnd 一次：沿用原样时，上一次 OnModelEnd 停下之前排在前面的钩子已经收到过
 			// （观测链装在最前），再带一次就是一次调用报两次。
-			if out.Metadata != nil && out.Metadata.Usage != nil && !hasRec {
-				modelOut.Usage = out.Metadata.Usage
+			if hookMessage.Metadata != nil && !hasRec {
+				modelOut.Usage = hookMessage.Metadata.Usage
 			}
 			// OnModelEnd 的返回值不往后流（同 OnToolEnd / OnNodeEnd）。
 			_, hookErr := compose_v2.CallHook(callCtx, func(c context.Context) (context.Context, error) {
@@ -1160,7 +1171,6 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				}
 				return fmt.Errorf("OnModelEnd: %w", hookErr)
 			}
-			preHookMsg := out      // 非 nil（:328 已保证 model 自身输出非 nil）
 			out = modelOut.Message // hook 可能替换
 			if out == nil {
 				// **对称 :328（model 自身 nil）+ :475（OnToolEnd 置 nil）守卫**：OnModelEnd 的
@@ -1173,33 +1183,22 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				hooks.OnError(callCtx, info, &schema.CommError{Code: "model_end_nil_message", Message: err.Error()})
 				return err
 			}
-			// out / preHookMsg 现都保证非 nil——条件简化 + 下方 len(out.Content) 安全
-			//
-			// 钩子换上的消息仍是这次模型调用的答复：盖上这次调用的 run_id（下面的改写信号、tools 节点给工具调用标的出处都从
-			// 它取）。最自然的写法 `out.Message = &schema.Message{...}` 不带标注，曾经改写信号的 run_id 为空、前端与对端对不上
-			// 原来那条消息，没脱敏的原文留着（审计实测，经 A2A 一跳宿主拿到的也是原文）。盖在消息与标注表的拷贝上，钩子交来的
-			// 对象不动：护栏钩子常返回一条共享的固定回复（out.Message = blocked），在它身上盖章会让并发的调用互相改写、
-			// 各自的改写信号对不上自己那条（-race 实测）。
-			if rid, _ := preHookMsg.Annotations[compose_v2.RunIDAnnotationKey].(string); rid != "" {
-				if cur, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string); cur != rid {
+			// 输出归属来自原调用。钩子可原地改写标注，也可能返回多个请求共享的固定答复，补章要拷贝。
+			replaced := out != hookMessage || out.Content != originalText
+			if runID != "" {
+				if cur, _ := out.Annotations[compose_v2.RunIDAnnotationKey].(string); cur != runID {
 					ann := make(map[string]any, len(out.Annotations)+1)
 					for k, v := range out.Annotations {
 						ann[k] = v
 					}
-					ann[compose_v2.RunIDAnnotationKey] = rid
+					ann[compose_v2.RunIDAnnotationKey] = runID
 					stamped := *out
 					stamped.Annotations = ann
 					out = &stamped
 				}
 			}
-			if out != preHookMsg || out.Content != preHookMsg.Content {
+			if replaced {
 				if sink := compose_v2.GetEventSink(segCtx); sink != nil {
-					runID := ""
-					if out.Annotations != nil {
-						if v, ok := out.Annotations[compose_v2.RunIDAnnotationKey].(string); ok {
-							runID = v
-						}
-					}
 					// 不是作废、是替换：带上新答复的正文（replacement），前端与对端用它替换那条消息。只有清片段的信号时，适配层
 					// 无从得知新内容，按作废处理会让整条答复消失（审计实测）
 					sink.Send(compose_v2.Event{
@@ -1315,10 +1314,22 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// (retrieval / embedding / guardrail). lookup 返空字符串时业务
 		// 未实现 Categorizer, ti.Extra 不填, observability 走默认 tool kind.
 		categoryLookup := compose_v2.GetToolCategoryLookup(ctx)
-		// 这一批上一次已经处理完、只是那次执行在提交之前作废了的那几个调用（见 agent_v2 的 fixedToolResults）：续跑时不再
-		// 处理——工具不执行（工具账命中）、OnToolStart / OnToolEnd 都不触发，结论与钩子做出的决定用定下时那份。
-		fixedCalls, fixedHookSigs := fixedToolResults(ctx, toolCalls)
-		isFixed := func(i int) bool { return i < len(fixedCalls) && fixedCalls[i] }
+		// 定稿的调用跳过开始与结束钩子，复用原来的结果和信号。
+		fixedContent, redispatched := fixedToolCallContentOf(ctx, toolCalls)
+		if useToolMemo && redispatched {
+			var err error
+			batch.memo, err = loadToolMemo(ctx, fixedContent)
+			if err != nil {
+				return nil, err
+			}
+		}
+		isFixed := func(i int) bool {
+			if i >= len(batch.memo) || batch.memo[i] == nil {
+				return false
+			}
+			result := batch.memo[i].Result
+			return result != nil && result.ToolMsg != nil && result.Final
+		}
 		// unfixed 去掉定下了的那几个：它们的 OnToolStart 没触发，失败路径上也不补 OnToolEnd（见 endSettledToolCalls）
 		unfixed := func(ends []toolCallEnd) []toolCallEnd {
 			out := make([]toolCallEnd, len(ends))
@@ -1333,9 +1344,9 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 都从节点的 ctx 起算，看不到别的调用的钩子放的值；节点后面的工作用节点自己的 ctx（见 BasicAgentToolFn）。
 		callCtxs := make([]context.Context, len(toolCalls))
 		// 这一批上次已经派发过（内容已定下）：续跑时的再次派发，OnToolStart 带上标记（见 ToolRedispatchedExtraKey）
-		redispatched := toolCallsDispatchedBefore(ctx)
 		for i := range toolCalls {
 			if isFixed(i) {
+				toolCalls[i] = fixedContent[i]
 				callCtxs[i] = ctx
 				continue
 			}
@@ -1375,9 +1386,20 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			toolCalls[i].Function.Arguments = ti.ArgumentsJSON
 			callCtxs[i] = callCtx
 		}
-		// 改写只在这一批第一次交给工具执行时生效：之后的执行换回那一次定下的内容（见 fixToolCallContent）。下面的
+		// 改写只在这一批第一次交给工具执行时生效：之后的执行换回那一次定下的内容（见 saveToolCallContent）。下面的
 		// 工具执行、OnToolEnd、这批决定的裁决都用这一份。
-		fixToolCallContent(ctx, toolCalls, schema.GetToolCalls(last))
+		if redispatched {
+			copy(toolCalls, fixedContent)
+		} else {
+			saveToolCallContent(ctx, toolCalls, schema.GetToolCalls(last))
+			if useToolMemo {
+				var err error
+				batch.memo, err = loadToolMemo(ctx, toolCalls)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 
 		// 调用业务 tools fn。盖章：这里跑的工具的产出会被本节点记成 tool_result（见
 		// withToolResultRecorder）——AgentAsTool 据此不在边界补记历史。只盖在工具这一段上（这一批的 ctx 与
@@ -1437,7 +1459,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			}
 			// 定下了的不再处理（OnToolStart 也没触发，见上）：结论与钩子做出的决定用定下时那份。
 			if isFixed(i) {
-				hookSignals = append(hookSignals, fixedHookSigs[i])
+				hookSignals = append(hookSignals, batch.memo[i].Result.HookSignals)
 				failedAfterHook[i], codeAfterHook[i] = !before.Success, before.ErrorCode
 				continue
 			}
@@ -1529,8 +1551,8 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		}
 		// 这一批处理完了：结果定进工具账（见 agent_v2 的 finalizeToolMemo）。被裁决换掉的那几条定下的是替换后的失败结果——
 		// 不定的话账里留着它转存前、钩子脱敏前的原文，节点之后作废时随出口存档落盘（审计实测）。
-		if finalizeToolMemo != nil {
-			finalizeToolMemo(ctx, toolCalls, results, hookSignals)
+		if useToolMemo {
+			finalizeToolMemo(ctx, toolCalls, batch.memo, results, hookSignals)
 		}
 		// 钩子做出的决定排在这批调用的决定之后交，按钩子的先后（理由见循环里收的那一处）。
 		for _, s := range hookSignals {
@@ -1942,7 +1964,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 // （compose_v2.EnterPhase）——自己的私有态一格、自己的提问与嵌套调用计数、自己的相位名，名字是
 // 钩子名 + 工具名 + 所属 tool_call（工具名与 callID 为空、idx 为 -1 表示整批）。工具名在
 // OnToolStart 那里是它改写之前的名字（相位在钩子跑之前就定了），之后是实际执行的名字——这一批
-// 第一次交给工具执行时定下的那个（见 fixToolCallContent），续跑时不变。这一维让 OnToolEnd 记过的
+// 第一次交给工具执行时定下的那个（见 saveToolCallContent），续跑时不变。这一维让 OnToolEnd 记过的
 // 结果只认那个工具、不依赖那份记录：改写曾经在续跑时生效，那时新工具的结果读到旧工具的记录、没过
 // 审计就放行（实测）。现在它是冗余的第二道，没有测试覆盖。工具体的分域同样带工具名。
 //

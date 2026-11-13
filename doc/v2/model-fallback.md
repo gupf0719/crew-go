@@ -15,7 +15,7 @@
 | 阶段 | 落地 | 文件 |
 |---|---|---|
 | P0 结构化错误 | `model.APIError`（Provider/StatusCode/Body/Err/**RetryAfter**）+ openai client 5 处回填（2 处 HTTP 非 200 带 StatusCode；3 处网络/IO 错 StatusCode=0）| `model/error.go` / `model/openai/client.go` |
-| P1+P2 装饰器 | `FallbackChatModel`：Generate + Stream（仅建流阶段切换）+ WithTools（复用 breaker 指针）+ per-member 重试 + per-member 断路器 + onSwitch + `DefaultFailoverPolicy` | `fallback/{fallback,policy,option}.go` |
+| P1+P2 装饰器 | `FallbackChatModel`：Generate + Stream（首个有效片段前切换）+ WithTools（复用 breaker 指针）+ per-member 重试 + per-member 断路器 + onSwitch + `DefaultFailoverPolicy` | `fallback/{fallback,policy,option}.go` |
 | P3 集成验证 | 真 LLM 双场景冒烟：主端点故障 → ①同链接 qwen3.7-plus ②跨链接 deepseek，均自动切换应答 | `example/fallback/fallback_smoke` |
 
 **包位置：`crew-go/fallback`（不是设计稿说的 `model` 包）**。原因：本装饰器要复用
@@ -306,17 +306,13 @@ func (f *FallbackChatModel) Generate(ctx context.Context, msgs []*schema.Message
 
 ## 6. Stream 的硬约束
 
-**流式比非流式难**：一旦第一个 chunk 已经 `send` 给下游消费者，再失败就**无法干净回切**——下游已经收到了半截输出。这是 LangChain `with_fallbacks` 同样存在的限制。
+`FallbackChatModel.Stream` 会预读到首个有效片段。文本、推理、拒答或实际内容块可以选中候选。
+首片段前的建流错误和读取错误使用同一候选重试、切换及断路器策略。只有角色、用量或标注的前置帧
+随选中的流按序交给消费者。只有空值的流视为缺少响应。
 
-**第一版策略（保守，无歧义）**：只在**建流阶段**切换——即 `m.model.Stream(ctx, ...)` 同步返回 error 时（如 `client.go:141` 的 HTTP 非 200 在拿到首 chunk 前就返回了），按 §5 流程切下一个候选。一旦 `Stream` 成功返回 reader、开始投递 chunk，就**不再切换**，流中途错误照常向下游传递。
-
-流的断路器按消费方观察到的结局结算。读到 EOF 记成功，候选故障由 `FailoverPolicy` 分类并记失败。提前 `Close` 或调用方取消归还半开探测名额。调用方应在退出时关闭 reader。每次探测只结算自己的名额。
-
-**增强项（列入 §11 待定）**，两种思路别混为一谈：
-- **eino 式全流预消费**：`retry_chatmodel.go:252` 用 `stream.Copy(2)` 复制一份，`consumeStreamForError`（`:156`）**消费到 EOF** 确认整条流无误后才返回另一份。代价大——长流要等 buffer 完才返回，基本**牺牲流式实时性**，不适合 BasicAgent 的 chunk 实时投递。**这是把「检错窗口」拉到整条流，不是「首 chunk 落地前」。**
-- **首 chunk peek（更轻）**：只预读第一个 chunk 检错，把切换窗口从「建流阶段」扩到「首 chunk 落地前」。**不需要**给 `schema.StreamReader` 加 `Copy`——它定义在 `schema/stream.go`（不是 alias），只有 Recv / Close / Done，用这三个写一个转发 wrapper 就能 peek（2026-09-18 核验，探针 `-race` 通过；§11.1）。
-
-第一版两者都不做，只在建流阶段（`Stream()` 同步返回 error）切换。
+预读由 `schema.StreamReader.ReadAhead` 在原 reader 上保存帧。选中后保持该流，读到后续错误就
+交给调用方。断路器按消费者实际读取的结局结算，提前关闭归还半开探测名额。
+这保留了流式交付，预读范围止于首个有效片段。
 
 > `streamOrGenerate`（`agent_v2/basic_agent.go`）只在模型**不支持流式**时改调 Generate：Stream 返回 `model.ErrStreamUnsupported`，或返回 nil reader 且没有错误。建流报错原样返回，由本装饰器切换、由重试层重试。曾经任何错误都改调 Generate，跟本装饰器叠在一起：所有候选建流都失败之后，整条候选链会经 Generate 再走一遍。本装饰器的 Stream 遇到不支持流式的候选，就地用这个候选的 Generate、结果包成只有一项的流：轮到哪个候选就用哪个，顺序不倒退，也不记断路器失败。把 `ErrStreamUnsupported` 交回调用方的话，调用方改调 Generate 会从第一个候选重新走——前面刚失败的候选立刻又被打一次（不看 Retry-After，断路器一次调用记两次失败）。BasicAgent 对只有一个片段的流整条采用、不做增量拼接，拿到的跟直接调这个候选的 Generate 一样（拼接会丢消息 ID、结束原因等字段，还把同一 ID 的两个工具调用并成一个；`OnModelEndStream` 钩子改了片段数时照常拼接）。候选的 Generate 返回 nil 消息按候选故障处理，Generate 与 Stream 两条路一样。
 
@@ -386,7 +382,7 @@ ag := agent_v2.NewBasicAgent(agent_v2.WithModel(m), /* ... */)
 
 **一个失败只被重试一层**（2026-10-26）：某个候选上的重试用完之后，交出的错误带 `compose_v2.RetriesExhaustedError` 标记，
 上面各层——BasicAgent 的模型调用重试（`agent_v2.WithModelRetry`）、编排成员重试、节点重试——都不再重试它，业务谓词也绕不开。
-不然每层 3 次叠三层就是 27 次请求，正好在服务端过载时成倍放大流量。分工：这里管建流之前、候选内的重试与切换；流开始之后的错
+不然每层 3 次叠三层就是 27 次请求，正好在服务端过载时成倍放大流量。分工：这里管首个有效片段前、候选内的重试与切换；选中候选后的错
 （连接中途断开、错误帧、空闲超时）这里接不住（已交出的片段拼不到另一个模型的输出上），由 `WithModelRetry` 整次重来。
 
 ### 7.1 WithTools 的传播（易漏点）
@@ -546,7 +542,7 @@ OpenAI、Anthropic 和 decision 客户端使用 `model.ParseRetryAfter`。可用
 > 落地后本节已同步实现状态（详见 §0）：②③④⑤⑦ 已决/已实现、⑧ 已接受为固有代价；
 > 仅 **① 仍真开放**（⑥ `member.tripped` metric 已实现，`cbcfe9fd`；2026-09-18 核验），已进中心 backlog（[`doc/code/todo.md`](../code/todo.md)）。
 
-1. **[OPEN] `schema.StreamReader` 是否支持 `Copy`**——决定 §6 能否做「首 chunk 落地前」增强切换。grep 确认 StreamReader 当前**无 Copy 能力**，第一版只做建流阶段切换。→ 中心 backlog。（2026-09-18 核验：这个问题本身问偏了——peek 不必靠 `Copy`，见 §6。）
+1. **已落地首片段前切换**。使用 `schema.StreamReader.ReadAhead`，见 `6。
 2. **[已决] 结构化错误回填**——`model.APIError` 已落地（`model/error.go` + §0 P0，openai client 5 处回填；qwen/deepseek 复用 openai.Client 自动受益）。
 3. **[已决] 不加 `agent_v2` 语法糖**——装饰器已在 model 层够用，加 `WithFallbackModels` 反模糊「这是 model 层能力」的边界（grep 确认无此 API，定案不加）。
 4. **[已决] onSwitch 独立回调**——已实现 `WithFallbackHook`（§7），不塞进 hook 体系（切换早于 agent/orch hook 触发时机）。

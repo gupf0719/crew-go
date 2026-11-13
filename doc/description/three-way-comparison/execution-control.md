@@ -122,6 +122,17 @@ ToolAnnotations received from untrusted servers.」。默认值 readOnly=false�
 | 与 maxRounds 显式排优先级 | 最后一轮不问 | — |
 | 内部决策 LLM 必须拒绝插话 | `runDecisionAgent` 摘收件箱；另外嵌套调用也摘 | 用户是在跟调用它的那个 agent 说话 |
 
+## 执行并发预算（2026-11-13）
+
+| 本地源码 | 做法 |
+|---|---|
+| LangGraph `b4cb0f19e` 的 `pregel/_executor.py` | 配置 `max_concurrency`，异步执行器用 semaphore 控制同时运行的任务。 |
+| OpenAI Agents SDK `64fbde5d` 的 `run_internal/tool_execution.py` | 工具队列按空闲槽位创建任务，完成后补充派发。 |
+| eino `4a4b7186` 的 `compose/tool_node.go` | 并发工具走 WaitGroup，按批处理已完成与待执行的条目。 |
+
+crew-go 在创建 goroutine 前等空位，BSP 超步统一提交。预算归单图超步或单 BasicAgent 批次，父成员等待嵌套调用时可持有自己的执行位置。
+队列响应调用方取消，已派发成员照常收尾。结果合并、部分成功的存档及中断仲裁沿用超步与批次的规则。
+
 ## 五、决策记录
 
 | 日期 | 决策 | 关联 |

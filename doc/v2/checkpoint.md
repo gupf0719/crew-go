@@ -47,7 +47,7 @@ type Checkpoint struct {
     NS        string           // 本 cp 的 ns 路径（嵌套寻址用）
     ParentNS  string           // 父 ns（O(1) 反查祖先）
     Status    CheckpointStatus // Unset / Pending / Failed —— **只是报告位**，不参与控制流，见 §3.1
-    SchemaVer int              // 当前 CheckpointSchemaVer = 19
+    SchemaVer int              // 当前 CheckpointSchemaVer = 21
     GraphID   string           // 防 cp 串台（§4.3）
     CreatedAt int64            // UnixNano，Cleanup 按它排序；框架只在 caller 没给时盖
     Epoch     string           // 写代：每次 SaveNS 换一枚（§2.2）
@@ -69,8 +69,10 @@ type Checkpoint struct {
     FrontierStarted   bool                   // 这一超步开没开始执行（成员中断 / 失败之后的档为真；停在超步边界上的——软取消、ctx 取消、断点停下——为假）——续跑时决定判不判 before 断点
     NodeVisits        map[NodeID]int         // 每节点成功跑过几次——中断 ID 的 visit 维度靠它跨 cp 递增
 
-    // ── 部分失败超步的补充（缺一个都是静默丢数据，见 §2.4）──
+    // ── 部分失败超步的补充 ──
     CompletedFrontier []FrontierMember  // 中断超步里已成功的成员
+    CompletedWriteOwners map[string]FrontierMember // 已提交的单写入者 channel 归属，空表表示没有这类写入
+    CompletedTargets  []NodeID          // 成功成员执行时已确定的出边目标
     DeferredSends     []SerializedSend  // 成功成员发出的 SendFrom 指令
     PendingSendWrites []SerializedWrite // 没能提交的 SendFrom payload（待 Resume 补 apply）
 
@@ -149,12 +151,12 @@ type SignalRecord struct {
 ⚠️ **`Durability` 的崩溃恢复价值需要配持久 backend 才成立**——InMemory 随进程一起没了，
 sync/async 每超步写出来的中途 cp 救不回任何东西。
 
-**真要自研**（Mongo / 自家 KV / 多租户分片）时，这一层最隐蔽的地方是：**漏序列化任何一个字段
-都不报错**，只是各自退化成一种静默的错。
+**自研后端必须完整往返存档字段**。缺失字段可能拒绝恢复，也可能改变后续执行。
 
 | 漏了 | 退化成 |
 |---|---|
 | `CompletedFrontier` | 发散 fan-out 部分失败时，Resume 后**成功分支的后继永久丢失** |
+| `CompletedWriteOwners` | 含单写入者 channel 的部分提交会拒绝恢复并保留原档。空表表示已核对且无此类写入，后端须区分空表与 nil |
 | `DeferredSends`（或其中 `Owner`）| Target **双发** |
 | `PendingSendWrites` | SendFrom 的 target **静默读到零值** |
 | `FrontierMember.InstanceID`（含空身份那条记录整条要留）| 多实例 Resume 后**实例互相冒充**，InterruptID 撞 → query 被 dedupe 吞 → 那个实例永远等不到答案 |
@@ -170,6 +172,9 @@ sync/async 每超步写出来的中途 cp 救不回任何东西。
 | `RecipientKey` | 续跑时密钥重铸、收件人变了，停下之前已提交的转交 / 路由决定认不出是发给谁的，静默丢失 |
 | `NodeStates` | 退化成「全部重跑」（= 引入前行为）：节点里已做成的副作用重放，其中包括已完成的嵌套调用——它们的完成记录也在这里（§5）。问过人的嵌套调用丢了记录之后：调用方只答当前一问时，两个问题轮流出现、永不收敛（实测）；累积传答案时不重问（旧答案被静默复用），但子 agent 整个重跑、副作用重放 |
 | `CreatedAt`（绕过 `Run` 直接写 backend 时）| 恒 0，被 `Cleanup` 当成最旧的优先删 |
+
+从 v19 或更早版本升级时，含单写入者 channel 的部分提交存档缺少写入归属。上线前应在旧版本完成这些任务，
+或由业务确认放弃后重新运行。判断依据是存档内容。已注册的接口 channel 可恢复实现该接口的具体类型，具体类型仍须在值注册表中注册。
 
 ⚠️ 同一类静默错还有一处不在字段里，在**键怎么比较**：(sid, ns) 逐字节就是存档的身份，逐字节
 不同的两个会话 / 两个 ns 是两份档——只差尾随空格、大小写、重音或组合字符写法的也是。键列用了
@@ -589,15 +594,11 @@ ctx 已经死了）不算否决，中断、失败之后的续跑也照常拿回�
 **分域**：同一次节点执行名下还有几块互不相干的地方，各有自己的一格（`SaveNodeState` /
 `GetNodeState`）和自己的步骤记录：
 
-- **工具函数里**按 tool_call 分域（`WithCurrentToolCallContext` 派生；BasicAgent 另按工具名再分一层）：
-  并发的 tool_call 各记各的，也碰不到 tools 节点自己那一格——它记着哪些 tool_call 已经做完，没分域时
-  工具里一次 `SaveNodeState` 就把那份账覆盖了、已执行过的工具在续跑时再执行一遍（实测）。工具名那一层
-  让不同工具的记录互不相认：`OnToolStart` 能改写工具名，但改写只在这一批第一次执行时生效、续跑沿用定下的
-  内容（`fixToolCallContent`），同一个 tool_call 正常情况下不会两次执行之间换工具；这一维让「换了工具就不认旧
-  记录」不依赖那份记录；BasicAgent 的**工具钩子**（`OnToolStart` /
-  `OnToolEnd`）每次调用是一个相位（`compose_v2.EnterPhase`，按钩子名 + 工具名 + 所属 tool_call 命名）：自己的
-  一格、自己的提问与嵌套调用计数（两个 tool_call 的钩子带同一个 call key 调同一个 agent 不再撞），采纳钩子
-  返回的 ctx 时框架把节点体那一套连同其余执行状态取回来（`compose_v2.CallHook`）；
+- **BasicAgent 工具账**按调用 ID、批内下标及首次派发后的工具名分域，各自保存审批和结果。
+  每次保存仅编码该调用的账项，仍随图的存档提交。v20 的旧批次账首次恢复时转换为独立账项。
+- **工具函数和工具钩子**各有独立分域。工具体通过 `WithCurrentToolCallContext` 按调用分域，BasicAgent
+  另按工具名区分。工具钩子经 `compose_v2.EnterPhase` 按钩子名、工具名和调用分域，各有自己的私有态、
+  提问和嵌套调用计数。`compose_v2.CallHook` 采纳钩子返回值后恢复节点体的执行状态。
 - **图的钩子相位与条件边**（`OnNodeStart` / `OnNodeEnd` / `OnNodeEvent` / cond）记在那个节点这次
   执行名下、按相位分域；嵌套图的 `OnGraphStart` / `OnGraphEnd` 与入口条件边记在承载它的外层节点
   执行名下；
@@ -707,8 +708,8 @@ ResumeContext 默认全 ctx 子树可见（适合"父节点直接是子 agent"�
 ### 7.4 Resume 恢复的是 state，不是 event
 
 `Checkpoint` **没有 Events 字段**。`cm.Restore(cp)` 恢复 channel state + frontier +
-PendingInterrupts，从 frontier 续跑，**不回放 event**。前端 SSE 断线重连要业务自己持久化流
-（如 Redis Stream）+ 按 last-event-id 续传。
+PendingInterrupts，从 frontier 续跑。AG-UI 接入可以使用独立的
+[Run 日志](agui.md#持久回执与断线续传) 回放 SSE。
 
 ### 7.5 防御机制
 

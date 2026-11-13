@@ -20,7 +20,7 @@ package agent_v2
 //
 // 路径由父编排在调 sub-agent 前 push 进 ctx，子 agent 记历史时读出来当归属。
 //
-// # 只放注册名，不放轮次 / 跳数 / 下标
+// # 注册成员跨执行保持同一归属
 //
 // 这是跟 graphNS（cp 寻址用）的**关键区别**，也是这套设计能成立的前提：
 //
@@ -33,7 +33,7 @@ package agent_v2
 //
 // 更要命的是跳数/轮次**跨 Run 会重置**（hops 存 ctx、每个 Run 从 0 起）：同一个 agent
 // 在 Run 1 记成 `agent_billing_hop1`、Run 2 续接时变 `agent_billing_hop0`，按它归属就
-// **读不回自己上一轮的历史**——那正是这一层存在的理由。所以带序号的段一律剔掉。
+// **读不回自己上一轮的历史**。临时成员只属于创建它的任务和步骤，使用独立编码的临时位置。
 //
 // # 代价：归属是编排结构的函数，改结构就是换身份
 //
@@ -78,6 +78,7 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -87,6 +88,20 @@ import (
 
 // historySlotCtxKey 是归属路径的 ctx key（私有类型防碰撞）。
 type historySlotCtxKey struct{}
+
+type historySegment string
+
+var historyNameEscaper = strings.NewReplacer("%", "%25", "/", "%2F")
+
+// namedHistorySegment 编码外部名称，保留斜杠为层级分隔符，保留前缀 % 给框架生成的位置。
+func namedHistorySegment(name string) historySegment {
+	return historySegment(historyNameEscaper.Replace(name))
+}
+
+// temporaryHistorySegment 只标识当前任务的这一步，下一任务创建的临时成员拥有自己的历史。
+func temporaryHistorySegment(taskID string, step int) historySegment {
+	return historySegment(fmt.Sprintf("%%tmp-%x-%d", taskID, step))
+}
 
 // WithHistorySlot 声明「接下来这个 sub-agent 在编排树里的位置」。
 //
@@ -98,14 +113,19 @@ type historySlotCtxKey struct{}
 // 业务自写编排（GraphAgent 的 NodeFunc 里调 sub-agent）时同样该 push，否则子 agent 的
 // 产出会回落到用 agent 名标归属——**同名就会合并**。`RunSubAgent` helper 已经代劳。
 //
-// name 为空时原样透传（不产生空段）。
+// name 为空时原样透传。名称中的 % 和 / 转义为 %25 和 %2F，框架生成的临时位置独立编码。
 //
 // 同时开一张**回执**：从这里往下实际产生了多少条历史记录（见 historyReceipt）。边界补记
 // 据此判断「这一步的执行体到底记了没有」。
 func WithHistorySlot(ctx context.Context, name string) context.Context {
-	if name == "" {
+	return pushHistorySegment(ctx, namedHistorySegment(name))
+}
+
+func pushHistorySegment(ctx context.Context, segment historySegment) context.Context {
+	if segment == "" {
 		return ctx
 	}
+	name := string(segment)
 	parent := HistorySlot(ctx)
 	if parent != "" {
 		name = parent + "/" + name
@@ -201,7 +221,7 @@ func historyOwner(ctx context.Context, agentName string) string {
 	if slot := HistorySlot(ctx); slot != "" {
 		return slot
 	}
-	return agentName
+	return string(namedHistorySegment(agentName))
 }
 
 // settleHistoryOnPause 在子调用以「可 Resume 的方式」退出时结算**输入**——只落输入，
@@ -316,7 +336,7 @@ func settleHistorySlot(ctx context.Context, agentName string, input, final *sche
 // 所以位置只传给这一次结算（做认领的流键 + 过守卫），不进 ctx。归属仍按
 // `historyOwner` 的既定回落取 agentName，后代归属逐字不变。
 func settleHistoryTopLevel(ctx context.Context, agentName string, input, final *schema.Message) {
-	settleHistoryAt(ctx, agentName, agentName, gateInputRecorded, input, final)
+	settleHistoryAt(ctx, string(namedHistorySegment(agentName)), agentName, gateInputRecorded, input, final)
 }
 
 // deferRootInput 让顶层执行体（GraphAgent）这次 Run 的原始输入排在这次 Run 写进历史的第一批记录前面。
@@ -337,12 +357,13 @@ func settleHistoryTopLevel(ctx context.Context, agentName string, input, final *
 // 终局失败不记。
 func deferRootInput(ctx context.Context, agentName string, input *schema.Message) {
 	w := historyWriterFrom(ctx)
+	owner := historyOwner(ctx, agentName)
 	if w == nil || historySuppressed(ctx) || agentName == "" || input == nil ||
 		input.Role != schema.RoleUser || isDerivedInput(input) || recordedInThisRun(ctx, input) ||
-		inputAlreadyInHistorySlot(ctx, agentName, input) {
+		inputAlreadyInHistorySlot(ctx, owner, input) {
 		return
 	}
-	w.deferRoot(input, w.stamp(input, historyOwner(ctx, agentName), agentName), agentName)
+	w.deferRoot(input, w.stamp(input, owner, agentName), owner)
 }
 
 // endRootInputWindow 在顶层 GraphAgent 的图跑完时调：还没补的原始输入收回，交给出口结算（见 deferRootInput）。
@@ -633,8 +654,7 @@ func startHistoryForOrchestration(ctx context.Context, subs []Agent, name string
 	// 运行入口声明优先——它更靠近这次运行，也是唯一能覆盖「编排里一个 BasicAgent 都
 	// 没有」那种形状的声明方式。见 WithHistoryCtx。
 	if hc := historyCfgFromCtx(ctx); hc != nil {
-		c, stop := startHistory(ctx, hc, name)
-		return c, stop, nil
+		return startHistory(ctx, hc, name)
 	}
 
 	chosen, conflict := borrowHistoryConfig(subs)
@@ -644,11 +664,7 @@ func startHistoryForOrchestration(ctx context.Context, subs []Agent, name string
 			"请让同一编排下（含嵌套的编排）的子 agent 用同一个 WithHistory 配置（同一个 store 实例、同一个 owner 或同一个 owner 函数）",
 			name, conflict.Error())
 	}
-	if chosen == nil {
-		return ctx, noop, nil
-	}
-	c, stop := startHistory(ctx, chosen, name)
-	return c, stop, nil
+	return startHistory(ctx, chosen, name)
 }
 
 // sameHistoryConfig 判两个子的历史配置是不是同一套。
@@ -728,50 +744,11 @@ func resolveHistoryConfigForAbort(ctx context.Context, subs []Agent) *historyCon
 	return chosen
 }
 
-// closeUnansweredToolCallsOnAbort 在**用户放弃任务**（`ResumeActionAbort`）那一刻，
-// 给历史里没有配对结果的 tool_call 补上一条工具结果。
-//
-// # 为什么补在写侧而不是读侧
-//
-// 不补的话，历史（append-only）里**永久**留着一条 `assistant tool_calls=1 content=""`
-// ——tools 节点是原子的，审批中断时结果那半根本没写过，而放弃之后也不会再有人写。
-// 实测复现：审批中断 → `WithResumeAction(Abort)` → 历史停在 `[user, assistant(tc=1)]`。
-//
-// 框架下游对这种残缺**已经有一整套读侧修补**（`dropDanglingToolCalls` + 合成一条记账
-// 文本），而那条记账文本是 **assistant + 零 tool_call**、正好长得像一条最终答复，于是
-// 凡是「挑一条消息代表某件事」的地方都得记得跳过它。**在洞产生的那一刻把它填上，
-// 上面整串防护就都不必存在。**
-//
-// # 文案不声称执行与否
-//
-// 只说「任务被放弃、这个调用没有结果」。中止发生在审批闸上时工具确实没跑，但这条路
-// 是通用的（别的中断点也能走到 Abort），**框架在这一层不知道跑没跑**——写一句会被后来
-// 的人当事实读的猜测，比不写更糟。
-//
-// # 失败只 warn
-//
-// 历史是旁路：写不进去不该让「用户放弃任务」这个操作失败（cp 已经删了，返错会让调用方
-// 以为没放弃成功而重试）。
-//
-// # 只补被放弃的这个任务的
-//
-// 悬空的 tool_call 是这个任务在中断那一刻留下的，只在这个任务写下的记录里找（按任务章查，task 是被放弃
-// 任务的 RunID）——任务挂着期间同一会话里别的任务写了多少都不用翻过去。补上的结果盖上声明它的那条
-// assistant 的归属与任务章：归属对上了，那个 agent 的视图里配对才是完整的。
-func closeUnansweredToolCallsOnAbort(ctx context.Context, hc *historyConfig, agentName, task string) {
-	if task == "" {
-		return
-	}
-	if hc == nil || hc.store == nil {
-		return
-	}
-	closeUnansweredToolCalls(ctx, hc.store, HistoryKey{Owner: hc.resolveOwner(ctx), ConvID: compose_v2.GetThreadID(ctx)}, agentName, task)
-}
-
-// closeUnansweredToolCalls 是 closeUnansweredToolCallsOnAbort 的本体：在 store 的 key 那场对话里给任务 task 没有结果的工具调用补一条。
-func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key HistoryKey, agentName, task string) {
+// closeUnansweredToolCalls 按任务扫描历史，为尚无结果的工具调用补齐放弃结果。
+// 只在根存档删除后调用，重试时会跳过已有结果的调用。
+func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key HistoryKey, task string) error {
 	if task == "" || store == nil || key.Owner == "" || key.ConvID == "" {
-		return
+		return nil
 	}
 	src := historySource{store: store, key: key, task: task}
 	var msgs []*schema.Message // 新 → 旧
@@ -780,12 +757,7 @@ func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key Histo
 		return false
 	}, nil)
 	if err != nil {
-		slog.WarnContext(ctx, "agent_v2: abort 收尾读历史失败，悬空 tool_call 未补",
-			"agent", agentName, "key", key.String(), "err", err)
-		return
-	}
-	if len(msgs) == 0 {
-		return
+		return err
 	}
 
 	slices.Reverse(msgs) // 历史扫描从新到旧，配对需要追加顺序。
@@ -801,12 +773,12 @@ func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key Histo
 		closers = append(closers, stampHistoryAgent(closer, owner, display, task))
 	}
 	if len(closers) == 0 {
-		return
+		return nil
 	}
-	if err := store.Append(ctx, key, closers); err != nil {
-		slog.WarnContext(ctx, "agent_v2: abort 收尾补记失败，历史里留着悬空 tool_call",
-			"agent", agentName, "key", key.String(), "count", len(closers), "err", err)
+	if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
+		return err
 	}
+	return store.Append(ctx, key, closers)
 }
 
 // beginRunActivity 校验放弃声明，再原子登记本次执行和要放弃的任务。排在建历史写入器和盖章之前。
@@ -862,7 +834,9 @@ func abandonTasksAtEntry(ctx context.Context, ids []string, agentName string) {
 			}
 		}
 		if w != nil {
-			closeUnansweredToolCalls(sctx, w.store, w.key, agentName, id)
+			if err := closeUnansweredToolCalls(sctx, w.store, w.key, id); err != nil {
+				slog.WarnContext(ctx, "agent_v2: 放弃任务的历史收尾失败", "agent", agentName, "task", id, "err", err)
+			}
 		}
 	}
 }

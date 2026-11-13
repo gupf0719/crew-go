@@ -454,9 +454,11 @@ type failDeleteCheckpointer struct {
 	sid string
 }
 
+var errAbandonDelete = errors.New("backend down")
+
 func (c failDeleteCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
 	if sid == c.sid {
-		return 0, errors.New("backend down")
+		return 0, errAbandonDelete
 	}
 	return c.Checkpointer.DeleteSubtree(ctx, sid, ns)
 }
@@ -476,14 +478,33 @@ func TestWithAbandonedTasks_DeleteFailureLeavesTaskResumableAndUnclosed(t *testi
 			} else {
 				_, err = f.newAgent().Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("查余额"), agent_v2.WithAbandonedTasks(old))
 			}
-			if err != nil {
-				t.Fatalf("删档失败只记日志，调用照常：%v", err)
+			if viaResumeAbort {
+				if !errors.Is(err, errAbandonDelete) {
+					t.Fatalf("显式 Abort 应报告删档失败，得到 %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("新 Run 应在旧任务删档失败后继续执行，得到 %v", err)
 			}
 			if abandonIndexOf(f.history(t), func(m *schema.Message) bool { return schema.GetToolResultID(m) == "c1" }) >= 0 {
 				t.Fatal("档没删掉（任务还能续）时不该补「被放弃」")
 			}
 			if n, _ := f.cp.ListPending(f.ctx, old); len(n) == 0 {
 				t.Fatal("fixture 没搭对：删档失败时存档应还在")
+			}
+			if viaResumeAbort {
+				canceled, cancel := context.WithCancel(f.ctx)
+				cancel()
+				_, err := f.newAgent().Resume(canceled, old, agent_v2.WithResumeSession(f.pending),
+					agent_v2.WithResumeAction(agent_v2.ResumeActionAbort))
+				if err != nil {
+					t.Fatalf("应能重试 Abort 并在请求已取消时清理，得到 %v", err)
+				}
+				if n, _ := f.cp.ListPending(f.ctx, old); len(n) != 0 {
+					t.Fatalf("重试后仍有存档 %v", n)
+				}
+				if abandonIndexOf(f.history(t), func(m *schema.Message) bool { return schema.GetToolResultID(m) == "c1" }) < 0 {
+					t.Fatal("重试清档后应补齐被放弃的工具结果")
+				}
 			}
 		})
 	}

@@ -158,7 +158,7 @@ func TestAsk_ConvergesAcrossHardShapes(t *testing.T) {
 			// 承重④：**次数有界**——ID 错位时的症状是每轮重做一遍、次数随轮数无限增长。
 			//
 			// ⚠️ 这里**不能断「恰好一次」**：一个 tool_call 内部多次中断时，工具体每次
-			// Resume 从头重跑（`toolCallMemo` 的粒度是 per-tool_call，管不到 call 内部），
+			// Resume 从头重跑（工具账的粒度是 per-tool_call，管不到 call 内部），
 			// 所以前面的问会被重做。这是**既有语义**（CLAUDE.md：业务工具自负幂等性），
 			// 不是本入口引入的。关键区别是**有界**：坏掉时实测 16 次且还在涨。
 			if upper := len(c.tools) * c.asks * (c.maxRounds + 1); len(effects) > upper {

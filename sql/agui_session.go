@@ -56,6 +56,13 @@ func (s *AGUISessionStore) Setup(ctx context.Context) error {
 	return nil
 }
 
+// 带版本的任务使用单独的持久字段。旧二进制看到空 task_id 会在加载会话时拒绝，
+// 因而无法拿旧工厂执行新版本任务，也无法覆盖版本字段。
+type storedAGUISession struct {
+	agui.SessionRecord
+	VersionedTaskID string `json:"versioned_task_id,omitempty"`
+}
+
 // LoadSession 读会话记录，找不到时返回 (nil, nil)。
 func (s *AGUISessionStore) LoadSession(ctx context.Context, key string) (*agui.SessionRecord, error) {
 	query := fmt.Sprintf("SELECT payload FROM %s WHERE sid = %s", s.sessionTable, s.dialect.Placeholder(1))
@@ -67,11 +74,17 @@ func (s *AGUISessionStore) LoadSession(ctx context.Context, key string) (*agui.S
 	if err != nil {
 		return nil, fmt.Errorf("sql agui session load: %w", err)
 	}
-	var record agui.SessionRecord
-	if err := json.Unmarshal(data, &record); err != nil {
+	var stored storedAGUISession
+	if err := json.Unmarshal(data, &stored); err != nil {
 		return nil, fmt.Errorf("sql agui session decode: %w", err)
 	}
-	return &record, nil
+	if stored.VersionedTaskID != "" {
+		if stored.WorkflowVersion == "" || stored.TaskID != "" {
+			return nil, errors.New("sql agui session has inconsistent workflow version fields")
+		}
+		stored.TaskID = stored.VersionedTaskID
+	}
+	return &stored.SessionRecord, nil
 }
 
 // SaveSession 持有 key 的有效租约时整条替换，record 为 nil 时删除。
@@ -84,7 +97,11 @@ func (s *AGUISessionStore) SaveSession(ctx context.Context, key string, record *
 	query := fmt.Sprintf("DELETE FROM %s WHERE sid = %s", s.sessionTable, ph(1))
 	args := []any{key}
 	if record != nil {
-		data, err := json.Marshal(record)
+		stored := storedAGUISession{SessionRecord: *record}
+		if stored.WorkflowVersion != "" {
+			stored.VersionedTaskID, stored.TaskID = stored.TaskID, ""
+		}
+		data, err := json.Marshal(stored)
 		if err != nil {
 			return 0, fmt.Errorf("sql agui session encode: %w", err)
 		}

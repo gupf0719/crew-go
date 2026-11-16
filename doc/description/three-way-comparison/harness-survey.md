@@ -37,7 +37,7 @@ crew-go 把 hook（8 业务 + 5 编排）/ 4 层压缩 / HITL / observability �
 | **plan/execute ModeProvider** | `_mode.py` | ⚠️ 有 PlanAgent，无 mode provider 抽象 |
 | 文件型记忆 | `_memory.py` | ✅ StoreMemory |
 | **SkillsProvider**（渐进披露） | `_skills.py` | ✅ skill 系统（见 [`skill-system.md`](skill-system.md)） |
-| **后台子 agent** | `_background_agents.py` | ❌ 无（仅同步嵌套） |
+| **后台子 agent** | `_background_agents.py` | [显式派单、独立存档及跨进程恢复](../../v2/durable-background-agent.md)（2026-11） |
 | **工具审批**（don't-ask-again） | `_tool_approval.py` | ✅ `WithApprovalMode`（`agent_v2/approval.go`，2026-06-24 落地——**本行原记 ❌，是调查期实况**；§四 表为准） |
 | shell / web search | `_file_access.py` / option | ➖ 按 tool 实现（`sandbox.NewBashTool`），非框架缺口——见 §四 末行 |
 | OTel | observability | ✅（见 [`observability-trace-spec.md`](observability-trace-spec.md)） |
@@ -90,14 +90,14 @@ compaction 细节：前 `ContextWindowCompactionStrategy`（token 预算）+ 后
 |---|---|---|
 | **AGENTS.md/外部指令注入中间件** ✅ **已实现 `WithAgentsMD`** | eino `agentsmd`（transient） | ✅ 已做 |
 | **工具审批/权限规则层**（don't-ask-again + 启发式） | MAF `_tool_approval.py` | ✅ **已做**（P1，`agent_v2/approval.go` commit b81776c/fddeed1）|
-| **后台子 agent**（异步委派 + 监控 + 取回） | MAF `_background_agents.py` | ⏸ **defer P2**（backlog）|
+| **后台子 agent**（异步委派 + 监控 + 取回） | MAF `_background_agents.py` | [2026-11 跟进，显式派单和跨进程恢复](../../v2/durable-background-agent.md) |
 | **harness 指令 vs 任务指令分层** | MAF `DEFAULT_HARNESS_INSTRUCTIONS` | ⏭ **skip P3**（eino 同构无缺口）|
 | **TodoProvider** | MAF `_todo.py` / dsh `tool-todo` / Claude Code TodoWrite | ⏸ **defer**（2026-08-13 重估：**产品层能力，非 SDK 层**——见下方决策记录）|
 | Shell / 文件读写编辑 / computer-use（按 tool 实现即可，非框架层缺口） | MAF / OpenAI / eino（`adk/filesystem` + filesystem middleware） | ➖ 非框架缺口（eino 做进 adk，crew-go 定位 Go 最简 SDK、文件访问按 tool/MCP 实现——定位差异非缺口）|
 
-### 决策记录：harness 4 块 scoping（2026-06，8 源本地源码调研后）
+### 历史决策记录（2026-06，8 源本地源码调研后）
 
-> **定位锚点**：crew-go 是 **Go 原生最简 SDK**，对标 claude-agent-sdk（通用 SDK 层）非 Claude Code（端到端 CLI 产品）。这是下面所有 do/defer/skip 的依据；**列 backlog 以本表 verdict 为准，别再当 🟢P2 待办重列**。
+> **定位锚点**：crew-go 是 **Go 原生最简 SDK**，对标 claude-agent-sdk（通用 SDK 层）非 Claude Code（端到端 CLI 产品）。下表保留当时的取舍。后续状态见上表。
 
 | 块 | 决策 | 理由 | 若做的最小设计 |
 |---|---|---|---|
@@ -198,7 +198,7 @@ usage-guide 写明）。与各家不同的一点是固定内容本身：各家�
 ### 6.3 §四 缺口表的增量结论
 
 - **TodoProvider**：MAF 已毕业（#7053）。**结论仍是 defer，但判据已于 2026-08-13 重估换掉**（见 §四 决策记录 + §7.3-2）——毕业不构成翻案理由，真正的判据是「产品层 / SDK 层分野」。
-- **后台子 agent**：外部两侧都在加码——MAF #6735（06-29，background agent loop 自动解析 provider + feedback message builder），Claude Code 把子 agent 改成**默认后台**并补上通知 hook 与并发/深度/预算三道闸（v2.1.198~2.1.224）。我们仍 defer P2，理由同 §四；但**外部的重心已从「能不能后台跑」转到「跑起来怎么管住」**——真要做时，闸门（并发上限 / 深度 / 预算 / 崩溃态）与 runner 本体同等重要，别只照 §四 那格的最小设计做完就收工。
+- **后台子 agent**：外部两侧都在加码——MAF #6735（06-29，background agent loop 自动解析 provider + feedback message builder），Claude Code 把子 agent 改成**默认后台**并补上通知 hook 与并发/深度/预算三道闸（v2.1.198~2.1.224）。本次调研时暂缓，理由同 §四；但**外部的重心已从「能不能后台跑」转到「跑起来怎么管住」**——真要做时，闸门（并发上限 / 深度 / 预算 / 崩溃态）与 runner 本体同等重要，别只照 §四 那格的最小设计做完就收工。
 - **本期新增、原表未列的三项**：会话历史层（`WithHistory`，[ISSUE-98](../../issue/issue-98-conversation-history.md)）/ 工具调用中间件（`WithToolMiddleware`）/ 节点私有中断态（`SaveNodeState`，让中断重跑跳过已成功的带副作用工具）。**血缘要分清**：中间件是**看了外部三家都提供 call-level seam** 才立项的（`143b558` 明记「零家提供包装 Tool 对象的 helper」）；另两项是本仓自己踩出来的（cp 成功即清留不住历史 / 一轮 N 个 tool_call 里一个中断则全部重放），外部有对应物但不是照着补的。
 - **本期未复核**：CrewAI（近两月 332 commit）、grok-build（squash 同步无细粒度信息）、AG-UI（527 commit，属前端协议非 harness）——留待需要时再挖，本节不作断言。
 
@@ -371,7 +371,7 @@ untrusted 的项目此后每条命令都要审批，除非有显式 exec policy 
 
 | 缺口 | 它怎么做 | 我们的现状 | 判断 |
 |---|---|---|---|
-| **长跑工具的统一 job 协议** | dsh `ctx.jobs`：按 owner 隔离后台任务，覆盖观察 / 取消 / 等待 / 完成通知，配 `tool-jobs` 给模型使用 | **2026-10-21 已落地**。顶层 BasicAgent 的 `WithBackgroundTasks` 可将点名的慢工具交给进程内管理器，先返回任务 ID，模型可查询、等待、取消和接收结果通知。[后台工具](../../v2/background-tasks.md) | 工具级生命周期，落地取舍见 §9 A-3 末尾。独立后台子 agent 的最新对照见 [11 月行业调查](industry-survey-2026q4.md) |
+| **长跑工具的统一 job 协议** | dsh `ctx.jobs`：按 owner 隔离后台任务，覆盖观察 / 取消 / 等待 / 完成通知，配 `tool-jobs` 给模型使用 | **2026-10-21 已落地**。顶层 BasicAgent 的 `WithBackgroundTasks` 可将点名的慢工具交给进程内管理器，先返回任务 ID，模型可查询、等待、取消和接收结果通知。[后台工具](../../v2/background-tasks.md) | 工具级生命周期，落地取舍见 §9 A-3 末尾。独立任务见 [可恢复的后台子 Agent](../../v2/durable-background-agent.md) |
 | **两级审批：异步打分 → 按分数升级为同步拦截** | Codex `guardian-v2/async_scorer`：第一级用小模型**异步非阻塞**打分，评估「当前动作风险」**与「agent 的轨迹是否会导向高风险动作」**；**分数 ≥ 0.50 才让后续动作进入阻塞式全量审查** | 审批只有一档：`ApprovalAsk` 下每个业务工具都抛中断等答案 | **缺口，且解法值得学**。它解的约束是「全量同步审批太贵、全不审不安全」——用便宜的异步观察**动态调节**审批强度 |
 | **授权化的会话检索** | dsh `ctx.sessionQuery`：trusted reads + 关系查询 + SQLite 全文搜索，**独立于压缩**，配 `tool-session-query` 暴露**workspace-authorized**查询给模型 | 历史层的 `Load` 是给 `prior` 与去重用的框架读：2026-10 起分页（`Before` / `Limit`）+ 按消息 ID / 任务章 / 归属过滤，**仍无按内容检索、无模型入口** | 缺口。但见 §9.2 第 3 条——我们的 `Owner` 维度正是现成的授权边界 |
 

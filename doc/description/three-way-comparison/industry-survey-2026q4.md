@@ -74,7 +74,7 @@ crew-go 顶层 BasicAgent 的 `WithBackgroundTasks` 可将点名的工具在运�
 任务由进程内 `BackgroundTaskManager` 持有。配置 Checkpointer 时，工具账可以恢复任务 ID。进程重启后
 原任务与结果会消失。独立子 agent thread、宿主唤醒和跨进程任务恢复需要额外的任务所有权协议。现有 `Inbox`
 和 `WithTurnGate` 已覆盖同一回合的插话与收尾反馈。
-[后台工具](../../v2/background-tasks.md) · [执行控制](../../v2/execution-control.md) · [后台子 agent 取舍](harness-survey.md)
+[后台工具](../../v2/background-tasks.md) · [执行控制](../../v2/execution-control.md) · [可恢复的后台子 Agent](../../v2/durable-background-agent.md)
 
 ## 三、决策模型成为可组合组件
 
@@ -301,3 +301,8 @@ go run ./sql/example/checkpoint_profile -samples 30 -rounds 12
   [Fallback 流式语义](../../v2/model-fallback.md#6-stream-的硬约束)
 - **行为评测** 通过真实 RoutingAgent 和 BasicAgent 跑 JSONL 用例，断言工具体的实际执行、参数、审批和终态。
   [评测示例](../../../example/README.md#agent-行为评测) · [ADK 工具轨迹评测](https://github.com/google/adk-docs/blob/main/docs/evaluate/criteria.md#tool_trajectory_avg_score)
+
+- **路由标定** 可用 `-replay` 在匹配的预测缓存上重算报告，用 `-thresholds` 对比自动承接率、错路由率、升级比例和
+  模拟 P95。部署门槛仍待标注业务数据和模型实测。[离线回放](../../v2/route-decider.md#用外部业务样本复测)
+- **后台子 Agent** 增加显式派单、独立存档和工作进程租约。子 Agent 可申请审批，且能把持久终态送回等待它的父任务。
+  SQLite 的独立进程退出测试验证接手时已完成的超步只执行一次。[接入与恢复边界](../../v2/durable-background-agent.md)

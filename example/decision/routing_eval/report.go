@@ -45,15 +45,16 @@ func (rl roles) deciders() []struct{ key, title string } {
 }
 
 type reporter struct {
-	cases []evalCase
-	byID  map[string]evalCase
-	runs  []runResult
-	roles roles
-	b     strings.Builder
+	thresholds []float64
+	cases      []evalCase
+	byID       map[string]evalCase
+	runs       []runResult
+	roles      roles
+	b          strings.Builder
 }
 
 // renderReport 按子集分别出报告：三个子集的难度与形态不同，混在一起算准确率会掩盖差别。
-func renderReport(cases []evalCase, runs []runResult, rl roles, review bool, preface string) string {
+func renderReport(cases []evalCase, runs []runResult, rl roles, review bool, preface string, thresholds []float64) string {
 	var b strings.Builder
 	b.WriteString(preface)
 	for _, t := range append(slices.Clone(tiers), externalTier) {
@@ -66,7 +67,9 @@ func renderReport(cases []evalCase, runs []runResult, rl roles, review bool, pre
 		if len(sub) == 0 {
 			continue
 		}
-		b.WriteString(newReporter(sub, runs, rl).render(t, review))
+		r := newReporter(sub, runs, rl)
+		r.thresholds = thresholds
+		b.WriteString(r.render(t, review))
 	}
 	return b.String()
 }
@@ -430,21 +433,28 @@ func (r *reporter) hybridWith(decider, title string) {
 		return
 	}
 	r.p("## 混合方案模拟（中文）：%s\n\n", title)
-	r.p("%s 置信度达到阈值时直接用它的判定，否则回落 qwen classifier。只统计两边都有有效结果的样本。\n\n", title)
-	r.p("| 阈值 | %s 自动承接 | 升级比例 | 自动承接错路由 | 混合准确率 |\n|---|---|---|---|---|\n", title)
 	var n, qRight int
+	var baseline []float64
 	for _, c := range r.cases {
 		_, okA := r.correct(jr, c.ID)
 		qc, okB := r.correct(qr, c.ID)
 		if okA && okB {
 			n++
+			baseline = append(baseline, qr.Records[c.ID].TotalMS)
 			if qc {
 				qRight++
 			}
 		}
 	}
-	for _, t := range []float64{0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.99} {
+	if n == 0 {
+		r.p("该子集没有两条路径均成功的样本。\n\n")
+		return
+	}
+	r.p("%s 置信度达到阈值时采纳其路由，否则回落 qwen classifier。两条路径配对成功 %d 条。模拟耗时加总决策和被升级样本的备选耗时。\n\n", title, n)
+	r.p("| 阈值 | %s 自动承接 | 升级比例 | 自动承接错路由 | 混合准确率 | 模拟 P95 (ms) |\n|---|---|---|---|---|---|\n", title)
+	for _, t := range r.thresholds {
 		var handled, wrongAuto, right int
+		latencies := make([]float64, 0, n)
 		for _, c := range r.cases {
 			jc, okA := r.correct(jr, c.ID)
 			qc, okB := r.correct(qr, c.ID)
@@ -452,8 +462,9 @@ func (r *reporter) hybridWith(decider, title string) {
 				continue
 			}
 			rec := jr.Records[c.ID]
-			if rec.Confidence != nil && *rec.Confidence >= t {
+			if rec.Pred != noRoute && rec.Confidence != nil && *rec.Confidence >= t {
 				handled++
+				latencies = append(latencies, rec.TotalMS)
 				if jc {
 					right++
 				} else {
@@ -461,13 +472,15 @@ func (r *reporter) hybridWith(decider, title string) {
 				}
 				continue
 			}
+			latencies = append(latencies, rec.TotalMS+qr.Records[c.ID].TotalMS)
 			if qc {
 				right++
 			}
 		}
-		r.p("| %.2f | %s | %s | %s | %s |\n", t, pct(handled, n), pct(n-handled, n), pct(wrongAuto, handled), pct(right, n))
+		r.p("| %g | %s | %s | %s | %s | %s |\n", t, pct(handled, n), pct(n-handled, n), pct(wrongAuto, handled),
+			pct(right, n), fmtMS(percentile(latencies, 95)))
 	}
-	r.p("| 只用 qwen | 0%% | 100%% | — | %s |\n\n", pct(qRight, n))
+	r.p("| 只用 qwen | 0%% | 100%% | — | %s | %s |\n\n", pct(qRight, n), fmtMS(percentile(baseline, 95)))
 }
 
 // cascade 用真实执行的阶段和耗时计算升级情况，基础设施失败单列在概况。

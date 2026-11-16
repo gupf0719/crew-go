@@ -57,6 +57,9 @@ func TestMemberDispatch_AllAgentRunsGoThroughHelper(t *testing.T) {
 				"NewSharedChildSession 做 events 隔离，跟 6 个走 runMember 的编排「共享父 session 让协作语义生效」" +
 				"是**故意**的语义差；skill fork 在进它之前摘掉全部授予（fail-closed）"},
 		},
+		"background/worker.go": {
+			"call": {2, "后台工作进程以子任务 ID 独立启动或恢复根 Agent，使用独立 session 与持久存档"},
+		},
 		"handoff_agent.go": {
 			"buildComposeGraph": {1, "转交能力的**铸造**点（建 grant 而非转授），每次尝试收一次候选" +
 				"做出的转交决定 + 按历史视图模式分档的条件补记——三样都是这一处独有的"},

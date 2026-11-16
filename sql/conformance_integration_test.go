@@ -60,6 +60,11 @@ func TestPostgresIntegration(t *testing.T) {
 			return db
 		})
 	})
+	t.Run("BackgroundTasks", func(t *testing.T) {
+		runBackgroundTaskScenarios(t, crewsql.Postgres{}, func() *sql.DB {
+			return stdlib.OpenDB(*config)
+		})
+	})
 }
 
 func TestMySQLIntegration(t *testing.T) {
@@ -96,6 +101,15 @@ func TestMySQLIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			return db
+		})
+	})
+	t.Run("BackgroundTasks", func(t *testing.T) {
+		connector, err := mysql.NewConnector(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runBackgroundTaskScenarios(t, crewsql.MySQL{}, func() *sql.DB {
+			return sql.OpenDB(connector)
 		})
 	})
 }

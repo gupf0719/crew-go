@@ -172,8 +172,10 @@ func TestAutoCompact_ReapproveOldSummaryKeepsBusinessQuestion(t *testing.T) {
 	const summaryQuestion, businessQuestion = "approve generated summary?", "approve independent action?"
 	oldSummaryID, saved := loadLegacySummaryCheckpoint(t, "de5a414-custom", businessQuestion)
 	businessID := saved.PendingInterrupts[0].InterruptID
-	var summaryApproved, businessApproved int
+	var summaryCalls, summaryApproved, businessApproved, nodeAttempts int
+	firstAttemptErr := errors.New("summary input temporarily unavailable")
 	summary := &fnModel{fn: func(ctx context.Context, in []*schema.Message) (*schema.Message, error) {
+		summaryCalls++
 		if countUserContent(in, "file history:") != 1 {
 			return nil, errors.New("summary history lost")
 		}
@@ -190,6 +192,10 @@ func TestAutoCompact_ReapproveOldSummaryKeepsBusinessQuestion(t *testing.T) {
 	msgs := []*schema.Message{schema.UserMessage(legacySummaryHistory), schema.AssistantMessage("notes"), schema.UserMessage("new request")}
 	b := compose_v2.NewBuilder().WithName("legacy_dynamic_auto_compact")
 	b.AddNode("model", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		nodeAttempts++
+		if nodeAttempts == 1 {
+			return nil, firstAttemptErr
+		}
 		compacted, err := agent_v2.AutoCompactRun(ctx, cfg, msgs)
 		if err != nil {
 			return nil, err
@@ -219,6 +225,14 @@ func TestAutoCompact_ReapproveOldSummaryKeepsBusinessQuestion(t *testing.T) {
 	run := func() error {
 		return compose_v2.Run(ctx, graph, compose_v2.NewChannelManager(), compose_v2.WithCheckpointer(cp),
 			compose_v2.WithSessionID(saved.ID), compose_v2.WithResumeAnswers(answers), compose_v2.WithResumeUserText("outside summary"))
+	}
+	if err := run(); !errors.Is(err, firstAttemptErr) || !compose_v2.IsRetryable(err) || summaryCalls != 0 || businessApproved != 0 {
+		t.Fatalf("首次续跑应在摘要调用前返回可重试错误，摘要调用 %d 业务审批 %d 错误 %v",
+			summaryCalls, businessApproved, err)
+	}
+	failed, err := cp.LoadNS(ctx, saved.ID, "")
+	if err != nil || failed == nil || !failed.HasResumableWork() {
+		t.Fatalf("可重试错误应保留待执行存档，实际 %+v 错误 %v", failed, err)
 	}
 	newID := compactionQuestionID(t, run(), summaryQuestion)
 	if newID == oldSummaryID || newID == businessID || summaryApproved != 0 || businessApproved != 0 {

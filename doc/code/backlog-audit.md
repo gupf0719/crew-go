@@ -1,6 +1,6 @@
 # 历史待办与 Issue 核验台账
 
-基线为 2026-11-16 的本地和远端 `test`（`e185749`）。独立 worktree 的 `fb1f22e` 只有本次之前的三项 P1 修复，是基线的旁支。两者从 `552685b` 分开。GitHub Issue 查询返回 0 条，仓内 Issue 编号以 [Issue 索引](../issue/issues.md) 和专题 Markdown 为准。
+基线为 2026-11-16 的本地和远端 `test`（`e185749`）。独立 worktree 的 `fb1f22e` 只有本次之前的三项 P1 修复，是基线的旁支。两者从 `552685b` 分开。2026-11-16 完成 A01 的合并态验证，下表记录关闭证据。GitHub Issue 查询返回 0 条，仓内 Issue 编号以 [Issue 索引](../issue/issues.md) 和专题 Markdown 为准。
 
 [现行优先级清单](todo.md)是选择下一批的入口。这里保留 ISSUE-01 至 ISSUE-99、同编号专题、最近复审及历史 TODO 的逐项证据。历史 TODO 的 490 条含主表 327 行、优先级快照 48 项，以及发布、测试、文档和其他章节 115 项。同一事项在不同快照里的记录仍可回查。行号对应 [TODO 快照](todo-history.md)或 `e185749` 的文件。
 
@@ -12,12 +12,12 @@
 
 | 来源 | 状态与归并 | 核对依据 |
 | --- | --- | --- |
-| 合并后复审 P1 · AG-UI 展示副本 | 实现已关闭，待集成 A01 | `fb1f22e` 的 `agui/tool_result_once_test.go` 和 `tool_result_legacy_memo_test.go` 覆盖实时、Resume、旧未确认展示的定稿。提交尚未进入 test。 |
-| 合并后复审 P1 · AutoCompact 误领业务答复 | 实现已关闭，待集成 A01 | `fb1f22e` 的真实 v21 业务挂起档，原业务 ID 保留。摘要调用不再猜测旧问题归属。 |
-| 合并后复审 P1 · 增量摘要旧审批兑付全量视图 | 实现已关闭，待集成 A01 | `fb1f22e` 的旧备忘 fixture、新请求数值、同视图续跑与嵌套审批，旧摘要按新视图重新提问。 |
+| 合并后复审 P1 · AG-UI 展示副本 | A01 已关闭 | 合并态 [AG-UI 展示隔离和 Resume](../../agui/tool_result_once_test.go) 与[旧工具账定稿](../../agui/tool_result_legacy_memo_test.go)通过。实时、续跑与旧档均按原调用实例对账。 |
+| 合并后复审 P1 · AutoCompact 误领业务答复 | A01 已关闭 | 合并态验证公开和内置摘要旧档、业务与摘要答复隔离，以及旧存档首次可重试失败后保留执行记录。 [旧档回归](../../agent_v2/autocompact_legacy_resume_test.go) · [归属与重试](../../agent_v2/autocompact_approval_resume_test.go) |
+| 合并后复审 P1 · 增量摘要旧审批兑付全量视图 | A01 已关闭 | 旧备忘重算、新请求数值、同视图续跑与嵌套审批回归通过。变更后的视图重新提问。 [视图绑定](../../agent_v2/autocompact_approval_resume_test.go) · [嵌套审批](../../agent_v2/autocompact_nested_approval_test.go) |
 | 合并后复审 P2 · AG-UI 迟到 Run | 开放 D01 | `agui/shared_session.go:319`。原 SQLite 双实例实测两个请求都成功，节点执行两次，对照一次。 |
 | 合并后复审 P2 · AG-UI 撤回后仍发工具结果 | 开放 D02 | `agui/adapter.go:427`。真实 SSE 快照撤回后，仍发送无对应调用的结果。 |
-| 合并后复审 P2 · 旧摘要在提前失败后丢失相位 | 合并到 A01 的恢复验收 | 原版 `b7c2241` fixture 可在短暂失败后用旧 ID 续跑。当前 test 的 `compose_v2/graph_loop.go:1509` 清旧挂起并写 v22。待集成方案对无绑定的旧摘要统一重新审批，另验可重试出口仍可完成该流程。 |
+| 合并后复审 P2 · 旧摘要在提前失败后丢失相位 | 随 A01 完成升级验收 | 原版 `b7c2241` fixture 依赖旧相位。合并态覆盖首次可重试失败、原档仍可执行、新摘要问题独立审批、原业务答复仍有效和最终完成。 [归属与重试](../../agent_v2/autocompact_approval_resume_test.go) |
 | 合并后复审 P2 · Redis 清档权限 | 开放 D04 | `redis/checkpointer_delete.go:94`。同一 Redis 7.4.2 运行角色前后版本 Go API 对照，新版报 `EXISTS` 权限不足。 |
 | 合并后复审 P3 · 慢后端取消补偿 | 开放 D05 | `agui/cancellation_recovery.go:150`。逐页第 6 秒返回的守约 backend 在 5 秒预算下持续超时，旧版能推进。 |
 | 合并后复审 P3 · Redis 旧 GraphID | 开放 D07 | `redis/checkpointer_migration.go:55`。真实 Redis 对照，普通 Unicode 成功，旧 writer 存入带非 UTF-8 字节的 GraphID 后迁移失败。 |
@@ -34,6 +34,8 @@
 | Skill 系统设计页 §待办 | 合并中心表 | 资源分层、调用预算、Go Action 及解析规则已实现。嵌套发现、热重载以及可选研究按真实诉求放入能力和待决项。已明确删除的 script/旧字段保留决策依据。 |
 | Structured Output 历史草案 §7–9 | 工具路径关闭。strict 自动切换等已决非目标 | `agent_v2/structured_output.go` 与相关测试支撑当前 forced tool 路径。独立响应模式没有以实现事项进入活跃表。 |
 | 三类根因和悬空工具实施笔记 | 归档，剩余映射到活跃清单 | `WithToolTimeout`、软降落、错误分类与上游审批保留已有测试。悬空工具写时全库扫描、头部事件架构草案已明确不做。具体取消/历史余项按当前入口核验。 |
+
+A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合并覆盖率 88.5%。SQLite 后台恢复、离线路由回放、嵌套冒烟 12/12、Plan Web mock 和 A2A HITL 也已通过。
 
 ## ISSUE-01–64 核验台账
 

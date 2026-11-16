@@ -28,7 +28,7 @@
 //	go run ./example/decision/routing_eval -repeat -review -qwen-ref qwen3.8-max-0902
 //	go run ./example/decision/routing_eval -systems bailian,qwen,cascade-bailian -repeat -bailian-workspace llm-xxxx
 //
-// 缺 key 的系统整个跳过，它的缓存也不进报告。
+// 联机模式缺 key 的系统跳过。-replay 只使用匹配输入指纹的缓存。
 //
 // 结果按「系统 × 条件」缓存在 -out 目录，命中输入指纹的样本不重跑；报告打印到
 // 标准输出，同时写入 -out 目录下的 report.md。
@@ -40,10 +40,13 @@ import (
 	"flag"
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +69,8 @@ func main() {
 	var (
 		systemsFlag  = flag.String("systems", "jev,qwen", "要跑的系统，逗号分隔：jev、bailian、qwen、cascade（Jev 拿不准交给 qwen 的升级链）、cascade-bailian（百炼拿不准交给 qwen）")
 		cascadeMin   = flag.Float64("cascade-threshold", 0.85, "升级链里决策模型那一档的门槛")
+		thresholds   = flag.String("thresholds", "", "混合方案模拟的阈值，逗号分隔，留空取默认扫描点")
+		replay       = flag.Bool("replay", false, "离线回放匹配输入指纹的完整预测缓存")
 		condsFlag    = flag.String("conds", "zh,zh-en,en,zh-default", "要跑的语言条件，逗号分隔；qwen 不跑 zh-en 与 zh-default")
 		setsFlag     = flag.String("set", "", "内嵌样本子集，逗号分隔：standard、hard、real（默认全选）")
 		casePath     = flag.String("cases", "", "业务标注 JSONL 文件，配置后只评测该文件")
@@ -94,7 +99,7 @@ func main() {
 		bailianWorkspace: *blWorkspace, bailianRegion: *blRegion, bailianModel: *blModel,
 		concurrency: *concurrency, limit: *limit, repeat: *repeat, rerun: *rerun, cascadeMin: *cascadeMin,
 		cascadeQwenModel: *cascadeQwen,
-		outDir:           *outDir, review: *review,
+		outDir:           *outDir, review: *review, replay: *replay, thresholds: *thresholds,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, "routing_eval:", err)
 		os.Exit(1)
@@ -110,7 +115,8 @@ type options struct {
 	concurrency, limit                       int
 	cascadeMin                               float64
 	cascadeQwenModel                         string
-	repeat, rerun, review                    bool
+	repeat, rerun, review, replay            bool
+	thresholds                               string
 	outDir                                   string
 }
 
@@ -118,6 +124,13 @@ func run(opt options) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
+	if opt.replay && opt.rerun {
+		return fmt.Errorf("-replay and -rerun are mutually exclusive")
+	}
+	thresholds, err := scanThresholds(opt.thresholds)
+	if err != nil {
+		return err
+	}
 	if opt.casePath != "" && len(opt.sets) > 0 {
 		return fmt.Errorf("-cases and -set are mutually exclusive")
 	}
@@ -162,7 +175,7 @@ func run(opt options) error {
 		runs = append(runs, res)
 	}
 
-	report := renderReport(cases, runs, rl, opt.review, reportPreface(jobs, opt))
+	report := renderReport(cases, runs, rl, opt.review, reportPreface(jobs, opt), thresholds)
 	fmt.Println(report)
 	path := filepath.Join(opt.outDir, "report.md")
 	if err := os.WriteFile(path, []byte(report), 0o644); err != nil {
@@ -172,7 +185,7 @@ func run(opt options) error {
 	return nil
 }
 
-// planJobs 按参数与可用的 key 排出要跑的「系统 × 条件 × 轮次」。缺 key 的系统跳过并提示。
+// planJobs 按参数排出「系统 × 条件 × 轮次」。联机模式跳过缺 key 的系统。
 func planJobs(opt options, conds []condition) ([]job, roles, error) {
 	var jobs []job
 	var rl roles
@@ -190,6 +203,9 @@ func planJobs(opt options, conds []condition) ([]job, roles, error) {
 		}
 	}
 	for _, name := range opt.systems {
+		if opt.replay && (name == "bailian" || name == "cascade-bailian") && opt.bailianWorkspace == "" {
+			return nil, roles{}, fmt.Errorf("replay %s requires the original -bailian-workspace", name)
+		}
 		switch name {
 		case "jev":
 			s, ok := jevDecider(opt)
@@ -210,7 +226,7 @@ func planJobs(opt options, conds []condition) ([]job, roles, error) {
 				add(s, c, false)
 			}
 		case "qwen":
-			if os.Getenv("QWEN_API_KEY") == "" {
+			if !opt.replay && os.Getenv("QWEN_API_KEY") == "" {
 				fmt.Fprintln(os.Stderr, "skip qwen: QWEN_API_KEY is not set")
 				continue
 			}
@@ -227,7 +243,7 @@ func planJobs(opt options, conds []condition) ([]job, roles, error) {
 				}
 			}
 		case "cascade", "cascade-bailian":
-			if os.Getenv("QWEN_API_KEY") == "" {
+			if !opt.replay && os.Getenv("QWEN_API_KEY") == "" {
 				fmt.Fprintf(os.Stderr, "skip %s: QWEN_API_KEY is not set\n", name)
 				continue
 			}
@@ -257,10 +273,10 @@ func planJobs(opt options, conds []condition) ([]job, roles, error) {
 	return jobs, rl, nil
 }
 
-// jevDecider 构造 Jev 系统；缺 key 时提示并返回 false。
+// jevDecider 构造 Jev 系统。联机模式缺 key 时跳过。
 func jevDecider(opt options) (*deciderSystem, bool) {
 	key := os.Getenv("TYPESAFE_API_KEY")
-	if key == "" {
+	if !opt.replay && key == "" {
 		fmt.Fprintln(os.Stderr, "skip jev: TYPESAFE_API_KEY is not set")
 		return nil, false
 	}
@@ -268,14 +284,14 @@ func jevDecider(opt options) (*deciderSystem, bool) {
 }
 
 // bailianDecider 构造百炼系统；key 取 DASHSCOPE_API_KEY，没有就取 QWEN_API_KEY（同一种百炼 key）。
-// 缺 key 或业务空间 ID 时提示并返回 false。
+// 业务空间 ID 用于确定服务端点。联机模式缺业务空间或 key 时跳过。
 func bailianDecider(opt options) (*deciderSystem, bool) {
 	key := os.Getenv("DASHSCOPE_API_KEY")
 	if key == "" {
 		key = os.Getenv("QWEN_API_KEY")
 	}
 	switch {
-	case key == "":
+	case !opt.replay && key == "":
 		fmt.Fprintln(os.Stderr, "skip bailian: neither DASHSCOPE_API_KEY nor QWEN_API_KEY is set")
 		return nil, false
 	case opt.bailianWorkspace == "":
@@ -291,8 +307,8 @@ func isDecider(s system) bool {
 	return ok
 }
 
-// runJob 跑一个执行单元：先读缓存，只对缺失、指纹不符或上次出错的样本发请求，
-// 跑完合并写回缓存。
+// runJob 跑一个执行单元。联机模式更新缺失、失效及上次出错的记录，
+// 离线回放要求每条输入的预测已按原指纹缓存。
 func runJob(ctx context.Context, jb job, cases []evalCase, opt options) (runResult, error) {
 	path := cachePath(opt.outDir, jb)
 	cached, err := loadCache(path)
@@ -306,7 +322,12 @@ func runJob(ctx context.Context, jb job, cases []evalCase, opt options) (runResu
 			continue
 		}
 		rec, ok := cached[c.ID]
-		if opt.rerun || !ok || rec.Err != "" || rec.InputHash != inputHash(jb.sys, c.scenario, c, jb.cond) {
+		matches := ok && rec.InputHash == inputHash(jb.sys, c.scenario, c, jb.cond)
+		if opt.replay {
+			if !matches {
+				return runResult{}, fmt.Errorf("replay %s/%s: missing or stale cache for %q", jb.sys.key(), jb.cond.Name, c.ID)
+			}
+		} else if opt.rerun || !matches || rec.Err != "" {
 			todo = append(todo, c)
 			continue
 		}
@@ -490,8 +511,28 @@ func reportPreface(jobs []job, opt options) string {
 			keys = append(keys, k)
 		}
 	}
+	if opt.replay {
+		return fmt.Sprintf("> 离线重算于 %s，使用已保存的预测和耗时。被测系统为 %s。\n\n",
+			time.Now().Format("2006-01-02 15:04 MST"), strings.Join(keys, "、"))
+	}
 	return fmt.Sprintf("> 生成于 %s。被测系统：%s。qwen 温度 0。每个「系统 × 条件」并发 %d。延迟含本机到各服务的网络往返。\n\n",
 		time.Now().Format("2006-01-02 15:04 MST"), strings.Join(keys, "、"), opt.concurrency)
+}
+
+func scanThresholds(raw string) ([]float64, error) {
+	if raw == "" {
+		return []float64{0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.99}, nil
+	}
+	var thresholds []float64
+	for field := range strings.SplitSeq(raw, ",") {
+		v, err := strconv.ParseFloat(strings.TrimSpace(field), 64)
+		if err != nil || math.IsNaN(v) || v < 0 || v > 1 {
+			return nil, fmt.Errorf("threshold %q must be a number in [0, 1]", field)
+		}
+		thresholds = append(thresholds, v)
+	}
+	slices.Sort(thresholds)
+	return slices.Compact(thresholds), nil
 }
 
 // selectTiers 按子集名过滤样本，子集名不认识时报错。

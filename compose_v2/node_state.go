@@ -180,10 +180,17 @@ func withNodeStateAccessor(ctx context.Context, cm *ChannelManager, id NodeID, i
 	if cm == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, nodeStateAccessorKey{}, &nodeStateAccessor{
+	return withAccessor(ctx, answerScopedAccessor(ctx, &nodeStateAccessor{
 		cm:  cm,
 		key: nodeStateKey(id, instanceID, visit),
-	})
+	}))
+}
+
+func answerScopedAccessor(ctx context.Context, a *nodeStateAccessor) *nodeStateAccessor {
+	if scope := resumeDeliveryFrom(ctx).answerScope; scope != "" {
+		return scopedOf(a, "resume-answer\x00"+scope)
+	}
+	return a
 }
 
 // withAccessor 把 a 装进 ctx（nil 表示「这里没有可记的地方」）。

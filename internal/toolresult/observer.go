@@ -42,16 +42,24 @@ func ObserverFrom(ctx context.Context) *Observer {
 	return observe
 }
 
-// Delivery 描述已经过实际结束钩子的展示。默认只记录是否展示，正文取提交结果。
+// Delivery 描述已经过实际结束钩子的展示。
 type Delivery struct {
-	Projected bool                   `json:"projected,omitempty"`
-	Result    *schema.ToolCallResult `json:"result,omitempty"`
-	ErrorCode *string                `json:"error_code,omitempty"`
+	Projected bool `json:"projected,omitempty"`
+	// UseFinalResult 表示结束钩子明确选用了提交结果，旧记录缺少此标注时无法确认展示内容。
+	UseFinalResult bool                   `json:"use_final_result,omitempty"`
+	Result         *schema.ToolCallResult `json:"result,omitempty"`
+	ErrorCode      *string                `json:"error_code,omitempty"`
 }
 
 // Project 将调用方显式提供的展示副本用于显示。批内裁决等后续产生的新失败使用提交结果。
 func (d *Delivery) Project(result *schema.ToolCallResult) *schema.ToolCallResult {
-	if !d.Projected || result != nil && !result.Success && (d.ErrorCode == nil || *d.ErrorCode != result.ErrorCode) {
+	if !d.Projected {
+		if d.UseFinalResult {
+			return result
+		}
+		return nil
+	}
+	if result != nil && !result.Success && (d.ErrorCode == nil || *d.ErrorCode != result.ErrorCode) {
 		return result
 	}
 	return d.Result
@@ -81,7 +89,9 @@ func (o *Observer) DeferDelivery(ctx context.Context, out *schema.ToolOutput, ca
 		return true
 	}
 	before, display := d.source.Result, out.Result
-	delivery := &Delivery{Projected: d.source != out && resultChanged(before, display)}
+	// 即使当前内容相同，独立的展示副本也应保留，避免后续原地改写流入展示。
+	projected := d.source != out && before != display
+	delivery := &Delivery{Projected: projected, UseFinalResult: !projected}
 	if delivery.Projected {
 		if display != nil {
 			// 存档只需要供宿主显示的字段，不再次保存模型侧的错误正文。
@@ -104,19 +114,6 @@ func (o *Observer) DeferDelivery(ctx context.Context, out *schema.ToolOutput, ca
 // Delivery 返回本次结束钩子选定的展示。nil 表示订阅方没有收到本次结束钩子。
 func (d *DeferredOutput) Delivery() *Delivery {
 	return d.delivery.Load()
-}
-
-func resultChanged(before, display *schema.ToolCallResult) bool {
-	if before == display {
-		return false
-	}
-	if before == nil || display == nil || before.Success != display.Success {
-		return true
-	}
-	if before.Success {
-		return before.Output != display.Output
-	}
-	return before.ErrorCode != display.ErrorCode
 }
 
 // WithStartScope 记录框架的开始钩子相位。业务钩子再派生相位时，发送记录仍写到此处。

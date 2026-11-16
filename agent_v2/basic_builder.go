@@ -935,7 +935,6 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	backgroundNotes, finishToolResult, useToolMemo := b.backgroundNotes, b.finishToolResult, b.useToolMemo
 
 	modelNode := func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
-		ctx = withBuiltInAutoCompactQuestion(ctx)
 		msgs, _ := compose_v2.Get(chs, basicMessagesCh)
 		round, _ := compose_v2.Get(chs, basicRoundCh)
 		// **每个任务至多一个软降落轮**（同一个预算下；续跑时调大了预算，新预算的最后一轮另算）：上一次模型调用就是

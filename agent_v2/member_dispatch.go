@@ -87,7 +87,7 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 	if IsNilAgent(m.agent) {
 		return nil, fmt.Errorf("runMember: nil member agent (含 Go typed nil interface 陷阱)")
 	}
-	subCtx := compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), m.nsSuffix))
+	subCtx := compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.NestedGraphParentNS(ctx), m.nsSuffix))
 	subCtx = pushHistorySegment(subCtx, m.historySlot)
 	// 标记「这次调用发生在成员位置上」。框架自己不读它（防重复写靠写入者维进 ns），
 	// 留给业务的 store 后端按需区分（见 WithSubAgentStoreScope）。
@@ -164,7 +164,7 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 // 返回原始 events 而不是 final：三个调用点要从里面取的东西各不相同（分类结果 / 达标
 // 判定 + 批评全文 / 改进建议），提取逻辑留在各自那边。
 func runDecisionAgent(ctx context.Context, nsSuffix string, ag Agent, sess *RunSession, input *schema.Message, route *routeGrant) ([]*AgentEvent, error) {
-	subCtx := compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), nsSuffix))
+	subCtx := compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.NestedGraphParentNS(ctx), nsSuffix))
 	subCtx = WithSubAgentStoreScope(subCtx, true)
 	subCtx = decisionCtx(subCtx)
 	// 同 runMember：决策 LLM 的执行交给它、它的 agent 级钩子有自己的相位

@@ -36,6 +36,17 @@ func GetGraphNS(ctx context.Context) string {
 	return ""
 }
 
+// NestedGraphParentNS 返回用于派生子图存档位置的父 namespace。
+// 节点内的审批绑定在当前图下分出一条子路径，当前图仍通过 [GetGraphNS] 读取。
+func NestedGraphParentNS(ctx context.Context) string {
+	ns := GetGraphNS(ctx)
+	delivery := resumeDeliveryFrom(ctx)
+	if delivery.answerNamespace != "" && delivery.answerNamespaceParent == ns {
+		return delivery.answerNamespace
+	}
+	return ns
+}
+
 // **历史删除**:
 //   - WithCurrentNS / GetCurrentNS / EnterChildNS (audit follow-up #6): 0 production
 //     caller, godoc 谎报 "业务 tool 算 interrupt_id 用 currentNS" 实际不用. 删整

@@ -146,7 +146,7 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 		// 嵌套 cp 物理分离：从 ctx 取 Checkpointer + sessionID + 父 ns，算子 ns
 		cper := GetCheckpointer(ctx)
 		sid := GetSessionID(ctx)
-		parentNS := GetGraphNS(ctx)
+		parentNS := NestedGraphParentNS(ctx)
 		// ISSUE-96 侧面 2：带上**实例维度**——同一 subgraph 节点被 SendFrom 同 Target
 		// 投递多次时，N 个实例各自的子 cp 必须物理分离。此前只用 id → N 个实例撞同一个
 		// childNS → 后写的覆盖先写的 → 一个实例的进度和它的 HITL 问题静默蒸发。

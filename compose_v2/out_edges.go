@@ -127,7 +127,7 @@ func evalMemberOutEdges(ctx context.Context, g *Graph, cm *ChannelManager, m Fro
 		from:       m.NodeID,
 		instanceID: m.InstanceID,
 		visit:      visit,
-		acc:        &nodeStateAccessor{cm: cm, key: nodeKey},
+		acc:        answerScopedAccessor(ctx, &nodeStateAccessor{cm: cm, key: nodeKey}),
 	})
 	if condRejected(ctx, err) {
 		cm.bumpRerunGen(nodeKey, "")

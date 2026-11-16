@@ -461,7 +461,7 @@ func lastExitEvent(events []*AgentEvent) []*AgentEvent {
 // （见 compose_v2.IsNSInSubtree）。槽号是身份的哈希（见 hashNSIndex），两次输入不同的调用撞进
 // 同一个槽时，被调方续跑时的身份核对会发现并拒绝（见 compose_v2.WithInputIdentity）。
 func nestedCallNS(ctx context.Context, name, key, digest string, positional, rerunnable bool) (ns, identity string, err error) {
-	parentNS := compose_v2.GetGraphNS(ctx)
+	parentNS := compose_v2.NestedGraphParentNS(ctx)
 	caller := identityString(string(compose_v2.GetCurrentNodeID(ctx)), compose_v2.SubCallScope(ctx))
 	fanoutIdx, isInstance := compose_v2.InstanceFanoutIndex(ctx)
 	// 在不在 tool_call 里看章，不看 ID 非空：有的 provider 不回 tool_call ID，那时同一批两个

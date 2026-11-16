@@ -203,12 +203,14 @@ func (h displayToolResult) OnToolEnd(ctx context.Context, info *hook.AgentInfo, 
 	return ctx, nil
 }
 
-type displayedToolModel struct{}
+type displayedToolModel struct {
+	wantResult string
+}
 
-func (displayedToolModel) Generate(_ context.Context, messages []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+func (m displayedToolModel) Generate(_ context.Context, messages []*schema.Message, _ ...model.Option) (*schema.Message, error) {
 	for _, message := range messages {
 		if message.Role == schema.RoleTool {
-			if message.Content != "model-only data" {
+			if message.Content != m.wantResult {
 				return nil, fmt.Errorf("model received display content: %q", message.Content)
 			}
 			return schema.AssistantMessage("done"), nil
@@ -251,7 +253,7 @@ func TestToolResult_RespectsDisplayHook(t *testing.T) {
 				hooks := tc.hook
 				hooks.Hooks = ui
 				return agent_v2.NewBasicAgent(agent_v2.WithName("lookup"), agent_v2.WithToolkit(tk),
-					agent_v2.WithModel(displayedToolModel{}), agent_v2.WithHooks(hooks))
+					agent_v2.WithModel(displayedToolModel{wantResult: "model-only data"}), agent_v2.WithHooks(hooks))
 			}, agui.WithCheckpointer(compose_v2.NewInMemoryCheckpointer()))
 			first := parseSSE(postAGUI(h, `{"threadId":"display-review","runId":"first","messages":[{"role":"user","content":"run"}]}`).Body.String())
 			last := first
@@ -284,6 +286,101 @@ func TestToolResult_RespectsDisplayHook(t *testing.T) {
 			wantHidden := tc.hook.hide || tc.hook.hideReplay
 			if wantHidden && len(contents) != 0 || !wantHidden && (len(contents) != 1 || contents[0] != "[redacted]" || resultIDs[0] != start) {
 				t.Fatalf("展示结果应由工具结束钩子决定，调用 %v，内容 %q", resultIDs, contents)
+			}
+		})
+	}
+}
+
+type copyToolDisplay struct {
+	hook.Hooks
+	independent bool
+}
+
+func (h copyToolDisplay) OnToolEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ToolOutput) (context.Context, error) {
+	display := *out
+	if h.independent {
+		// 本次结果无需脱敏，前端仍接收自己的结果副本。
+		result := *out.Result
+		display.Result = &result
+	}
+	return h.Hooks.OnToolEnd(ctx, info, &display)
+}
+
+type addModelToolDetail struct {
+	hook.NoOpHooks
+	detail string
+	ask    bool
+}
+
+func (h addModelToolDetail) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ToolOutput) (context.Context, error) {
+	out.Result.Output += h.detail
+	if h.ask {
+		_, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "提交工具批次？"})
+		return ctx, err
+	}
+	return ctx, nil
+}
+
+func TestToolResult_KeepsIndependentDisplayCopy(t *testing.T) {
+	const publicResult = "public lookup result"
+	const modelDetail = " contextual detail for the model only"
+	for _, tc := range []struct {
+		name       string
+		copyOutput bool
+		copyResult bool
+		resume     bool
+	}{
+		{name: "independent", copyOutput: true, copyResult: true},
+		{name: "independent_after_resume", copyOutput: true, copyResult: true, resume: true},
+		{name: "shared_result", copyOutput: true},
+		{name: "original_output"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int
+			h := ownedHandler(func(ui hook.Hooks) agent_v2.Agent {
+				tk := tool.NewToolkit()
+				tk.Register(tool.NewFuncTool("lookup", "查询", nil, func(context.Context, map[string]any) (*tool.Result, error) {
+					calls++
+					return tool.Success(publicResult), nil
+				}))
+				display := ui
+				if tc.copyOutput {
+					display = copyToolDisplay{Hooks: ui, independent: tc.copyResult}
+				}
+				hooks := hook.NewChainHooks(display, addModelToolDetail{detail: modelDetail, ask: tc.resume})
+				return agent_v2.NewBasicAgent(agent_v2.WithName("lookup"), agent_v2.WithToolkit(tk),
+					agent_v2.WithModel(displayedToolModel{wantResult: publicResult + modelDetail}), agent_v2.WithHooks(hooks))
+			}, agui.WithCheckpointer(compose_v2.NewInMemoryCheckpointer()))
+			first := parseSSE(postAGUI(h, `{"threadId":"display-copy","runId":"first","messages":[{"role":"user","content":"run"}]}`).Body.String())
+			last, events := first, first
+			if tc.resume {
+				id := findInterruptID(first)
+				if id == "" || contains(eventTypes(first), "TOOL_CALL_RESULT") {
+					t.Fatalf("提交前应挂起且不发工具结果，实际 %v", eventTypes(first))
+				}
+				last = resumeEntries(t, h, "display-copy", "resumed", resolved(id, "提交"))
+				events = append(events, last...)
+			}
+			var starts, resultIDs, contents []string
+			for _, ev := range events {
+				switch ev["type"] {
+				case "TOOL_CALL_START":
+					starts = append(starts, ev["toolCallId"].(string))
+				case "TOOL_CALL_RESULT":
+					resultIDs = append(resultIDs, ev["toolCallId"].(string))
+					contents = append(contents, ev["content"].(string))
+				}
+			}
+			if outcomeType(last) != "success" || calls != 1 || len(starts) != 1 || len(resultIDs) != 1 || resultIDs[0] != starts[0] {
+				t.Fatalf("应成功执行一次并按原调用身份发结果，调用 %d 次，开始 %v，结果 %v，事件 %v",
+					calls, starts, resultIDs, eventTypes(events))
+			}
+			want := publicResult
+			if !tc.copyResult {
+				want += modelDetail
+			}
+			if contents[0] != want {
+				t.Fatalf("前端收到工具结果 %q，期望 %q", contents[0], want)
 			}
 		})
 	}

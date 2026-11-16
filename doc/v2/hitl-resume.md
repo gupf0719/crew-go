@@ -259,6 +259,7 @@ type InterruptSite struct {
 
     InToolCall bool   // 在不在某个 tool_call 里（false 时不计入哈希）
     Phase      string // 所在相位：节点体为空；钩子、交接出去的那一段各有名字（空时不计入）
+    AnswerScope string // 审批对象的绑定范围（空时不计入）
 
     RerunGen       int    // 所在分域被条件边否决、重做了几次（0 时不计入哈希）
     OuterRerunGens string // 嵌套图里：承载它的每一层外层执行的重做代际（全 0 时为空、不计入）
@@ -283,6 +284,7 @@ func (s InterruptSite) InterruptID() string  // fnv64a → 16 hex chars
 | **ToolCallID** | 模型给的 ID——可能为空（有的 provider 不回），所以它不回答「在不在 tool_call 里」|
 | **InToolCall** | 「在某个 tool_call 里」与「不在任何 tool_call 里」——ID 为空、下标为 0 时只靠前两维分不开：钩子里的提问与 tool_call #0 里的提问撞成同一个 ID，用户答了前一问、后一问被判「答案已兑付」、整个 Run 终局失败（实测）|
 | **Phase** | 相位：图的钩子、业务工具钩子（每次调用一个）、嵌套调用的被调方在自己图外的那一段各有名字（`compose_v2.EnterPhase` / `HandOver`，各有自己的计数器）。被调方在图外提问时 ns 是它的、节点与 tool_call 维却是调用方的——调用方节点恰好叫 "tools" 时跟被调方 tools 节点钩子里的提问撞 ID（实测，不需要空 ID）|
+| **AnswerScope** | AutoCompact 等调用可用 `compose_v2.WithResumeAnswerScope` 把同一执行位置的答复和步骤状态绑定到审批对象。派生相位继承绑定。节点内绑定后，子图从该绑定的 namespace 派生存档位置。 |
 | **ToolCallIdx** | 一轮里第几个 tool_call（节点内并发扇出）|
 | **Idx** | 同一个相位里问了第几次（一个工具连问两次）|
 | **RerunGen** | 同一次节点执行**被条件边否决之后重做**时在同一个位置问的问题（否决不推进 visit）——没有它的话调用方累积传的「批准 v1」直接兑付给 v2。按分域算：嵌套图的入口否决只让产出那份输入的分域（某个 tool_call、某个钩子相位；经 `RunSubAgent` 调起的 agent 的主图算调用方的）换代，兄弟 tool_call 的提问 ID 不变。被调方在自己的图之外问的（交接出去的那一段，如 a2a RemoteAgent 的 human gate）从交接那一层数起：调用方那一层被否决重做时，身份没变的那次调用里已答的问题不换 ID |

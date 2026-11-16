@@ -1,0 +1,158 @@
+{
+  "checkpoint": {
+    "id": "75d311bc-15d5-4e13-8135-4fb5187c97bc",
+    "status": 1,
+    "schema_ver": 21,
+    "graph_id": "compact:074755ef1695d773",
+    "task_id": "da3572fea8b252ea",
+    "channels": {
+      "__basic_agent_compaction__": {
+        "type": "*agent_v2.compactionMemo",
+        "data": {
+          "upto": 2,
+          "anchor": "2:ba82ba2105ab7cd6",
+          "head": [
+            {
+              "id": "38d58898bbe00523c9343318e8ae0d36",
+              "role": "user",
+              "content": "# Previous Conversation Summary\n\ncondensed stable first pass",
+              "annotations": {
+                "compaction_summary": true
+              }
+            }
+          ],
+          "transient": true
+        }
+      },
+      "__basic_agent_final__": {
+        "type": "*schema.Message",
+        "data": {
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "tool_call",
+              "toolcall": {
+                "type": "",
+                "id": "new-tool",
+                "arguments": "{}",
+                "name": "inspect"
+              }
+            }
+          ],
+          "annotations": {
+            "run_id": "a73e895b-06ab-4fb4-a92e-92234fa52d01",
+            "tool_call_batch_id": "1a50c5cb-4207-4748-8c0a-fd57a68e7b44"
+          }
+        }
+      },
+      "__basic_agent_final_round__": {
+        "type": "bool",
+        "data": false
+      },
+      "__basic_agent_messages__": {
+        "type": "[]*schema.Message",
+        "data": [
+          {
+            "id": "ec3ffd0b74adda2a9904147a405ed4e5",
+            "role": "user",
+            "content": "raw history document history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes history notes "
+          },
+          {
+            "id": "fe824e3ce10cd589f1a96ca78dd0423f",
+            "role": "assistant",
+            "content": "notes recorded"
+          },
+          {
+            "id": "19d156359fb17cd11208927a0a33563d",
+            "role": "user",
+            "content": "begin"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "content_blocks": [
+              {
+                "type": "tool_call",
+                "toolcall": {
+                  "type": "",
+                  "id": "new-tool",
+                  "arguments": "{}",
+                  "name": "inspect"
+                }
+              }
+            ],
+            "annotations": {
+              "run_id": "a73e895b-06ab-4fb4-a92e-92234fa52d01",
+              "tool_call_batch_id": "1a50c5cb-4207-4748-8c0a-fd57a68e7b44"
+            }
+          },
+          {
+            "role": "tool",
+            "content": "OK",
+            "content_blocks": [
+              {
+                "type": "tool_result",
+                "toolresult": {
+                  "type": "",
+                  "toolCallId": "new-tool",
+                  "content": "OK"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "__basic_agent_preamble_input__": {
+        "type": "*BasicAgentPreambleInput",
+        "data": {
+          "UserInput": {
+            "id": "19d156359fb17cd11208927a0a33563d",
+            "role": "user",
+            "content": "begin"
+          }
+        }
+      },
+      "__basic_agent_round__": {
+        "type": "int",
+        "data": 1
+      },
+      "__basic_agent_tool_binding__": {
+        "type": "*agent_v2.toolBinding",
+        "data": null
+      },
+      "__basic_agent_tools_used__": {
+        "type": "bool",
+        "data": true
+      }
+    },
+    "pending_interrupts": [
+      {
+        "question": "approve incremental view?",
+        "interrupt_id": "69c26f34cbe7bf28"
+      }
+    ],
+    "current_frontier": [
+      {
+        "node_id": "model"
+      }
+    ],
+    "frontier_started": true,
+    "node_visits": {
+      "model": 1,
+      "preamble": 1,
+      "tools": 1
+    },
+    "completed_write_owners": null,
+    "node_states": {
+      "2e3d59b47374d601:scope:a39bcd408416b1aa454864f06d987d30:redo0:fb5f8c1862fd34564e27336c9374ffbe": {
+        "type": "bool",
+        "data": true
+      },
+      "2e3d59b47374d601:scope:a39bcd408416b1aa454864f06d987d30:redo0:fb5f8c1862fd34564e27336c9374ffbe:streams": {
+        "type": "compose_v2.nodeStreams",
+        "data": null
+      }
+    }
+  }
+}

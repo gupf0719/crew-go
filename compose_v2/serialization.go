@@ -283,6 +283,8 @@ func UnmarshalTagged(data []byte) (any, error) {
 
 //   - v22：公开 AutoCompact 的旧固定相位恢复以存档版本为界。恢复旧相位后在 NodeStates 记住调用归属。
 
+//   - v23：AutoCompact 的审批绑定摘要调用和输入视图，将视图代际保存在节点状态。旧摘要审批续跑时重新提问。
+
 // CheckpointSchemaVer 是 Checkpoint 当前存档版本号。恢复时可据此识别旧版运行状态的语义。
 // Marshal 和 Unmarshal 不按版本拒绝存档。
 //
@@ -298,7 +300,7 @@ func UnmarshalTagged(data []byte) (any, error) {
 //   - 业务侧迁移逻辑负责按 cp.SchemaVer 分支决定 unmarshal 字段
 //   - framework 加 `Migrate(v Old, vNew int) (*Checkpoint, error)` 类工具
 //   - 不在 Unmarshal 路径加 fail-fast
-const CheckpointSchemaVer = 22
+const CheckpointSchemaVer = 23
 
 // checkpointSchemaVer (private alias 保 framework 内部 reference 兼容).
 const checkpointSchemaVer = CheckpointSchemaVer

@@ -106,7 +106,7 @@ func TestAutoCompact_SummaryAndMainAskResumeSeparately(t *testing.T) {
 				return nil, errors.New("summary received an unrelated answer")
 			}
 		}
-		// 在相同节点位置重建合并前 test 分支使用的摘要相位，不消耗实际提问的序号。
+		// 在摘要内部再开同名相位，当前请求的答复范围应沿用。
 		previousSummaryID = compose_v2.CurrentInterruptSite(compose_v2.EnterPhase(ctx, "auto_compact")).InterruptID()
 		ans, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "批准摘要？"})
 		if err != nil {
@@ -142,7 +142,7 @@ func TestAutoCompact_SummaryAndMainAskResumeSeparately(t *testing.T) {
 	_, err := ag.Run(ctx, sess, schema.UserMessage("new question"))
 	summaryID := compactionQuestionID(t, err, "批准摘要？")
 	if summaryID != previousSummaryID {
-		t.Fatalf("摘要提问 ID %q 与既有存档中的身份 %q 不同", summaryID, previousSummaryID)
+		t.Fatalf("摘要提问 ID %q 与相同答复范围下的身份 %q 不同", summaryID, previousSummaryID)
 	}
 	answers := map[string]*schema.Message{
 		summaryID:   schema.UserMessage("summary"),

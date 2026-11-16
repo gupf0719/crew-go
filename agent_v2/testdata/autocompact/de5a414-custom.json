@@ -1,0 +1,23 @@
+{
+  "checkpoint": {
+    "id": "legacy-dynamic-auto-compact",
+    "status": 1,
+    "schema_ver": 21,
+    "graph_id": "legacy_dynamic_auto_compact",
+    "task_id": "5c76c6d8bcb79cd6",
+    "pending_interrupts": [
+      {
+        "question": "approve independent action?",
+        "interrupt_id": "c51d1a9a144fad9c"
+      }
+    ],
+    "current_frontier": [
+      {
+        "node_id": "model"
+      }
+    ],
+    "frontier_started": true,
+    "completed_write_owners": null
+  },
+  "first_answer_id": "5bb2b1fe53840cfa"
+}

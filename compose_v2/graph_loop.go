@@ -617,7 +617,6 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 进一张新图 ⟹ 外层图的节点位置作废。不清的话子图的 OnNodeStart 会读到父节点的
 	// 身份（普通 ctx value 跨边界继承），算出的中断身份跨 Resume 会漂。
 	ctx = clearInheritedNodePosition(ctx)
-	ctx = withRestoredResume(ctx, nil)
 	// 出口读写的宽限状态：外层 Run 放过就沿用（后端在这个任务的出口挂住过，各层都不再等，见 exitGrace）
 	ctx, releaseExitGrace := withExitGrace(ctx)
 	defer releaseExitGrace()
@@ -679,7 +678,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	}
 	detachedSID = cfg.sessionID
 	if cfg.graphNS == "" {
-		cfg.graphNS = GetGraphNS(ctx)
+		cfg.graphNS = NestedGraphParentNS(ctx)
 	}
 	if cfg.sessionID != "" {
 		var err error
@@ -1491,7 +1490,6 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		if err := cm.Restore(cfg.resumeFrom); err != nil {
 			return fmt.Errorf("auto-restore: %w", err)
 		}
-		ctx = withRestoredResume(ctx, cfg.resumeFrom)
 		restoreRejected = false
 		// 从存档续跑：已提交的进度原样拿回、不重新交出流，所在那段执行取代的东西一个都不撤（见 stream_attempt.go）
 		markStreamsUncertain(ctx)
@@ -2649,7 +2647,8 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 			// 的字面量链是空的：钩子里嵌套图的入口否决推进了钩子这一格，钩子自己看不见，按
 			// Rerunnable 记的产出原样拿回、续跑永不收敛；草稿不记时嵌套图里的提问不换 ID，对 v1
 			// 的批准兑付给了 v3——均实测）
-			a = scopedOf(&nodeStateAccessor{cm: cm, key: nodeStateKey(id, instanceID, visit)}, sc)
+			a = answerScopedAccessor(base, &nodeStateAccessor{cm: cm, key: nodeStateKey(id, instanceID, visit)})
+			a = scopedOf(a, sc)
 		}
 		return withHookPhase(base, sc, a)
 	}

@@ -557,9 +557,11 @@ type ResumeContext struct {
 type resumeCtxKey struct{}
 
 type resumeDelivery struct {
-	context       *ResumeContext
-	addressedOnly bool
-	restored      *restoredResume
+	context               *ResumeContext
+	addressedOnly         bool
+	answerScope           string
+	answerNamespace       string
+	answerNamespaceParent string
 }
 
 func resumeDeliveryFrom(ctx context.Context) resumeDelivery {
@@ -630,6 +632,31 @@ func WithAddressedResumeOnly(ctx context.Context) context.Context {
 	delivery := resumeDeliveryFrom(ctx)
 	delivery.addressedOnly = true
 	return context.WithValue(ctx, resumeCtxKey{}, delivery)
+}
+
+// WithResumeAnswerScope 把当前调用及其派生调用的寻址答复和节点私有态绑定到 scope，同时隐藏非寻址恢复数据。
+// scope 是调用方根据审批对象计算的稳定身份，随 [EnterPhase] 和子图保留。嵌套绑定依次叠加。
+// 从节点中打开绑定时，派生子图从该绑定的 namespace 派生存档位置。
+// 空 scope 与 [WithAddressedResumeOnly] 等效。
+func WithResumeAnswerScope(ctx context.Context, scope string) context.Context {
+	if scope == "" {
+		return WithAddressedResumeOnly(ctx)
+	}
+	delivery := resumeDeliveryFrom(ctx)
+	delivery.addressedOnly = true
+	delivery.answerScope += strconv.Itoa(len(scope)) + ":" + scope
+	// 先读取调用位置并且不占用提问序号。已完成的旧子图节点不会在另一份审批视图中被重放。
+	site := interruptSiteFromCtx(ctx)
+	site.AnswerScope = delivery.answerScope
+	if id := site.InterruptID(); id != "" {
+		delivery.answerNamespaceParent = site.GraphNS
+		delivery.answerNamespace = JoinNS(site.GraphNS, "approval-"+id)
+	}
+	ctx = context.WithValue(ctx, resumeCtxKey{}, delivery)
+	if accessor := nodeStateAccessorFrom(ctx); accessor != nil {
+		ctx = withAccessor(ctx, answerScopedAccessor(ctx, accessor))
+	}
+	return ctx
 }
 
 // GetResumeContext 从 ctx 读取可供当前调用直接查看的恢复数据。
@@ -1098,6 +1125,10 @@ type InterruptSite struct {
 	// 提问撞成同一个 ID（实测，不需要空 ID）。为空时不计入哈希。
 	Phase string
 
+	// AnswerScope 将同一执行位置的答复进一步绑定到审批对象，由 [WithResumeAnswerScope] 设置。
+	// 为空时沿用普通提问的身份。
+	AnswerScope string
+
 	// TaskID 是**唯一一个跨任务的维度**——「这一次任务」的代号，新开时铸、续跑时从存档
 	// 读回。
 	//
@@ -1342,6 +1373,7 @@ func interruptSiteFromCtx(ctx context.Context) InterruptSite {
 		ToolCallIdx:    GetCurrentToolCallIndex(ctx),
 		InToolCall:     InToolCall(ctx),
 		Phase:          SubCallScope(ctx),
+		AnswerScope:    resumeDeliveryFrom(ctx).answerScope,
 		TaskID:         GetCurrentTaskID(ctx),
 		RerunGen:       RerunGeneration(ctx),
 		OuterRerunGens: outerRerunGensID(ctx),
@@ -1405,11 +1437,14 @@ func (s InterruptSite) InterruptID() string {
 	if s.InToolCall {
 		_, _ = h.Write([]byte(":t"))
 	}
-	// 相位名是不透明的串（可能含 NUL），带长度写入：它排在最后，前面各段也都不含 ':' 以外的
-	// 分隔歧义，长度前缀让「相位名的内容」与「后面再加的段」永远分得开。
+	// 相位和答复绑定都是不透明的串。长度前缀区分各字段及字段内的分隔符。
 	if s.Phase != "" {
 		_, _ = fmt.Fprintf(h, ":p%d:", len(s.Phase))
 		_, _ = h.Write([]byte(s.Phase))
+	}
+	if s.AnswerScope != "" {
+		_, _ = fmt.Fprintf(h, ":a%d:", len(s.AnswerScope))
+		_, _ = h.Write([]byte(s.AnswerScope))
 	}
 	return fmt.Sprintf("%016x", h.Sum64())
 }

@@ -93,7 +93,7 @@
 | multimodal 工具（1.8）| ➖ 非缺口 | ❌ 不跟进 | 按 tool 实现 |
 | v3 streaming（2.1）| ➖ 非缺口 | ❌ 不跟进 | 传输层 |
 
-> ⏳ **harness 整体接入未完**：agentsmd（1.1 ✅）只是 harness 的一块——经 2026-06 scoping（8 源调研，见 [`harness-survey.md`](harness-survey.md) §四决策记录）：**工具审批层 P1 ✅ 已做**（`agent_v2/approval.go`：WithApprovalMode / ApprovalAuto / ApprovalAsk）、后台 async P2 defer、指令分层 **skip**（eino 同构无缺口）、TodoProvider defer（业务自建）。**别把「agentsmd ✅」读成「harness 完成」。**
+> ⏳ **harness 整体接入未完**：agentsmd（1.1 ✅）只是 harness 的一块——经 2026-06 scoping（8 源调研，见 [`harness-survey.md`](harness-survey.md) §四决策记录）：**工具审批层 P1 ✅ 已做**（`agent_v2/approval.go`：WithApprovalMode / ApprovalAuto / ApprovalAsk）、显式持久后台子 Agent 已进入 test（[e185749](https://github.com/gupf0719/crew-go/commit/e18574950566e8b5a52f1f9ebff0f3da50028bca)）、指令分层 **skip**（eino 同构无缺口）、TodoProvider defer（业务自建）。**别把「agentsmd ✅」读成「harness 完成」。**
 
 > 跨篇延伸（不在本表重复）：**OTel 可观测对齐**（invoke_agent SpanKind + token 名）见 [`observability-trace-spec.md`](observability-trace-spec.md) §四；**harness provider 缺口**（Todo/审批/后台 agent/AGENTS.md）见 [`harness-survey.md`](harness-survey.md) §四；**skill 升级点**（eino 压缩预算 PreserveSkills 🟡P1 / MAF 脚本+CrewAI 自动晋升 🟢P2）见 [`skill-system.md`](skill-system.md) 行业收敛节。
 

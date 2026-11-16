@@ -46,7 +46,7 @@ overshoot 到 ~并发度才熔断（实测 N=200 并发 → 主候选被打 ~6 �
 特性（AutoCompact/ReactiveCompact 同样复用并接受）；精确截断需 breaker 层加 singleflight
 （独立任务）。详见 `WithBreaker` godoc。onSwitch 回调并发触发，业务回调访问共享态需自行加锁。
 
-**待办（设计 §11 仍开放）**：Stream 首-chunk peek 增强切换（需 StreamReader Copy 能力，未核实）。
+**流式切换**在首个有效片段前完成，使用 `schema.StreamReader.ReadAhead` 保存预读内容。详见 §6。
 （`member.tripped` metric 已实现见 §11.6；`agent_v2` 语法糖已决不加见 §11.3。）
 
 ---
@@ -539,10 +539,9 @@ OpenAI、Anthropic 和 decision 客户端使用 `model.ParseRetryAfter`。可用
 
 ## 11. 待定问题 / 风险（2026-06 落地后已收敛）
 
-> 落地后本节已同步实现状态（详见 §0）：②③④⑤⑦ 已决/已实现、⑧ 已接受为固有代价；
-> 仅 **① 仍真开放**（⑥ `member.tripped` metric 已实现，`cbcfe9fd`；2026-09-18 核验），已进中心 backlog（[`doc/code/todo.md`](../code/todo.md)）。
+> ① 首片段前切换与 ⑥ 熔断指标均已实现。②③④⑤⑦ 的决定和实现见下，⑧ 为既定代价。
 
-1. **已落地首片段前切换**。使用 `schema.StreamReader.ReadAhead`，见 `6。
+1. **已落地首片段前切换**。使用 `schema.StreamReader.ReadAhead`，见 §6。
 2. **[已决] 结构化错误回填**——`model.APIError` 已落地（`model/error.go` + §0 P0，openai client 5 处回填；qwen/deepseek 复用 openai.Client 自动受益）。
 3. **[已决] 不加 `agent_v2` 语法糖**——装饰器已在 model 层够用，加 `WithFallbackModels` 反模糊「这是 model 层能力」的边界（grep 确认无此 API，定案不加）。
 4. **[已决] onSwitch 独立回调**——已实现 `WithFallbackHook`（§7），不塞进 hook 体系（切换早于 agent/orch hook 触发时机）。

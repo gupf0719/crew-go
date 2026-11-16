@@ -1,5 +1,7 @@
 # crew-go 问题清单（v1 时代历史 ISSUE + v2 ISSUE-73 起）
 
+当前状态见 [优先级清单](../code/todo.md) 和 [ISSUE-01 至 ISSUE-99 逐条核验](../code/backlog-audit.md)。本页保留原始题目、实施经过与历史链接。
+
 > ⚠️ **历史 ISSUE 集合**：本目录 ISSUE-40~72 + 本清单本身都是 v1 时代
 > （`agent/` + `compose/`，GraphState-based）的问题跟踪。Stage 7 后 v1 已删，
 > 文中所有 `compose/*.go:line` / `agent/*.go:line` 引用都是 v1 路径。
@@ -14,7 +16,7 @@
 
 | ISSUE | 状态 | 主题 | 文件 |
 |---|---|---|---|
-| **ISSUE-73** | 进行中 | v2 文档 audit 跟踪 | [issue-73-v2-doc-audit-tracking.md](issue-73-v2-doc-audit-tracking.md) |
+| **ISSUE-73** | 主体已关闭，文档余项归中心清单 | v2 文档 audit 跟踪 | [issue-73-v2-doc-audit-tracking.md](issue-73-v2-doc-audit-tracking.md) |
 | **ISSUE-74** | ✅ 已修（2026-05-14）| BasicAgent buildInitialMessages preamble 阶段 InterruptError 不存 cp（R25 audit HIGH-2 发现，方案 A preamble 节点化 6 step 落地）| [issue-74-preamble-hitl-cp-gap.md](issue-74-preamble-hitl-cp-gap.md) |
 | **ISSUE-75** | ✅ 已修（2026-05-15）| BasicAgent commitFinal postamble 阶段 InterruptError 后 cp 已 cleanup（R27a audit HIGH-1 发现）—— 方案 A postamble 节点化落地（与 ISSUE-74 完全对称）：commitFinal 迁到 graph 末段独立 postamble 节点，抛 Interrupt 时 cleanupOnSuccess 不触发 cp 保留供 Resume | [issue-75-postamble-hitl-cp-gap.md](issue-75-postamble-hitl-cp-gap.md) |
 | **ISSUE-76** | ✅ 已修（2026-05-15）| AutoCompact 在 Memory-enabled + 单 user input + 多 ReAct 轮场景下静默失效（R29 audit 视角 2 MED-1 发现）—— 方案 A 增强版: AutoCompactRun 检测 [0..tailStartIdx) 全 protected (mem/skill marker) 时 reset tailStartIdx 让真实 ReAct 轮组进 early summarize | [issue-76-autocompact-memory-fallback-gap.md](issue-76-autocompact-memory-fallback-gap.md) |
@@ -34,11 +36,11 @@
 | **ISSUE-90** | ✅ 已实现 | Plan Web 会话查询、Redis 多副本续跑、删除与完成即清理 | [会话生命周期](issue-90-plan-chat-web-lifecycle-prod.md) |
 | **ISSUE-91** | ✅ 已实现 | `agent_v2.NewAgentFunc` 将文本函数接入编排及存档 | [外部 Agent 接入](issue-91-external-agent-adapter.md) |
 | **ISSUE-92** | ✅ 已实现 | Skill 参考分层、匹配、读取预算、授权和去重 | [参考文档分层](issue-92-skill-source-layering.md) |
-| **ISSUE-93** | 📋 记录跟踪（2026-06-05）| HandoffAgent 模型 B 阶段 2 audit 遗留 3 LOW（同批已修 MED pending key 碰撞 `34a0c87` + active 跨实例污染 `92f9078` + doc/godoc stale `6bc28bf`）——①historyMode ctx 泄漏非 handoff 编排内层 BasicAgent（未触发，修需 7 编排 churn 大，godoc 已注明）②SelfHistoryCompacted cutoff dead（既有非 handoff 引入，AutoCompact summary 不 AddEvent → 退化等同 SelfHistory，对 handoff 无影响）③~~consumePendingTransfer >64 tool_call 静默丢~~（已随转交信号改走 ctx 收件槽消失）；+ by-design Raw orphan tool_call（opt-in 已知风险文档已警示非 bug）。<br>**2026-09-18 核验**：①② 仍在。① 当初「修需 7 编排 churn 大」的理由已被编排派发收敛（`f9626d1a`）削弱，但仍不是单点——`runMember` 与 `runSubAgent` 都要改，`runDecisionAgent` 与 skill fork 也会把 mode 透传下去；ISSUE-98 之后 historyMode 还决定输入要不要 AddEvent、历史怎么去重，泄漏的影响已不止可见性（未实测）| [issue-93-handoff-modelb-audit-low.md](issue-93-handoff-modelb-audit-low.md) |
-| **ISSUE-94** | ⚪ **已解决**（2026-07-27，`2b5c9bc`）—— 加 `CPStatusFailed` | **非-interrupt 致命错留下的存档被当成「有人在等答案」自动捡起**。根因不是「留了 cp」而是**存档在说谎**：`SnapshotForGraph` 无条件标 Pending，破坏了 auto-load 赖以成立的不变量（cp 存在 ⇒ 真有人等答案）。解法：出口按 `IsControlFlowSignal` 判——中断 / 软取消 / 陈旧写回是挂起（照常 Pending），其余标 `CPStatusFailed`。**完全不看错误是瞬时还是确定性**（框架判不了也不必判），绕开了原 backlog 卡住的那个难点。标了之后 `ListPending` 不返它（不再静默重撞），但**存档保留** + 新增 `Status.Resumable()`，业务显式 `WithResumeFrom` 仍能从失败点续跑——crash-recovery 能力不丢。durability 中途写的不受影响（恒 Pending，那是崩溃恢复点）| [issue-94-dangling-cp-nonterminal-error.md](issue-94-dangling-cp-nonterminal-error.md) |
-| **ISSUE-98** | 🟢 **已实施**（2026-07-23）—— 历史层落地（`agent_v2.WithHistory` + `HistoryStore` + conformance）、三写入点接上、`prior` 换源、伪历史 cp API（`cp.ThreadID`/`ListByThread`/`LatestByThread`/`ErrThreadNotFound`）连 redis/sql backend 一并删除 | **opt-in 会话历史层**——业务要「列会话 / 接着上次聊 / 回看某轮」，现在做不到。缺两样：① **跨 Run 会话身份**（cp 主键、store key 前缀、`cp.ThreadID` 三处都 per-Run，而业务经 `WithThreadIDCtx` 声明的值只喂了 observability 和 handoff）② **完整对话流不跨 Run**（`basicMessagesCh` 是 append-only 完整流、压缩从不写回、postamble 拿得到全量——但随 cp「成功即清」蒸发，`WithStoreMemory` 就在那个位置却只舀走最后一条 assistant）。**外溢出两个已存在缺陷**：多轮对话喂给模型的 `prior` 残缺（读 events，实测第二轮只剩「问题 + 结论」，工具调用和结果全丢，模型无法判断结论来源）——**三方零例外都没这个问题**，根因是「事件流当审计摘要写、当完整历史读」的契约不一致；`ListByThread`/`LatestByThread` 名不副实。**形态**：真相源位置学 LangGraph（channel）、持久化分层学 OpenAI/MAF（历史独立层、跟 cp 零耦合）。**不走 LangGraph 一套**（cp 无消息级归属 + O(N²) + 要放弃「成功即清」，且它自己的 ShallowPostgresSaver 试过这形状已弃用）；**不走 eino 形态**（它 runSession 框架管、我们 RunSession 业务管，实测不传 sess 的 Resume 会出错）。**决策**：增量写 / 每超步 / 异步不阻塞 / append-only 免游标 / 写失败吞+warn / 内部决策 LLM 不进历史 / 不提供 ListConversations——每条都有业内依据 | [issue-98-conversation-history.md](issue-98-conversation-history.md) |
-| **ISSUE-99** | ⚪ **CLOSED**（2026-07-24）—— 随 `WithIncrementalSkillListing` 一并删除，触发路径不再存在 | **增量 skill listing 的静默失效**：「已宣布过哪些 skill」有两个真相源（session KV / prior 消息上的名单）取并集 ⟹ 不变量「回收到的名字其宣布消息这轮真在 prompt 里」可以不成立而框架不知道。业务 `WithHistoryCompactor` 砍掉 listing 后 KV 仍说"发过"→ 不补发，而增量模式下工具描述里本就没有 skill 名 ⟹ 模型失去所有获知渠道且零报错。**没有单独修，而是删掉了整个功能**——这是同一根因的第 6 次表现（前 5 次：deac747 / c26b7d2 / R14 HIGH-1 / R17 MED-2 / R19 HIGH-2），根因是「一份必须一直在模型眼前的状态被放进了会被压缩的对话流」，删除前需 5 文件 14 处单独保护、漏一处即静默失效。实测框架层同侪零家这么放。**留作决策实证 + 通用教训**（状态存放位置决定防护代码量 / 两个真相源取并集 = 不变量可失效而无人知 / 静默失效比报错严重） | [issue-99-listing-invariant-broken-by-kv.md](issue-99-listing-invariant-broken-by-kv.md) |
-| **ISSUE-97** | 🟡 **部分缓解**（2026-07-21）—— opt-in 守卫已上线，**核心危害防不住**（见右） | **同一 sessionID 被并发 Run/Resume**（两个进程副本同时处理同一会话）：双方各自载入同一份 cp、各自执行、各自写回 → 后写者静默覆盖先写者，**两边都返回 err=nil**，事后无从察觉。已实证复现（`-race` 干净——是逻辑双重执行不是数据竞争，race detector 永远抓不到）。**五方源码调研结论**：没有任何一家在库/框架的存储层做乐观并发防它，责任统一上移（服务端 / durable runtime / 进程架构 / 应用层）——**副作用双跑物理上防不住**，它发生在 Save 之前，任何存储机制只能在写回时拒绝，那时活已经干了两遍。**我们做的**：`WithStaleWriteGuard()` / `WithStaleWriteGuardCtx(ctx)`（后者是 `agent_v2` 9 编排下唯一开关，也让嵌套子图继承）+ `Checkpoint.Epoch` 世代标记 + `ErrCheckpointStale`，**默认关闭、默认行为一字不变**。它只把最坏的「静默」变成「可见」，让业务能补偿/告警。**已知边界**：① 不阻止副作用双跑 ② 检测非原子（read-then-write 有窗口，两副本可能都通过）③ 真原子需 backend 支持条件写（`UPDATE ... WHERE epoch = ?`）④ **看不见跨层冲突**——多层编排每层各自载入各自比对，子层基线就是它刚读到那代，检测窗口只覆盖本层「读到写」这一段；父层被拒时子层已落盘的也不回滚 ⑤ **只管 cp**——Handoff 控制权转交、StoreMemory 记忆都经 `store.Store` 在图内落盘，早于出口判定，Run 返 stale 时它们可能已生效。真解在调用方：会话亲和路由 / 分布式锁 / 队列；上层 `agui`、`a2a/server` 已各自拒同 threadID/taskID 并发。<br>**2026-09-18 核验**补一条边界 ⑥：**带「新开」信号的 Run 不设世代基线**（`compose_v2/graph_loop.go` 约 604 行），守卫要等本次首写之后才生效，而首写本身不校验——agent_v2 顶层 Run 恒新开，于是默认 exit 档下，新开的 Run 全程不受保护——成功清理时还会把槽里别人的挂起档一并删掉；sync / async 档从本次第二次写入起受保护（每次写成功都会把基线推到自己写的那一代）（探针：Run 执行期间往同一槽写入别人的挂起档，sync 档报 stale 并保住那份档，exit 档不报、成功清理时把它删掉）。「两个任务同 sid」本身违反 RunID 一任务一枚的契约，但 `WithStaleWriteGuard` godoc 没写这条（见 `doc/code/todo.md` 同名条目）| [checkpoint-storage.md §同一会话并发执行](../description/three-way-comparison/checkpoint-storage.md) |
+| **ISSUE-93** | ① 历史模式作用域待处理，②③关闭 | Handoff 模式进入内层编排的历史边界，旧压缩边界与转交数量问题见复核。 | [专题](issue-93-handoff-modelb-audit-low.md) |
+| **ISSUE-94** | ✅ 已关闭 · 失败档与待答档分离 | `CPStatusFailed` 记录失败现场，`ListPending` 排除失败档。仍有 frontier 或 pending work 的失败档可按内容恢复，由 `HasResumableWork` 判断。 | [ISSUE-94 专题](issue-94-dangling-cp-nonterminal-error.md) |
+| **ISSUE-98** | 历史存储主体关闭，残余事项拆分 | HistoryStore、归属、查询和回归已经实现。重做审计、转存生命周期等独立事项见逐条台账。 | [专题](issue-98-conversation-history.md) |
+| **ISSUE-99** | ⚪ **CLOSED**（2026-07-24）—— 随 `WithIncrementalSkillListing` 一并删除，触发路径不再存在 | **增量 skill listing 的静默失效**（同编号其他专题在核验台账单列）：「已宣布过哪些 skill」有两个真相源（session KV / prior 消息上的名单）取并集 ⟹ 不变量「回收到的名字其宣布消息这轮真在 prompt 里」可以不成立而框架不知道。业务 `WithHistoryCompactor` 砍掉 listing 后 KV 仍说"发过"→ 不补发，而增量模式下工具描述里本就没有 skill 名 ⟹ 模型失去所有获知渠道且零报错。**没有单独修，而是删掉了整个功能**——这是同一根因的第 6 次表现（前 5 次：deac747 / c26b7d2 / R14 HIGH-1 / R17 MED-2 / R19 HIGH-2），根因是「一份必须一直在模型眼前的状态被放进了会被压缩的对话流」，删除前需 5 文件 14 处单独保护、漏一处即静默失效。实测框架层同侪零家这么放。**留作决策实证 + 通用教训**（状态存放位置决定防护代码量 / 两个真相源取并集 = 不变量可失效而无人知 / 静默失效比报错严重） | [issue-99-listing-invariant-broken-by-kv.md](issue-99-listing-invariant-broken-by-kv.md) |
+| **ISSUE-97** | 内置 SQL、Redis 主路径已关闭 | 共享任务租约保护 Run、Resume 与放弃，写入和清理核对令牌。应用自定义存储与外部副作用的边界仍按契约交付。 | [共享任务租约](../v2/checkpoint.md#61-共享存档的任务租约) |
 | **ISSUE-96** | 🟢 **已闭合**（2026-07-20）—— 6 侧面全修 + 4 路并发审计再抓 5 个（`SendDirective.instanceID` 漏 wire / 发号器跨重启重号 / 宽度失去兜底 / cond 未注册 target 同族分支 / 越界下标静默退化）也已修完，各配哨兵 + sanity-revert；**收口后又抓到第 7 个同根 bug**：混合 frontier（同 NodeID 既是静态边目标又是 `SendFrom` 目标）下 fan-out 兄弟推高 per-NodeID 共享的 `visitCount`，空身份成员再读就变了值 → InterruptID 跨 Resume 漂移 → **HITL 永不收敛**（每次 Resume 重新提问）。修法：只有空身份成员推进该计数器（`96d026d`）。**它是 flaky 不是稳定坏**——静态实例偶尔恰好读到已推高的值就碰巧对上，回归测试用 channel 屏障强制时序。同批删掉 `branchIdx` 死链（生产/测试零调用，godoc 却在教业务编入它算 InterruptID = 教人踩侧面 1）；cp schema v9 | **记录/身份用 NodeID 粒度，执行单位却是 branch 实例**——同 NodeID 多实例唯一来源是 `SendFrom` 同 Target 投递（静态/cond 边走 `nextSet` map 恒去重）。两个身份维度都不稳：`branchIdx` 是**位置**（部分失败时 frontier 缩成失败子集 → 重排）、`visit` 是 **per-NodeID 共享计数器**（成功兄弟推进它 + 超步内并发竞态）。**3 个已实证静默丢数据**（全同根，全有探针）：① canonical InterruptID 跨 Resume 漂移+不收敛（= ISSUE-95 finding 2）；② `SendFrom`+`RunSubAgent` **子 cp 互覆**（2 实例只活 1 个 cp，另一个 HITL 问题蒸发）——**踩的是 `run_subagent.go:45-47` 文档推荐的 fanout 路径**；③ 多实例+cond `CondFailRerunFrom` → 兄弟实例产出丢 2/3、Run 返 nil。同根历史：`90a94d2` 自引回归（按 NodeID 清 purge 误删兄弟实例 send）+ MED-3 fail-fast（`subgraph.go:114` 注释早已诊断出同一根因，当时只挡 subgraph 那半、明写裸节点那半是「独立议题」）。④ fan-out **宽度被当迭代深度**（`SendFrom` 同 Target > maxVisit=100 → 假 MaxIterationsError，且 worker 一次没跑就存 Pending cp → 每次 Resume 都触顶 → **永久卡死**；对照组 101 distinct NodeID 正常）；⑤ **MED-3 guard 根本没在拦**（只拦 branchIdx>0 + 错被兄弟 Interrupt 顶掉 + Resume 走 fast path 恒 0 → 实测 Run1 报错但子图已跑、Resume 就 err=nil）；⑥ **observability 两个 session 级 map 无实例维度**（3 实例只导出 1 个 span 且 duration 张冠李戴 / chunk 逐 token 编织；-race 抓不到——逻辑碰撞非 data race）。**方案**：身份是**三个正交维度**（图级 token 新增 / **visit 保留**——静态边单实例本就稳且守跨访问代际 / **tc 下标拆独立 getter**——4 个消费点想要的是它、只是借用了同一个 ctx key）。fresh-mint 不透明 token 随 frontier 持久化（碰撞/代际/竞态/漂移四问题一起消失；**不需要确定性**——只有重算才要，我们持久化）。净简化：可删 `purgePrior` 启发式 + 拆 MED-3 guard | [issue-96-branch-instance-identity.md](issue-96-branch-instance-identity.md) |
 | **ISSUE-95** | 🟢 已收口（finding 1 ✅ `90a94d2`+`7d6b913` / finding 3 ✅ `bca57e8`；**finding 2 ✅ 已随 [ISSUE-96](issue-96-branch-instance-identity.md) 侧面 1 闭合** —— 它是那个根因的一个侧面，单独修不掉）| Tier 1/2 扩审 3 finding（均 pre-existing，非 commit `9389cbf`）：**MED ✅ 已修** graph_loop 部分失败超步"完成兄弟自身带 SendFrom 且自身 cond 出边又报错成重跑目标"→ 旧 deferred send 没清 + 重跑重产 → 目标节点**双发**（实测 Z==2 应为 1）。修法：`SendDirective.owner`（不导出，框架唯一点 stamp）+ `SerializedSend.Owner` 进 wire + edge 失败块按 owner purge。⚠️ **purge 集合是 `rerun \ frontier` 不是 `rerun`** —— 记录按 NodeID、执行单位却是 branch 实例，按 NodeID 清会误删已成功兄弟实例的 send → 静默丢（`90a94d2` 照原方案实现即翻车，`7d6b913` 修回）；**原记的 `purgeCompletedRerun(rerun)` 方案与「5 PA-H1 回归绿」验收均已证伪**（那套回归对多实例零覆盖，哨兵补在 `compose_v2/multi_instance_test.go`）；**MED 🔵 已转 ISSUE-96 侧面 1** 多实例部分成功后 canonical InterruptID 跨 Resume 漂移（branchIdx 位置重排 + **visit 被成功兄弟污染**双维、Resume 不收敛每轮重问用户，打破 MakeInterruptID godoc 承诺）；**MED ✅ 已修**（`bca57e8`）OnToolEnd 硬编码 Success:true——**非 by-design**：observability 按 !Success 记工具失败（当时的 `gen_ai_tool_errors` 指标，OTel 重写后是工具 span 与工具时长的 `error.type`），生产方恒 true → 该 auto-fire metric 对业务级工具失败**恒 0**（tool.Failure 的结构化声明在 hook 边界被抹平）；顺带 hook 对失败 tool_result 的改写此前被静默丢弃（回写分支进不去，违反 OnToolEnd [消费] 档语义）。修法：makeToolsFn 经不导出 annotation 把 Error.Code/Message 跨层带给 hook fire 层。**既有 metric 测试是假绿**（手工构造 Success:false 直调 hook，从没经过 BasicAgent）→ 补真 E2E| [issue-95-graphloop-sendfrom-double-send.md](issue-95-graphloop-sendfrom-double-send.md) |
 
@@ -988,7 +990,7 @@ platform 层的活，不是 orchestration 库的活**——LangGraph 库层（`p
 实际落地选择**保持父子 typed state 类型独立**，通过 `WithSubgraphInput/Output adapter 函数显式映射，
 更类型安全 + 避免 LangGraph TypedDict 同名字段隐式共享坑。
 
-详见：[issue-48-native-subgraph-node.md](issue-48-native-subgraph-node.md)（设计文档）+ [graph.md §5](../description/graph.md)（落地说明）
+详见：[issue-48-native-subgraph-node.md](issue-48-native-subgraph-node.md)（设计文档）+ [当前子图约定](../v2/channel-engine.md)（v2 落地）
 
 ---
 
@@ -1104,7 +1106,7 @@ ISSUE-42 让 runtime 把 `HistoryFor(name)` 当 LLM 输入源，跨 agent 事件
 - [compose/sequential.go](../../compose/sequential.go)：step 1+ 显式拼 "原始目标 + 上一步产出" 作 input
 - [compose/plan.go](../../compose/plan.go)：`defaultExecInput` 改为精简默认（原始目标 + 你的任务 + 上一步产出），不再塞完整 plan/executed
 - [agent/rewrite_test.go](../../agent/rewrite_test.go)：新增 3 个 `TestSelfHistory_*` case
-- 文档同步 [CLAUDE.md](../../CLAUDE.md)、[doc/description/design.md](../description/design.md)、[doc/description/patterns.md](../description/patterns.md)
+- 文档同步 [CLAUDE.md](../../CLAUDE.md)、[当前图设计](../v2/channel-based-design.md)、[当前编排范式](../v2/orchestration-patterns.md)
 
 ---
 
@@ -1359,7 +1361,7 @@ reflect.SetReflector(reflectorFn)   // 或 .SetEvaluator(a) / .SetEvalFunc(fn)
 1. `compose/sequential.go` / `parallel.go` / `loop.go` / `routing.go` / `handoff.go` / `plan.go` / `reflect.go` — 加 AddAgent/SetXxx 方法
 2. 旧构造函数保持可用，内部改调新 API；加 `// Deprecated: 推荐使用 NewXxxAgent().AddAgent(...)` 注释
 3. `example/` 下新示例优先用 builder 风格；现有旧示例不动（旧构造函数仍有效）
-4. `doc/description/patterns.md` / CLAUDE.md 核心类型速查刷新推荐用法
+4. [当前编排范式](../v2/orchestration-patterns.md) / CLAUDE.md 核心类型速查刷新推荐用法
 5. 测试：为每种 Agent 新增"builder 等价于旧构造"的表驱动测试
 
 ### 校验
@@ -1448,7 +1450,7 @@ PlanAgent 新增 `WithPlanToolkit(tk *tool.Toolkit)` 选项，作为 `TmpSubAgen
 
 1. `compose/plan.go` — 加类型 + 解析逻辑 + `WithPlanToolkit`
 2. `compose/plan_test.go` — 覆盖三条 fallback 路径 + 工具筛选
-3. `doc/description/patterns.md` — 在 PlanAgent 节补说明
+3. [当前编排范式](../v2/orchestration-patterns.md) — 在 PlanAgent 节补说明
 4. CLAUDE.md 核心类型速查：`PlanStep/TmpSubAgentConfig`
 
 ### 兼容性
@@ -1474,7 +1476,7 @@ PlanAgent 新增 `WithPlanToolkit(tk *tool.Toolkit)` 选项，作为 `TmpSubAgen
 ## ✅ ISSUE-33 · 多轮对话 example 剩余 3 种模式（2026-04-16）
 
 **优先级**：中
-**状态**：✅ 已完成（2026-06）——`handoff_chat` / `reflect_chat` / `routing_chat` 三个交互式 REPL example，真 qwen 端到端验证（跨 handoff 上下文保持：L2 读出前轮型号 / 用户反馈驱动迭代："太复杂"→读历史重做简化版 / 跨轮路由感知：math→code→综合前两轮 msgs=4），`example/doc.go` 已同步
+**状态**：✅ 已完成（2026-06）——`handoff_chat` / `reflect_chat` / `routing_chat` 三个交互式 REPL example，真 qwen 端到端验证（跨 handoff 上下文保持：L2 读出前轮型号 / 用户反馈驱动迭代："太复杂"→读历史重做简化版 / 跨轮路由感知：math→code→综合前两轮 msgs=4），[示例索引](../../example/README.md) 已同步
 **延续**：ISSUE-32（P1+P2 已完成）
 
 ### 问题
@@ -1493,7 +1495,7 @@ ISSUE-32 只实现了 BasicAgent 和 PlanAgent 两种模式的多轮对话示例
 
 - 每个模式独立子目录 + `main.go`，交互式 REPL
 - 复用 `traceHook` 或等价 hook 打印子 agent 内部事件
-- 同步 `example/doc.go` 命令列表
+- 同步 [示例索引](../../example/README.md) 命令列表
 
 ---
 
@@ -1528,7 +1530,7 @@ ISSUE-32 只实现了 BasicAgent 和 PlanAgent 两种模式的多轮对话示例
 |---|---|
 | `example/orchestration/basic_chat/main.go` | 天气 bot：`get_weather(city, date?)` 假数据；多轮对话推荐脚本"北京天气→明天呢→那上海呢→第一个城市是什么"演示历史继承 |
 | `example/orchestration/plan_chat/main.go` | 3 专家子 agent（researcher 带 search 工具 / writer / critic）；自定义 JSON Planner 产出带 `SubAgentName` 的 `[]PlanStep`，PlanAgent 按名称派发；多轮追加需求时 planner 基于上轮历史增量规划 |
-| `example/doc.go` | 新增两行 `go run ./example/orchestration/basic_chat` / `go run ./example/orchestration/plan_chat` 运行说明 |
+| [示例索引](../../example/README.md) | 新增两行 `go run ./example/orchestration/basic_chat` / `go run ./example/orchestration/plan_chat` 运行说明 |
 
 ### 验证
 
@@ -1721,6 +1723,8 @@ FanOut 只支持编译期静态声明目标，节点运行时无法根据输出�
 
 ## ✅ ISSUE-24 · 数据流转 Bug 专项审查（2026-04-15）
 
+> 2026-11-16 复核：L4 已复现并重新打开，见 [D06](../code/todo.md#p3--窄路径扩展与设计决策)。其余历史分项见[编号台账](../code/backlog-audit.md#issue-0164-核验台账)。
+
 **优先级**：高  
 **状态**：已修复（全量）—— v1 历史档案，H4 文中 `Memory.Write` 已由 PR 3.3 commit `e6505f9` 替代为 `store.Put`
 **来源**：全量 agent/ + compose/ 代码审查
@@ -1844,7 +1848,7 @@ spec 04-13 commit `86ba2f8` 新增 Skill Selection 子系统：
 - `SkillSelectionModel { baseUrl, apiKey, model }` — 专门用于多候选 skill 仲裁的 LLM 配置
 - 挂载位置：`RuntimeConfig.skillSelectionModel`（全局默认）+ `ChatConfig.skillSelectionModel`（per-call 覆盖）
 - 优先级：per-call → RuntimeConfig → env fallback
-- `skill/selection.go`：多 skill 匹配时调用独立 LLM endpoint 做仲裁，返回 `{ skill_name, reason, strategy }`
+- 旧版 Skill 选择器：多 skill 匹配时调用独立 LLM endpoint 做仲裁，返回 `{ skill_name, reason, strategy }`
 
 我们目前没有 Skill 系统，此 issue 依赖先完成 Skill 基础设施后再实现。
 设计上需参考 spec 的**优先级解析模式**（per-call → global config → env）。
@@ -2133,7 +2137,7 @@ func injectState(ctx context.Context, factory StateFactory) (context.Context, an
 | `compose/plan.go` | planState |
 | `compose/helpers.go` | 删 stateInt，ParallelAgentNode 适配 |
 | `compose/compose_test.go` | 适配新 API |
-| `example/example_test.go` | 用户侧 state 迁移 |
+| 旧版示例测试文件 | 用户侧 state 迁移 |
 
 ### 风险点
 

@@ -46,7 +46,7 @@ overshoot 到 ~并发度才熔断（实测 N=200 并发 → 主候选被打 ~6 �
 特性（AutoCompact/ReactiveCompact 同样复用并接受）；精确截断需 breaker 层加 singleflight
 （独立任务）。详见 `WithBreaker` godoc。onSwitch 回调并发触发，业务回调访问共享态需自行加锁。
 
-**流式切换**在首个有效片段前完成，使用 `schema.StreamReader.ReadAhead` 保存预读内容。详见 §6。
+流式候选在首个有效片段或达到预读上限时选定。预读帧由 `schema.StreamReader.ReadAhead` 保存，详见 §6。
 （`member.tripped` metric 已实现见 §11.6；`agent_v2` 语法糖已决不加见 §11.3。）
 
 ---
@@ -306,13 +306,14 @@ func (f *FallbackChatModel) Generate(ctx context.Context, msgs []*schema.Message
 
 ## 6. Stream 的硬约束
 
-`FallbackChatModel.Stream` 会预读到首个有效片段。文本、推理、拒答或实际内容块可以选中候选。
-首片段前的建流错误和读取错误使用同一候选重试、切换及断路器策略。只有角色、用量或标注的前置帧
-随选中的流按序交给消费者。只有空值的流视为缺少响应。
+`FallbackChatModel.Stream` 在首个有效片段或第 64 帧处结束预读。文本、推理、拒答或实际内容块可提前选中候选。
+读到上限或 EOF 时，已有非空消息即可选中。前置帧原样随流交付。整个前缀都为空值时按缺少响应处理。
 
-预读由 `schema.StreamReader.ReadAhead` 在原 reader 上保存帧。选中后保持该流，读到后续错误就
-交给调用方。断路器按消费者实际读取的结局结算，提前关闭归还半开探测名额。
-这保留了流式交付，预读范围止于首个有效片段。
+建流或预读的错误走候选重试与切换。选中后，原流的异常交给当前消费者。可重试、可切换且超过 60 秒的
+`Retry-After` 约束后续请求，嵌套时由已处理限流的实际候选设置等待期。调用方取消或提前关闭归还本次探测名额。
+
+每次放行记下断路器代际。熔断、半开探测换手或恢复后，旧调用的结局失效。等待 `Retry-After` 后继续的
+调用沿用最初获准时的代际。
 
 > `streamOrGenerate`（`agent_v2/basic_agent.go`）只在模型**不支持流式**时改调 Generate：Stream 返回 `model.ErrStreamUnsupported`，或返回 nil reader 且没有错误。建流报错原样返回，由本装饰器切换、由重试层重试。曾经任何错误都改调 Generate，跟本装饰器叠在一起：所有候选建流都失败之后，整条候选链会经 Generate 再走一遍。本装饰器的 Stream 遇到不支持流式的候选，就地用这个候选的 Generate、结果包成只有一项的流：轮到哪个候选就用哪个，顺序不倒退，也不记断路器失败。把 `ErrStreamUnsupported` 交回调用方的话，调用方改调 Generate 会从第一个候选重新走——前面刚失败的候选立刻又被打一次（不看 Retry-After，断路器一次调用记两次失败）。BasicAgent 对只有一个片段的流整条采用、不做增量拼接，拿到的跟直接调这个候选的 Generate 一样（拼接会丢消息 ID、结束原因等字段，还把同一 ID 的两个工具调用并成一个；`OnModelEndStream` 钩子改了片段数时照常拼接）。候选的 Generate 返回 nil 消息按候选故障处理，Generate 与 Stream 两条路一样。
 
@@ -382,7 +383,7 @@ ag := agent_v2.NewBasicAgent(agent_v2.WithModel(m), /* ... */)
 
 **一个失败只被重试一层**（2026-10-26）：某个候选上的重试用完之后，交出的错误带 `compose_v2.RetriesExhaustedError` 标记，
 上面各层——BasicAgent 的模型调用重试（`agent_v2.WithModelRetry`）、编排成员重试、节点重试——都不再重试它，业务谓词也绕不开。
-不然每层 3 次叠三层就是 27 次请求，正好在服务端过载时成倍放大流量。分工：这里管首个有效片段前、候选内的重试与切换；选中候选后的错
+不然每层 3 次叠三层就是 27 次请求，正好在服务端过载时成倍放大流量。分工：这里负责选中前的候选内重试和切换；选中候选后的错
 （连接中途断开、错误帧、空闲超时）这里接不住（已交出的片段拼不到另一个模型的输出上），由 `WithModelRetry` 整次重来。
 
 ### 7.1 WithTools 的传播（易漏点）

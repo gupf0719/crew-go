@@ -44,9 +44,9 @@ func (m *capModel) WithTools([]*schema.ToolInfo) (model.ChatModel, error) { retu
 // TestCrossTask_ResumeDoesNotAdoptAbandonedBranch 钉住**Resume 的后半程走进上个任务
 // 遗留的分支时，不捡走它的现场**（backlog「Resume 路径不带新任务信号」那条的完整链）。
 //
-// 链条（同 sid——业务把 sid 当会话复用）：任务 A 在 step2 中断后被放弃（step2 槽里躺着
-// A 的挂起档）→ 任务 B 新 Run 中断在 step1（fresh 全树，s2 没进过、A 的残留幸存）→
-// Resume(B) 答完 step1 → **后半程进 step2** → step2 的 auto-load 看到的是 A 的档。
+// 链条：任务 A 在 step2 中断 → 保存 A 实际产出的 s2 存档，然后清掉 A → 复用 sid 的任务 B
+// 新 Run 中断在 step1 → 注入迟到的 A 子档，绕开已经通过的入口守卫 → Resume(B) 答完
+// step1 → **后半程进 step2** → step2 的 auto-load 看到 A 的档。
 //
 // Resume 路径**刻意**不 push「新开」信号（嵌套 HITL 靠 auto-load 恢复，红线），所以这里
 // 承重的是 auto-load 闸的**身份维**：`Checkpoint.BelongsToTask`——A 的档 TaskID 是 A 的
@@ -80,7 +80,7 @@ func TestCrossTask_ResumeDoesNotAdoptAbandonedBranch(t *testing.T) {
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), cp)
 	sess := agent_v2.NewRunSession()
 
-	// 任务 A：step1 中断 → 答 → step2 中断 → 放弃
+	// 任务 A：step1 中断 → 答 → step2 中断。
 	_, errA := seq.Run(ctx, sess, schema.UserMessage("任务A"))
 	ieA1, ok := compose_v2.IsInterrupt(errA)
 	if !ok {
@@ -91,11 +91,16 @@ func TestCrossTask_ResumeDoesNotAdoptAbandonedBranch(t *testing.T) {
 	if _, ok := compose_v2.IsInterrupt(errA2); !ok {
 		t.Fatalf("A step2 该中断: %v", errA2)
 	}
-	pend, _ := cp.ListPending(ctx, sess.RunID)
-	t.Logf("任务A放弃后残留 %d 份挂起档", len(pend))
+	const lateNS = "s2"
+	lateCheckpoint, err := cp.LoadNS(ctx, sess.RunID, lateNS)
+	if err != nil || lateCheckpoint == nil || !lateCheckpoint.HasResumableWork() || lateCheckpoint.TaskID == "" {
+		t.Fatalf("任务 A 的 s2 应留下带任务身份的可续子档，实际存档=%v、错误=%v", lateCheckpoint, err)
+	}
+	if _, err := cp.DeleteSubtree(ctx, sess.RunID, ""); err != nil {
+		t.Fatal(err)
+	}
 
-	// **同 sid**（L72 的前提：业务把 sid 当会话复用、不调 NextTask）——A 的残留
-	// 与 B 在同一个 sid 下，s2 槽里躺着 A 的挂起档。
+	// B 通过入口守卫时没有可续存档。等 B 挂起后才恢复 A 的 s2 残留，独立验证续跑时仍检查子档归属。
 	var b1Seen, b2Seen []string
 	seqB := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("seq")).
 		AddStep("s1", mkStep("s1", &b1Seen)).AddStep("s2", mkStep("s2", &b2Seen))
@@ -103,6 +108,13 @@ func TestCrossTask_ResumeDoesNotAdoptAbandonedBranch(t *testing.T) {
 	ieB1, ok := compose_v2.IsInterrupt(errB)
 	if !ok {
 		t.Fatalf("B step1 该中断: %v", errB)
+	}
+	bCheckpoint, err := cp.LoadNS(ctx, sess.RunID, "")
+	if err != nil || bCheckpoint == nil || bCheckpoint.TaskID == "" || bCheckpoint.TaskID == lateCheckpoint.TaskID {
+		t.Fatalf("任务 B 应留下不同任务身份的根档，实际存档=%v、错误=%v", bCheckpoint, err)
+	}
+	if err := cp.SaveNS(ctx, sess.RunID, lateNS, lateCheckpoint); err != nil {
+		t.Fatal(err)
 	}
 	_, errBR := seqB.Resume(ctx, sess.RunID, agent_v2.WithResumeUserInputs(
 		map[string]*schema.Message{ieB1.Query.InterruptID: schema.UserMessage("好")}))

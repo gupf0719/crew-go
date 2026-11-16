@@ -408,8 +408,8 @@ func TestHistoryTaskSpan_FreshTaskDedupReadsAlmostNothing(t *testing.T) {
 	t.Logf("会话 1200 多条，新任务这一次调用读回 %d 条", st.n)
 }
 
-// TestHistoryTaskSpan_SameSessionRunAgain_OtherTasksInBetween：同一个 session 对象（同一个 RunID）中断之后
-// 又 Run 一次、传同一个消息对象——按任务章它仍是那个任务，用户原话只该有一份；中间插进来多少别的任务的
+// TestHistoryTaskSpan_SameSessionRunAgain_OtherTasksInBetween：明确放弃中断后再用同一个 session 对象
+// 和消息对象发起 Run——历史按原 RunID 和消息身份去重，用户原话只该有一份；中间插进来多少别的任务的
 // 记录都一样。曾经按「会话最后一条是不是本任务写的」判延续，中间只要夹 1 条就判错、记两份（复核实测）；
 // 现在「这个任务写过历史」记在 session 的 KV 上。
 func TestHistoryTaskSpan_SameSessionRunAgain_OtherTasksInBetween(t *testing.T) {
@@ -424,10 +424,14 @@ func TestHistoryTaskSpan_SameSessionRunAgain_OtherTasksInBetween(t *testing.T) {
 			ctx = compose_v2.WithCheckpointerCtx(ctx, compose_v2.NewInMemoryCheckpointer())
 			sess := agent_v2.NewRunSession()
 			in := schema.UserMessage("我的原话")
-			if _, err := seq.Run(ctx, sess, in); err == nil {
-				t.Fatal("Run 1 应中断")
+			_, err := seq.Run(ctx, sess, in)
+			if _, ok := compose_v2.IsInterrupt(err); !ok {
+				t.Fatalf("Run 1 应中断，实际 %v", err)
 			}
 			spanForeignTurns(t, ctx, hs, "t", k)
+			if _, err := seq.Resume(ctx, sess.RunID, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
+				t.Fatalf("放弃旧任务：%v", err)
+			}
 			if _, err := seq.Run(ctx, sess, in); err != nil {
 				t.Fatalf("Run 2: %v", err)
 			}
@@ -440,8 +444,8 @@ func TestHistoryTaskSpan_SameSessionRunAgain_OtherTasksInBetween(t *testing.T) {
 	}
 }
 
-// TestHistoryTaskSpan_RunAgainThenAbort_OtherTasksInBetween：同一 session 中断 → 夹 k 轮别的任务 → 再 Run
-// 又中断 → 放弃。两次 Run 留下的悬空调用都要补上——起点要是第一次 Run 的那个，不是第二次的。
+// TestHistoryTaskSpan_RunAgainThenAbort_OtherTasksInBetween：同一 session 中断 → 夹 k 轮别的任务 →
+// 执行现场已被外层清除但历史未补 → 再 Run 又中断 → 放弃。两次 Run 留下的悬空调用都要补上。
 func TestHistoryTaskSpan_RunAgainThenAbort_OtherTasksInBetween(t *testing.T) {
 	for _, k := range []int{0, 1, 32} {
 		t.Run(fmt.Sprintf("k=%d", k), func(t *testing.T) {
@@ -458,20 +462,29 @@ func TestHistoryTaskSpan_RunAgainThenAbort_OtherTasksInBetween(t *testing.T) {
 				agent_v2.WithHistory(hs, "tenant1"),
 				agent_v2.WithModel(newStubModel([]*schema.Message{tc("tcA"), tc("tcB"), schema.AssistantMessage("final")})))
 			conv := fmt.Sprintf("c_rerun_abort_%d", k)
-			ctx := compose_v2.WithCheckpointerCtx(compose_v2.WithThreadIDCtx(context.Background(), conv),
-				compose_v2.NewInMemoryCheckpointer())
+			cp := compose_v2.NewInMemoryCheckpointer()
+			ctx := compose_v2.WithCheckpointerCtx(compose_v2.WithThreadIDCtx(context.Background(), conv), cp)
 			sess := agent_v2.NewRunSession()
-			if _, err := ag.Run(ctx, sess, schema.UserMessage("hi")); err == nil {
-				t.Fatal("Run 1 应中断")
+			_, err := ag.Run(ctx, sess, schema.UserMessage("hi"))
+			if _, ok := compose_v2.IsInterrupt(err); !ok {
+				t.Fatalf("Run 1 应中断，实际 %v", err)
 			}
 			spanForeignTurns(t, ctx, hs, "tenant1", k)
-			if _, err := ag.Run(ctx, sess, schema.UserMessage("hi again")); err == nil {
-				t.Fatal("Run 2 应中断")
+			if _, err := cp.DeleteSubtree(ctx, sess.RunID, ""); err != nil {
+				t.Fatalf("清除 Run 1 的执行现场：%v", err)
+			}
+			_, err = ag.Run(ctx, sess, schema.UserMessage("hi again"))
+			if _, ok := compose_v2.IsInterrupt(err); !ok {
+				t.Fatalf("Run 2 应中断，实际 %v", err)
+			}
+			key := agent_v2.HistoryKey{Owner: "tenant1", ConvID: conv}
+			if d := danglingCount(spanLoadAll(t, ctx, hs, key)); d != 2 {
+				t.Fatalf("两次运行各应留下一个悬空 tool_call，实际 %d 个", d)
 			}
 			if _, err := ag.Resume(ctx, sess.RunID, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
 				t.Fatalf("Abort: %v", err)
 			}
-			msgs := spanLoadAll(t, ctx, hs, agent_v2.HistoryKey{Owner: "tenant1", ConvID: conv})
+			msgs := spanLoadAll(t, ctx, hs, key)
 			if d := danglingCount(msgs); d != 0 {
 				t.Errorf("放弃后仍有 %d 个悬空 tool_call", d)
 				spanDump(t, msgs)
@@ -560,9 +573,9 @@ func TestHistoryTaskSpan_NestedWriterReadsOnlyMatches(t *testing.T) {
 	t.Logf("嵌套写入器的新任务读回 %d 条（会话 1200 多条）", st.n)
 }
 
-// TestHistoryTaskSpan_NewSessionObjectSameRunID_OtherTasksInBetween：中断之后用一个**新建的 session 对象**（同
-// 一个 RunID）再 Run、传同一个输入对象——无状态服务端按存下的 RunID 重建 session 就是这样。它仍是那个任务，
-// 用户原话只该有一份。曾经「这个任务写过历史」记在 session 对象的 KV 上，新对象 KV 是空的，退回看会话
+// TestHistoryTaskSpan_NewSessionObjectSameRunID_OtherTasksInBetween：明确放弃中断后用一个新建的 session 对象
+// （同 RunID）再 Run、传同一个输入对象。历史按原 RunID 和消息身份去重，用户原话只该有一份。
+// 曾经「这个任务写过历史」记在 session 对象的 KV 上，新对象 KV 是空的，退回看会话
 // 最后一条是谁写的；中间夹 1 条别的任务的记录就判错、记两份（审计实测）。
 func TestHistoryTaskSpan_NewSessionObjectSameRunID_OtherTasksInBetween(t *testing.T) {
 	for _, k := range []int{0, 1, 32} {
@@ -576,10 +589,14 @@ func TestHistoryTaskSpan_NewSessionObjectSameRunID_OtherTasksInBetween(t *testin
 			ctx = compose_v2.WithCheckpointerCtx(ctx, compose_v2.NewInMemoryCheckpointer())
 			sess := agent_v2.NewRunSession()
 			in := schema.UserMessage("我的原话")
-			if _, err := seq.Run(ctx, sess, in); err == nil {
-				t.Fatal("Run 1 应中断")
+			_, err := seq.Run(ctx, sess, in)
+			if _, ok := compose_v2.IsInterrupt(err); !ok {
+				t.Fatalf("Run 1 应中断，实际 %v", err)
 			}
 			spanForeignTurns(t, ctx, hs, "t", k)
+			if _, err := seq.Resume(ctx, sess.RunID, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
+				t.Fatalf("放弃旧任务：%v", err)
+			}
 			again := &agent_v2.RunSession{RunID: sess.RunID}
 			if _, err := seq.Run(ctx, again, in); err != nil {
 				t.Fatalf("Run 2: %v", err)
@@ -593,9 +610,9 @@ func TestHistoryTaskSpan_NewSessionObjectSameRunID_OtherTasksInBetween(t *testin
 	}
 }
 
-// TestHistoryTaskSpan_NewSessionObjectThenAbort_OtherTasksInBetween：中断 → 夹 k 轮别的任务 → 新 session 对象
-// （同 RunID）再 Run 又中断 → 放弃。两次 Run 留下的悬空调用都要补上：放弃按任务章找这个任务写下的全部
-// 记录。曾经往前扫到任务的起点章为止，第二次 Run 被判成新任务、又盖了一个起点章，扫到它就停，第一次的
+// TestHistoryTaskSpan_NewSessionObjectThenAbort_OtherTasksInBetween：中断 → 夹 k 轮别的任务 → 清除执行现场、
+// 保留未补的历史 → 新 session 对象（同 RunID）再 Run 又中断 → 放弃。放弃按任务章找全部记录，
+// 两次 Run 留下的悬空调用都要补上。曾经往前扫到任务的起点章为止，第二次 Run 盖了新的起点章，第一次的
 // 悬空调用漏补（审计实测）。
 func TestHistoryTaskSpan_NewSessionObjectThenAbort_OtherTasksInBetween(t *testing.T) {
 	for _, k := range []int{0, 1, 32} {
@@ -613,21 +630,30 @@ func TestHistoryTaskSpan_NewSessionObjectThenAbort_OtherTasksInBetween(t *testin
 				agent_v2.WithHistory(hs, "tenant1"),
 				agent_v2.WithModel(newStubModel([]*schema.Message{tc("tcA"), tc("tcB"), schema.AssistantMessage("final")})))
 			conv := fmt.Sprintf("c_newobj_abort_%d", k)
-			ctx := compose_v2.WithCheckpointerCtx(compose_v2.WithThreadIDCtx(context.Background(), conv),
-				compose_v2.NewInMemoryCheckpointer())
+			cp := compose_v2.NewInMemoryCheckpointer()
+			ctx := compose_v2.WithCheckpointerCtx(compose_v2.WithThreadIDCtx(context.Background(), conv), cp)
 			sess := agent_v2.NewRunSession()
-			if _, err := ag.Run(ctx, sess, schema.UserMessage("hi")); err == nil {
-				t.Fatal("Run 1 应中断")
+			_, err := ag.Run(ctx, sess, schema.UserMessage("hi"))
+			if _, ok := compose_v2.IsInterrupt(err); !ok {
+				t.Fatalf("Run 1 应中断，实际 %v", err)
 			}
 			spanForeignTurns(t, ctx, hs, "tenant1", k)
+			if _, err := cp.DeleteSubtree(ctx, sess.RunID, ""); err != nil {
+				t.Fatalf("清除 Run 1 的执行现场：%v", err)
+			}
 			again := &agent_v2.RunSession{RunID: sess.RunID}
-			if _, err := ag.Run(ctx, again, schema.UserMessage("hi again")); err == nil {
-				t.Fatal("Run 2 应中断")
+			_, err = ag.Run(ctx, again, schema.UserMessage("hi again"))
+			if _, ok := compose_v2.IsInterrupt(err); !ok {
+				t.Fatalf("Run 2 应中断，实际 %v", err)
+			}
+			key := agent_v2.HistoryKey{Owner: "tenant1", ConvID: conv}
+			if d := danglingCount(spanLoadAll(t, ctx, hs, key)); d != 2 {
+				t.Fatalf("两次运行各应留下一个悬空 tool_call，实际 %d 个", d)
 			}
 			if _, err := ag.Resume(ctx, sess.RunID, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
 				t.Fatalf("Abort: %v", err)
 			}
-			msgs := spanLoadAll(t, ctx, hs, agent_v2.HistoryKey{Owner: "tenant1", ConvID: conv})
+			msgs := spanLoadAll(t, ctx, hs, key)
 			if tcs := spanToolCallCount(msgs); tcs != 2 {
 				t.Fatalf("fixture 没搭对：两次 Run 应各留下一个 tool_call，实际 %d 个", tcs)
 			}
@@ -640,7 +666,7 @@ func TestHistoryTaskSpan_NewSessionObjectThenAbort_OtherTasksInBetween(t *testin
 }
 
 // TestHistoryTaskSpan_NilSessionPinnedSID_OtherTasksInBetween：session 传 nil、ctx 上钉着 sid——框架每次 Run 现铸
-// 一个 session 对象，任务就是那个 sid。中断后（中间夹 k 轮别的任务）再 Run，用户原话只该有一份（曾经同
+// 一个 session 对象，任务就是那个 sid。中断后（中间夹 k 轮别的任务）明确放弃再 Run，用户原话只该有一份（曾经同
 // 「新 session 对象」那条一样退回猜、记两份）。
 func TestHistoryTaskSpan_NilSessionPinnedSID_OtherTasksInBetween(t *testing.T) {
 	for _, k := range []int{0, 1, 32} {
@@ -652,12 +678,17 @@ func TestHistoryTaskSpan_NilSessionPinnedSID_OtherTasksInBetween(t *testing.T) {
 			ctx := agent_v2.WithHistoryCtx(context.Background(), hs, "t")
 			ctx = compose_v2.WithThreadIDCtx(ctx, conv)
 			ctx = compose_v2.WithCheckpointerCtx(ctx, compose_v2.NewInMemoryCheckpointer())
-			pinned := compose_v2.WithSessionIDCtx(ctx, fmt.Sprintf("sid-nil-%d", k))
+			sid := fmt.Sprintf("sid-nil-%d", k)
+			pinned := compose_v2.WithSessionIDCtx(ctx, sid)
 			in := schema.UserMessage("我的原话")
-			if _, err := seq.Run(pinned, nil, in); err == nil {
-				t.Fatal("Run 1 应中断")
+			_, err := seq.Run(pinned, nil, in)
+			if _, ok := compose_v2.IsInterrupt(err); !ok {
+				t.Fatalf("Run 1 应中断，实际 %v", err)
 			}
 			spanForeignTurns(t, ctx, hs, "t", k)
+			if _, err := seq.Resume(pinned, sid, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
+				t.Fatalf("放弃旧任务：%v", err)
+			}
 			if _, err := seq.Run(pinned, nil, in); err != nil {
 				t.Fatalf("Run 2: %v", err)
 			}

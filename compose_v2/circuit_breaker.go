@@ -52,8 +52,8 @@ type CircuitBreaker struct {
 	probing bool
 	// probeAt 是探测放行时刻——**防探测方 panic/忘记回报致 probing 永久卡死永久禁用**：
 	// 探测超过一个 cooldownDuration 未回报则视为过期，允许新探测（自愈兜底）。
-	probeAt time.Time
-	probeID uint64
+	probeAt    time.Time
+	generation uint64
 }
 
 // 默认 cooldown：trip 后 5 分钟允许第一次探测。覆盖大部分 quota 反弹 / API
@@ -85,8 +85,8 @@ func (cb *CircuitBreaker) Allow() bool {
 	return ok
 }
 
-// AllowWithProbe 放行一次请求，并为半开探测返回非零编号。延迟结算的调用方用此编号
-// 将结局交给 RecordAttempt，防止过期探测影响后来取得名额的请求。
+// AllowWithProbe 放行请求并返回当前代际。在同一断路器上用返回值结算普通调用和半开探测。
+// 熔断、探测换手或恢复后，之前获准的调用结局不再改变新代际。
 func (cb *CircuitBreaker) AllowWithProbe() (uint64, bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -97,10 +97,9 @@ func (cb *CircuitBreaker) AllowWithProbe() (uint64, bool) {
 		// cooldown 过——**half-open 单次探测**：占下探测名额，其他并发 Allow 返 false 防 thundering herd。
 		cb.probing = true
 		cb.probeAt = time.Now()
-		cb.probeID++
-		return cb.probeID, true
+		cb.generation++
 	}
-	return 0, true
+	return cb.generation, true
 }
 
 // CircuitBreakerResult 表示一次放行请求的结局。
@@ -112,16 +111,12 @@ const (
 	CircuitBreakerFailed
 )
 
-// RecordAttempt 结算 AllowWithProbe 放行的请求。编号为零表示普通请求。探测名额在途时
-// 只接受持有者的结局。返回值表示此次失败触发了熔断。
-func (cb *CircuitBreaker) RecordAttempt(probeID uint64, result CircuitBreakerResult) bool {
+// RecordAttempt 结算 AllowWithProbe 放行的请求。返回值表示此次失败触发了熔断。
+// 推迟的调用可先以 CircuitBreakerIgnored 归还探测名额，重试时仍沿用原代际。
+func (cb *CircuitBreaker) RecordAttempt(generation uint64, result CircuitBreakerResult) bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	if cb.probing {
-		if probeID != cb.probeID {
-			return false
-		}
-	} else if probeID != 0 {
+	if generation != cb.generation {
 		return false
 	}
 	switch result {
@@ -178,6 +173,7 @@ func (cb *CircuitBreaker) recordFailureLocked() bool {
 		if !cb.tripped {
 			justTripped = true // closed→open 首次熔断边缘
 		}
+		cb.generation++
 		cb.tripped = true
 		cb.trippedAt = time.Now() // 探测失败也重置 cooldown 起点
 	}
@@ -192,6 +188,9 @@ func (cb *CircuitBreaker) RecordSuccess() {
 }
 
 func (cb *CircuitBreaker) recordSuccessLocked() {
+	if cb.tripped {
+		cb.generation++
+	}
 	cb.failures = 0
 	cb.tripped = false
 	cb.probing = false // 探测成功——解除熔断 + 清探测标志

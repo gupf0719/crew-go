@@ -47,7 +47,7 @@ func TestTaskEntry_EveryEntryDecidesBeforeOnAgentStart(t *testing.T) {
 					}
 					switch fn := ce.Fun.(type) {
 					case *ast.SelectorExpr:
-						if fn.Sel.Name == "OnAgentStart" && hookPos == token.NoPos {
+						if (fn.Sel.Name == "OnAgentStart" || fn.Sel.Name == "callAgentStart") && hookPos == token.NoPos {
 							hookPos = ce.Pos()
 						}
 					case *ast.Ident:

@@ -246,7 +246,7 @@ func TestHookCtx_AdoptedHooksOnlyThroughCallHook(t *testing.T) {
 								calls++
 							}
 						case *ast.SelectorExpr:
-							if ident, ok := fn.X.(*ast.Ident); ok && ident.Name == "agent_v2" && fn.Sel.Name == "CallAgentStart" {
+							if ident, ok := fn.X.(*ast.Ident); ok && ((ident.Name == "agent_v2" && fn.Sel.Name == "CallAgentStart") || (ident.Name == "activity" && fn.Sel.Name == "callAgentStart")) {
 								calls++
 							}
 						}

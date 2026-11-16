@@ -153,9 +153,9 @@ func (f *FallbackChatModel) Generate(ctx context.Context, messages []*schema.Mes
 	}, nil)
 }
 
-// Stream 按序在候选间切换，直到某条流交出首个有效片段。
-// 首片段前的建流和读取错误都走候选的重试、切换与断路器策略。选中后保持该条流，
-// 后续错误交给消费者。断路器在消费者读到流结局或关闭时结算。
+// Stream 按序在候选间切换，选中后交付原流及其终态。首个有效片段前的读取错误走候选重试和切换。
+// 最多预读 64 帧。读到上限或 EOF 时，已收到非 nil 消息便可选定。断路器在消费者读到流结局或
+// 关闭时结算。可切换的长 Retry-After 让后续请求暂避当前候选。
 //
 // **不支持流式的候选**（Stream 返回 model.ErrStreamUnsupported，或 nil reader 且没有错误）
 // 就地用它的 Generate，结果包成只有一项的流——轮到哪个候选就用哪个，顺序不倒退。把
@@ -164,7 +164,11 @@ func (f *FallbackChatModel) Generate(ctx context.Context, messages []*schema.Mes
 // BasicAgent 整条采用那一项、不做增量拼接，拿到的跟直接调 Generate 一样（OnModelEndStream
 // 钩子改了片段数时照常拼接）。
 func (f *FallbackChatModel) Stream(ctx context.Context, messages []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	parentReceipt, _ := ctx.Value(streamGateReceiptKey{}).(*streamGateReceipt)
+	var candidateReceipt *streamGateReceipt
 	return tryMembers(ctx, f, func(ctx context.Context, m model.ChatModel) (*schema.StreamReader[*schema.Message], error) {
+		candidateReceipt = &streamGateReceipt{}
+		ctx = context.WithValue(ctx, streamGateReceiptKey{}, candidateReceipt)
 		sr, err := m.Stream(ctx, messages, opts...)
 		if sr != nil {
 			if err == nil {
@@ -180,17 +184,29 @@ func (f *FallbackChatModel) Stream(ctx context.Context, messages []*schema.Messa
 			return nil, err
 		}
 		return schema.NewSingleChunkReader(msg), nil
-	}, func(sr *schema.StreamReader[*schema.Message], i int, mem *fallbackMember, probeID uint64) {
+	}, func(sr *schema.StreamReader[*schema.Message], i int, mem *fallbackMember, generation uint64) {
+		receipt := candidateReceipt
 		sr.ObserveEnd(func(err error) {
 			switch {
 			case ctx.Err() != nil || errors.Is(err, schema.ErrStreamCanceled):
-				mem.breaker.RecordAttempt(probeID, compose_v2.CircuitBreakerIgnored)
+				mem.breaker.RecordAttempt(generation, compose_v2.CircuitBreakerIgnored)
 			case errors.Is(err, io.EOF):
-				mem.breaker.RecordAttempt(probeID, compose_v2.CircuitBreakerSucceeded)
-			case f.policy.ShouldFailover(ctx, err):
-				recordMemberFailure(ctx, i, mem, probeID, err)
+				mem.breaker.RecordAttempt(generation, compose_v2.CircuitBreakerSucceeded)
+			case !f.policy.ShouldFailover(ctx, err):
+				mem.breaker.RecordAttempt(generation, compose_v2.CircuitBreakerIgnored)
 			default:
-				mem.breaker.RecordAttempt(probeID, compose_v2.CircuitBreakerIgnored)
+				delay := compose_v2.RetryAfterFromError(err)
+				if delay <= memberRetryAfterLimit || !shouldRetryMember(ctx, err) {
+					recordMemberFailure(ctx, i, mem, generation, err)
+					return
+				}
+				if !receipt.applied.Load() {
+					mem.gate.set(time.Now().Add(delay), err)
+				}
+				if parentReceipt != nil {
+					parentReceipt.applied.Store(true)
+				}
+				mem.breaker.RecordAttempt(generation, compose_v2.CircuitBreakerIgnored)
 			}
 		})
 	})
@@ -238,9 +254,9 @@ func (f *FallbackChatModel) WithTools(tools []*schema.ToolInfo) (model.ChatModel
 //     时不记、回来时才算，别的请求在 T 之前照样一个个打到它（审计实测 15 个并发请求全部打到半开的候选）。
 //  2. **真失败当场记、一次调用里一个候选至多记一次**：候选的最终失败（不是设门的那种）在这次调用不再用它时记。调用方
 //     在原地等的途中取消不算候选的失败、不记。
-//  3. **回到推迟的候选是这次尝试的继续，不再经过断路器**：跟原地重试一样——等完服务端要求的时间就请求，不因为别的
-//     请求在此期间把它熔断而作罢（回来那次没占探测名额，报「换候选没用」时也不放名额；失败照常记、成功照常
-//     RecordSuccess）。回来之前先看门：门被别的调用推后了就跟着推后。曾经回来时重新问断路器：等满 Retry-After
+//  3. **回到推迟的候选是这次尝试的继续**：等完服务端要求的时间就请求，沿用初次放行的断路器代际。
+//     其他调用已推动断路器换代时，本次仍向调用方交付结果。回来之前先看门：门被别的调用推后了就跟着推后。
+//     曾经回来时重新问断路器：等满 Retry-After
 //     之后被别的请求记的失败挡住、一次没请求就失败（审计实测）。
 //  4. **候选 i 报「换候选没用」（切换判据为假、又不是控制流）时，排在 i 后面的不再试**（没试过的、推迟着的都算），
 //     **排在 i 前面推迟着的照样回去**；最终失败时返回排得最靠前的那个「换候选没用」的错——跟原地等一样：原地等的话
@@ -300,13 +316,11 @@ func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(cont
 			}
 			continue
 		}
-		// 回到推迟的候选是这次尝试的继续（第 3 条）：不再经过断路器，也没有占它的探测名额。只被门挡过、这次调用还没
-		// 请求过的不算继续，照常经过断路器——不然它因真失败熔断时，T 一到所有调用一起绕过断路器去请求它
+		// 回访沿用原代际。仅被门挡过的候选还未获准，仍须经过断路器。
 		revisit := st.deferred && st.requested
-		var probeID uint64
 		if !revisit {
 			var allowed bool
-			probeID, allowed = mem.breaker.AllowWithProbe()
+			st.generation, allowed = mem.breaker.AllowWithProbe()
 			if !allowed {
 				st.done = true // 熔断中：这次调用里不再回来
 				continue
@@ -323,9 +337,9 @@ func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(cont
 		out, err, d, gated := callMemberWithRetry(ctx, f.retry, mem, st.nextAttempt, mayDefer, call)
 		if err == nil {
 			if onAccepted == nil {
-				mem.breaker.RecordAttempt(probeID, compose_v2.CircuitBreakerSucceeded)
+				mem.breaker.RecordAttempt(st.generation, compose_v2.CircuitBreakerSucceeded)
 			} else {
-				onAccepted(out, i, mem, probeID)
+				onAccepted(out, i, mem, st.generation)
 			}
 			return out, nil
 		}
@@ -335,8 +349,8 @@ func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(cont
 			exhausted = re
 		}
 		if gated {
-			// 设了门（第 1 条）：不是失败，不记断路器；这次请求占着半开的探测名额时放掉（回访的那次没占）
-			mem.breaker.RecordAttempt(probeID, compose_v2.CircuitBreakerIgnored)
+			// 长 Retry-After 只设置等待期，并归还本次探测名额。
+			mem.breaker.RecordAttempt(st.generation, compose_v2.CircuitBreakerIgnored)
 			if d != nil {
 				st.deferred, st.readyAt, st.nextAttempt = true, d.readyAt, d.attempt
 			} else {
@@ -346,10 +360,8 @@ func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(cont
 		}
 		st.done = true
 		if !f.policy.ShouldFailover(ctx, err) {
-			// 控制流 / 4xx：不切换（不计 breaker——非 member 瞬时故障）。**但须清 half-open probing**：若本次
-			// 是 half-open 探测（Allow 置了 probing），非切换返回既不 RecordSuccess 也不 RecordFailure，probing
-			// 泄漏 true → 候选被额外排除到 probeAt+cooldown 才自愈。回访的那次没有经过 Allow，不碰别人的名额。
-			mem.breaker.RecordAttempt(probeID, compose_v2.CircuitBreakerIgnored)
+			// 控制流和请求错误仅归还同代的探测名额。
+			mem.breaker.RecordAttempt(st.generation, compose_v2.CircuitBreakerIgnored)
 			// 换候选没用（第 4 条）：排在它后面的不再试，前面推迟着的照样回去
 			skipAfter(states, i)
 			if compose_v2.IsRetryFutile(ctx, err) || !anyDeferred(states) {
@@ -358,7 +370,7 @@ func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(cont
 			noSwitchErr = err // 此后再报的只会出自排得更靠前的候选：后者覆盖前者
 			continue
 		}
-		recordMemberFailure(ctx, i, mem, probeID, err)
+		recordMemberFailure(ctx, i, mem, st.generation, err)
 	}
 	if noSwitchErr != nil {
 		return zero, finalErr(noSwitchErr)
@@ -400,8 +412,8 @@ func tryMembers[T any](ctx context.Context, f *FallbackChatModel, call func(cont
 
 // recordMemberFailure 给候选记一次失败；断路器 closed→open 的边缘 sink-gated emit member.tripped（同 failover
 // 零开销门）。
-func recordMemberFailure(ctx context.Context, i int, mem *fallbackMember, probeID uint64, err error) {
-	if mem.breaker.RecordAttempt(probeID, compose_v2.CircuitBreakerFailed) {
+func recordMemberFailure(ctx context.Context, i int, mem *fallbackMember, generation uint64, err error) {
+	if mem.breaker.RecordAttempt(generation, compose_v2.CircuitBreakerFailed) {
 		emitMemberTrippedEvent(ctx, i, err)
 	}
 }
@@ -428,6 +440,7 @@ func skipAfter(states []memberState, i int) {
 // 尝试的继续，回来时不经过断路器）；只被门挡过的为假。err 是它在这次调用里的失败原因：请求过的是自己拿到的最后一个
 // 错，只被门挡过的是门的错（gateClosedError）。
 type memberState struct {
+	generation  uint64
 	done        bool
 	deferred    bool
 	requested   bool

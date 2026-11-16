@@ -165,7 +165,8 @@ func TestEnterRunTask_OnAgentEndSeesNewTaskSignal(t *testing.T) {
 				top = agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("seq"),
 					agent_v2.WithSequentialHooks(hooks)).AddStep("s1", step)
 			}
-			ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
+			cp := compose_v2.NewInMemoryCheckpointer()
+			ctx := compose_v2.WithCheckpointerCtx(context.Background(), cp)
 			sess := agent_v2.NewRunSession()
 			if _, err := top.Run(ctx, sess, schema.UserMessage("任务A")); err != nil {
 				t.Fatalf("任务 A 应正常收尾（audit 的中断在 OnAgentEnd 里被吞），got %v", err)
@@ -173,7 +174,15 @@ func TestEnterRunTask_OnAgentEndSeesNewTaskSignal(t *testing.T) {
 			if n := firsts.get("收尾审计"); n != 1 {
 				t.Fatalf("前提没搭对：任务 A 的 audit 应执行一次，got %d", n)
 			}
-			_, _ = top.Run(ctx, sess, schema.UserMessage("任务B"))
+			saved, err := cp.LoadAllInSession(ctx, sess.RunID)
+			if err != nil || len(saved) != 1 || saved[0].NS == "" {
+				t.Fatalf("任务 A 应只留下 audit 的子档，实际存档=%v、错误=%v", saved, err)
+			}
+			next := restoreCheckpointAfterAdmission(t, ctx, cp, sess.RunID, saved[0].NS)
+			_, err = top.Run(next, sess, schema.UserMessage("任务B"))
+			if _, interrupted := compose_v2.IsInterrupt(err); !interrupted {
+				t.Fatalf("任务 B 应在 pause 上中断，实际 %v", err)
+			}
 			if len(hooks.freshAtEnd) != 2 || !hooks.freshAtEnd[1] {
 				t.Errorf("任务 B 的 OnAgentEnd 应看得到「新开」信号，got %v", hooks.freshAtEnd)
 			}

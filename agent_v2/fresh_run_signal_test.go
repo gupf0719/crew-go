@@ -224,6 +224,41 @@ func TestFreshRunSignal_AllOrchestrationsPush(t *testing.T) {
 	})
 }
 
+type lateCheckpointAtGraphStart struct {
+	compose_v2.NoOpOrchestrationHooks
+	restore func(context.Context) error
+}
+
+func (h *lateCheckpointAtGraphStart) OnGraphStart(ctx context.Context, _ compose_v2.Channels) (context.Context, error) {
+	if h.restore == nil {
+		return ctx, nil
+	}
+	restore := h.restore
+	h.restore = nil
+	return ctx, restore(ctx)
+}
+
+// restoreCheckpointAfterAdmission 使旧档在新 Run 通过入口后才出现，仍可单独验证图内的隔离。
+func restoreCheckpointAfterAdmission(t *testing.T, ctx context.Context, cp compose_v2.Checkpointer, runID, ns string) context.Context {
+	t.Helper()
+	saved, err := cp.LoadNS(ctx, runID, ns)
+	if err != nil || !saved.HasResumableWork() {
+		t.Fatalf("旧任务应在 ns=%q 留下可续存档，实际存档=%v、错误=%v", ns, saved, err)
+	}
+	if _, err := cp.DeleteSubtree(ctx, runID, ""); err != nil {
+		t.Fatal(err)
+	}
+	inject := &lateCheckpointAtGraphStart{restore: func(ctx context.Context) error {
+		return cp.SaveNS(ctx, runID, ns, saved)
+	}}
+	t.Cleanup(func() {
+		if inject.restore != nil {
+			t.Errorf("新任务应进入图并恢复 ns=%q 的残留存档", ns)
+		}
+	})
+	return compose_v2.WithOrchHooks(ctx, inject)
+}
+
 // TestFreshRunSignal_ConsumersHonorIt 钉住**消费者侧**：读这个信号的地方都真的读了。
 //
 // 上面那个测试只钉住**生产者**（九个入口 push 了没有）。审计实测：把两个消费者
@@ -295,8 +330,9 @@ func TestFreshRunSignal_ConsumersHonorIt(t *testing.T) {
 		if _, isInt := compose_v2.IsInterrupt(err); !isInt {
 			t.Fatalf("任务 A 应抛中断留下 Pending 子 cp，got %v", err)
 		}
-		// 同 session 发第二个任务（不 Resume 任务 A）
-		if _, err := seq.Run(ctx, sess, schema.UserMessage("任务B")); err != nil {
+		// 同 session 发第二个任务，令 A 的子档在 B 进入图时迟到。
+		next := restoreCheckpointAfterAdmission(t, ctx, cp, sess.RunID, "g")
+		if _, err := seq.Run(next, sess, schema.UserMessage("任务B")); err != nil {
 			t.Fatalf("任务 B: %v", err)
 		}
 

@@ -304,12 +304,9 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	abandonTasksAtEntry(ctx, cfg.abandoned, g.Name())
 	activity.FinishAbandon()
 	var hookErr error
-	ctx, hookErr = CallAgentStart(ctx, hooks, info, agentIn)
+	ctx, hookErr = activity.callAgentStart(ctx, hooks, info, agentIn)
 	if hookErr != nil {
-		if _, isInt := compose_v2.IsInterrupt(hookErr); !isInt && ctx.Err() == nil {
-			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: hookErr.Error()})
-		}
-		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, hookErr)
+		return collectEvents(session, startOffset), hookErr
 	}
 	// 消费 hook 改写: 空 Messages 时保持原 input (避免 inputWriter 拿 nil panic).
 	input = adoptHookInput(agentIn, input)

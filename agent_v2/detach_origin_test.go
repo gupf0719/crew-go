@@ -670,8 +670,7 @@ func (h *doRawRunInAgentStart) OnAgentStart(ctx context.Context, info *hook.Agen
 // （那一项的存活标记为真）与在编排的 agent 级钩子里脱离（那一项没有存活标记）各一格。
 //
 // 曾经根图入口把自己的 sid 从来源链里一律去掉、不看那一项的执行还在不在跑：链上那条「仍在执行」被删，里面的调用
-// 不再被拒、被调方真的跑了（审计实测；在那之前是报 ErrRunAborted）。引擎本身不拦直接 compose_v2.Run 一个正在执行
-// 的任务的 sid，这条守的是 agent 入口那道拒绝不被遮住。
+// 不再被拒、被调方真的跑了（审计实测；在那之前是报 ErrRunAborted）。外层刻意不配存档，避免被使用存档的任务入口拒绝，单独验证内层拒绝会执行。
 func TestDetach_RawRunWithRunningTaskSID_InnerCallStillRejected(t *testing.T) {
 	check := func(t *testing.T, ran bool, subErr error) {
 		t.Helper()
@@ -692,7 +691,7 @@ func TestDetach_RawRunWithRunningTaskSID_InnerCallStillRejected(t *testing.T) {
 			return nil
 		})
 		seq := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("seq")).AddStep("step", step)
-		if _, err := seq.Run(compose_v2.WithCheckpointerCtx(context.Background(), cper), agent_v2.NewRunSession(), schema.UserMessage("go")); err != nil {
+		if _, err := seq.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("go")); err != nil {
 			t.Fatalf("外层：%v", err)
 		}
 		check(t, ran, subErr)
@@ -702,7 +701,7 @@ func TestDetach_RawRunWithRunningTaskSID_InnerCallStillRejected(t *testing.T) {
 		h := &doRawRunInAgentStart{t: t, cper: cper, x: dtBasic("x", "x done")}
 		seq := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("seq"), agent_v2.WithSequentialHooks(h)).
 			AddStep("s1", dtBasic("worker", "worker done"))
-		if _, err := seq.Run(compose_v2.WithCheckpointerCtx(context.Background(), cper), agent_v2.NewRunSession(), schema.UserMessage("go")); err != nil {
+		if _, err := seq.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("go")); err != nil {
 			t.Fatalf("外层：%v", err)
 		}
 		check(t, h.ran, h.subErr)

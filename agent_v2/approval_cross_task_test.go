@@ -370,8 +370,9 @@ func TestApproval_NestedNoLeakAcrossTasks(t *testing.T) {
 	}
 	// ← 用户就此放弃，不 Resume ie2
 
-	// ── 任务 B：全新任务，同 session ──
-	_, err = seq.Run(ctx, sess, schema.UserMessage("查话费"))
+	// ── 任务 B：全新任务，同 session。A 的子档在 B 通过入口后才出现 ──
+	next := restoreCheckpointAfterAdmission(t, ctx, cp, sess.RunID, "w")
+	_, err = seq.Run(next, sess, schema.UserMessage("查话费"))
 
 	// 承重①：必须重新要审批。放弃任务留下的子 cp 里带着 Approved，
 	// 没有世代比对的话它会被原样捡回来。

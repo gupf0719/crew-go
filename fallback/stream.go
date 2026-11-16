@@ -5,23 +5,35 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 
 	"crew-go/schema"
 )
 
-// peekStream 在交给调用方前检查首个有效片段。候选选定后由原 reader 交付前置帧。
+const streamPeekLimit = 64
+
+// 每次候选尝试单独传递回执。先看到同一流终态的内层可标记已经为实际候选设置等待期。
+type streamGateReceiptKey struct{}
+
+type streamGateReceipt struct {
+	applied atomic.Bool
+}
+
+// peekStream 查找有效片段，同时限制暂存帧数。候选选定后由原 reader 交付前置帧。
 func peekStream(ctx context.Context, raw *schema.StreamReader[*schema.Message]) (*schema.StreamReader[*schema.Message], error) {
 	sawMessage := false
+	frames := 0
 	_, err := raw.ReadAhead(ctx, func(msg *schema.Message) bool {
 		sawMessage = sawMessage || msg != nil
-		return visibleStreamChunk(msg)
+		frames++
+		return visibleStreamChunk(msg) || frames >= streamPeekLimit
 	})
-	if err == nil || (errors.Is(err, io.EOF) && sawMessage) {
+	if sawMessage && (err == nil || errors.Is(err, io.EOF)) {
 		return raw, nil
 	}
 	raw.Close()
-	if errors.Is(err, io.EOF) {
-		err = fmt.Errorf("fallback: model stream ended before its first chunk: %w", io.ErrUnexpectedEOF)
+	if err == nil || errors.Is(err, io.EOF) {
+		err = fmt.Errorf("fallback: model stream returned no message during lookahead: %w", io.ErrUnexpectedEOF)
 	}
 	return nil, err
 }

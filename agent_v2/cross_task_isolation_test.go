@@ -1,6 +1,6 @@
 package agent_v2_test
 
-// 「同 sid 的下一个任务不得捡起上一个的挂起存档」的回归。
+// 「独立任务不得捡起上一个任务的挂起存档」的回归。
 //
 // # 修的是什么
 //
@@ -12,7 +12,7 @@ package agent_v2_test
 //
 // # 判据：顶层 Run 恒不当续跑
 //
-// 「顶层」= `compose_v2.GetGraphNS(ctx) == ""`。嵌套（ns 非空）必须保持 auto-load——
+// 顶层由 ctx 是否已有执行任务判定。嵌套必须保持 auto-load——
 // 父 Resume 时子 agent 正是靠「父重跑 → 子的 Run 被调 → 子 auto-load 自己的 cp」恢复的，
 // 去掉它嵌套 HITL 全断（实测 nested_smoke 12/12 → 3/12）。
 //
@@ -36,7 +36,7 @@ import (
 	"crew-go/tool"
 )
 
-func TestCrossTaskIsolation_NewRunDoesNotInheritPendingCheckpoint(t *testing.T) {
+func TestCrossTaskIsolation_NewRunWithNewIDDoesNotInheritPendingCheckpoint(t *testing.T) {
 	var pays atomic.Int32
 	var lastAmt atomic.Value
 	payTool := tool.NewFuncTool("pay", "扣款", map[string]any{"type": "object",
@@ -74,24 +74,28 @@ func TestCrossTaskIsolation_NewRunDoesNotInheritPendingCheckpoint(t *testing.T) 
 
 	cper := compose_v2.NewInMemoryCheckpointer()
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), cper)
-	// **业务把 sid 设成会话级稳定值**——godoc 邀请的用法
-	const stableSid = "conv_alice"
+	sess := agent_v2.NewRunSession()
+	oldRunID := sess.RunID
 
 	// 任务 A：扣 100，卡在人工确认
-	_, errA := mk("100").Run(ctx, &agent_v2.RunSession{RunID: stableSid}, schema.UserMessage("扣 100"))
+	_, errA := mk("100").Run(ctx, sess, schema.UserMessage("扣 100"))
 	if _, ok := compose_v2.IsInterrupt(errA); !ok {
 		t.Fatalf("任务 A 应中断, got %v", errA)
 	}
 	if pays.Load() != 1 || lastAmt.Load() != "100" {
 		t.Fatalf("前提不成立：A 应扣款 1 次 100，实际 %d 次 %v", pays.Load(), lastAmt.Load())
 	}
-	if cp, _ := cper.LoadNS(ctx, stableSid, ""); cp == nil || cp.Status != compose_v2.CPStatusPending {
+	if cp, _ := cper.LoadNS(ctx, oldRunID, ""); cp == nil || cp.Status != compose_v2.CPStatusPending {
 		t.Fatal("前提不成立：A 应留下 Pending cp")
 	}
 
-	// 任务 B：**全新任务**（Run 不是 Resume），同 sid
+	// 任务 B 在同一会话对象上换 RunID 后发起。
+	sess.NextTask()
 	before := pays.Load()
-	_, _ = mk("999").Run(ctx, &agent_v2.RunSession{RunID: stableSid}, schema.UserMessage("扣 999"))
+	_, errB := mk("999").Run(ctx, sess, schema.UserMessage("扣 999"))
+	if _, ok := compose_v2.IsInterrupt(errB); !ok {
+		t.Fatalf("任务 B 应挂起在自己的提问，实际 %v", errB)
+	}
 
 	if got := pays.Load() - before; got != 1 {
 		t.Errorf("❌ 新任务期间扣款发生 %d 次，应恰 1 次\n"+
@@ -100,6 +104,9 @@ func TestCrossTaskIsolation_NewRunDoesNotInheritPendingCheckpoint(t *testing.T) 
 	}
 	if lastAmt.Load() != "999" {
 		t.Errorf("❌ 最后一次扣款金额 %v，应是 999——B 拿到的是 A 的产出", lastAmt.Load())
+	}
+	if cp, _ := cper.LoadNS(ctx, oldRunID, ""); !cp.HasResumableWork() {
+		t.Fatal("任务 B 应保留任务 A 的挂起档")
 	}
 }
 

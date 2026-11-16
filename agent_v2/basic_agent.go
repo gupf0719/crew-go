@@ -313,12 +313,9 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	abandonTasksAtEntry(ctx, cfg.abandoned, a.config.Name)
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = CallAgentStart(ctx, a.config.Hooks, info, agentIn)
+	ctx, startErr = activity.callAgentStart(ctx, a.config.Hooks, info, agentIn)
 	if startErr != nil {
-		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
-			_ = a.config.Hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
-		}
-		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, startErr)
+		return collectEvents(session, startOffset), startErr
 	}
 	// 消费 hook 改写: 业务可改 agentIn.Messages 做 PII filter / 模板包装 (跟 PlanAgent 对齐)
 	input = adoptHookInput(agentIn, input)

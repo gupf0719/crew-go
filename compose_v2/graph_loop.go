@@ -682,7 +682,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	}
 	if cfg.sessionID != "" {
 		var err error
-		ctx, activity, err = beginTaskActivity(ctx, cfg.checkpointer, cfg.sessionID, nil)
+		ctx, activity, err = beginTaskActivity(ctx, cfg.checkpointer, cfg.sessionID, nil, false)
 		if err != nil {
 			return fmt.Errorf("graph %q (ns=%q): %w", g.ID(), cfg.graphNS, err)
 		}
@@ -1857,6 +1857,10 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				}
 				cm.updateFrontier(frontier) // 整 frontier 重跑（含成功分支）
 				applyErr := fmt.Errorf("apply writes: %w", commitErr)
+				if dupErr != nil {
+					cm.clearInterrupts()
+					return errors.Join(dupErr, applyErr)
+				}
 				if branchErr := res.exitErr(); branchErr != nil {
 					return errors.Join(branchErr, applyErr)
 				}
@@ -2249,7 +2253,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 			if shouldStayPending(err) {
 				res.StayPending = true
 			}
-			if ie, isInt := IsInterrupt(err); isInt {
+			if ie, isInt := pendingInterrupt(err); isInt {
 				res.AllInterrupts = []*InterruptError{ie}
 				res.interruptRaws = []error{err}
 			}
@@ -2402,7 +2406,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 			if shouldStayPending(r.err) {
 				out.StayPending = true
 			}
-			if ie, isInt := IsInterrupt(r.err); isInt {
+			if ie, isInt := pendingInterrupt(r.err); isInt {
 				out.AllInterrupts = append(out.AllInterrupts, ie)
 				out.interruptRaws = append(out.interruptRaws, r.err)
 			}
@@ -2444,8 +2448,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 // ⚠️ 返的错**不 `%w` 原 InterruptError**——否则 `IsInterrupt` 仍为 true 但它已不会被
 // record，调用方拿不到任何 ID 可配，Resume 死锁。
 //
-// ⚠️ 同超步里若有兄弟分支抛了合法中断，「中断优先」会让这条违规错**不出现在返回值里**，
-// 调用方看到一次正常 HITL、答完下一轮才撞上它。要当场看见得读 `OnNodeEnd`。
+// 同超步的终局失败优先于兄弟分支的合法中断。
 func validateInterrupt(ctx context.Context, id NodeID, err error, ie *InterruptError) error {
 	where := func() string {
 		if ns := GetGraphNS(ctx); ns != "" {
@@ -2466,19 +2469,10 @@ func validateInterrupt(ctx context.Context, id NodeID, err error, ie *InterruptE
 			"（agent.Resume(ctx, sid, ...)）；节点里别把它的中断返回（原样、取出来、再包一层都不行），把 sid 交给"+
 			"该处理它的地方，这个节点照常返回", ErrRunAborted, where(), sid)
 	}
-	if ie == nil {
-		// typed-nil：业务写 `var ie *InterruptError; return nil, ie` 时 IsInterrupt 返
-		// (nil, true)。放过去的话后面按「中断」处理却没有任何 query 可挂。
-		return fmt.Errorf("%w: %s: 返回了 nil 的 *InterruptError", ErrRunAborted, where())
-	}
-	if vErr := ie.Validate(); vErr != nil {
-		return fmt.Errorf("%w: %s: %v", ErrRunAborted, where(), vErr)
+	if shapeErr := interruptShapeError(ie); shapeErr != nil {
+		return fmt.Errorf("%w: %s: %v", ErrRunAborted, where(), shapeErr)
 	}
 	queries := ie.AllQueries()
-	if len(queries) == 0 {
-		return fmt.Errorf("%w: %s: InterruptError 里没有 AskQuery"+
-			"——caller 要靠它配答案，reason=%q", ErrRunAborted, where(), ie.Reason)
-	}
 	seen := make(map[string]string, len(queries))
 	for _, q := range queries {
 		if q == nil {
@@ -2769,7 +2763,8 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 		// **hook 抛的中断走同一套校验**——它原先整条绕过（早退在这儿、校验在下面几十行），
 		// 于是空 ID 的挂起照样落进存档：实测两个分支各抛一次 ⟹ 两条挂起 ID 都是空、
 		// 彼此不可区分。那正是空 ID 拒绝要消灭的形态，从这个入口原样存活。
-		if ie, isInt := IsInterrupt(startErr); isInt {
+		startErr, ie, isInt := normalizeNodeInterrupt(startErr)
+		if isInt {
 			if vErr := validateInterrupt(ctx, id, startErr, ie); vErr != nil {
 				return nil, nil, nil, nil, nil, vErr
 			}
@@ -2836,7 +2831,8 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 		// 业务抛的中断先过一道形状校验（没有 query / Query 与 Queries 同时填 /
 		// 空 ID / 批内撞 ID / Queries 含 nil 元素），全在 validateInterrupt 里——**与 OnNodeStart 那条路
 		// 共用同一份**，别在任何一处另写一遍。
-		if ie, isInt := IsInterrupt(err); isInt {
+		err, ie, isInt := normalizeNodeInterrupt(err)
+		if isInt {
 			if vErr := validateInterrupt(nodeCtx, id, err, ie); vErr != nil {
 				return nil, nil, nil, nil, nil, vErr
 			}

@@ -261,12 +261,9 @@ func (r *ReflectAgent) Run(ctx context.Context, session *RunSession, input *sche
 	abandonTasksAtEntry(ctx, cfg.abandoned, r.Name())
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = CallAgentStart(ctx, hooks, info, agentIn)
+	ctx, startErr = activity.callAgentStart(ctx, hooks, info, agentIn)
 	if startErr != nil {
-		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
-			_ = hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
-		}
-		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, startErr)
+		return collectEvents(session, startOffset), startErr
 	}
 	input = adoptHookInput(agentIn, input)
 

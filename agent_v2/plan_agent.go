@@ -448,12 +448,9 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 	abandonTasksAtEntry(ctx, cfg.abandoned, p.Name())
 	activity.FinishAbandon()
 	var startErr error
-	ctx, startErr = CallAgentStart(ctx, p.hooks, info, agentIn)
+	ctx, startErr = activity.callAgentStart(ctx, p.hooks, info, agentIn)
 	if startErr != nil {
-		if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
-			_ = p.hooks.OnError(ctx, info, &schema.CommError{Code: "agent_start_error", Message: startErr.Error()})
-		}
-		return collectEvents(session, startOffset), WrapAgentStartErr(ctx, startErr)
+		return collectEvents(session, startOffset), startErr
 	}
 
 	// **ISSUE-83 fix**: hook OnAgentEnd 兜底——所有退出路径触发（success / Interrupt /

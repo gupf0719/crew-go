@@ -509,6 +509,10 @@ tool_call 完成时记，AgentAsTool 返回之后同一个 tool_call 还可能�
 DetachTask 连会话 ID 与软取消信号一起剥。入口拒绝恒不可重试。业务在自己的循环里开新任务换 RunID（`sess.NextTask()`），长寿 ctx 上钉着的旧 sid
 不碍事。approve_always 规则按 RunID 分，换了 RunID 就是新的一套。
 
+内建图 Agent 的顶层 Run 在登记任务和取得后端租约后检查整个 RunID。发现任一 namespace 有可续工作时，
+返回 `agent_v2.ErrRunIDHasResumableCheckpoint`。继续该任务用 Resume。开始新任务用 `RunSession.NextTask`，
+需要放弃旧任务时可以使用 `WithAbandonedTasks`。钩子为新任务选择其他存档后端时，在使用它之前同样检查。
+
 ### 4.3 GraphID 防串台
 
 同一个 sessionID 跑两个不同的 Graph 时，两份 cp 都写 `(sid, "")` 会后写覆盖前写。`cp.GraphID`

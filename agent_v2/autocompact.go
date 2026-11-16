@@ -600,7 +600,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 			return messages, err
 		}
 		defer entry.releaseCallSlot()
-		probeID, allowed := entry.breaker.AllowWithProbe()
+		generation, allowed := entry.breaker.AllowWithProbe()
 		if !allowed && !asked {
 			asked = autoCompactHadQuestion(stateCtx)
 			if !asked {
@@ -612,7 +612,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 				if ctx.Err() != nil || compose_v2.MustPropagate(ctx, err) {
 					result = compose_v2.CircuitBreakerIgnored
 				}
-				entry.breaker.RecordAttempt(probeID, result)
+				entry.breaker.RecordAttempt(generation, result)
 			}()
 		}
 	}

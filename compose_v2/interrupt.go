@@ -252,7 +252,7 @@ func (e *InterruptError) Error() string {
 //
 // # 调用方必须知道的三件事
 //
-//  1. **≥2 个中断时返的是一个 [errors.Join] 复合体**（合并后的 InterruptError 打头 +
+//  1. **多个中断时返回同一个可解包的复合错误**（合并后的 InterruptError 打头 +
 //     各分支原始链）。于是 `errors.Is` 在它上面是 **OR**——「有没有哪个分支是 X」，不再是
 //     「这个错是不是 X」。一个中断分支的链上挂着 [ErrCheckpointStale]，整体就判 stale，兄弟那条
 //     完全可答的干净中断跟着一起判死。这是有意的 fail-closed，但株连是真的。（引擎出口写档撞上
@@ -260,8 +260,9 @@ func (e *InterruptError) Error() string {
 //  2. **元素应当来自互异的子调用**。合并**不去重**：N 个元素带同一个 `InterruptID` 会合成
 //     一批撞 ID 的 query，被 `validateInterrupt` 当协议违规拒（`ErrRunAborted` + 清存档）。
 //     一个逻辑提问被扇成 N 份时**别送进来**——在扇出侧当场停（记忆分片检索就是这么做的）。
-//  3. **会改写入参**：[MergeInterrupts] 往元素的 `*AskQuery` 上写 `Reason`，且结果里的
-//     `Queries` 与入参共享指针。别拿包级哨兵 `var ErrX = &InterruptError{...}` 当元素传。
+//  3. 聚合时保留原始错误链，复制问题后填充 Reason。仅有一个中断时沿用原错误。
+//
+// 含多个中断的错误树会先校验每个中断的形状，非法中断使本次聚合返回 [ErrRunAborted]。
 func PickFanoutError(errs []error) error {
 	var raws []error
 	var firstErr error
@@ -345,91 +346,123 @@ func pickFanoutError(interruptRaws []error, firstErr, exhausted error) error {
 			}
 		}
 		return firstErr
-	case 1:
-		return interruptRaws[0]
 	default:
-		ies := make([]*InterruptError, 0, len(interruptRaws))
-		for _, raw := range interruptRaws {
-			if ie, ok := IsInterrupt(raw); ok {
-				ies = append(ies, ie)
-			}
-		}
-		// 合并后的 ie 打头（`asInterrupt` 对多错误树 DFS 从左到右，放前面让 IsInterrupt
-		// 最快命中），各分支原始链并列挂后面保住各自的第二 sentinel。这里聚合安全的
-		// 理由见 exitErr——挂上去的每一条都来自抛中断的分支，全是控制流信号。
-		joined := make([]error, 0, len(interruptRaws)+1)
-		joined = append(joined, MergeInterrupts(ies))
-		joined = append(joined, interruptRaws...)
-		return errors.Join(joined...)
+		return joinInterruptErrors(interruptRaws)
 	}
 }
 
-// MergeInterrupts 把多个 InterruptError 聚合成单个 InterruptError——toolsFn fanout
-// 化时多 tc 同时抛 Interrupt，需把 N 个 ie.Query 收集到单个 InterruptError.Queries
-// 让 graph_loop 单一 NodeFunc return 路径仍能 record 全部 query 不丢。
-//
-// **协议**：
-//   - len(ies)==0 返 nil
-//   - len(ies)==1 直接返该 ie 不包装（保兼容 errors.As / IsInterrupt）
-//   - len(ies)>=2 创建新 InterruptError 收集所有 ie.AllQueries() 到 Queries 字段
-//
-// **使用场景**：业务自定义 toolsFn / makeToolsFn fanout 多 tc 时；其它单 query
-// 场景（preamble/postamble/单 tool 抛 Interrupt）直接用 `&InterruptError{Query: q}`
-// 不需走此 helper。
+// fanoutInterruptError 保留已聚合的问题和各分支的原始错误链。外层再次聚合时只读取一次问题。
+type fanoutInterruptError struct {
+	error
+	projection *InterruptError
+	causes     []error
+}
+
+func (e *fanoutInterruptError) Unwrap() []error { return e.causes }
+
+func joinInterruptErrors(raws []error) error {
+	var interrupts []*InterruptError
+	for _, raw := range raws {
+		walkInterrupts(raw, func(ie *InterruptError) bool {
+			interrupts = append(interrupts, ie)
+			return false
+		})
+	}
+	if len(raws) == 1 && len(interrupts) <= 1 {
+		return raws[0]
+	}
+
+	// 聚合会丢掉各叶子的结构，先检查每个叶子，避免非法中断被合法兄弟掩盖。
+	for _, ie := range interrupts {
+		if err := interruptShapeError(ie); err != nil {
+			return fmt.Errorf("%w: %v", ErrRunAborted, err)
+		}
+	}
+	projection := MergeInterrupts(interrupts)
+	causes := make([]error, 0, len(raws)+1)
+	causes = append(causes, projection)
+	causes = append(causes, raws...)
+	return &fanoutInterruptError{error: errors.Join(causes...), projection: projection, causes: causes}
+}
+
+// pendingInterrupt 将已有的终局失败和存档错误交给图退出仲裁。
+func pendingInterrupt(err error) (*InterruptError, bool) {
+	ie, ok := IsInterrupt(err)
+	if !ok || errors.Is(err, ErrRunAborted) || errors.Is(err, ErrCheckpointNotResumable) ||
+		errors.Is(err, ErrCheckpointNotPersisted) {
+		return nil, false
+	}
+	return ie, true
+}
+
+func normalizeNodeInterrupt(err error) (error, *InterruptError, bool) {
+	if ie, ok := pendingInterrupt(err); !ok {
+		return err, ie, false
+	}
+	err = joinInterruptErrors([]error{err})
+	ie, ok := IsInterrupt(err)
+	return err, ie, ok
+}
+
+func interruptShapeError(ie *InterruptError) error {
+	if ie == nil {
+		return errors.New("返回了 nil 的 *InterruptError")
+	}
+	if err := ie.Validate(); err != nil {
+		return err
+	}
+	if len(ie.AllQueries()) == 0 {
+		return fmt.Errorf("InterruptError 里没有 AskQuery——caller 要靠它配答案，reason=%q", ie.Reason)
+	}
+	return nil
+}
+
+// MergeInterrupts 合并中断的问题并复制每个问题。问题自身的 Reason 优先，空值沿用其所属中断的 Reason。
+// 忽略 nil 元素。没有中断时返回 nil，只有一个中断时保留其字段，多个中断时将问题按输入顺序收进 Queries。
+// 多个中断的 Data 不聚合。收到任一独立任务的中断时，结果保留它的任务归属。
 func MergeInterrupts(ies []*InterruptError) *InterruptError {
-	// audit¹¹ HIGH-1 fix: 过滤 nil 元素 — 业务自定义 toolsFn 并发抛 Interrupt 时
-	// 收集 slice 可能含 nil 元素 (有些 goroutine 没抛 / err 不是 Interrupt). 旧代码
-	// `for _, ie := range ies { queries = append(queries, ie.AllQueries()...) }` 不
-	// 检 ie nil → ie.AllQueries() nil deref panic.
 	filtered := make([]*InterruptError, 0, len(ies))
 	for _, ie := range ies {
 		if ie != nil {
 			filtered = append(filtered, ie)
 		}
 	}
-	if len(filtered) == 0 {
+	switch len(filtered) {
+	case 0:
 		return nil
-	}
-	// audit #5 视角 8 F3 fix: per-query 保留 ie.Reason — fanout 多 tc 业务区分
-	// "tool_X 想确认 vs tool_Y 想确认" 上下文. 每 ie 的 query 未填 Reason 时拷贝
-	// ie.Reason 上去 (业务自填 query.Reason 优先).
-	// 注: ie.Data 仍跨 ie 边界丢失 (any json 不可逆, AskQuery 不存 Meta 字段),
-	// 业务想跨 fanout 保 typed metadata 走 store.Store 用 InterruptID 作 key.
-	//
-	// **audit #5 阶段 1 follow-up MED-A fix**: 单 ie 早返路径**也**拷贝 ie.Reason —
-	// 之前单 ie 直接 return filtered[0] 不拷贝, 跟多 ie 行为不一致让业务自定义
-	// toolsFn 单 tc 抛 ie 时 q.Reason="" silent 丢失. 现单 / 多 ie 路径统一拷贝行为.
-	propagateIEReasonToQueries := func(ie *InterruptError) {
-		if ie.Reason == "" {
-			return
-		}
-		for _, q := range ie.AllQueries() {
-			if q != nil && q.Reason == "" {
-				q.Reason = ie.Reason
+	case 1:
+		original := filtered[0]
+		owned := *original
+		owned.Query = mergeInterruptQuery(original.Query, original.Reason)
+		if original.Queries != nil {
+			owned.Queries = make([]*AskQuery, len(original.Queries))
+			for i, query := range original.Queries {
+				owned.Queries[i] = mergeInterruptQuery(query, original.Reason)
 			}
 		}
+		return &owned
 	}
-	if len(filtered) == 1 {
-		propagateIEReasonToQueries(filtered[0])
-		return filtered[0]
-	}
-	var queries []*AskQuery
+	merged := &InterruptError{Reason: fmt.Sprintf("聚合 %d 个中断", len(filtered))}
 	for _, ie := range filtered {
-		propagateIEReasonToQueries(ie)
-		queries = append(queries, ie.AllQueries()...)
-	}
-	merged := &InterruptError{
-		Reason:  fmt.Sprintf("聚合 %d 个 InterruptError (fanout 多 tc 抛, ie.Reason 已拷贝到 query.Reason 见 godoc)", len(filtered)),
-		Queries: queries,
-	}
-	// 合并进来的有一个是独立运行交出的中断，合并之后整个就不是这个任务答得了的（见 InterruptError.detached）
-	for _, ie := range filtered {
-		if ie.detached {
+		for _, query := range ie.AllQueries() {
+			merged.Queries = append(merged.Queries, mergeInterruptQuery(query, ie.Reason))
+		}
+		if !merged.detached && ie.detached {
 			merged.detached, merged.detachedSID = true, ie.detachedSID
-			break
 		}
 	}
 	return merged
+}
+
+func mergeInterruptQuery(query *AskQuery, reason string) *AskQuery {
+	if query == nil {
+		return nil
+	}
+	owned := query.clone()
+	if owned.Reason == "" {
+		owned.Reason = reason
+	}
+	return owned
 }
 
 // Validate 检查 InterruptError 字段一致性——Query 和 Queries 同时填时返 error.
@@ -463,43 +496,32 @@ func (e *InterruptError) Validate() error {
 
 // IsInterrupt 检查 error 是否是 InterruptError。
 func IsInterrupt(err error) (*InterruptError, bool) {
-	if err == nil {
-		return nil, false
-	}
-	var ie *InterruptError
-	if asInterrupt(err, &ie) {
-		return ie, true
-	}
-	return nil, false
+	var found *InterruptError
+	ok := walkInterrupts(err, func(ie *InterruptError) bool {
+		found = ie
+		return true
+	})
+	return found, ok
 }
 
-func asInterrupt(err error, target **InterruptError) bool {
+// walkInterrupts 深度优先地访问错误树中的中断。框架聚合和独立任务包装各自持有一次投影。
+func walkInterrupts(err error, visit func(*InterruptError) bool) bool {
 	for err != nil {
-		if ie, ok := err.(*InterruptError); ok {
-			*target = ie
-			return true
-		}
-		// 独立运行交出的中断：交带记号的拷贝，不往下走到原对象（见 detachedInterruptError.marked）
-		if d, ok := err.(*detachedInterruptError); ok && d.marked != nil {
-			*target = d.marked
-			return true
-		}
-		// 简化版 errors.As——手动走 Unwrap 链找 *InterruptError（只认这一种目标类型，
-		// 不用 stdlib errors.As 省 reflect 开销）。**必须同时认单链 Unwrap() error 与
-		// 多错误树 Unwrap() []error**（Go 1.20+ errors.Join）：漏 []error 分支会让
-		// errors.Join 包的 InterruptError 检测不到——graph_loop.go 两条路都靠它：部分中断 +
-		// 同超步 ApplyAll 失败走 `errors.Join(branchErr, applyErr)`，以及**多个分支同时
-		// 中断**走 `exitErr` 的 `errors.Join(合并后的中断, 各中断分支的原始链...)`（后者
-		// 挂原始链是为了保住各分支并列的第二 sentinel，`MergeInterrupts` 造的新 ie 没有
-		// Unwrap、只返它等于把 N 条链全扔了）。漏此分支
-		// 把 HITL 中断误判成致命错、Resume 闭环静默失效。语义对齐 stdlib errors.As：先试单链、再
-		// DFS 多链、从左到右第一个命中即返（单链是多链的退化，行为一致）。
-		switch u := err.(type) {
+		switch e := err.(type) {
+		case *InterruptError:
+			return visit(e)
+		case *fanoutInterruptError:
+			return visit(e.projection)
+		case *detachedInterruptError:
+			if e.marked != nil {
+				return visit(e.marked)
+			}
+			err = e.Unwrap()
 		case interface{ Unwrap() error }:
-			err = u.Unwrap()
+			err = e.Unwrap()
 		case interface{ Unwrap() []error }:
-			for _, e := range u.Unwrap() {
-				if asInterrupt(e, target) {
+			for _, cause := range e.Unwrap() {
+				if walkInterrupts(cause, visit) {
 					return true
 				}
 			}

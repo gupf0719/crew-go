@@ -77,14 +77,9 @@ type RunSession struct {
 	//
 	// # 契约：一枚 RunID 只服务一个任务
 	//
-	// 开新任务就要换一枚（`NextTask` 一行搞定）。**不换的后果没有任何提示**：任务 B
-	// 成功收尾时按 sid 清整棵子树，会把任务 A 还挂着、正等用户回答的存档一起删掉——
-	// 实测 `err = nil`、无告警，之后 `A.Resume` 返 `ErrNoPendingCheckpoint`。
-	//
-	// 框架不替你判「这次算不算新任务」，因为**只有入口知道**：同一个 sid 上再来一次
-	// 调用，可能是「上个任务的续跑」也可能是「新任务」，两者在数据里长得一样。同理
-	// 框架也不能偷偷帮你换——换了 Resume 就找不到那份存档了。
-	//
+	// 开新任务用 [RunSession.NextTask] 换一枚。内建图 Agent 检查顶层 Run 的 RunID，
+	// 有可续存档时返回 [ErrRunIDHasResumableCheckpoint]。继续旧任务用 Resume。
+
 	// # 跨任务累积状态不需要复用 RunID
 	//
 	// `values` / `events` 挂在 **RunSession 对象**上，不挂在 RunID 上（两者都不进 cp，

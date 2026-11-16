@@ -287,7 +287,7 @@ func TestHistGAGate_SoftCancel_KeepsInput(t *testing.T) {
 // 而守卫内部自己去 `HistorySlot(ctx)` 取（顶层恒空串）⟹ 拿空串比对 owner=agentName 的
 // 记录，恒不命中。
 //
-// 可观测后果就是本用例：同一个 sid 上 Run → 中断 → 再 Run，**即便调用方传的是同一个
+// 可观测后果就是本用例：同一个 sid 上 Run → 中断 → 明确放弃 → 再 Run，**即便调用方传的是同一个
 // message 指针**，用户那句话也被记两遍。（换成新构造的消息仍会记两遍——那是身份不同，
 // 框架确实分不出来，不在本用例范围。）
 func TestHistGAGate_ReRunSameSid_SamePointer_NoDoubleInput(t *testing.T) {
@@ -309,14 +309,19 @@ func TestHistGAGate_ReRunSameSid_SamePointer_NoDoubleInput(t *testing.T) {
 	ctx = compose_v2.WithThreadIDCtx(ctx, "c_rerun")
 	ctx = compose_v2.WithCheckpointerCtx(ctx, cper)
 
-	// **同一个指针**跑两次 Run（业务复用 session 对象是有的写法）
+	// 终结首个挂起任务后，保留历史，用同一个指针重新提交输入。
 	theInput := schema.UserMessage("我的原话")
 	sess := agent_v2.NewRunSession()
-	if _, err := ga.Run(ctx, sess, theInput); err == nil {
-		t.Fatal("Run 1 应中断")
+	_, err := ga.Run(ctx, sess, theInput)
+	if _, ok := compose_v2.IsInterrupt(err); !ok {
+		t.Fatalf("Run 1 应中断，实际 %v", err)
 	}
-	if _, err := ga.Run(ctx, sess, theInput); err != nil {
-		t.Fatalf("Run 2: %v", err)
+	if _, err := ga.Resume(ctx, sess.RunID, agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)); err != nil {
+		t.Fatalf("放弃旧任务：%v", err)
+	}
+	events, err := ga.Run(ctx, sess, theInput)
+	if final := agent_v2.FinalMessage(events); err != nil || final == nil || final.Content != "【图结论】" {
+		t.Fatalf("Run 2 应完成，答复=%v、错误=%v", final, err)
 	}
 
 	msgs := gateHist(t, hs, ctx, "c_rerun")

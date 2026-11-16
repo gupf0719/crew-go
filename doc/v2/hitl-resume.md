@@ -109,7 +109,7 @@ func (e *InterruptError) AllQueries() []*AskQuery       // 统一 accessor——
 
 | 字段 | 必填 | 用途 |
 |---|---|---|
-| `Reason` | 否 | 业务自定义标识（hook 可按 reason 路由不同处理）。**多 query 模式聚合**：`MergeInterrupts(ies)` helper 聚合 N 个 InterruptError 时 `Reason` 被覆盖为聚合字符串 (实际中文字面量, 含聚合数量 + "ie.Reason 已拷贝到 query.Reason 见 godoc" 提示; 按 `compose_v2/interrupt.go::MergeInterrupts` 符号自查) — 原各 ie 的 `Reason` **自动 propagate 到 q.Reason** (audit #5 视角 8 F3 fix), per-query 语义不丢失 |
+| `Reason` | 否 | 单次中断的原因。多个中断合并时，来源中断的原因填入副本中尚无原因的问题。 |
 | `Query` | 单/多互斥 | **单 query 模式**——99% 场景填 Query 即可（含 InterruptID + Question + Options + Reason）|
 | `Queries` | 单/多互斥 | **多 query 模式**——ISSUE-81 toolsFn fanout 多 tc 同时抛 Interrupt 用；与 Query 互斥，Queries 非空时优先 |
 | `Data` | 否 | 业务自定义 metadata（如 active agent 名 / round 号 / hint）—— **仅同进程透传**，cp 只存 *AskQuery 不含 Data。**多 query 场景**：业务想区分 per-query Reason 用 `q.Reason` 字段 (audit #5 视角 8 F3 加, ie.Reason 自动 propagate 到 q.Reason); 想跨 ie 边界保 typed metadata 走 `store.Store` 用 InterruptID 作 key |
@@ -194,10 +194,10 @@ if err != nil { /* 真错 */ }
 fan-out 多分支并发各抛 InterruptError 时：
 - 每个 ie 都通过 `ie.AllQueries()` 协议 record 到 `cm.PendingInterrupts`
 - 单一 cp 含**多个 AskQuery**
-- 框架返**单一 `*InterruptError`**（`res.exitErr()`，不是 multi-error）—— 多个分支同时中断时它是 `MergeInterrupts` 合出来的那一个，`ie.AllQueries()` **含本超步全部 query**，跟 cp.PendingInterrupts 的数量一致；不必再 `cper.LoadNS(...)` 去补
+- 调用方经 `IsInterrupt` 取得中断视图。多个问题按分支顺序聚合，视图与 `cp.PendingInterrupts` 对应。
 - **中断优先于兄弟分支的业务错**：同一超步里 1 个分支中断 + 兄弟分支业务失败时，返回值仍是中断（否则调用方按「Run 失败了」处理不会 Resume，cp 里挂着的问题永远没人答）。被让位的那些业务错不会永久静默——它们在 `FailedBranches` 里，Resume 时一起重跑；要当场看每个失败分支各自的原因，走 `OnNodeEnd(ctx, nodeID, chs, nodeErr)`（每个失败分支各 fire 一次，带分支身份）
-- **只有一个分支中断时返的是那条分支的原始 error**，不是抠出来的裸 `*InterruptError`——链上并列挂的第二 sentinel（如 `ErrCheckpointStale`）必须保住，下游 a2a/server、agui、observability 三处都把 stale 判在 `IsInterrupt` 之前
-- **toolsFn fanout 多 tc 同时抛 Interrupt**（ISSUE-81）走 `MergeInterrupts(ies)` helper 聚合到单 ie.Queries，graph_loop 走 AllQueries 协议 record 全部 query 不丢
+- 只有一个中断时保留分支原始错误。任一分支的终局失败、坏存档或写档失败优先于中断。
+- 工具批次调用 `PickFanoutError`，按分支顺序收齐错误树中的中断。聚合前校验叶子的形状，合并副本保留问题各自的原因，结果的错误链保留各分支原始错误。
 
 业务 Resume 时一次性传所有 user 答案（map 多 key）：
 

@@ -279,7 +279,8 @@ func TestEnterRunTask_CapturedHookCtxOnOtherSession_RejectedUnlessDetached(t *te
 func TestEnterRunTask_CapturedResumeHookCtxOnOtherSession_DetachedRunsOwnInput(t *testing.T) {
 	for _, which := range []string{"start", "end"} {
 		t.Run(which, func(t *testing.T) {
-			root := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
+			cp := compose_v2.NewInMemoryCheckpointer()
+			root := compose_v2.WithCheckpointerCtx(context.Background(), cp)
 			h := &hookCtxCapture{top: "x"}
 			x := agent_v2.NewBasicAgent(agent_v2.WithName("x"), agent_v2.WithHooks(h), agent_v2.WithMaxRounds(4),
 				agent_v2.WithToolkit(entryPauseToolkit()),
@@ -301,15 +302,20 @@ func TestEnterRunTask_CapturedResumeHookCtxOnOtherSession_DetachedRunsOwnInput(t
 			firsts := &countLog{}
 			y := askingTwoNodeAgent(t, "y", firsts)
 			sessY := agent_v2.NewRunSession()
-			if _, err := y.Run(root, sessY, schema.UserMessage("Y1")); err == nil {
-				t.Fatalf("Y1 应停在中断上")
+			_, err = y.Run(root, sessY, schema.UserMessage("Y1"))
+			if _, interrupted := compose_v2.IsInterrupt(err); !interrupted {
+				t.Fatalf("Y1 应停在中断上，实际 %v", err)
 			}
 			_, err = y.Run(captured, sessY, schema.UserMessage("Y2"))
 			requireRejectedNotInTask(t, err)
 			if n := firsts.get("Y2"); n != 0 {
 				t.Errorf("被拒的那次不该跑任何节点，Y2 的第一个节点执行了 %d 次", n)
 			}
-			_, _ = y.Run(agent_v2.DetachTask(captured), sessY, schema.UserMessage("Y2"))
+			next := restoreCheckpointAfterAdmission(t, agent_v2.DetachTask(captured), cp, sessY.RunID, "")
+			_, err = y.Run(next, sessY, schema.UserMessage("Y2"))
+			if _, interrupted := compose_v2.IsInterrupt(err); !interrupted {
+				t.Fatalf("Y2 的新任务应执行到自己的提问，实际 %v", err)
+			}
 			if n := firsts.get("Y2"); n != 1 {
 				t.Errorf("DetachTask 之后 Y 的新任务的输入应进图（Y2 的第一个节点执行 1 次），实际 %d 次——被上个任务的存档吞掉", n)
 			}

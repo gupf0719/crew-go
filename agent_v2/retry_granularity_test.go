@@ -90,10 +90,9 @@ func TestRetry_Granularity(t *testing.T) {
 // 于是一个「第 2 次尝试起清掉新开信号」的改动能全绿通过整套测试，而它实际打破了
 // 那条不变量。触发条件是三条同时成立：
 //
-//  1. 同 sid 跨任务复用（`NewRunSession` godoc 邀请的「与业务持久化主键对齐」用法）
-//  2. 任务 A 停在中断且**不 Resume**（被放弃）⟹ 留下 Pending 子树
-//  3. 任务 B 是全新 Run + **配了重试**，且第 1 次尝试失败在**比残留 ns 更浅**的位置
-//     （所以没覆盖掉 A 的档）
+//  1. 任务 A 在深处中断，取出实际写入的子档，再清掉整个任务的存档。
+//  2. 任务 B 复用 sid 通过新 Run 入口守卫，在第一个成员执行时注入 A 的迟到子档。
+//  3. 任务 B **配了重试**，且第 1 次尝试失败在**比残留 ns 更浅**的位置（没有覆盖 A 的档）。
 //
 // 第 3 条不刁钻：重试存在的理由正是「成员会瞬时失败」，而成员在浅层先挂掉是最常见的形态。
 //
@@ -116,7 +115,7 @@ func TestRetry_CrossTaskIsolationHolds(t *testing.T) {
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), cp)
 	sess := agent_v2.NewRunSession()
 
-	// 任务 A：深处（member/I2）中断，放弃不 Resume
+	// 任务 A：深处（member/I2）中断，取出还未完成的子档。
 	tkA := agent_v2_newToolkit()
 	tkA.Register(mkHold())
 	i2A := agent_v2.NewBasicAgent(agent_v2.WithName("I2"), agent_v2.WithToolkit(tkA),
@@ -131,8 +130,13 @@ func TestRetry_CrossTaskIsolationHolds(t *testing.T) {
 	if _, err := outerA.Run(ctx, sess, schema.UserMessage("任务A")); err == nil {
 		t.Fatal("fixture 没搭对：任务 A 该停在中断上（不中断就没有残留可泄漏）")
 	}
-	if pend, _ := cp.ListPending(ctx, sess.RunID); len(pend) == 0 {
-		t.Fatal("fixture 没搭对：任务 A 没留下挂起档，这条用例恒真")
+	const lateNS = "member/I2"
+	lateCheckpoint, err := cp.LoadNS(ctx, sess.RunID, lateNS)
+	if err != nil || lateCheckpoint == nil || !lateCheckpoint.HasResumableWork() || lateCheckpoint.TaskID == "" {
+		t.Fatalf("任务 A 的 I2 应留下带任务身份的可续子档，实际存档=%v、错误=%v", lateCheckpoint, err)
+	}
+	if _, err := cp.DeleteSubtree(ctx, sess.RunID, ""); err != nil {
+		t.Fatal(err)
 	}
 
 	// 任务 B：同 sid、全新 Run、配重试；I1 第 1 次失败（浅层）
@@ -143,28 +147,42 @@ func TestRetry_CrossTaskIsolationHolds(t *testing.T) {
 		agent_v2.WithMaxRounds(4), agent_v2.WithModel(newStubModel([]*schema.Message{
 			schema.AssistantMessage("B 直接完成")}))) // 永不产生 tool_call
 	var cB atomic.Int32
+	var restoreErr error
+	i1B := &failOnceMember{name: "I1", calls: &cB, beforeFailure: func(ctx context.Context) {
+		restoreErr = cp.SaveNS(ctx, sess.RunID, lateNS, lateCheckpoint)
+	}}
 	innerB := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("inner")).
-		AddStep("I1", &failOnceMember{name: "I1", calls: &cB}).AddStep("I2", i2B)
+		AddStep("I1", i1B).AddStep("I2", i2B)
 	outerB := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("outer"),
 		agent_v2.WithSequentialMaxRetries(3)).AddStep("member", innerB)
-	_, errB := outerB.Run(ctx, sess, schema.UserMessage("任务B"))
+	eventsB, errB := outerB.Run(ctx, sess, schema.UserMessage("任务B"))
 
 	if cB.Load() < 2 {
 		t.Fatalf("fixture 没搭对：B 的 I1 只跑了 %d 次，重试没生效 ⟹ 走不到第 2 次尝试", cB.Load())
+	}
+	if restoreErr != nil {
+		t.Fatalf("没有成功注入旧子档：%v", restoreErr)
 	}
 	if n := holdRuns.Load(); n > 0 {
 		t.Errorf("任务 B 执行了任务 A 的待办：hold 跑了 %d 次，而 B 的 model 永不产生 tool_call。\n"+
 			"errB=%v\n上一个被放弃任务的挂起档被 B 捡起来了——跨任务隔离破了。", n, errB)
 	}
+	if final := agent_v2.FinalMessage(eventsB); errB != nil || final == nil || final.Content != "B 直接完成" {
+		t.Errorf("任务 B 应完成自己的执行，答复=%v、错误=%v", final, errB)
+	}
 }
 
 type failOnceMember struct {
-	name  string
-	calls *atomic.Int32
+	name          string
+	calls         *atomic.Int32
+	beforeFailure func(context.Context)
 }
 
-func (f *failOnceMember) Run(context.Context, *agent_v2.RunSession, *schema.Message, ...agent_v2.RunOption) ([]*agent_v2.AgentEvent, error) {
+func (f *failOnceMember) Run(ctx context.Context, _ *agent_v2.RunSession, _ *schema.Message, _ ...agent_v2.RunOption) ([]*agent_v2.AgentEvent, error) {
 	if f.calls.Add(1) == 1 {
+		if f.beforeFailure != nil {
+			f.beforeFailure(ctx)
+		}
 		return nil, errors.New("瞬时失败")
 	}
 	return []*agent_v2.AgentEvent{agent_v2.NewOutputEvent(f.name, schema.AssistantMessage("ok"))}, nil

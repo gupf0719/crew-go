@@ -10,6 +10,7 @@ import (
 type taskActivityState struct {
 	running    int
 	abandoning bool
+	exclusive  *TaskActivity
 }
 
 var taskActivities = struct {
@@ -20,6 +21,7 @@ var taskActivities = struct {
 // TaskActivity 持有一次调用的执行登记与放弃许可。由取得它的调用串行释放。
 type TaskActivity struct {
 	sid            string
+	fresh          *freshTaskCheckpoints
 	abandoned      []string
 	sharedRun      *checkpointTaskLease
 	sharedAbandons []*checkpointTaskLease
@@ -32,17 +34,37 @@ type TaskActivity struct {
 //
 // 给图引擎和 Agent 入口使用：在读写存档或历史之前调用，结束时 Release。放弃操作完成后可先调用 FinishAbandon。
 func BeginTaskActivity(ctx context.Context, sid string, abandoned []string) (context.Context, *TaskActivity, error) {
-	return beginTaskActivity(ctx, GetCheckpointer(ctx), sid, abandoned)
+	return beginTaskActivity(ctx, GetCheckpointer(ctx), sid, abandoned, false)
 }
 
-func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandoned []string) (context.Context, *TaskActivity, error) {
+// BeginFreshTaskActivity 保护新任务对存档的独占使用。沿同一 ctx 派生的执行可借用登记，
+// 其他存档调用在本次任务退出前得到 [ErrTaskBusy]。每个实际使用的后端在持有租约时检查该 sid 下的可续存档。
+func BeginFreshTaskActivity(ctx context.Context, sid string, abandoned []string) (context.Context, *TaskActivity, error) {
+	return beginTaskActivity(ctx, GetCheckpointer(ctx), sid, abandoned, true)
+}
+
+type taskActivityKey struct{}
+
+func (taskActivityKey) ExecutionState() {}
+
+type taskActivityBinding struct {
+	parent   *taskActivityBinding
+	activity *TaskActivity
+}
+
+func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandoned []string, fresh bool) (context.Context, *TaskActivity, error) {
 	executionCtx := ctx
 	if sid != "" && !WithinNodeScope(ctx) {
 		executionCtx = withoutDetachedFrom(ctx, sid)
 	}
 	abandoned = slices.Clone(abandoned)
+	parent, _ := ctx.Value(taskActivityKey{}).(*taskActivityBinding)
+	activity := &TaskActivity{sid: sid, abandoned: abandoned}
 	taskActivities.Lock()
-	if taskActivities.byID[sid].abandoning {
+	state := taskActivities.byID[sid]
+	inherited, freshOwner, ownsExclusive := inheritedActivity(state, parent, sid)
+	claimsStorage := cp != nil && (fresh || (freshOwner != nil && state.exclusive == nil))
+	if state.abandoning || (cp != nil && !ownsExclusive) || (claimsStorage && inherited != state.running) {
 		taskActivities.Unlock()
 		return ctx, nil, &TaskBusyError{TaskID: sid, operation: "cannot execute task"}
 	}
@@ -57,15 +79,21 @@ func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandon
 		}
 	}
 	if sid != "" {
-		state := taskActivities.byID[sid]
+		if fresh {
+			activity.fresh = &freshTaskCheckpoints{checked: make(map[Checkpointer]string)}
+			freshOwner = activity
+		}
+		if claimsStorage {
+			state.exclusive = freshOwner
+		}
 		state.running++
 		taskActivities.byID[sid] = state
+		executionCtx = context.WithValue(executionCtx, taskActivityKey{}, &taskActivityBinding{parent: parent, activity: activity})
 	}
 	for _, id := range abandoned {
 		taskActivities.byID[id] = taskActivityState{abandoning: true}
 	}
 	taskActivities.Unlock()
-	activity := &TaskActivity{sid: sid, abandoned: abandoned}
 	var ok bool
 	defer func() {
 		if !ok {
@@ -76,8 +104,33 @@ func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandon
 	if err != nil {
 		return ctx, nil, err
 	}
+	if freshOwner != nil {
+		if err := freshOwner.fresh.check(executionCtx, cp, sid); err != nil {
+			return ctx, nil, err
+		}
+	}
 	ok = true
 	return executionCtx, activity, nil
+}
+
+// inheritedActivity 只认可当前 ctx 链上仍有效的同任务登记。调用方持有 taskActivities 的锁。
+func inheritedActivity(state taskActivityState, parent *taskActivityBinding, sid string) (count int, freshOwner *TaskActivity, ownsExclusive bool) {
+	ownsExclusive = state.exclusive == nil
+	if sid == "" || state.running == 0 {
+		return
+	}
+	for current := parent; current != nil; current = current.parent {
+		activity := current.activity
+		if activity.sid != sid {
+			continue
+		}
+		count++
+		if freshOwner == nil && activity.fresh != nil {
+			freshOwner = activity
+		}
+		ownsExclusive = ownsExclusive || activity == state.exclusive
+	}
+	return
 }
 
 // FinishAbandon 释放放弃许可。调用方应在删档和历史收尾结束后调用。
@@ -117,10 +170,13 @@ func (a *TaskActivity) Release() {
 		delete(taskActivities.byID, a.sid)
 	} else {
 		state.running--
+		if state.exclusive == a {
+			state.exclusive = nil
+		}
 		taskActivities.byID[a.sid] = state
 	}
-	taskActivities.Unlock()
 	a.sid = ""
+	taskActivities.Unlock()
 }
 
 func taskExecuting(sid string) bool {

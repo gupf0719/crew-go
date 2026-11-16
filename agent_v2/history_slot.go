@@ -782,8 +782,8 @@ func CloseAbandonedTaskHistory(ctx context.Context, destination TaskHistoryDesti
 	return store.Append(ctx, key, closers)
 }
 
-// beginRunActivity 校验放弃声明，再原子登记本次执行和要放弃的任务。排在建历史写入器和盖章之前。
-func beginRunActivity(ctx context.Context, tasks []abandonedTask, session *RunSession, agentName string) (context.Context, *compose_v2.TaskActivity, error) {
+// beginRunActivity 登记本次执行和要放弃的任务，在建历史写入器和盖章之前校验新任务的存档。
+func beginRunActivity(ctx context.Context, tasks []abandonedTask, session *RunSession, agentName string) (context.Context, *runActivity, error) {
 	ids := make([]string, len(tasks))
 	for i, task := range tasks {
 		id := task.id
@@ -797,9 +797,23 @@ func beginRunActivity(ctx context.Context, tasks []abandonedTask, session *RunSe
 				agentName, id)
 		}
 	}
-	ctx, activity, err := compose_v2.BeginTaskActivity(ctx, session.RunID, ids)
+	_, nested := enclosingTask(ctx)
+	admittedID, _ := ctx.Value(rootRunAdmissionKey{}).(string)
+	// 透传的自研入口可能已经声明新开，但尚未有内建入口取得存档准入。
+	freshRoot := !nested || (compose_v2.IsFreshRunCtx(ctx) && !compose_v2.WithinNodeScope(ctx) && admittedID != session.RunID)
+	begin := compose_v2.BeginTaskActivity
+	if freshRoot {
+		begin = compose_v2.BeginFreshTaskActivity
+	}
+	ctx, task, err := begin(ctx, session.RunID, ids)
 	if err != nil {
 		return ctx, nil, fmt.Errorf("agent %q: %w", agentName, err)
+	}
+	activity := &runActivity{TaskActivity: task}
+	if freshRoot {
+		activity.runID = session.RunID
+		activity.initial = compose_v2.GetCheckpointer(ctx)
+		ctx = context.WithValue(ctx, rootRunAdmissionKey{}, session.RunID)
 	}
 	return ctx, activity, nil
 }

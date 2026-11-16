@@ -178,7 +178,7 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 		var savedSubCp *Checkpoint
 		if cper != nil && sid != "" {
 			// 节点钩子可选择独立的 Checkpointer。子树从预读到出口清理共用该存储域的租约。
-			subCtx, activity, err := beginTaskActivity(ctx, cper, sid, nil)
+			subCtx, activity, err := beginTaskActivity(ctx, cper, sid, nil, false)
 			if err != nil {
 				return nil, fmt.Errorf("subgraph %q: %w", id, err)
 			}

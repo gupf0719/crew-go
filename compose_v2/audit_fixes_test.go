@@ -357,8 +357,8 @@ func TestPhase51b_GraphID_GuardOnAutoLoad(t *testing.T) {
 	if saved == nil {
 		t.Fatalf("Run 1 后应有 saved cp")
 	}
-	if saved.GraphID != "g_A" {
-		t.Fatalf("saved cp.GraphID 应是 'g_A'，实际 %q", saved.GraphID)
+	if saved.GraphID != graphA.CheckpointIdentity() {
+		t.Fatalf("存档应记录图的存档身份 %q，实际 %q", graphA.CheckpointIdentity(), saved.GraphID)
 	}
 
 	// Run 2: graph B（WithName "g_B"）同 sid → 应 fail-fast ErrGraphIDConflict

@@ -26,7 +26,7 @@ var executionCtxKeys = []any{
 	toolCallIdxKey{}, currentToolCallIDKey{}, toolCallInstanceKey{}, inToolCallKey{}, withinNodeScopeKey{},
 	nodeStateAccessorKey{}, subCallCounterKey{}, subCallScopeKey{}, abnormalNodeExitKey{},
 	componentKindKey{}, eventSinkKey{}, sendSinkKey{}, toolCategoryLookupKey{}, outerRerunGensKey{}, outerRegensKey{},
-	threadIDKey{}, softCancelCtxKey{}, detachedKey{}, detachedFromKey{}, runAliveKey{}, signalScopeKey{}, taskRecipientKeyCtxKey{}, hookCallKey{}, exitGraceKey{}, streamRecordKey{}, runningSlotKey{}, checkpointTaskLeaseKey{}, taskActivityKey{},
+	threadIDKey{}, softCancelCtxKey{}, detachedKey{}, detachedFromKey{}, runAliveKey{}, signalScopeKey{}, taskRecipientKeyCtxKey{}, hookCallKey{}, exitGraceKey{}, streamRecordKey{}, runningSlotKey{}, checkpointTaskLeaseKey{}, taskActivityKey{}, checkpointRevisionCtxKey{}, resumeCheckpointTargetKey{},
 }
 
 // configurableExecutionCtxKeys 是执行状态里调用方可配的那一样（脱离时剥；采纳派生的 ctx 时听钩子的），

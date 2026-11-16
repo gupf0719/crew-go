@@ -107,6 +107,7 @@ func TestAutoCompact_ReapproveLegacyBasicAgentSummary(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	ctx = compose_v2.WithCheckpointerCtx(ctx, cp)
+	saved.GraphID = knownBasicSummaryGraphIdentity(t)
 	if err := cp.SaveNS(ctx, saved.ID, "", saved); err != nil {
 		t.Fatal(err)
 	}
@@ -204,6 +205,7 @@ func TestAutoCompact_ReapproveLegacyPublicSummary(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	cp := compose_v2.NewInMemoryCheckpointer()
+	saved.GraphID = graph.CheckpointIdentity()
 	if err := cp.SaveNS(ctx, saved.ID, "", saved); err != nil {
 		t.Fatal(err)
 	}
@@ -367,4 +369,26 @@ func TestAutoCompact_PublicSummaryKeepsCustomPhaseAnswer(t *testing.T) {
 	if err := run(answers); err != nil || summaryApproved != 2 || customApproved != 1 {
 		t.Fatalf("摘要与当前版本的自定义提问串台，摘要获准 %d 自定义获准 %d err=%v", summaryApproved, customApproved, err)
 	}
+}
+
+// 已知 fixture 来源是同构的 BasicAgent。重签图身份后仍使用未转换的旧摘要状态与问题 ID。
+func knownBasicSummaryGraphIdentity(t *testing.T) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cp := compose_v2.NewInMemoryCheckpointer()
+	ctx = compose_v2.WithCheckpointerCtx(ctx, cp)
+	model := &fnModel{fn: func(ctx context.Context, _ []*schema.Message) (*schema.Message, error) {
+		return compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "确认图契约？"})
+	}}
+	agent := agent_v2.NewBasicAgent(agent_v2.WithName("compact"), agent_v2.WithModel(model))
+	sess := agent_v2.NewRunSession()
+	if _, err := agent.Run(ctx, sess, schema.UserMessage("获取存档身份")); err == nil {
+		t.Fatal("确认图契约应中断")
+	}
+	saved, err := cp.LoadNS(ctx, sess.RunID, "")
+	if err != nil || saved == nil || saved.GraphID == "" {
+		t.Fatalf("应从实际运行拿到图存档身份，实际存档=%v 错误=%v", saved, err)
+	}
+	return saved.GraphID
 }

@@ -275,7 +275,7 @@ func isExecutionKey(key any) bool {
 		nodeStateAccessorKey, subCallCounterKey, subCallScopeKey, abnormalNodeExitKey,
 		componentKindKey, eventSinkKey, sendSinkKey, toolCategoryLookupKey, outerRerunGensKey, outerRegensKey,
 		threadIDKey, softCancelCtxKey, detachedKey, detachedFromKey, runAliveKey, signalScopeKey, taskRecipientKeyCtxKey, hookCallKey,
-		exitGraceKey, streamRecordKey, runningSlotKey, checkpointTaskLeaseKey, taskActivityKey:
+		exitGraceKey, streamRecordKey, runningSlotKey, checkpointTaskLeaseKey, taskActivityKey, checkpointRevisionCtxKey, resumeCheckpointTargetKey:
 		return true
 	}
 	_, ok := key.(ExecutionStateKey)

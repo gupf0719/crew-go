@@ -4,9 +4,10 @@
 
 - 根模块与三个子模块要求 Go 1.26.0 或更高版本。仓库工具链与 GitLab CI 使用 Go 1.26.4。
 - 对共用同一 Redis 或 SQL 存档域的进程，先停旧副本，再启动新版。新版用任务租约协调执行、续跑和清档。 [任务租约](../v2/checkpoint.md#61-共享存档的任务租约)
-- 升级前完成或放弃显式起名的 BasicAgent 的旧挂起任务，以及仍使用旧路由档位下标的任务。它们升级后会遇到 GraphID 冲突。新建路由升级链时给每个 `WithRouteDecider` 档位使用稳定名称。 [路由决策](../v2/route-decider.md)
+- 新版恢复要求带版本的图存档身份。切换前让旧版处理仍在途的任务，或显式放弃，再统一切换读写版本。旧档可以读取和导出。回退前由新版处理新版产生的待答档。 [存档身份](../v2/checkpoint.md#43-graphid-防串台)
+- 新建路由升级链时给每个 `WithRouteDecider` 档位使用稳定名称。 [路由决策](../v2/route-decider.md)
 - 使用 `SendDirective.Input` 的部署应统一 Checkpoint 的读写版本。Schema 19 增加 `frontier_inputs` 和 `deferred_sends[].input`，缺少这两个字段的旧存档仍可读取。旧进程读取新存档会忽略这些字段，回退前先处理挂起的私有投递。 [存档结构](../v2/checkpoint.md)
-- Schema 23 将 AutoCompact 审批绑定到本次摘要调用和实际送模视图。升级后，旧存档中的摘要审批会重新提问，业务提问仍使用原 ID。切换版本时使用相同版本的存档读写者。 [摘要提问](../v2/context-compaction.md#压缩结果的复用单次-run-内的备忘与跨-run-的压缩边界)
+- Schema 23 将 AutoCompact 审批绑定到本次摘要调用和实际送模视图。经过图身份校验后，未绑定的旧摘要审批会重新提问，业务提问沿用原 ID。 [摘要提问](../v2/context-compaction.md#压缩结果的复用单次-run-内的备忘与跨-run-的压缩边界)
 - 旧工具账已登记展示但未记录展示方式时，AG-UI 续跑向前端发送空正文，模型与历史沿用存档中的定稿结果。 [AG-UI 事件映射](../v2/agui.md)
 - A2A 使用 `a2a-go/v2 v2.7.0`。新版服务端要求请求携带 `A2A-Version: 1.0`。`server.Card` 默认声明 `text/plain` 和 `application/json`，按 `text` 匹配名片的客户端需更新。自装配服务端应按请求 owner 隔离任务读取、列表与重订阅。旧挂起档缺少答复投递状态时，续跑需能读取远端任务做对账。 [A2A 接入](../v2/a2a.md)
 - MCP stdio 通过 `WithStdioEnvAllowlist` 选择继承变量，服务明确需要的凭据也可用 `WithStdioEnv` 提供。 [MCP](../v2/mcp.md)

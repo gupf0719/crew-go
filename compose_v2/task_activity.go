@@ -80,7 +80,7 @@ func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandon
 	}
 	if sid != "" {
 		if fresh {
-			activity.fresh = &freshTaskCheckpoints{checked: make(map[Checkpointer]string)}
+			activity.fresh = &freshTaskCheckpoints{checked: make(map[freshCheckpointPartition]string)}
 			freshOwner = activity
 		}
 		if claimsStorage {

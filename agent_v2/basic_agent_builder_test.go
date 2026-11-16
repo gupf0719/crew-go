@@ -159,13 +159,17 @@ func TestBasicAgentBuilder_HITL_InToolFn(t *testing.T) {
 	}
 
 	cm1 := compose_v2.NewChannelManager()
-	err := compose_v2.Run(context.Background(), makeGraph(), cm1,
+	g1 := makeGraph()
+	err := compose_v2.Run(context.Background(), g1, cm1,
 		compose_v2.WithInitialWrites(agent_v2.BasicAgentInputWrites(schema.UserMessage("test"))...),
 	)
 	if _, isInt := compose_v2.IsInterrupt(err); !isInt {
 		t.Fatalf("应中断，实际 %v", err)
 	}
-	snap, _ := cm1.Snapshot()
+	snap, err := cm1.SnapshotForGraph(g1)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Run 2: 注入 answer
 	cm2 := compose_v2.NewChannelManager()

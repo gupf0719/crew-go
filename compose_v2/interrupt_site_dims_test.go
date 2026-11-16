@@ -113,6 +113,7 @@ func TestInterruptSiteDims_GraphNSReadFromCtx(t *testing.T) {
 	run := func(ns string) {
 		cp := &compose_v2.Checkpoint{
 			TaskID:          "FIXED_TASK",
+			GraphID:         g.CheckpointIdentity(),
 			CurrentFrontier: []compose_v2.FrontierMember{{NodeID: "n"}},
 		}
 		if err := compose_v2.Run(context.Background(), g, compose_v2.NewChannelManager(),

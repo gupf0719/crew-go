@@ -178,7 +178,7 @@ func TestRepro_R8_Bug4_WithResumeFromGraphIDGuard(t *testing.T) {
 	// 构造一个属于 g1 的 cp（含 GraphID）
 	cp := &compose_v2.Checkpoint{
 		SchemaVer:       6,
-		GraphID:         g1.ID(),
+		GraphID:         g1.CheckpointIdentity(),
 		Status:          compose_v2.CPStatusPending,
 		CurrentFrontier: []compose_v2.FrontierMember{{NodeID: "x"}},
 	}
@@ -189,7 +189,7 @@ func TestRepro_R8_Bug4_WithResumeFromGraphIDGuard(t *testing.T) {
 	if !errors.Is(err, compose_v2.ErrGraphIDConflict) {
 		t.Fatalf("Bug 4 reproduced: WithResumeFrom 不做 GraphID 冲突校验\n"+
 			"期望 ErrGraphIDConflict，实际 err=%v\n"+
-			"修复方向：WithResumeFrom 路径加 cp.GraphID != g.ID() 守卫", err)
+			"WithResumeFrom 应检查 cp.GraphID 和 g.CheckpointIdentity() 是否一致", err)
 	}
 }
 
@@ -197,7 +197,7 @@ func TestRepro_R8_Bug4_WithResumeFromGraphIDGuard(t *testing.T) {
 // 业务用裸 cm.Snapshot 时 cp 缺 GraphID/Status，跨进程接收方无法守卫；新
 // SnapshotForGraph 自动填两字段。
 //
-// **预期行为**：SnapshotForGraph(g) 产 cp.GraphID == g.ID() + cp.Status == Pending。
+// SnapshotForGraph(g) 记录图的存档身份，状态由剩余工作决定。
 func TestRepro_R8_Bug5_SnapshotForGraphAutoFillsMetadata(t *testing.T) {
 	noopFn := func(_ context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 		return nil, nil
@@ -217,11 +217,8 @@ func TestRepro_R8_Bug5_SnapshotForGraphAutoFillsMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SnapshotForGraph: %v", err)
 	}
-	if cp.GraphID == "" || cp.GraphID != g.ID() {
-		t.Fatalf("Bug 5 reproduced: SnapshotForGraph 不填 GraphID\n"+
-			"期望 cp.GraphID = %q，实际 %q\n"+
-			"修复方向：SnapshotForGraph 在 Snapshot 后填 cp.GraphID = g.ID()",
-			g.ID(), cp.GraphID)
+	if cp.GraphID == "" || cp.GraphID != g.CheckpointIdentity() {
+		t.Fatalf("SnapshotForGraph 应记录图的存档身份 %q，实际 %q", g.CheckpointIdentity(), cp.GraphID)
 	}
 	// Status **按内容算**：这个 cm 从没跑过任何东西——没有 frontier、没有挂起提问，
 	// 也就没有任何可执行的东西，标成「挂起等 Resume」是假的。
@@ -242,7 +239,7 @@ func TestRepro_R8_Bug5_SnapshotForGraphAutoFillsMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
-	if cp2.GraphID != g.ID() {
+	if cp2.GraphID != g.CheckpointIdentity() {
 		t.Fatalf("wire round-trip 丢 GraphID: %q", cp2.GraphID)
 	}
 }

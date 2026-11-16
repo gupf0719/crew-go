@@ -45,16 +45,13 @@ func TestPlanAgent_GraphIDStableAcrossRebuild(t *testing.T) {
 	}
 }
 
-// 对照组：显式设名时那个名字仍是图身份。
-//
-// 没有这一条，上面那个用例可以靠「干脆永远不把名字给 graph」通过，等于把显式命名的
-// 作用一并删掉——而显式名的用处正是让 sub-agent 集合变更不改指纹。
-func TestPlanAgent_ExplicitNameIsGraphIdentity(t *testing.T) {
+// 显式名称参与存档身份，同名时仍需校验 worker 拓扑。
+func TestPlanAgent_ExplicitNameAndTopologyAreCheckpointIdentity(t *testing.T) {
 	mk := func(name string, extraSub bool) *agent_v2.PlanAgent {
 		p := agent_v2.NewPlanAgent(agent_v2.Planner(gidPlanner), agent_v2.PlanName(name))
 		p.AddSubAgent("w", &gidInterruptAgent{name: "worker"})
 		if extraSub {
-			// 改 sub-agent 集合 ⟹ 节点集变 ⟹ fingerprint 会变。显式名让身份不受影响。
+			// 增加 worker，编译后的节点集合变化。
 			p.AddSubAgent("w2", &gidInterruptAgent{name: "worker2"})
 		}
 		return p
@@ -68,8 +65,8 @@ func TestPlanAgent_ExplicitNameIsGraphIdentity(t *testing.T) {
 	if _, isInt := compose_v2.IsInterrupt(err); !isInt {
 		t.Fatalf("第一次 Run 应中断；实际 err=%v", err)
 	}
-	if _, err := mk("myplan", true).Resume(ctx, sess.RunID); errors.Is(err, compose_v2.ErrGraphIDConflict) {
-		t.Errorf("同名但 sub-agent 集合变了，显式名该让身份不变，实际撞了冲突：%v", err)
+	if _, err := mk("myplan", true).Resume(ctx, sess.RunID); !errors.Is(err, compose_v2.ErrGraphIDConflict) {
+		t.Errorf("同名但 worker 拓扑改变应拒绝续跑，实际 %v", err)
 	}
 
 	// 不同名字必须是不同身份——冲突守卫要能报出来。

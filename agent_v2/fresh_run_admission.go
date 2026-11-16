@@ -19,9 +19,10 @@ func (rootRunAdmissionKey) ExecutionState() {}
 
 type runActivity struct {
 	*compose_v2.TaskActivity
-	runID       string
-	initial     compose_v2.Checkpointer
-	hookBackend *compose_v2.TaskActivity
+	runID        string
+	initial      compose_v2.Checkpointer
+	initialOwner string
+	hookBackend  *compose_v2.TaskActivity
 }
 
 func (a *runActivity) Release() {
@@ -51,7 +52,7 @@ func (a *runActivity) checkHookBackend(ctx context.Context) (next context.Contex
 	next = ctx
 	defer recoverToErr(ctx, "check fresh run checkpoint after agent start", &retErr)
 	cp := compose_v2.GetCheckpointer(ctx)
-	if a.runID == "" || cp == nil || (reflect.ValueOf(cp).Comparable() && cp == a.initial) {
+	if a.runID == "" || cp == nil || (reflect.ValueOf(cp).Comparable() && cp == a.initial && compose_v2.GetOwner(ctx) == a.initialOwner) {
 		return ctx, nil
 	}
 	next, activity, err := compose_v2.BeginTaskActivity(ctx, a.runID, nil)

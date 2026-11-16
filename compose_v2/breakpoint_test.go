@@ -257,7 +257,7 @@ func TestBreakpoint_NoDurableCheckpointPastBreakpoint(t *testing.T) {
 	}
 }
 
-// 没配 checkpointer 时用 Snapshot + WithResumeFrom 续跑（godoc 里写的那条路）。
+// 没配 checkpointer 时用 SnapshotForGraph + WithResumeFrom 续跑。
 func TestBreakpoint_ResumeFromSnapshotWithoutCheckpointer(t *testing.T) {
 	var aRuns, bRuns atomic.Int32
 	b := compose_v2.NewBuilder().WithName("bp_snapshot")
@@ -272,7 +272,7 @@ func TestBreakpoint_ResumeFromSnapshotWithoutCheckpointer(t *testing.T) {
 	}
 	cm := compose_v2.NewChannelManager()
 	mustBreakpoint(t, compose_v2.Run(context.Background(), g, cm, compose_v2.WithInterruptBefore("b")))
-	snap, err := cm.Snapshot()
+	snap, err := cm.SnapshotForGraph(g)
 	if err != nil {
 		t.Fatal(err)
 	}

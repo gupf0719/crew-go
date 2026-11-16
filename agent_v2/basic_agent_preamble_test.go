@@ -159,7 +159,7 @@ func TestBasicAgentBuilder_Preamble_InterruptResume(t *testing.T) {
 	}
 
 	// 验证 frontier 是 [preamble]——Resume 重跑 preamble
-	snap, err := cm1.Snapshot()
+	snap, err := cm1.SnapshotForGraph(g1)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}

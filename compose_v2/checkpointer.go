@@ -529,54 +529,11 @@ func (s CheckpointStatus) String() string {
 // vs"会话已结束/不存在"。
 var ErrNoPendingCheckpoint = errors.New("no pending checkpoint for resume")
 
-// ErrGraphIDConflict 是 GraphID 防串台机制的统一哨兵（ISSUE-50 P0）。
-// 检测到两个 GraphID 共享同 (sid, ns) 时返此 error——**写路径和读路径都查**：
-// `SaveNS` 落盘前、Run 入口的 auto-load、显式 `WithResumeFrom` 载入、子图载入子档。
-// （要全集就 grep 本哨兵的 `%w` 点，别指望这行清单不漂。）
+// ErrGraphIDConflict 表示存档的图契约与本次恢复不相容，或目标属于另一个任务。
+// 恢复检查和 SaveNS 的写入检查都使用该错误。业务可用原图和原业务版本恢复，
+// 或显式放弃原任务。新任务可使用新的 RunID。
 //
-// **它报的不是「这里有存量状态」，是「身份本身不自洽」**——同一个槽存着另一张图的
-// channel 布局和 frontier，接着跑会错位崩盘，没有安全的默认行为可定义，所以只能拒。
-//
-// # 撞上之后怎么办：两条出路，各有代价
-//
-// **错误正文只陈述事实、不给建议**，因为两条出路的代价截然不同、而且**其中一条会毁数据**——
-// 该选哪条只有调用方知道。
-//
-//  1. **换一个 sessionID**：旧存档原样留着（它可能正挂着另一个执行者等人回答的问题）。
-//     代价是这个 sid 上的旧任务从此没人收——要么业务自己择机
-//     `Checkpointer.DeleteSubtree(sid, ns)` 显式清，要么留给运维。
-//  2. **[WithFreshRun]**：本次忽略旧存档从头跑。⚠️ **它顺带会毁掉那份旧存档**——本次
-//     跑成功后出口按 sid 所有权清整棵子树（见 [WithSessionID]），根 Run 的 ns 是 `""`、
-//     是所有 ns 的祖先，于是**整个 sid 底下的东西一起没**，包括别人的挂起存档。
-//     ⚠️ 而且本次**中断**时也不安好：SaveNS 那道守卫不看 Status，槽里那个别人的 GraphID
-//     会让本次的存档写不进去，于是这次自己的 HITL 反而不可续。
-//     ⟹ 只在「这个 sid 确实归我、旧档可弃」时才用它。
-//
-// 想显式表达「我知道它在那儿、我要它没」，直接调 `Checkpointer.DeleteSubtree(sid, ns)`
-// ——那是这个意图唯一诚实的写法，[WithFreshRun] 只是它的隐式版本、而且只在成功路径生效。
-//
-// # 嵌套子 agent 撞上时，业务两个杠杆都没有
-//
-// `agent_v2` 的 sub-agent 走的是「父 sid + 框架算出来的 ns」，业务既传不了 [WithFreshRun]、
-// 也换不了 sid（两者都不是它给的）。这条路上撞上本错有几个含义：
-//
-//   - **裸调了 `sub.Run(ctx, ...)`**，没走 `agent_v2.RunSubAgent`：子 agent 没有自己的 ns，存档落进别人的槽。
-//     节点、工具体、图级钩子与编排的 agent 级钩子里的裸调在入口就被拒（报的是 [ErrRunAborted]）；走到这里的是
-//     经 `agent_v2.EnterRun` 进入的自研壳在自己的钩子或前置逻辑里裸调——它跟壳透传的那个 agent 同一个槽，载入对方的
-//     挂起档时撞上。出路是改走 `RunSubAgent`；
-//   - **同一个位置上 Run 与续跑调的不是同一个 agent**（按运行时条件挑被调方、续跑前改了 agent 的名字或 skill 的
-//     `agent:`）——出路是续跑时调回原来那个，或放弃这个任务；
-//   - 同一个父 sid 上先后跑了拓扑不同的两棵编排树——出路在编排侧（换一个 `RunSession`），
-//     不在本次调用的参数里。
-//
-// 这几种都是代码里的结构问题：不改代码，每次续跑都撞在同一处，那个任务续不上（槽里的档不清）。
-//
-// # 不可重试，也不能被吞
-//
-// 它实现 [NonRetryable]：槽里那份存档还在，重跑必然撞同一个槽。曾经是 `errors.New`，
-// [IsRetryable] 把它当可重试——配了重试的编排会把整个成员连同副作用再跑几遍、每次都撞上。
-// 它也在 [MustPropagate] 的集合里：上面几个含义都是编排结构出了问题，转成给模型看的工具失败无济于事
-// ——模型换不换参数都修不了它，冲突的那份存档也还留在槽里。
+// 该错误实现 [NonRetryable]，编排和工具包装器保留错误链。
 var ErrGraphIDConflict error = &graphIDConflictError{}
 
 // graphIDConflictError 是 [ErrGraphIDConflict] 的类型。不导出：调用方只用 `errors.Is`

@@ -71,7 +71,7 @@ crew-go 的图引擎是**channel-based BSP（Bulk Synchronous Parallel）超步�
 compose_v2/
 ├── channel.go              Channel[T] 泛型定义 + 4 reducer 工厂
 ├── channel_manager.go      ChannelManager + anyChannel 类型擦除
-├── graph.go                Graph 编译产物 + 节点/边数据结构 + Graph.ID()（GraphID 防 cp 串台，无独立 ctx 透传文件）
+├── graph.go                Graph 编译产物与节点、边数据结构
 ├── graph_loop.go           Run 主入口 + computeNextTasks + ApplyAll
 ├── send.go                 SendFrom / SendDirective fan-out 协议
 ├── access.go               Get/Write/Has 包级泛型访问函数
@@ -308,7 +308,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) e
 | Helper | 用途 |
 |---|---|
 | `WithCheckpointerCtx(ctx, c)` | ctx 透传 cp 后端（嵌套子 agent 自动继承）|
-| `Graph.ID()` | graph 身份（防 cp 串台，ISSUE-50 P0）——`cp.GraphID = g.ID()` 直读，框架自动；WithGraphID ctx pair 废弃已删 |
+| `Graph.ID()` | 图的公开标识，用于显示和诊断。 |
+| `Graph.CheckpointIdentity()` | 编译图的恢复身份，随图结构和显式版本变化。 [存档身份](checkpoint.md#43-graphid-防串台) |
 | `WithGraphNS(ctx, ns)` | 显式子图 ns（嵌套自定义 GraphAgent 用）|
 | `WithOrchHooks(ctx, h)` | ctx 透传 OrchHooks（嵌套子 agent 自动继承）|
 
@@ -1539,7 +1540,7 @@ helper（不导出）封装了写入与读出。
 | ❌ 反模式 | ✅ 正确做法 |
 |---|---|
 | 业务自定义类型不 RegisterValueType | `func init() { compose_v2.RegisterValueType[MyT]("myapp.MyT") }` |
-| 同 sessionID 跑两个不同 Graph 想复用 cp | 不同 Graph 的 `g.ID()` 自动不同 → fail-fast `ErrGraphIDConflict`；确需换 graph 用 `WithFreshRun` 忽略旧 cp |
+| 同 RunID 尝试恢复另一个图的存档 | 图身份冲突返回 `ErrGraphIDConflict`，保留原档。新任务使用新的 RunID。 |
 | Resume 时只塞部分 InterruptID 答案不传 ResumeAction | 显式 `WithResumeAction(ResumeActionContinue)` + 传完整 answers |
 | 业务依赖失败 cp 长期保留（cleanup 防污染会自动删成功 cp）| 业务侧定期 `cper.Cleanup(ctx, keepLastN)` 控总量 |
 | 跨 Run 想累积历史用 sessionID 复用 | 用 `agent_v2` 会话历史层（`WithHistory`，按会话身份 append-only 留存）|

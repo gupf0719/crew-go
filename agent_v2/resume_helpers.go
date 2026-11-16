@@ -17,11 +17,12 @@ import (
 // abort 路径含删档、cp.cleanup 事件、历史和钩子收尾). caller 不再做
 // 后续 Run / hook fire 等业务逻辑.
 type resumePrep struct {
-	Cper      compose_v2.Checkpointer  // 已从 ctx 取出, caller build Run opts 时复用
-	Rcfg      resumeConfig             // 已解析的 ResumeOption
-	Session   *RunSession              // 已初始化 (nil 时 helper 新建 RunID = sessionID)
-	AbortDone bool                     // ResumeActionAbort 已处理 (caller 直接 return nil, nil)
-	activity  *compose_v2.TaskActivity // 续跑时由入口 defer 释放，覆盖历史写入器收尾
+	Checkpoint *compose_v2.Checkpoint
+	Cper       compose_v2.Checkpointer  // 已从 ctx 取出, caller build Run opts 时复用
+	Rcfg       resumeConfig             // 已解析的 ResumeOption
+	Session    *RunSession              // 已初始化 (nil 时 helper 新建 RunID = sessionID)
+	AbortDone  bool                     // ResumeActionAbort 已处理 (caller 直接 return nil, nil)
+	activity   *compose_v2.TaskActivity // 续跑时由入口 defer 释放，覆盖历史写入器收尾
 }
 
 // resolveAbortHistoryStore 取得已确定历史分区对应的后端。
@@ -303,8 +304,8 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 	}
 
 	// 6. WithSession push
-	newCtx := WithSession(ctx, session)
+	newCtx := compose_v2.BindResumeCheckpointTarget(WithSession(ctx, session), sessionID, ns, savedCp)
 
 	transferActivity = true
-	return &resumePrep{Cper: cper, Rcfg: rcfg, Session: session, activity: activity}, newCtx, nil
+	return &resumePrep{Checkpoint: savedCp, Cper: cper, Rcfg: rcfg, Session: session, activity: activity}, newCtx, nil
 }

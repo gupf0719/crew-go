@@ -95,7 +95,7 @@ func TestResume_FromCheckpoint_ContinuesFromInterruption(t *testing.T) {
 	t.Logf("Run 1 中断时 counter=%d", partialCount)
 
 	// === Snapshot + 序列化 + 反序列化（模拟跨进程）===
-	snap1, err := cm1.Snapshot()
+	snap1, err := cm1.SnapshotForGraph(g1)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestResume_FromAlreadyCompletedSnapshot(t *testing.T) {
 	}
 
 	// Snapshot——CurrentFrontier 应空
-	snap, err := cm1.Snapshot()
+	snap, err := cm1.SnapshotForGraph(g)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}

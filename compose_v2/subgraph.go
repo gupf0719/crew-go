@@ -144,7 +144,10 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 	subNodeFunc := func(ctx context.Context, parentChs Channels) ([]ChannelWrite, error) {
 
 		// 嵌套 cp 物理分离：从 ctx 取 Checkpointer + sessionID + 父 ns，算子 ns
-		cper := GetCheckpointer(ctx)
+		var cper Checkpointer
+		if !checkpointingDisabled(ctx) {
+			cper = GetCheckpointer(ctx)
+		}
 		sid := GetSessionID(ctx)
 		parentNS := NestedGraphParentNS(ctx)
 		// ISSUE-96 侧面 2：带上**实例维度**——同一 subgraph 节点被 SendFrom 同 Target
@@ -187,23 +190,21 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 			// Phase 2 Sub-3 audit fix: subgraph LoadNS fire cp.load event
 			loadStart := time.Now()
 			cp, err := cper.LoadNS(ctx, sid, childNS)
-			// **判断算一次，事件和决策共用**——以前这里抄了一份下面那个决策的条件，
-			// 靠注释「请保持一致」维系。同一份判据的两个拷贝在本仓漂移过四次，
-			// 能合就合掉，别留手工同步的义务。
-			// `willResume` = **决策**用的判据（存档状态 + 父的意图）。GraphID 不进来
-			// ——它是 fail-fast 守卫不是续跑判据：不匹配时**报错**而不是「不续跑」。
-			willResume := cp.HasResumableWork() && !IsFreshRunCtx(ctx) &&
-				cp.BelongsToTask(getRunTaskID(ctx))
-			// 事件那个字段的契约**另含 GraphID**（见 `CpLoadAction.WouldResume` 的 godoc：
-			// 「GraphID 冲突 ⟹ false」），根图那处也是这么算的。合并镜像时若只用决策那份，
-			// 同一字段在 `Source="auto_load"` 和 `"subgraph"` 两条路上语义就分叉了——
-			// 业务按它统计「Resume 次数」会把一次注定报错的加载计成 Resume。
-			eventWouldResume := willResume && (cp.GraphID == "" || cp.GraphID == sub.ID())
+			willResume := err == nil && CanAutoResumeCheckpoint(ctx, cp)
+			var identityErr error
+			if willResume {
+				effective, contractErr := sub.WithCheckpointContext(ctx).withCheckpointChannels(cfg.imports)
+				if contractErr != nil {
+					identityErr = checkpointTargetRejection(contractErr, cp)
+				} else {
+					identityErr = effective.CheckCheckpointIdentity(cp)
+				}
+			}
 			loadAction := &CpLoadAction{
 				SessionID:   sid,
 				NS:          childNS,
 				Found:       cp != nil,
-				WouldResume: eventWouldResume,
+				WouldResume: willResume && identityErr == nil,
 				Source:      "subgraph",
 				DurationMs:  time.Since(loadStart).Milliseconds(),
 				Ok:          err == nil,
@@ -218,23 +219,10 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 			if err != nil {
 				return nil, fmt.Errorf("subgraph %q LoadNS(%q,%q): %w", id, sid, childNS, err)
 			}
-			// **判据与根图 auto-load 同一个谓词**（HasResumableWork，按内容判）。这里
-			// 曾用 `Status.Resumable()` 而根图只认 `Pending`——同一份失败子档一条路捡、
-			// 一条路不捡，实测嵌套 Resume 时副作用重放。判据收敛之后那个分歧不复存在：
-			// 失败档（frontier 还指着失败分支）两条路都续，「新任务」由 fresh 信号表达。
-			// **父说了这是新任务时，子图不续跑**。这条路径**绕过了根图那个闸门**——
-			// 它显式 `WithResumeFrom(cp)`，而那个闸门第一条就是 `resumeFrom == nil`，
-			// 于是整套「新开」信号在这里被完整跳过。实测后果：同 sid 跑第二个任务时子图
-			// 整段没跑、业务拿到的 final 是**上一个任务的产出**，且 err == nil。
-			//
-			if willResume { // ← 注意与事件那个 `eventWouldResume` **不是**同一个值（后者另含 GraphID，见上），不再是两份要手工对齐的拷贝
-				// Phase 5.1.b ISSUE-50 P0 防串台守卫：cp.GraphID 与当前 sub.ID()
-				// 不匹配时 fail-fast——业务用同 (sid, childNS) 跑两个不同子 graph
-				// 时 silent restore 会让新子图崩盘
-				if cp.GraphID != "" && cp.GraphID != sub.ID() {
-					return nil, fmt.Errorf("%w: subgraph %q LoadNS cp.GraphID=%q vs sub.ID()=%q (sid=%q ns=%q)",
-						ErrGraphIDConflict, id, cp.GraphID, sub.ID(), sid, childNS)
-				}
+			if identityErr != nil {
+				return nil, fmt.Errorf("subgraph %q at session %q namespace %q: %w", id, sid, childNS, identityErr)
+			}
+			if willResume {
 				savedSubCp = cp
 			}
 		}
@@ -286,7 +274,7 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 		}
 		subOpts = append(subOpts, WithRunNS(childNS))
 		if subResumeCp != nil {
-			subOpts = append(subOpts, WithResumeFrom(subResumeCp))
+			subOpts = append(subOpts, WithResumeFrom(subResumeCp), func(o *runOptions) { o.checkedResumeTarget = true })
 		}
 		if len(importInitialWrites) > 0 {
 			subOpts = append(subOpts, withImportOverlay(importInitialWrites...))
@@ -362,6 +350,7 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 	}
 
 	b.nodes[id] = subNodeFunc
+	b.setCheckpointSubgraph(id, sub, cfg)
 	b.applyNodeOptions(id, cfg.nodeOpts)
 	return b
 }

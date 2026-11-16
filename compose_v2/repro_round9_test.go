@@ -376,6 +376,7 @@ func TestRepro_R9_B4_UnmatchedAnswerLogsWarning(t *testing.T) {
 	b.AddEdge(compose_v2.StartNode, "ask")
 	b.AddEdge("ask", compose_v2.EndNode)
 	g, _ := b.Compile()
+	cp.GraphID = g.CheckpointIdentity()
 
 	cm := compose_v2.NewChannelManager()
 	// caller 提供拼错的 ID

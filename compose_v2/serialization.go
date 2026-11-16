@@ -605,64 +605,28 @@ func (cm *ChannelManager) Snapshot() (*Checkpoint, error) {
 	return cp, nil
 }
 
-// SnapshotForGraph 是 Snapshot 的 graph-aware 变体——业务跨进程 wire-push 推荐用。
+// SnapshotForGraph 创建带编译图存档身份的快照，供 [WithResumeFrom] 恢复。
+// GraphID 填 [Graph.CheckpointIdentity]，有 frontier 或待答内容时标为 [CPStatusPending]。
+// 已完成的快照保持 [CPStatusUnset]。裸 [ChannelManager.Snapshot] 用于诊断和状态导出。
 //
-// **audit Round 8 Bug 5 修复**：业务 wire-push 路径（cm.Snapshot →
-// MarshalCheckpoint → wire → UnmarshalCheckpoint → WithResumeFrom）原本完全不
-// 带 GraphID/Status，跨 graph mix cp 时 silent corruption（Bug 4 amplified）。
+// 业务跨进程恢复时，在生产存档的一侧绑定当时的图身份：
 //
-// 本方法在 Snapshot 基础上自动填：
-//   - GraphID = g.ID()——让接收端 WithResumeFrom 能做冲突守卫（Bug 4 修复）
-//   - Status  = **按内容算**：有 frontier 或有挂起提问才 [CPStatusPending]，否则留
-//     [CPStatusUnset]（见下）
-//
-// # Status 为什么按内容算，而不是无条件盖 Pending
-//
-// 这个方法是 [ChannelManager] 上的公开方法，**业务任意时刻都能调**——包括在一次跑完
-// 之后。它**结构上拿不到 runErr**，也就没有引擎出口那处判据（`shouldStayPending`）所需
-// 的信息，替引擎盖章只会跟那处漂移。
-//
-// 而无条件盖 Pending 在三条路上分别是零收益、误报、有害：
-//   - 它自己文档化的 wire-push 路径上**零收益**——接收端 `WithResumeFrom` 根本不看
-//     Status，恢复 frontier 读的是 `cp.CurrentFrontier`；
-//   - cp.load 事件里的 `WouldResume` 字段会**误报**；
-//   - 业务把产物存进 checkpointer 时**有害**：一份「已经跑完」的快照被标成挂起，
-//     下次同 sid 跑就被 auto-load 当未完成任务捡起来——实测表现是 Run 静默返 nil、
-//     一个节点都没跑、存档还被当成功清掉。
-//
-// 留 [CPStatusUnset] 正是要的：「跑完了」和「没盖过戳」在 auto-load 侧行为一致（都不捡）。
-//
-// ⚠️ **代价（实测，别照着推理）**：Unset 的存档会绕过 Run 入口那道 auto-load 的
-// GraphID 守卫——它整个包在 `Status == Pending` 里。业务把这种快照存进别人的
-// (sid, ns) 时：入口不报 [ErrGraphIDConflict]、**静默走 fresh run**，而且这一跑跑成功
-// 之后按 sid 所有权清整棵子树 ⟹ **别人那份存档被删掉且 err=nil**。
-//
-// **不要指望出口那道 `SaveNS` 守卫兜住**：成功路径上根本没有 SaveNS，只有
-// `DeleteSubtree`，而它不看 GraphID。（[CPStatusFailed] 的存档今天也一样绕过入口守卫，
-// 那是先于本改动就有的同形状缝。）
-//
-// ⟹ **别把跑完的快照存进 checkpointer**。要种 channel 初值用 [WithInitialWrites]，
-// 要续跑用 [WithResumeFrom] 直接把 cp 递进去——两者都不经过那个槽。
-//
-// 业务跨进程典型用法：
-//
-//	cp, _ := cm.SnapshotForGraph(g)        // 自动填 GraphID + Status
-//	data, _ := compose_v2.MarshalCheckpoint(cp)
-//	// ... 跨进程：data → wire → 下游
-//	cp2, _ := compose_v2.UnmarshalCheckpoint(data)
-//	err := compose_v2.Run(ctx, sameOrSameID(g), cm2, compose_v2.WithResumeFrom(cp2))
-//	// ↑ 接收端 cp.GraphID 不匹配会 fail-fast 报 ErrGraphIDConflict
-//
-// 不要 graph-aware 元数据时仍可用裸 Snapshot——单进程内部用 / 调试用 OK。
+//	cp, err := cm.SnapshotForGraph(g.WithCheckpointContext(ctx))
+//	// MarshalCheckpoint(cp) 持久化。另一侧 UnmarshalCheckpoint 后传入 WithResumeFrom。
+//	// 续跑使用同一图配置和同一业务版本。
 func (cm *ChannelManager) SnapshotForGraph(g *Graph) (*Checkpoint, error) {
 	cp, err := cm.Snapshot()
 	if err != nil {
 		return nil, err
 	}
 	if g != nil {
-		cp.GraphID = g.ID()
+		effective, err := g.withCheckpointChannels(cm.checkpointChannels())
+		if err != nil {
+			return nil, err
+		}
+		cp.GraphID = effective.CheckpointIdentity()
 	}
-	// 按内容算，不无条件盖——理由见 godoc「Status 为什么按内容算」。
+	// 只有还需要执行的快照才进入待恢复列表。
 	// 判据跟引擎出口那处「要不要存档」同源（`graph_loop.go` 的空 frontier + 空挂起
 	// 早退），但这里读的是快照自身而不是 runErr——那个信息这个方法拿不到。
 	if cp.HasResumableWork() {
@@ -955,6 +919,13 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 	// 成立 —— Resume 期间任何重跑节点调 SendFrom 都会 fresh mint，跟旧号共用同一个 ID
 	// 空间。故 Restore 时把发号器抬过本 cp 出现过的最大值。
 	bumpInstanceCounterFromCheckpoint(cp)
+	origin, err := checkpointRestoreOriginOf(cp)
+	if err != nil {
+		return fmt.Errorf("restore checkpoint origin: %w", err)
+	}
+	cm.mixedRestores = cm.mixedRestores || (cm.hasRestored && cm.restoreOrigin != origin)
+	cm.restoreOrigin = origin
+	cm.hasRestored = true
 	restored = true
 	return nil
 }

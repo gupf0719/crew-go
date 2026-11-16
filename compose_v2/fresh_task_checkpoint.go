@@ -19,7 +19,12 @@ func (*freshTaskCheckpointConflict) NonRetryable() {}
 // 先取得它的租约，再检查整个 RunID。每个通过检查的后端可保存本次任务自己的进度。
 type freshTaskCheckpoints struct {
 	mu      sync.Mutex
-	checked map[Checkpointer]string
+	checked map[freshCheckpointPartition]string
+}
+
+type freshCheckpointPartition struct {
+	checkpointer Checkpointer
+	owner        string
 }
 
 func (f *freshTaskCheckpoints) check(ctx context.Context, cp Checkpointer, sid string) error {
@@ -36,9 +41,10 @@ func (f *freshTaskCheckpoints) check(ctx context.Context, cp Checkpointer, sid s
 		}
 	}
 	comparable := reflect.ValueOf(cp).Comparable()
+	partition := freshCheckpointPartition{checkpointer: cp, owner: GetOwner(ctx)}
 	if comparable {
 		f.mu.Lock()
-		checkedToken, ok := f.checked[cp]
+		checkedToken, ok := f.checked[partition]
 		f.mu.Unlock()
 		if ok && checkedToken == token {
 			return nil
@@ -64,7 +70,7 @@ func (f *freshTaskCheckpoints) check(ctx context.Context, cp Checkpointer, sid s
 	}
 	if comparable {
 		f.mu.Lock()
-		f.checked[cp] = token
+		f.checked[partition] = token
 		f.mu.Unlock()
 	}
 	return nil

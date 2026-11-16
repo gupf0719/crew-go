@@ -169,41 +169,24 @@ type Graph struct {
 	breakBefore breakpointSet
 	breakAfter  breakpointSet
 
-	// ── ISSUE-50 P0 防串台：Graph 身份字段（Phase 5.1.b 引入） ──
-	name string // 业务可选 WithName 设置，空时 ID() 走 fingerprint 兜底
-	// identityPrefix 见 WithIdentityPrefix：非空时 ID() 是它加上 fingerprint，与 name 互斥。
-	identityPrefix string
-	cachedID       string // ID() 首次调用后缓存（fingerprint 计算昂贵，跨 Run 不变）
+	name                      string // 业务可选 WithName 设置，空时 ID() 走旧指纹
+	identityPrefix            string // 与 name 互斥
+	cachedID                  string
+	checkpointDefinition      [sha256.Size]byte
+	checkpointIdentity        string
+	checkpointOwner           string
+	checkpointRevision        string
+	checkpointContextRevision string
 }
 
-// ID 返回 Graph 身份字符串（ISSUE-50 P0 防串台）。
+// ID 返回 Graph 的公开标识，供观测和诊断使用。持久化比较使用 [Graph.CheckpointIdentity]。
 //
 // 优先级：
 //  1. 显式 WithName(...) 设置的 name —— 业务推荐，可读性高、跨进程稳定
 //  2. WithIdentityPrefix(...) 设置的前缀 + ":" + fingerprint —— 区分结构相同的不同图，结构变了身份照样变
 //  3. fingerprint 兜底：sha256(sorted(nodeIDs) || sorted(channelName:type)) 前 16 hex chars
 //
-// 为何需要：Checkpointer 按 (sessionID, ns) 二级 key 存 cp；两个不同 Graph 共享同
-// (sessionID, ns) 时旧 cp 被新 graph 覆盖、Resume 加载到"别人"的存档但 frontier
-// NodeID / channel name 对不上 → typed channel value 串台污染。本 ID 配合
-// Checkpoint.GraphID 字段 + Run 入口 fail-fast 校验，把"静默错数据"问题挡在
-// Resume 入口。
-//
-// fingerprint 兜底设计：
-//   - sorted nodeIDs 保证拓扑相同的 graph 同 ID（节点 ID 改一个就变）
-//   - sorted channel(name + reflect.Type) 保证 channel schema 变 → ID 变（避免
-//     "同名 channel 不同 type" 串台，如 LastValue[string] vs Append[int]）
-//   - 16 hex = 64 bit collision 空间 ~10^19，业务规模够用
-//   - 缓存到 cachedID，跨 Run 不重算
-//
-// **fingerprint 限制（必读）**：
-//  1. **不区分 NodeFunc 行为** —— 同 nodeID 不同 NodeFunc 实现（如一个调 LLM
-//     一个调 print）→ fingerprint 相同 → cp 串台风险未防住
-//  2. **不哈希 edges 拓扑** —— 仅哈希 nodeIDs + channels；边拓扑变（如分叉/合并
-//     改变）但节点 ID 集合 + channel 集合不变 → fingerprint 不变
-//
-// 这两类"形似神不同"的 graph 必须 `WithName(...)` 显式声明唯一身份，**不要依赖
-// fingerprint 兜底**。fingerprint 仅作"业务忘配 WithName 时的最小防御"。
+// 无名图的旧指纹只计节点 ID 与 channel 类型，编译期缓存。
 func (g *Graph) ID() string {
 	if g.name != "" {
 		return g.name
@@ -289,20 +272,24 @@ func (b *GraphBuilder) Compile() (*Graph, error) {
 	if g.name == "" {
 		_ = g.ID()
 	}
+	g.checkpointDefinition = g.fingerprintCheckpoint(b.checkpointRevision, b.checkpointSubgraphs)
+	g.checkpointIdentity = g.checkpointIdentityForVariant()
 	return g, nil
 }
 
 // GraphBuilder 构造 Graph。
 type GraphBuilder struct {
-	nodes          map[NodeID]NodeFunc
-	nodeComponents map[NodeID]string     // Phase 2: node→组件类型声明 (见 Graph.nodeComponents)
-	nodePolicies   map[NodeID]nodePolicy // 节点的超时 / 重试声明（见 Graph.nodePolicies）
-	edges          []edge
-	channels       []anyChannel
-	maxVisit       int
-	maxWidth       int
-	name           string // ISSUE-50 P0：业务可选 WithName 显式声明 graph 身份
-	identityPrefix string // 见 WithIdentityPrefix
+	nodes               map[NodeID]NodeFunc
+	nodeComponents      map[NodeID]string     // Phase 2: node→组件类型声明 (见 Graph.nodeComponents)
+	nodePolicies        map[NodeID]nodePolicy // 节点的超时 / 重试声明（见 Graph.nodePolicies）
+	edges               []edge
+	channels            []anyChannel
+	maxVisit            int
+	maxWidth            int
+	name                string // 业务可选 WithName 声明图的逻辑标识
+	identityPrefix      string
+	checkpointRevision  string
+	checkpointSubgraphs map[NodeID][sha256.Size]byte
 	// interruptBefore / interruptAfter 见 WithInterruptBefore / WithInterruptAfter（编译期断点）。
 	interruptBefore []NodeID
 	interruptAfter  []NodeID
@@ -348,6 +335,7 @@ func (b *GraphBuilder) AddNode(id NodeID, fn NodeFunc, opts ...NodeOption) *Grap
 	if isFrameworkNil(fn) {
 		panic("GraphBuilder.AddNode: nil fn (含 Go typed nil func 陷阱)")
 	}
+	delete(b.checkpointSubgraphs, id)
 	b.nodes[id] = fn
 	b.applyNodeOptions(id, opts)
 	return b
@@ -477,29 +465,15 @@ func (b *GraphBuilder) WithMaxFrontierWidth(n int) *GraphBuilder {
 	return b
 }
 
-// WithName 设置 Graph 身份名（ISSUE-50 P0 防串台）。
-//
-// 业务推荐显式调用——稳定、可读、跨进程不变。不调时框架按 fingerprint 兜底
-// （`sha256(sorted(nodeIDs) | sorted(channels))` 前 16 hex），但 fingerprint 在
-// graph 拓扑或 channel schema 变更时会变，跨进程 Resume 老 cp 会失败。
-//
-// 关联：Checkpoint.GraphID 持久化本字段，Run 入口 auto-load 加 fail-fast 校验
-// `cp.GraphID != "" && cp.GraphID != g.ID()` → 防两个不同 Graph 共享同
-// (sessionID, ns) 时 cp 互覆盖造成 channel value 串台污染。
-//
-// 同名不同 NodeFunc 行为的 graph 必须 WithName 显式声明唯一身份（fingerprint
-// 不区分 NodeFunc 实现）。详见 Graph.ID() godoc。
+// WithName 设置图的稳定逻辑名。它也是 [Graph.ID] 的返回值，并参与存档身份的计算。
+// 节点等业务函数的行为变化由 [GraphBuilder.WithCheckpointRevision] 显式标记。
 func (b *GraphBuilder) WithName(name string) *GraphBuilder {
 	b.name = name
 	return b
 }
 
-// WithIdentityPrefix 让 Graph 身份取「prefix + ":" + fingerprint」（见 [Graph.ID]）。
-//
-// 用在「结构相同、却是不同的图」上：只靠 fingerprint 时两张结构相同的图身份相同，一张图的挂起档能被另一张读进去
-// 接着跑（节点函数不同、channel 布局相同，不报错）；只靠 [GraphBuilder.WithName] 又丢了结构这一维——同名的图改了
-// 节点或 channel 之后续跑旧档不再报冲突。两维都要时用它。前缀必须跨进程稳定（不能是每次构造都变的值），否则重建
-// 图之后续不上自己的档。与 WithName 互斥，两个都设 Compile 报错。
+// WithIdentityPrefix 为图设置稳定逻辑前缀。它参与存档身份的计算，
+// [Graph.ID] 返回「prefix + ":" + 旧指纹」。与 [GraphBuilder.WithName] 互斥。
 func (b *GraphBuilder) WithIdentityPrefix(prefix string) *GraphBuilder {
 	b.identityPrefix = prefix
 	return b

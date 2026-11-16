@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"sort"
 	"strconv"
 	"sync/atomic"
@@ -29,11 +30,12 @@ type runOptions struct {
 	inputDigest string
 	// inputIsIdentity：摘要就是这次调用的身份（WithInputIdentity），auto-load 时对不上是
 	// 撞槽、拒绝（不可重试、不清档）；否则只告警。
-	inputIsIdentity bool
-	resumeFrom      *Checkpoint                // Phase 5.1.b.4：合并 CheckpointSnapshot 为单一 Checkpoint
-	resumeAnswers   map[string]*schema.Message // by InterruptID — audit R9 B1
-	resumeUserText  string                     // 非寻址型「用户这轮说了什么」，见 ResumeContext.UserText
-	hooks           OrchestrationHooks
+	inputIsIdentity     bool
+	resumeFrom          *Checkpoint
+	checkedResumeTarget bool                       // 低阶子图已在同一租约下读出其目标档
+	resumeAnswers       map[string]*schema.Message // by InterruptID — audit R9 B1
+	resumeUserText      string                     // 非寻址型「用户这轮说了什么」，见 ResumeContext.UserText
+	hooks               OrchestrationHooks
 
 	// Phase 5.1.a Step 3+4：Checkpointer 集成
 	// 业务通过 WithCheckpointer + WithSessionID 注入后子图 cp 写到 (sessionID, ns)
@@ -407,16 +409,10 @@ func WithEmitCpEvent(enabled bool) RunOption {
 	}
 }
 
-// WithResumeFrom 从 cp 恢复执行。
-//
-// 调用方义务：
-//  1. 在传入的 cm 上注册所有 channel（同 Run 1 时一致）
-//  2. 把 cp 通过本 option 传入 Run（Run 内部自动调 cm.Restore + frontier 恢复）
-//
-// Run 看到 ResumeFrom != nil 时直接从 cp.CurrentFrontier 起跑（而非 StartNode）。
-// frontier 为空 = 上次已跑完，直接返成功。
-//
-// Phase 5.1.b.4 后接收 *Checkpoint（之前 *CheckpointSnapshot——合并为单一类型）。
+// WithResumeFrom 从带当前图存档身份的快照恢复执行。手动导出使用
+// [ChannelManager.SnapshotForGraph]，同一身份下也可复制到空的目标槽。
+// Run 在恢复前检查快照和已有的可续目标档，再注册 channel 和恢复 frontier。
+// 空 frontier 且没有待答内容的已完成快照以成功结束。
 func WithResumeFrom(cp *Checkpoint) RunOption {
 	return func(o *runOptions) {
 		o.resumeFrom = cp
@@ -510,6 +506,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 走局部变量而不是把它塞进返回的 error 里：后者等于让「报告」再次驮着「后果」，
 	// 正是这轮要拆开的东西。
 	var stayPendingFact bool
+	var frontierIdentityErr error
+	var frontierQuestionsRecorded bool
+	var frontierTargetUnknown bool
 	// **本 defer 只收 defer 链自身抛的 panic**（业务 OnGraphEnd hook / 自定义 checkpointer
 	// 的 SaveNS / DeleteSubtree）。完整分工见 panic_recovery.go——**别在这里复述它**。
 	//
@@ -589,9 +588,15 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	if g == nil {
 		return errors.New("graph is nil")
 	}
+	g = g.WithCheckpointContext(ctx)
 	if cm == nil {
 		return errors.New("channel manager is nil")
 	}
+	effective, contractErr := g.withCheckpointChannels(cm.checkpointChannels())
+	if contractErr != nil {
+		return checkpointTargetRejection(contractErr, nil)
+	}
+	g = effective
 	// **记下「我是不是从某个节点体里被调进来的」**——这是 OnGraphStart 拒不拒中断的判据
 	// （见下方使用点）。`clearInheritedNodePosition` 清的是节点**身份**维度，不清这枚章：
 	// 嵌套图的图级钩子相位同样在外层节点的执行范围里（见 withinNodeScopeKey）。
@@ -687,6 +692,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			return fmt.Errorf("graph %q (ns=%q): %w", g.ID(), cfg.graphNS, err)
 		}
 	}
+	if err := checkForeignCheckpointSubtree(ctx, cfg.checkpointer, cfg.sessionID, cfg.graphNS); err != nil {
+		return err
+	}
 	// 一个存档槽 (sid, ns) 同一时刻只归一个执行：一张正在跑的图，或一次在这个槽上跑图的 agent 调用从入口到出口（它的 agent 级钩子期间槽里
 	// 放着它自己的挂起档，见 OccupySlot）。在占着它的执行里发起、落进同一个槽的嵌套 Run 会把那份档当成自己的读进来接着跑
 	// （两张图的 GraphID 相同时——两个 BasicAgent 的图都是——用自己的节点跑别人的 frontier，实测旁路工具多执行一次），成功收尾时
@@ -707,6 +715,72 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				ErrRunAborted, where, g.ID(), cfg.sessionID, cfg.graphNS, owner.graphNS)
 		}
 		ctx = context.WithValue(ctx, runningSlotKey{}, &runningSlot{sessionID: cfg.sessionID, graphNS: cfg.graphNS, parent: active})
+	}
+	// 钩子和退出清理之前先确定可恢复存档的归属。钩子派生新的上下文时，
+	// 再按实际的存储上下文核对，防止恢复一个分区的档却写入另一个分区。
+	autoLoad := cfg.resumeFrom == nil && !cfg.freshRun && !IsFreshRunCtx(ctx) &&
+		cfg.checkpointer != nil && cfg.sessionID != ""
+	readsCheckpoint := autoLoad || (cfg.resumeFrom != nil && cfg.checkpointer != nil && cfg.sessionID != "")
+	owner := GetOwner(ctx)
+	target, _ := ctx.Value(resumeCheckpointTargetKey{}).(resumeCheckpointTarget)
+	boundResumeTarget := target.checkpoint != nil && target.sid == cfg.sessionID && target.ns == cfg.graphNS
+	if boundResumeTarget {
+		ctx = context.WithValue(ctx, resumeCheckpointTargetKey{}, resumeCheckpointTarget{})
+	}
+	var rootCp *Checkpoint
+	var loadErr error
+	var loadDuration time.Duration
+	loadRunCheckpoint := func(c context.Context) (*Checkpoint, error) {
+		loadCtx := WithGraphNS(withSessionID(withCheckpointer(c, cfg.checkpointer), cfg.sessionID), cfg.graphNS)
+		loadStart := time.Now()
+		cp, err := cfg.checkpointer.LoadNS(loadCtx, cfg.sessionID, cfg.graphNS)
+		loadDuration = time.Since(loadStart)
+		return cp, err
+	}
+	if cfg.checkedResumeTarget {
+		rootCp = cfg.resumeFrom
+	} else if readsCheckpoint {
+		rootCp, loadErr = loadRunCheckpoint(ctx)
+	}
+	checkResumeIdentity := func() error {
+		if loadErr != nil {
+			return fmt.Errorf("check resume target checkpoint: %w", loadErr)
+		}
+		if boundResumeTarget && (GetOwner(ctx) != target.owner || !sameCheckpointSnapshot(target.checkpoint, rootCp)) {
+			return RejectCheckpointIdentity(target.checkpoint, "agent start changed the checkpoint target")
+		}
+		if cfg.resumeFrom != nil && rootCp.HasResumableWork() && !rootCp.BelongsToTask(cfg.resumeFrom.TaskID) {
+			conflict := RejectCheckpointIdentity(rootCp, "explicit resume target belongs to a different task")
+			if cfg.staleWriteGuard {
+				return errors.Join(conflict, ErrCheckpointStale)
+			}
+			return conflict
+		}
+		resumeCandidate := cfg.resumeFrom
+		if autoLoad && loadErr == nil && CanAutoResumeCheckpoint(ctx, rootCp) {
+			resumeCandidate = rootCp
+		}
+		if resumeCandidate == nil {
+			return nil
+		}
+		identityErr := g.CheckCheckpointIdentity(resumeCandidate)
+		if identityErr == nil && rootCp.HasResumableWork() && rootCp != resumeCandidate {
+			identityErr = g.CheckCheckpointIdentity(rootCp)
+		}
+		if identityErr == nil {
+			identityErr = cm.checkRestoreOrigin(resumeCandidate)
+		}
+		if identityErr != nil {
+			// 源快照可以来自其他任务。父图要保留的是此目标槽原来公开过的问题。
+			if cfg.resumeFrom != nil && rootCp.HasResumableWork() && rootCp != resumeCandidate {
+				identityErr = checkpointTargetRejection(identityErr, rootCp)
+			}
+			return fmt.Errorf("session %q namespace %q: %w", cfg.sessionID, cfg.graphNS, identityErr)
+		}
+		return nil
+	}
+	if err := checkResumeIdentity(); err != nil {
+		return err
 	}
 	// 图级相位（OnGraphStart / OnGraphEnd / 入口条件边）的名字：这张图的 ns，嵌套时再加「外层这次
 	// 执行里第几次跑这个 ns 的图」。它们记在承载这张图的外层节点执行名下，同一次外层执行在循环里
@@ -868,27 +942,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// ——resumeFrom 在此、auto-load 在下方。全新 Run 留空 = 无基线可比，守卫跳过。
 	if cfg.resumeFrom != nil {
 		cm.setCpEpochBaseline(cfg.resumeFrom.Epoch)
-		// **还要确认槽当前是不是空的**：caller 手里的 cp 可能来自别的 sid（fork / 从
-		// 归档恢复到新 sid），此时目标槽本来就没东西。不探测的话 `slotWasEmpty` 恒
-		// false，守卫看到「基线非空 + 槽为空」就判成"有人删过"——**全程只有一个执行者
-		// 也会被误判**，而且是 fail-closed：写回被拒 ⟹ 存档根本没落盘，caller 却拿到
-		// InterruptError 去问用户，答完 Resume 撞 ErrNoPendingCheckpoint，fork 出的会话
-		// 永久不可 Resume。
-		//
-		// 只在守卫开启时探（多一次 LoadNS）——默认路径零额外 IO。
-		if cfg.staleWriteGuard && cfg.checkpointer != nil && cfg.sessionID != "" {
-			switch cur, err := cfg.checkpointer.LoadNS(ctx, cfg.sessionID, cfg.graphNS); {
-			case err != nil:
-				// **不能倒向任何一边**：当"空"会让普通 Resume 在读抖动时误判成"载入时
-				// 空、现在非空"；维持默认（当"非空"）则槽真为空时报"别人删了"——一次
-				// 读抖动就够让 fork 到空槽的会话拿到 stale + 存档不落盘 + 永久不可
-				// Resume。标第三态，由 checkStale 按 fail-open 处置。
-				slog.WarnContext(ctx, "compose_v2: stale-write guard 探测槽状态失败，按未知处理",
-					"session", cfg.sessionID, "ns", cfg.graphNS, "err", err)
-				cm.markCpSlotUnknown()
-			case cur == nil:
-				cm.markCpSlotEmpty()
-			}
+		// 显式档可以来自另一个槽。沿用入口读取的目标档判断该槽是否为空。
+		if cfg.staleWriteGuard && cfg.checkpointer != nil && cfg.sessionID != "" && rootCp == nil {
+			cm.markCpSlotEmpty()
 		}
 	}
 
@@ -960,16 +1016,21 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				purge.report(ctx, cfg)
 				return
 			}
-			var rootCp *Checkpoint
+			var snapshot *Checkpoint
 			snapErr := exitStorageOp(ctx, exitOpLocal, "checkpoint snapshot", func(context.Context) error {
 				var err error
-				rootCp, err = cm.Snapshot()
+				snapshot, err = cm.Snapshot()
 				return err
 			})
 			if snapErr != nil {
 				// 快照不出来就写不了档，跟写档失败同样处置（同 F2 修复语义：不静默）。
 				np := newCheckpointNotPersisted(runErr,
 					fmt.Errorf("root cp snapshot failed (likely channel value type not registered): %w", snapErr))
+				if frontierIdentityErr != nil {
+					np.aborted = false
+					runErr = checkpointTargetRejection(errors.Join(frontierIdentityErr, np), rootCp)
+					return
+				}
 				runErr = np
 				if np.aborted {
 					purge := purgeExitSlot(ctx, cfg, cm, "abort", "purge-not-persisted", "")
@@ -978,7 +1039,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				}
 				return
 			}
-			if !rootCp.HasResumableWork() {
+			if !snapshot.HasResumableWork() {
 				// 根 graph 没中断点 + 没 ask_user——视作不需要 cp（业务错快速失败场景）
 				return
 			}
@@ -1006,11 +1067,11 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			// 仍然要 || runErr 那一半——单分支路径 / apply 阶段出错 / hook 错等
 			// 不经 executeFrontier 收集的退出，事实位不会被置上。
 			if runErr != nil && !stayPendingFact && !shouldStayPending(runErr) {
-				rootCp.Status = CPStatusFailed
+				snapshot.Status = CPStatusFailed
 			} else {
-				rootCp.Status = CPStatusPending
+				snapshot.Status = CPStatusPending
 			}
-			rootCp.GraphID = g.ID() // Phase 5.1.b ISSUE-50 P0 防串台
+			snapshot.GraphID = g.CheckpointIdentity()
 			// opt-in 的 cp.save 事件经 deliverCpEvent 直接调 hooks（不经 EventSink；钩子 panic 就地兜住、
 			// 只记日志）。node ID 用 "" 标"非节点 framework 级 event".
 			// 统一写入口：世代比对 + mint + SaveNS + 更新基线（见 guardedSaveNS）
@@ -1030,13 +1091,13 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			} else {
 				saveErr = exitStorageOp(ctx, exitOpWrite, "checkpoint save", func(c context.Context) error {
 					var err error
-					saveStart, err = writeCp(c, cfg, cm, rootCp)
+					saveStart, err = writeCp(c, cfg, cm, snapshot)
 					return err
 				})
 			}
 			if saveErr == nil {
 				notes.flush(ctx)
-				emitCpSaveEvent(ctx, cfg, rootCp, saveStart, nil)
+				emitCpSaveEvent(ctx, cfg, snapshot, saveStart, nil)
 				return
 			}
 			// **档没写成就不能报告成可以续**：曾经把写档错误跟原错误一起 `%w`，中断仍在错误链上
@@ -1045,19 +1106,38 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			// 挂起类信号退出错误链、写档原因留在链上（`ErrCheckpointStale` / `ErrGraphIDConflict`
 			// 照样 errors.Is 得出来），槽不属于别人时带 ErrRunAborted 并尽力清档。
 			//
-			// 入口的 GraphID 守卫只在 `Status == Pending` 时查，槽里是 Unset 的 cp（业务自己
-			// Save 的 / 自研 backend 漏序列化 Status）就绕过去了，出口这次 SaveNS 是唯一防线。
 			np := newCheckpointNotPersisted(runErr, fmt.Errorf("root cp save failed: %w", saveErr))
+			if frontierIdentityErr != nil || errors.Is(saveErr, ErrGraphIDConflict) {
+				np.aborted = false
+				target := rootCp
+				var readErr error
+				if errors.Is(saveErr, ErrGraphIDConflict) {
+					readErr = exitStorageOp(ctx, exitOpRead, "conflicting checkpoint target", func(c context.Context) error {
+						var err error
+						target, err = cfg.checkpointer.LoadNS(c, cfg.sessionID, cfg.graphNS)
+						return err
+					})
+				}
+				cause := errors.Join(frontierIdentityErr, np, readErr)
+				if readErr != nil {
+					runErr = &checkpointIdentityRejection{cause: cause, unknownTarget: true}
+				} else {
+					runErr = checkpointTargetRejection(cause, target)
+				}
+				notes.flush(ctx)
+				emitCpSaveEvent(ctx, cfg, snapshot, saveStart, saveErr)
+				return
+			}
 			runErr = np
 			var purge *exitPurge
 			if np.aborted {
-				// 写档结果不明（宽限到点）时槽里可能就是这次写的那一代——rootCp.Epoch 在写之前铸好，清档前的检查认它
+				// 写档结果不明（宽限到点）时槽里可能就是这次写的那一代——snapshot.Epoch 在写之前铸好，清档前的检查认它
 				// 作自己的；没走到写（被检查拦下、预算用完没发）时它是空的。
-				purge = purgeExitSlot(ctx, cfg, cm, "abort", "purge-not-persisted", rootCp.Epoch)
+				purge = purgeExitSlot(ctx, cfg, cm, "abort", "purge-not-persisted", snapshot.Epoch)
 				np.recordPurge(purge)
 			}
 			notes.flush(ctx)
-			emitCpSaveEvent(ctx, cfg, rootCp, saveStart, saveErr)
+			emitCpSaveEvent(ctx, cfg, snapshot, saveStart, saveErr)
 			if purge != nil {
 				purge.report(ctx, cfg)
 			}
@@ -1179,6 +1259,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 放标记、调、采纳收在 callHookOnto 一处（见 CallHook）；采纳之后图接着用的执行状态由 onto 铺（下面的注释）。
 	var startErr error
 	newCtxNil := false
+	checkpointCtxChanged := false
 	ctx, startErr = callHookOnto(ctx, func(c context.Context) (got context.Context, err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1192,7 +1273,11 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		// 见 OrchestrationHooks godoc）。守卫只挡「start 压根没被调到」那条路。
 		graphStartFired = true
 		sc := graphHookScope("OnGraphStart", graphPhaseNS)
-		got, err = cfg.hooks.OnGraphStart(withHookPhase(c, sc, scopedOf(outerAcc, sc)), cm.Channels())
+		hookCtx := withHookPhase(c, sc, scopedOf(outerAcc, sc))
+		got, err = cfg.hooks.OnGraphStart(hookCtx, cm.Channels())
+		if readsCheckpoint && got != nil {
+			checkpointCtxChanged = !reflect.ValueOf(got).Comparable() || got != hookCtx
+		}
 		newCtxNil = got == nil && err == nil
 		return got, err
 	}, func(in context.Context) context.Context {
@@ -1236,6 +1321,54 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 一直是 Run 入口建的那个，业务按自己推的 span 挂事件时挂到了调用方的 span 上（审计实测）。OnGraphStart 钩子
 	// 自己发的那一刻图的 ctx 还没定下，拿到的是调它之前的。
 	ctx = withEventSink(ctx, graphEventSink(ctx, cfg.hooks, cfg.graphNS))
+	if checkpointCtxChanged {
+		var scopeErr error
+		boundTarget := rootCp.HasResumableWork() || cfg.resumeFrom != nil
+		switch {
+		case boundTarget && GetOwner(ctx) != owner:
+			scopeErr = RejectCheckpointIdentity(rootCp, "checkpoint owner changed in the graph start hook")
+		default:
+			actual, err := loadRunCheckpoint(ctx)
+			switch {
+			case err != nil:
+				scopeErr = fmt.Errorf("recheck checkpoint after graph start: %w", err)
+			case boundTarget && !sameCheckpointSnapshot(rootCp, actual):
+				scopeErr = RejectCheckpointIdentity(rootCp, "graph start hook changed the checkpoint target")
+			default:
+				rootCp, loadErr = actual, nil
+				scopeErr = checkResumeIdentity()
+			}
+		}
+		if scopeErr != nil {
+			restoreRejected = true
+			return scopeErr
+		}
+	}
+
+	// 有冲突时只向祖先交付实际保留的待答项。若本层无法形成合法待答清单，
+	// 保留原档和子树，并用旧档的问题更新祖先。
+	defer func() {
+		if frontierIdentityErr == nil {
+			return
+		}
+		if frontierTargetUnknown {
+			restoreRejected = true
+			runErr = &checkpointIdentityRejection{cause: frontierIdentityErr, unknownTarget: true}
+			return
+		}
+		if !frontierQuestionsRecorded || runErr == nil || errors.Is(runErr, ErrRunAborted) {
+			restoreRejected = true
+			cause := frontierIdentityErr
+			if runErr != nil && !errors.Is(runErr, ErrRunAborted) {
+				if _, interrupted := IsInterrupt(runErr); !interrupted {
+					cause = runErr
+				}
+			}
+			runErr = checkpointTargetRejection(cause, rootCp)
+			return
+		}
+		runErr = projectCheckpointRejection(runErr, cm.PendingInterrupts())
+	}()
 
 	// **F4 修复**（Phase 5.1.a Step 5）：caller 传了 WithCheckpointer+WithSessionID
 	// 但没传 WithResumeFrom 时，自动从 (sid, graphNS) 取 saved root cp——
@@ -1254,11 +1387,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	noResumeReason := "本次声明了新开（WithFreshRun / 父层已声明），auto-load 整块跳过——" +
 		"注意档很可能还在，只是本次不捡它"
 	explicitResume := cfg.resumeFrom != nil
-	if cfg.resumeFrom == nil && !cfg.freshRun && !IsFreshRunCtx(ctx) &&
-		cfg.checkpointer != nil && cfg.sessionID != "" {
-		// opt-in 的 cp.load 事件（经 deliverCpEvent，钩子 panic 就地兜住、只记日志）
-		loadStart := time.Now()
-		rootCp, loadErr := cfg.checkpointer.LoadNS(ctx, cfg.sessionID, cfg.graphNS)
+	if autoLoad {
 		// 比对基线（WithStaleWriteGuard）——**两个分支都要设**：
 		//   载入到 cp → 记它那一代；载入到空槽 → 记"槽当时是空的"（后来变非空即冲突）
 		// 漏掉 nil 分支的两个后果：① 会话第一轮完全裸奔（双方基线都空、谁也发现不了
@@ -1269,23 +1398,14 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			cm.markCpSlotEmpty()
 		}
 		if cfg.emitCpEvent && cfg.hooks != nil {
-			// audit follow-up: 计 WouldResume — cp 有可续内容 + GraphID 不冲突
-			// 才真走 Resume. 业务订阅区分 "看到 cp / 真用 cp".
-			// 判据与下方真闸门同一个谓词（HasResumableWork，按内容判）——两处漂移
-			// 会让观测跟行为对不上。
-			wouldResume := false
-			if rootCp.HasResumableWork() && rootCp.BelongsToTask(getRunTaskID(ctx)) {
-				if rootCp.GraphID == "" || rootCp.GraphID == g.ID() {
-					wouldResume = true
-				}
-			}
+			wouldResume := loadErr == nil && CanAutoResumeCheckpoint(ctx, rootCp)
 			loadAction := &CpLoadAction{
 				SessionID:   cfg.sessionID,
 				NS:          cfg.graphNS,
 				Found:       rootCp != nil,
 				WouldResume: wouldResume,
 				Source:      "auto_load",
-				DurationMs:  time.Since(loadStart).Milliseconds(),
+				DurationMs:  loadDuration.Milliseconds(),
 				Ok:          loadErr == nil,
 			}
 			if rootCp != nil {
@@ -1304,6 +1424,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			})
 		}
 		if loadErr != nil {
+			restoreRejected = true
 			return fmt.Errorf("auto-load root cp: %w", loadErr)
 		}
 		// 记下「为什么没捡到」供下方守卫按处境说话——三种处境对调用方是三件事
@@ -1321,32 +1442,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		}
 		// **身份维**（BelongsToTask）：内容判据回答「有没有可续的」，身份判据回答
 		// 「是不是本任务的」——上个被放弃任务的残留对前者不可区分（见谓词 godoc）。
-		if rootCp.HasResumableWork() && rootCp.BelongsToTask(getRunTaskID(ctx)) {
-			// **捡不捡按内容判，不按档位判**（HasResumableWork godoc 有三条理由与实测）。
-			// 失败档（frontier 还指着失败分支）从此也被捡起——Resume 只重跑失败成员、
-			// 成功兄弟不重放；曾按 `Status == Pending` 挡它，代价是嵌套 Resume 时
-			// 子图捡不起自己的失败子档 ⟹ fresh run ⟹ 已完成超步副作用重放。
-			//
-			// Phase 5.1.b ISSUE-50 P0 防串台守卫（fail-fast）：
-			// cp.GraphID 与当前 g.ID() 不匹配时拒绝 auto-load——业务用同
-			// (sid, ns) 跑两个不同 graph 时，silent 用旧 cp restore 会让
-			// 新 graph frontier/channel 错位崩盘。撞上之后的两条出路和各自的
-			// 代价见 ErrGraphIDConflict godoc（**其中一条会毁掉槽里那份存档**，
-			// 所以这里不替调用方选）。
-			//
-			// 兼容旧 cp（cp.GraphID == ""）跳过校验——不破坏 Phase 5.1.a
-			// Step 1-5 已存的 cp。
-			if rootCp.GraphID != "" && rootCp.GraphID != g.ID() {
-				// **正文只陈述事实，出路进 ErrGraphIDConflict 的 godoc**。
-				//
-				// 这里原先写着「应显式 WithFreshRun」——而那个动作会让本次跑成功后
-				// 把槽里这份别人的存档连同整个 sid 子树一起清掉。**框架检测到「这儿有
-				// 别人的东西」，然后教调用方执行一个毁掉它的动作**，照做的人不会知道
-				// 自己刚删了什么。两条出路的代价差别很大且其中一条毁数据，该选哪条只有
-				// 调用方知道，所以正文不选、只把定位信息给全。
-				return fmt.Errorf("%w: session %q ns %q holds a checkpoint for graph %q, cannot auto-load into graph %q",
-					ErrGraphIDConflict, cfg.sessionID, cfg.graphNS, rootCp.GraphID, g.ID())
-			}
+		if CanAutoResumeCheckpoint(ctx, rootCp) {
 			cfg.resumeFrom = rootCp // Phase 5.1.b.4：直接用 *Checkpoint，无需桥接
 			// **audit Round 10 Bug B1 修复**：auto-load 路径同显式 WithResumeFrom
 			// 路径一样需要检查 unmatched answer IDs——R9 B4 fix 仅覆盖显式路径
@@ -1442,8 +1538,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			// 而引擎捡不捡档读的是 `HasResumableWork()`（按内容判）。这里曾按
 			// `Status == Pending` 算——那是档位 gate 撤销**之前**的判据，于是失败档
 			// 上报 `WouldResume=false` 而引擎照样续跑，业务的统计跟实际行为对不上。
-			wouldResume := cfg.resumeFrom.HasResumableWork() &&
-				(cfg.resumeFrom.GraphID == "" || cfg.resumeFrom.GraphID == g.ID())
+			wouldResume := cfg.resumeFrom.HasResumableWork()
 			deliverCpEvent(ctx, cfg, Event{
 				Type:    CpEventType,
 				Content: string(CpOperationLoad),
@@ -1455,27 +1550,13 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 						Status:      cfg.resumeFrom.Status.String(),
 						WouldResume: wouldResume,
 						Source:      "explicit",
-						// 显式 resumeFrom 本身不读 backend。**守卫开启时例外**：那条
-						// 路径会多探一次槽状态（见上方 markCpSlotUnknown 段），那次
-						// IO 不计在这里——业务按 cp event 统计 cp 层 IO 时需知道。
+						// 此事件只记录调用方传来的源档。入口校验已有目标槽的 I/O 单独处理。
 						DurationMs: 0,
 						Ok:         true,
 					}},
 					"graph_ns": cfg.graphNS,
 				},
 			})
-		}
-		// **audit Round 8 Bug 4 修复**：WithResumeFrom 显式路径同 auto-load 路径
-		// 一样应做 GraphID 冲突守卫——之前只 auto-load 检查，业务跨进程
-		// MarshalCheckpoint→wire→UnmarshalCheckpoint→WithResumeFrom 时若误 mix
-		// 不同 graph 的 cp，silent restore 让 frontier/channel 错位崩盘。
-		//
-		// 兼容旧 cp（cp.GraphID == ""）跳过校验——业务用裸 cm.Snapshot 拿到的 cp
-		// 没 GraphID（Bug 5 已修后 Snapshot 可选填）；空 GraphID 仍允许通过保
-		// 向后兼容。
-		if cfg.resumeFrom.GraphID != "" && cfg.resumeFrom.GraphID != g.ID() {
-			return fmt.Errorf("%w: WithResumeFrom cp.GraphID=%q vs g.ID()=%q: caller 跨 graph mix cp 拒绝静默 restore",
-				ErrGraphIDConflict, cfg.resumeFrom.GraphID, g.ID())
 		}
 		// 有待回答问题时必须有对应的 frontier。已完成且无挂起的存档仍支持幂等恢复。
 		if len(cfg.resumeFrom.CurrentFrontier) == 0 && len(cfg.resumeFrom.PendingInterrupts) > 0 {
@@ -1698,6 +1779,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		// 中断 / 失败留下的档，续跑时不再判它的 before 断点（见 judgeStart）
 		cm.markFrontierStarted()
 		res := executeFrontier(ctx, g, frontier, cm, cfg.hooks)
+		frontierIdentityErr = checkpointIdentityRejectionError(res.IdentityRejections)
+		frontierTargetUnknown = checkpointTargetUnknown(res.IdentityRejections)
+		frontierQuestionsRecorded = false
 
 		// 同一逻辑超步的单写入者冲突在提交前终止。恢复时也要检查此前已提交的成员。
 		if res.SingleWriterConflictErr != nil {
@@ -1767,10 +1851,19 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 					batch = append(batch, query)
 				}
 			}
+			if len(res.IdentityRejections) != 0 {
+				var previous []*AskQuery
+				if cfg.resumeFrom != nil {
+					previous = cfg.resumeFrom.PendingInterrupts
+				}
+				batch = preserveConflictedQuestions(batch, previous, res.IdentityRejections, res.ConsumedAnswers)
+				stayPendingFact = stayPendingFact || len(batch) != 0
+			}
 			// ⚠️ **撞 ID 只记下事实，不在这儿 return**：下面还有 SuccessWrites 的
 			// ApplyAll 和 appendCompletedSiblingsLocked——从这儿跳出去会让成功兄弟的 writes
 			// 没 commit、身份和 sends 没记，留下半应用状态。在最终 return 处替换错误。
 			dupErr = cm.recordInterruptBatch(batch)
+			frontierQuestionsRecorded = dupErr == nil
 			// ⚠️ **窄化推迟到下面 ApplyAll 成功之后**（pre-arm / post-disarm）。
 			//
 			// 这里曾经就地 `updateFrontier(res.FailedBranches)`，靠 ApplyAll 的 error
@@ -1831,6 +1924,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 					res.SucceededBranches, res.ConsumedAnswers, res.Signals, nextFrontier, dirWrites, nextInputs)
 			}
 			if commitErr != nil {
+				// 提交失败时，刚收到的答案和兄弟进度都还未结算。发生子档身份冲突时，
+				// 保留本层旧档与原问题，不将这批未提交的状态投影到祖先。
+				frontierQuestionsRecorded = false
 				// **audit Round 11 Bug R11-1+R11-3 修复**：ApplyAll panic atomic
 				// 回滚（R9 D1）让成功分支 writes 也丢失 + 类型链销毁让 caller
 				// errors.As(err, &InterruptError) 失败。修复：
@@ -2074,6 +2170,9 @@ type frontierResult struct {
 	// `%w`、靠多错误树的 OR 保住；现在中断不在它的链上，那个机制不成立。
 	NotPersistedErr error
 
+	// IdentityRejections 记录被拒绝的子档及其原待答项。
+	IdentityRejections []*checkpointIdentityRejection
+
 	AllInterrupts []*InterruptError
 	// interruptRaws 是各中断分支返出来的**原始 error**，与 AllInterrupts 按下标一一
 	// 对应：后者是 `IsInterrupt` 从链上抠出来的裸 `*InterruptError`，前者是没动过的
@@ -2099,8 +2198,9 @@ type frontierResult struct {
 
 // exitErr 定本超步失败时返给调用方的那**一个** error。
 //
-// # 终局失败 > 坏存档 > 档没写成 > 中断 > 第一个业务错
+// # 存档身份拒绝 > 终局失败 > 坏存档 > 档没写成 > 中断 > 第一个业务错
 //
+//	有子档身份拒绝 → 返该冲突并保留存档，已结算的兄弟进度仍可提交
 //	有分支终局失败 → 那条分支的原始 error（`ErrRunAborted`，见 AbortErr）
 //	有分支存档坏了 → 那条分支的原始 error（见 NotResumableErr）
 //	有分支档没写成 → 那条分支的原始 error（见 NotPersistedErr）
@@ -2160,6 +2260,9 @@ type frontierResult struct {
 //
 // 被返回值省略的那些分支也不会永久静默：它们都在 FailedBranches 里，Resume 时会重跑。
 func (r frontierResult) exitErr() error {
+	if err := checkpointIdentityRejectionError(r.IdentityRejections); err != nil {
+		return err
+	}
 	// 终局失败严格支配「等回答」——理由见上。这一档是本函数独有的（扇出调用方没有
 	// cp 子树要清），故留在这儿；`AbortErr` 与 `NotResumableErr` 之后的那两档（中断 / 第一个业务错）跟框架里别处的扇出仲裁**共用同一份判据**，
 	// 见 PickFanoutError。
@@ -2237,9 +2340,10 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 		applyNestedEntryRejections(ctx, cm, frontier[0], err)
 		if err != nil {
 			res := frontierResult{
-				FailedBranches: []FrontierMember{frontier[0]},
-				FirstErr:       err,
-				WriteOwners:    writeOwners,
+				FailedBranches:     []FrontierMember{frontier[0]},
+				FirstErr:           err,
+				IdentityRejections: appendCheckpointIdentityRejections(nil, err),
+				WriteOwners:        writeOwners,
 			}
 			if errors.Is(err, ErrRunAborted) {
 				res.AbortErr = err
@@ -2381,6 +2485,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 	for _, r := range results {
 		if r.err != nil {
 			out.FailedBranches = append(out.FailedBranches, r.member)
+			out.IdentityRejections = appendCheckpointIdentityRejections(out.IdentityRejections, r.err)
 			if out.FirstErr == nil {
 				out.FirstErr = r.err
 			}

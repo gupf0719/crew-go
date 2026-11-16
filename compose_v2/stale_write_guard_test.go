@@ -7,11 +7,13 @@ package compose_v2_test
 // 报成功、事后无从察觉"变成"至少一方拿到 ErrCheckpointStale"。
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"crew-go/compose_v2"
 	"crew-go/schema"
@@ -745,148 +747,110 @@ func TestStaleWriteGuard_ResumeFromIntoEmptySlot(t *testing.T) {
 	}
 }
 
-// flakyLoadCheckpointer 让指定序号的 LoadNS 报错，其余透传——模拟一次读抖动。
+// flakyLoadCheckpointer 让第一次 LoadNS 报错，其余透传。
 type flakyLoadCheckpointer struct {
 	compose_v2.Checkpointer
-	failNth int32 // 第几次 LoadNS 失败（1-based）
-	calls   atomic.Int32
+	calls atomic.Int32
 }
 
+var errTransientCheckpointRead = errors.New("transient backend read error")
+
 func (f *flakyLoadCheckpointer) LoadNS(ctx context.Context, sid, ns string) (*compose_v2.Checkpoint, error) {
-	if f.calls.Add(1) == f.failNth {
-		return nil, errors.New("transient backend read error")
+	if f.calls.Add(1) == 1 {
+		return nil, errTransientCheckpointRead
 	}
 	return f.Checkpointer.LoadNS(ctx, sid, ns)
 }
 
-// TestStaleWriteGuard_ProbeReadFailure_FailsOpen：探测槽状态的那次 LoadNS 报错时，
-// 守卫必须 **fail-open**，不能把上面那条刚修好的 bug 原样复现。
-//
-// `WithResumeFrom` 路径要单独探一次"槽当前空不空"。探不到时**不能倒向任何一边**：
-//   - 当成"空" → 普通 Resume 在读抖动时会误判成"载入时空、现在非空"，砸掉最常见路径
-//   - 当成"非空"（维持默认）→ 槽真为空时报"别人删了"，**一次读抖动就够**让 fork
-//     出的会话拿到 stale + 存档不落盘 + 永久不可 Resume
-//
-// 所以标第三态 unknown，由 checkStale 在 `cur == nil` 分支放行——与它自己读失败时
-// 同款处置，也是 checkpoint-storage.md 白纸黑字的契约（守卫是护栏不是主链路）。
-//
-// sanity-revert：把 graph_loop 探测里的 `markCpSlotUnknown()` 删掉（回到 err 时
-// 什么都不标）→ 本条 FAIL 并报 stale。
-func TestStaleWriteGuard_ProbeReadFailure_FailsOpen(t *testing.T) {
-	inner := compose_v2.NewInMemoryCheckpointer()
-	ctx := context.Background()
-	var ranWork atomic.Int32
+// 显式恢复要先验证目标槽的身份。读失败时保留现场，读恢复后可继续。
+func TestStaleWriteGuard_TargetReadFailureStopsExplicitResume(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sid  string
+	}{{"resume_in_place", "original"}, {"fork_into_empty_slot", "fork"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			cp := compose_v2.NewInMemoryCheckpointer()
+			var ranWork atomic.Int32
+			graph := buildGuardGraph(t, &ranWork)
 
-	ie, ok := compose_v2.IsInterrupt(compose_v2.Run(ctx, buildGuardGraph(t, &ranWork),
-		compose_v2.NewChannelManager(),
-		compose_v2.WithCheckpointer(inner), compose_v2.WithSessionID("probe_orig")))
-	if !ok {
-		t.Fatal("原会话应中断")
-	}
-	archived, _ := inner.LoadNS(ctx, "probe_orig", "")
-	if archived == nil {
-		t.Fatal("应有归档 cp")
-	}
+			original, ok := compose_v2.IsInterrupt(compose_v2.Run(ctx, graph, compose_v2.NewChannelManager(),
+				compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID("original")))
+			if !ok {
+				t.Fatal("原任务应在第一问挂起")
+			}
+			saved, beforeSource := graphConflictCheckpoint(t, ctx, cp, "original", "")
+			_, beforeTarget := graphConflictCheckpoint(t, ctx, cp, tc.sid, "")
+			if saved == nil || len(original.AllQueries()) != 1 {
+				t.Fatal("原任务应留下可续档和原答案位")
+			}
 
-	// 第 1 次 LoadNS 正是探测那次（fork 目标槽为空）
-	cper := &flakyLoadCheckpointer{Checkpointer: inner, failNth: 1}
-	dup := *archived
-	err := compose_v2.Run(ctx, buildGuardGraph(t, &ranWork), compose_v2.NewChannelManager(),
-		compose_v2.WithCheckpointer(cper), compose_v2.WithSessionID("probe_target"),
-		compose_v2.WithResumeFrom(&dup), compose_v2.WithStaleWriteGuard(),
-		compose_v2.WithResumeAnswers(map[string]*schema.Message{
-			ie.AllQueries()[0].InterruptID: schema.UserMessage("go"),
-		}))
-	if errors.Is(err, compose_v2.ErrCheckpointStale) {
-		t.Fatalf("探测读抖动一次就被判 stale——全程只有一个执行者，守卫是护栏不是主链路: %v", err)
-	}
-	if _, isInt := compose_v2.IsInterrupt(err); isInt {
-		cp, _ := inner.LoadNS(ctx, "probe_target", "")
-		if cp == nil {
-			t.Error("拿到 InterruptError 但存档没落盘——一次读抖动就让会话永久不可 Resume")
-		}
-	}
-}
+			cper := &flakyLoadCheckpointer{Checkpointer: cp}
+			opts := []compose_v2.RunOption{
+				compose_v2.WithCheckpointer(cper), compose_v2.WithSessionID(tc.sid), compose_v2.WithResumeFrom(saved),
+				compose_v2.WithStaleWriteGuard(), compose_v2.WithResumeAnswers(map[string]*schema.Message{
+					original.AllQueries()[0].InterruptID: schema.UserMessage("go"),
+				}),
+			}
+			err := compose_v2.Run(ctx, graph, compose_v2.NewChannelManager(), opts...)
+			_, afterSource := graphConflictCheckpoint(t, ctx, cp, "original", "")
+			_, afterTarget := graphConflictCheckpoint(t, ctx, cp, tc.sid, "")
+			if !errors.Is(err, errTransientCheckpointRead) || ranWork.Load() != 0 ||
+				!bytes.Equal(beforeSource, afterSource) || !bytes.Equal(beforeTarget, afterTarget) {
+				t.Fatalf("目标仓库读失败时应保留两端原档且不执行，err=%v work=%d source=%t target=%t",
+					err, ranWork.Load(), bytes.Equal(beforeSource, afterSource), bytes.Equal(beforeTarget, afterTarget))
+			}
 
-// TestStaleWriteGuard_ProbeReadFailure_StillDetectsRealConflict：探测失败不能把守卫
-// 整个关掉——`cur != nil` 那一维仍要照常比 Epoch。
-//
-// unknown 态只在"槽为空"这一个分支放行（那时无法区分"本来就空"和"别人删了"）。
-// 槽里有东西时基线是明确的（caller 给的那代），该拦还得拦。
-func TestStaleWriteGuard_ProbeReadFailure_StillDetectsRealConflict(t *testing.T) {
-	inner := compose_v2.NewInMemoryCheckpointer()
-	ctx := context.Background()
-	var ranWork atomic.Int32
-
-	ie, ok := compose_v2.IsInterrupt(compose_v2.Run(ctx, buildGuardGraph(t, &ranWork),
-		compose_v2.NewChannelManager(),
-		compose_v2.WithCheckpointer(inner), compose_v2.WithSessionID("conflict_orig")))
-	if !ok {
-		t.Fatal("原会话应中断")
-	}
-	archived, _ := inner.LoadNS(ctx, "conflict_orig", "")
-
-	// 目标槽里已经有**别人**的 cp（epoch 与 archived 那代不同）
-	if _, ok := compose_v2.IsInterrupt(compose_v2.Run(ctx, buildGuardGraph(t, &ranWork),
-		compose_v2.NewChannelManager(),
-		compose_v2.WithCheckpointer(inner), compose_v2.WithSessionID("conflict_target"))); !ok {
-		t.Fatal("占位会话应中断")
-	}
-
-	cper := &flakyLoadCheckpointer{Checkpointer: inner, failNth: 1} // 探测那次失败
-	dup := *archived
-	err := compose_v2.Run(ctx, buildGuardGraph(t, &ranWork), compose_v2.NewChannelManager(),
-		compose_v2.WithCheckpointer(cper), compose_v2.WithSessionID("conflict_target"),
-		compose_v2.WithResumeFrom(&dup), compose_v2.WithStaleWriteGuard(),
-		compose_v2.WithResumeAnswers(map[string]*schema.Message{
-			ie.AllQueries()[0].InterruptID: schema.UserMessage("go"),
-		}))
-	if !errors.Is(err, compose_v2.ErrCheckpointStale) {
-		t.Errorf("槽里是别人的 cp、基线是 caller 给的那代 → 仍应检出 stale，got %v\n"+
-			"  unknown 态只该在'槽为空'那一个分支放行，不是把守卫整个关掉", err)
+			err = compose_v2.Run(ctx, graph, compose_v2.NewChannelManager(), opts...)
+			later, pending := compose_v2.IsInterrupt(err)
+			target, _ := graphConflictCheckpoint(t, ctx, cp, tc.sid, "")
+			if !pending || len(later.AllQueries()) != 1 || ranWork.Load() != 1 || target == nil ||
+				len(target.PendingInterrupts) != 1 || target.PendingInterrupts[0].InterruptID != later.AllQueries()[0].InterruptID ||
+				target.PendingInterrupts[0].InterruptID == original.AllQueries()[0].InterruptID {
+				t.Fatalf("读恢复后应执行一次并在第二问留下可续档，err=%v work=%d", err, ranWork.Load())
+			}
+			if tc.sid != "original" {
+				if _, afterFork := graphConflictCheckpoint(t, ctx, cp, "original", ""); !bytes.Equal(beforeSource, afterFork) {
+					t.Fatal("续跑分叉后应保留原任务的档")
+				}
+			}
+		})
 	}
 }
 
-// TestStaleWriteGuard_ProbeReadFailure_NormalResumeNotMisjudged：探测读抖动时把槽
-// **当成空**同样会出事——这条钉的是三态相对"二态 + 读失败当空槽"的差异点。
-//
-// 普通 `WithResumeFrom`（槽里就是我要恢复的那份）遇到探测读失败：
-//   - 当成"空槽" → 写回时 `cur != nil` + slotWasEmpty ⟹ 报"载入时槽为空，现已被
-//     写入 — 另一个执行者在本次 Run 期间创建了它" ⟹ **最常见的 Resume 路径被一次
-//     读抖动砸掉**
-//   - 标 unknown → `cur != nil` 分支照常比 Epoch，基线就是 caller 给的那代 ⟹ 匹配
-//
-// sanity-revert：把 graph_loop 探测里的 `markCpSlotUnknown()` 换成 `markCpSlotEmpty()`
-// → 本条 FAIL 并报 stale。
-func TestStaleWriteGuard_ProbeReadFailure_NormalResumeNotMisjudged(t *testing.T) {
-	inner := compose_v2.NewInMemoryCheckpointer()
-	ctx := context.Background()
+// 两份同图存档的身份一致。目标槽的 Epoch 若与传入档不同，陈旧写回守卫仍必须拒绝。
+func TestStaleWriteGuard_MatchingGraphDoesNotAcceptDifferentEpoch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cp := compose_v2.NewInMemoryCheckpointer()
 	var ranWork atomic.Int32
+	graph := buildGuardGraph(t, &ranWork)
 
-	ie, ok := compose_v2.IsInterrupt(compose_v2.Run(ctx, buildGuardGraph(t, &ranWork),
-		compose_v2.NewChannelManager(),
-		compose_v2.WithCheckpointer(inner), compose_v2.WithSessionID("normal_sid")))
-	if !ok {
-		t.Fatal("原会话应中断")
+	original, ok := compose_v2.IsInterrupt(compose_v2.Run(ctx, graph, compose_v2.NewChannelManager(),
+		compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID("epoch-original")))
+	if !ok || len(original.AllQueries()) != 1 {
+		t.Fatal("原任务应停在第一问")
 	}
-	saved, _ := inner.LoadNS(ctx, "normal_sid", "")
-	if saved == nil {
-		t.Fatal("应有存档")
+	archived, _ := graphConflictCheckpoint(t, ctx, cp, "epoch-original", "")
+	if _, ok := compose_v2.IsInterrupt(compose_v2.Run(ctx, graph, compose_v2.NewChannelManager(),
+		compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID("epoch-target"))); !ok {
+		t.Fatal("目标任务应停在自己的第一问")
+	}
+	target, before := graphConflictCheckpoint(t, ctx, cp, "epoch-target", "")
+	if archived == nil || target == nil || archived.Epoch == target.Epoch {
+		t.Fatal("来源与目标应各有不同世代的存档")
 	}
 
-	// 同一个 sid 上 resume 它自己的那份 cp——槽非空、基线正是槽里那代
-	cper := &flakyLoadCheckpointer{Checkpointer: inner, failNth: 1} // 探测那次失败
-	dup := *saved
-	err := compose_v2.Run(ctx, buildGuardGraph(t, &ranWork), compose_v2.NewChannelManager(),
-		compose_v2.WithCheckpointer(cper), compose_v2.WithSessionID("normal_sid"),
-		compose_v2.WithResumeFrom(&dup), compose_v2.WithStaleWriteGuard(),
+	err := compose_v2.Run(ctx, graph, compose_v2.NewChannelManager(),
+		compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID("epoch-target"),
+		compose_v2.WithResumeFrom(archived), compose_v2.WithStaleWriteGuard(),
 		compose_v2.WithResumeAnswers(map[string]*schema.Message{
-			ie.AllQueries()[0].InterruptID: schema.UserMessage("go"),
+			original.AllQueries()[0].InterruptID: schema.UserMessage("go"),
 		}))
-	if errors.Is(err, compose_v2.ErrCheckpointStale) {
-		t.Fatalf("普通 Resume 被一次探测读抖动判成 stale: %v\n"+
-			"  把读失败当'空槽'会让写回时撞上'载入时槽为空，现已被写入'——"+
-			"这是最常见的 Resume 路径，不能因为护栏读了一次失败就砸掉", err)
+	_, after := graphConflictCheckpoint(t, ctx, cp, "epoch-target", "")
+	if !errors.Is(err, compose_v2.ErrCheckpointStale) || !bytes.Equal(before, after) {
+		t.Errorf("目标档属于其他世代，陈旧写回应失败并保留原档，err=%v 同档=%t", err, bytes.Equal(before, after))
 	}
 }
 

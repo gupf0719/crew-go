@@ -20,6 +20,7 @@ type anyChannel interface {
 	zeroAny() any
 	reduceAny(prev, next any) any
 	singleWriterPerStep() bool
+	checkpointMergeKind() string
 }
 
 // ChannelManager 管理所有 channel 的注册 + 当前值 + reduce 调度。
@@ -32,6 +33,10 @@ type ChannelManager struct {
 	mu       sync.RWMutex
 	channels map[string]anyChannel // 注册表：name → channel handle
 	values   map[string]any        // 当前值：name → reduced value（已写入的）
+	// Restore 合并快照内已写入的值；记录来源以便 Run 拒绝混入另一张图的状态。
+	restoreOrigin checkpointRestoreOrigin
+	hasRestored   bool
+	mixedRestores bool
 	// baseline 是**不经 reducer** 摆进来的底层值——子图 import 专用（见 setBaseline）。
 	// 读 = reduce(baseline, values)；写只进 values；Snapshot 只存 values。
 	// 非子图的 cm 恒为 nil，读路径零开销。
@@ -1049,4 +1054,17 @@ func typesEqual(a, b reflect.Type) bool {
 	// register 唯一调用点传的 typeRep() 恒非 nil（reflect.TypeOf((*T)(nil)).Elem()），
 	// 原 nil 守卫是不可达死代码，删。
 	return a == b
+}
+
+func (cm *ChannelManager) checkpointChannels() []anyChannel {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	var channels []anyChannel
+	if len(cm.channels) != 0 {
+		channels = make([]anyChannel, 0, len(cm.channels))
+		for _, channel := range cm.channels {
+			channels = append(channels, channel)
+		}
+	}
+	return channels
 }

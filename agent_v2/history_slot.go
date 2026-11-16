@@ -813,6 +813,7 @@ func beginRunActivity(ctx context.Context, tasks []abandonedTask, session *RunSe
 	if freshRoot {
 		activity.runID = session.RunID
 		activity.initial = compose_v2.GetCheckpointer(ctx)
+		activity.initialOwner = compose_v2.GetOwner(ctx)
 		ctx = context.WithValue(ctx, rootRunAdmissionKey{}, session.RunID)
 	}
 	return ctx, activity, nil

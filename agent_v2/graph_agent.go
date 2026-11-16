@@ -76,10 +76,7 @@ type GraphOutputReader func(chs compose_v2.Channels) *schema.Message
 //
 // **必填**：graph + InputWriter + OutputReader。
 //
-// 存档冲突检查用的是图自己的身份（[compose_v2.Graph.ID]），GraphAgent 的名字不进去。两个 GraphAgent 包着结构相同、
-// 没设名字的图（同样的节点 ID 与 channel）时身份相同，一个进了另一个的存档槽（经 [EnterRun] 进入的壳在自己的阶段里
-// 裸调）会把对方的挂起档读进来接着跑，`err == nil`。建图时用 `WithName` 或 `WithIdentityPrefix` 区分它们，撞上时报
-// `compose_v2.ErrGraphIDConflict`、不执行。
+// 存档身份包括编译图的恢复契约和 GraphAgent 的稳定名称。
 func NewGraphAgent(graph *compose_v2.Graph, opts ...GraphAgentOption) *GraphAgent {
 	g := &GraphAgent{graph: graph}
 	for _, opt := range opts {
@@ -92,6 +89,7 @@ func NewGraphAgent(graph *compose_v2.Graph, opts ...GraphAgentOption) *GraphAgen
 		panic("NewGraphAgent: WithGraphAgentName required")
 	}
 	if g.graph != nil {
+		g.graph = g.graph.WithCheckpointOwner("graph_agent:" + g.name)
 		for _, bp := range []struct {
 			opt string
 			ids []compose_v2.NodeID
@@ -439,6 +437,9 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 		return nil, nil
 	}
 	defer prep.activity.Release()
+	if err := g.graph.WithCheckpointContext(newCtx).CheckCheckpointIdentity(prep.Checkpoint); err != nil {
+		return nil, err
+	}
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	// MED-1 fail-fast：composite Resume 同样不透传 per-call 覆盖给 inner step。
 	if err := rejectCompositeOverride(rcfg.overrides()); err != nil {

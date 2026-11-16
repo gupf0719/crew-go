@@ -122,7 +122,8 @@ func scenarioBasicAgentHITL() error {
 
 	// Run 1: 触发 ask_user
 	cm1 := compose_v2.NewChannelManager()
-	err := compose_v2.Run(context.Background(), makeGraph(), cm1,
+	original := makeGraph()
+	err := compose_v2.Run(context.Background(), original, cm1,
 		compose_v2.WithInitialWrites(agent_v2.BasicAgentInputWrites(schema.UserMessage("hello"))...),
 	)
 	if _, isInt := compose_v2.IsInterrupt(err); !isInt {
@@ -130,7 +131,7 @@ func scenarioBasicAgentHITL() error {
 	}
 	fmt.Println("  · Run 1 触发 ask_user 中断 ✓")
 
-	snap, _ := cm1.Snapshot()
+	snap, _ := cm1.SnapshotForGraph(original)
 	if len(snap.PendingInterrupts) != 1 {
 		return fmt.Errorf("snapshot 应含 1 个 pending，实际 %d", len(snap.PendingInterrupts))
 	}
@@ -192,7 +193,8 @@ func scenarioSequentialNestedHITL() error {
 
 	// Run 1: s1 → s2 抛中断
 	cm1 := compose_v2.NewChannelManager()
-	err := compose_v2.Run(context.Background(), makeSeq(), cm1)
+	original := makeSeq()
+	err := compose_v2.Run(context.Background(), original, cm1)
 	ie, isInt := compose_v2.IsInterrupt(err)
 	if !isInt {
 		return fmt.Errorf("Run 1 应中断，实际 %v", err)
@@ -202,7 +204,7 @@ func scenarioSequentialNestedHITL() error {
 	}
 	fmt.Println("  · Run 1: s1 完成 + s2 ask_user 中断 ✓")
 
-	snap, _ := cm1.Snapshot()
+	snap, _ := cm1.SnapshotForGraph(original)
 	if len(snap.CurrentFrontier) != 1 || snap.CurrentFrontier[0].NodeID != "s2_ask" {
 		return fmt.Errorf("frontier 应是 [s2_ask]，实际 %v", snap.CurrentFrontier)
 	}
@@ -446,7 +448,8 @@ func scenarioPerBranchDelta() error {
 	}
 
 	cm1 := compose_v2.NewChannelManager()
-	err := compose_v2.Run(context.Background(), makePar(), cm1)
+	original := makePar()
+	err := compose_v2.Run(context.Background(), original, cm1)
 	if err == nil {
 		return errors.New("Run 1 应失败（flaky 第 1 次）")
 	}
@@ -457,7 +460,7 @@ func scenarioPerBranchDelta() error {
 	}
 	fmt.Printf("  · Run 1: ok1/ok2 writes 保留 (per-branch delta) + flaky 失败标记 ✓\n")
 
-	snap, _ := cm1.Snapshot()
+	snap, _ := cm1.SnapshotForGraph(original)
 	if len(snap.CurrentFrontier) != 1 || snap.CurrentFrontier[0].NodeID != "flaky" {
 		return fmt.Errorf("frontier 应只含 flaky，实际 %v", snap.CurrentFrontier)
 	}

@@ -241,7 +241,8 @@ func runDemo() error {
 		chunkLogger: func(c string) { fmt.Printf("📥 chunk: %q\n", c) },
 	}
 	cm2 := compose_v2.NewChannelManager()
-	err = compose_v2.Run(context.Background(), makeRound2Graph(), cm2,
+	round2Graph := makeRound2Graph()
+	err = compose_v2.Run(context.Background(), round2Graph, cm2,
 		compose_v2.WithInitialWrites(agent_v2.BasicAgentInputWrites(schema.UserMessage("查天气需要权限"))...),
 		compose_v2.WithHooks(bus2a),
 	)
@@ -257,7 +258,7 @@ func runDemo() error {
 		q.Question, q.InterruptID, q.Options)
 
 	// 模拟跨进程：marshal cp + 重启
-	snap, _ := cm2.Snapshot()
+	snap, _ := cm2.SnapshotForGraph(round2Graph)
 	data, err := compose_v2.MarshalCheckpoint(snap)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)

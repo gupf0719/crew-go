@@ -100,9 +100,10 @@ type Reducer[T any] func(prev, next T) T
 // reducer 由用户显式声明，不内嵌"默认 LastValue"——避免 EndChannel 用 LastValue 时
 // 可被覆盖为 false 的语义陷阱。需要单调结束语义请用 OnceFlag reducer。
 type Channel[T any] struct {
-	n  string     // channel 名（拓扑唯一）
-	fn Reducer[T] // 合并函数
-	z  T          // 零值（read 未写入时返回）
+	n              string     // channel 名（拓扑唯一）
+	fn             Reducer[T] // 合并函数
+	z              T          // 零值（read 未写入时返回）
+	checkpointKind string     // 内置合并契约，零值表示自定义
 	// single 声明「一个超步里只该有一个写入者」。LastValue 家族置位——它的 reducer
 	// 是 `return next`，两个并发分支同时写时**静默丢一个**，赢家由 frontier 索引序
 	// 决定。引擎据此在超步归并前拒掉这种图（见 frontierResult.SingleWriterConflictErr）。
@@ -128,6 +129,13 @@ func (h *channelHandle[T]) name() string { return h.ch.n }
 
 // singleWriterPerStep 返 channel 是否声明「一个超步里只该有一个写入者」。
 func (h *channelHandle[T]) singleWriterPerStep() bool { return h.ch.single }
+
+func (h *channelHandle[T]) checkpointMergeKind() string {
+	if kind := h.ch.checkpointKind; kind != "" {
+		return kind
+	}
+	return "custom"
+}
 
 // typeRep 返 Channel[T] 的 T 类型代表。
 //
@@ -191,10 +199,11 @@ func (h *channelHandle[T]) reduceAny(prev, next any) any {
 func LastValue[T any](name string) *Channel[T] {
 	var zero T
 	return &Channel[T]{
-		n:      name,
-		fn:     func(_, next T) T { return next },
-		z:      zero,
-		single: true,
+		n:              name,
+		fn:             func(_, next T) T { return next },
+		z:              zero,
+		single:         true,
+		checkpointKind: "last-value",
 	}
 }
 
@@ -212,7 +221,8 @@ func LastValue[T any](name string) *Channel[T] {
 // 类典型 channel 影响可忽略；换来并发安全 + 业务 Get 拿 slice 视为只读时有保证。
 func Append[T any](name string) *Channel[[]T] {
 	return &Channel[[]T]{
-		n: name,
+		n:              name,
+		checkpointKind: "append",
 		fn: func(prev, next []T) []T {
 			out := make([]T, 0, len(prev)+len(next))
 			out = append(out, prev...)
@@ -226,9 +236,10 @@ func Append[T any](name string) *Channel[[]T] {
 // 适用：token usage 计数、节点访问数等。
 func Sum(name string) *Channel[int] {
 	return &Channel[int]{
-		n:  name,
-		fn: func(p, n int) int { return p + n },
-		z:  0,
+		n:              name,
+		fn:             func(p, n int) int { return p + n },
+		z:              0,
+		checkpointKind: "sum",
 	}
 }
 
@@ -240,7 +251,8 @@ func Sum(name string) *Channel[int] {
 // OnceFlag 显式表达单调性，PoC 用它实现 EndChannel 等终止信号。
 func OnceFlag(name string) *Channel[bool] {
 	return &Channel[bool]{
-		n: name,
+		n:              name,
+		checkpointKind: "once-flag",
 		fn: func(prev, next bool) bool {
 			if prev {
 				return prev // 已 set，锁定

@@ -310,7 +310,8 @@ func TestPanicStack_RestoreUnmarshalPanic(t *testing.T) {
 	if err := src.ApplyAll([]compose_v2.ChannelWrite{compose_v2.Write(chBad, &panickyJSONValue{X: 1})}); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := src.Snapshot()
+	graph := psSingleNodeGraph(t, psNoop)
+	snap, err := src.SnapshotForGraph(graph)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +326,7 @@ func TestPanicStack_RestoreUnmarshalPanic(t *testing.T) {
 
 	t.Run("via Run", func(t *testing.T) {
 		logs := psCaptureLogs(t)
-		err := compose_v2.Run(context.Background(), psSingleNodeGraph(t, psNoop), fresh(t), compose_v2.WithResumeFrom(snap))
+		err := compose_v2.Run(context.Background(), graph, fresh(t), compose_v2.WithResumeFrom(snap))
 		psAssertPanicStack(t, err, site)
 		if !strings.Contains(err.Error(), "Restore panic (rolled back)") {
 			t.Fatalf("该是 Restore（持锁区）兜住的，实际 %q", err.Error())

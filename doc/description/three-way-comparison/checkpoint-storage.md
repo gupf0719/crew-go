@@ -486,7 +486,7 @@ class CheckpointNotLatest(Exception):
 | ISSUE-70 Phase 2 | 嵌套 / fan-out cp **物理分离**：子图 cp 写父 store 独立 ns `(parentSID, childNS)`、fan-out 各分支独立 ns，不嵌入父 cp，多层 / 多分支互不覆盖 | LangGraph 同 store + ns 寻址 | 不抄 ns 完全刚性——保留 sandbox 走独立 store 路径 |
 | ISSUE-70 决策 | 不加 `durability` 模式（**后反转**，见末行 Durability port）| LangGraph durability 三档 | 当年判断"成功即清"是核心语义、sync 模式会破坏——**此担心后证伪** |
 | ISSUE-70 决策 | 不加 `WithIsolatedCheckpointStore` | （三方都没有） | 同 thread 两个 store 原子性问题真实，不可取 |
-| ISSUE-50 P0 | GraphID 防串台：`Graph.ID()` 身份（name 或拓扑+state 类型 fingerprint）+ `cp.GraphID` 字段 + `SaveNS` 冲突守卫 + Resume 入口 fail-fast 校验 | LangGraph / eino 均无 graph 身份概念 | 两家"同 thread 跨 graph"是业务自管未防御；我们 fail-fast 守护，避免不同 Graph 共享 sid 时 cp 静默互覆 + state 串台 |
+| ISSUE-50 P0 | GraphID 防串台。版本化存档身份覆盖拓扑、channel 合并契约和业务版本，Resume 与 SaveNS 校验同一字段 | LangGraph / eino 均无 graph 身份概念 | 两家"同 thread 跨 graph"是业务自管未防御；我们 fail-fast 守护，避免不同 Graph 共享 sid 时 cp 静默互覆 + state 串台 |
 | ISSUE-50 P1 | thread-aware：`cp.ThreadID` 字段 + `ListByThread` / `LatestByThread` + `ErrThreadNotFound` | LangGraph thread_id 一级 | **已被 ISSUE-98 推翻并删除**——受制于「成功即清」这套 API 只能返当前挂起的 run，名不副实。会话历史改由 `agent_v2` 独立 append-only 层（`WithHistory`）承担，cp 层回归纯「单次 Run 临时态」。见本文 §跨 run 会话 + [ISSUE-98](../../issue/issue-98-conversation-history.md) |
 | ~~本次~~ 已推翻 | ~~删 `CPStatusFailed` 死枚举——Status 只留 `Pending` / `Unset`~~ | LangGraph（pending_writes 对账、无 Status）/ eino（业务错不写 cp）都不用"失败态 cp" | 当时的理由是"cp 存在即有挂起中断待续、Failed 态无产品场景"——**那是照抄别人的结论而丢掉了自己的前提**：他们不需要 Failed 态是因为业务错根本不写 cp，而我们所有 `runErr != nil` 都写 |
 | ISSUE-94（`2b5c9bc`）| 加回 `CPStatusFailed` + `Status.Resumable()`，判据 `IsControlFlowSignal(runErr)` | 三家都没有对应物（他们靠"失败不写 cp"绕开） | 失败现场和"等人回答的挂起"在存档上长得一模一样时，auto-load 分不出来——一次因下游永久 500 退出的 Run 会被下一次同 sid 调用当成挂起捡起来接着跑。**"能不能恢复"和"要不要自动恢复"是两件事**：两态 `Resumable()` 都为真，auto-load 只捡 `Pending`。⚠️ **2026-08-13 撤**：这个立论建在「失败现场和挂起在存档上长得一样」上，而那是**设计选择**不是必然——把「谁失败了」写成内容（frontier 指着失败分支），档自己就带着区分。撤后闸门按内容判、`Status` 退为报告位 |
@@ -934,6 +934,8 @@ N 个 tool_call（下单 / 扣款 / 发消息）。那格我们有 `compose_v2.S
 读路径检测并拒绝、删路径既不检测也不拒绝**：auto-load 撞上 `cp.GraphID != g.ID()` 会
 `ErrGraphIDConflict` fail-fast 并提示「应显式 `WithFreshRun`」，出口的删除一声不吭地毁掉它。
 这条不对称跟「是谁的错」无关，是我们自己两条路的判据不一致。
+
+顶层内建 Agent 已在任务登记内保护所有 namespace 的可续档。恢复检查使用版本化的图身份，跨后端续跑核对待清子树的任务归属。 [现行存档契约](../../v2/checkpoint.md#43-graphid-防串台)
 
 ### 孤儿：不删，让它不可寻址
 

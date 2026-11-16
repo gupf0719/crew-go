@@ -218,6 +218,7 @@ func TestAutoCompact_ReapproveOldSummaryKeepsBusinessQuestion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	cp := compose_v2.NewInMemoryCheckpointer()
+	saved.GraphID = graph.CheckpointIdentity()
 	if err := cp.SaveNS(ctx, saved.ID, "", saved); err != nil {
 		t.Fatal(err)
 	}
@@ -288,6 +289,7 @@ func TestAutoCompact_ReapproveOldViewAfterMemoInvalidation(t *testing.T) {
 	defer cancel()
 	cp := compose_v2.NewInMemoryCheckpointer()
 	ctx = compose_v2.WithCheckpointerCtx(ctx, cp)
+	saved.GraphID = knownBasicSummaryGraphIdentity(t)
 	if err := cp.SaveNS(ctx, saved.ID, "", saved); err != nil {
 		t.Fatal(err)
 	}

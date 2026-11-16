@@ -91,7 +91,7 @@ func TestInterrupt_AskUser_ResumeWithAnswer(t *testing.T) {
 	}
 
 	// === Snapshot + 序列化 ===
-	snap1, err := cm1.Snapshot()
+	snap1, err := cm1.SnapshotForGraph(g1)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -169,10 +169,14 @@ func TestInterrupt_RejectAnswer_ContinuesWithRejection(t *testing.T) {
 
 	// Run 1: 中断
 	cm1 := compose_v2.NewChannelManager()
-	if err := compose_v2.Run(context.Background(), makeGraph(), cm1); err == nil {
+	g1 := makeGraph()
+	if err := compose_v2.Run(context.Background(), g1, cm1); err == nil {
 		t.Fatal("应中断")
 	}
-	snap, _ := cm1.Snapshot()
+	snap, err := cm1.SnapshotForGraph(g1)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Run 2: 答 "no"
 	cm2 := compose_v2.NewChannelManager()
@@ -210,11 +214,15 @@ func TestInterrupt_MissingAnswer_ReInterrupts(t *testing.T) {
 	}
 
 	cm1 := compose_v2.NewChannelManager()
-	err1 := compose_v2.Run(context.Background(), makeGraph(), cm1)
+	g1 := makeGraph()
+	err1 := compose_v2.Run(context.Background(), g1, cm1)
 	if _, isInt := compose_v2.IsInterrupt(err1); !isInt {
 		t.Fatalf("Run 1 应中断，实际 %v", err1)
 	}
-	snap, _ := cm1.Snapshot()
+	snap, err := cm1.SnapshotForGraph(g1)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Run 2 不带 answer
 	cm2 := compose_v2.NewChannelManager()
@@ -248,12 +256,19 @@ func TestInterrupt_WrongInterruptID_ReInterrupts(t *testing.T) {
 	}
 
 	cm1 := compose_v2.NewChannelManager()
-	_ = compose_v2.Run(context.Background(), makeGraph(), cm1)
-	snap, _ := cm1.Snapshot()
+	g1 := makeGraph()
+	err1 := compose_v2.Run(context.Background(), g1, cm1)
+	if _, isInt := compose_v2.IsInterrupt(err1); !isInt {
+		t.Fatalf("Run 1 应中断，实际 %v", err1)
+	}
+	snap, err := cm1.SnapshotForGraph(g1)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	cm2 := compose_v2.NewChannelManager()
 	_ = cm2.Restore(snap)
-	err := compose_v2.Run(context.Background(), makeGraph(), cm2,
+	err = compose_v2.Run(context.Background(), makeGraph(), cm2,
 		compose_v2.WithResumeFrom(snap),
 		compose_v2.WithResumeAnswers(map[string]*schema.Message{"ask_other": schema.UserMessage("yes")}), // 错 ID
 	)

@@ -264,6 +264,9 @@ func (e *InterruptError) Error() string {
 //
 // 含多个中断的错误树会先校验每个中断的形状，非法中断使本次聚合返回 [ErrRunAborted]。
 func PickFanoutError(errs []error) error {
+	if err := fanoutCheckpointIdentityError(errs); err != nil {
+		return err
+	}
 	var raws []error
 	var firstErr error
 	for _, e := range errs {
@@ -399,9 +402,12 @@ func normalizeNodeInterrupt(err error) (error, *InterruptError, bool) {
 	if ie, ok := pendingInterrupt(err); !ok {
 		return err, ie, false
 	}
-	err = joinInterruptErrors([]error{err})
-	ie, ok := IsInterrupt(err)
-	return err, ie, ok
+	normalized := joinInterruptErrors([]error{err})
+	if errors.Is(normalized, ErrRunAborted) {
+		return withInterruptValidationError(err, normalized), nil, false
+	}
+	ie, ok := IsInterrupt(normalized)
+	return normalized, ie, ok
 }
 
 func interruptShapeError(ie *InterruptError) error {

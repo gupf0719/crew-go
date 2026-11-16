@@ -53,7 +53,7 @@
 | A08 | 验收 | 复核有具体目标的弱测试与历史探针 | 核对 Reflect/Plan 失败重试代数、Toolkit.StreamCall 的流式分派与退化，以及观测扇出实例和真实 fallback 指标。ISSUE-99 的现有嵌套测试已断言各成员输出，补慢历史后端下共享输入只写一次的断言。provider 候选归 A18。历史 TODO 207、291、569、639–640、659 及 ISSUE-16、99。 |
 | A09 | 验收 | Plan Web 目标环境双副本和生产入口 | 已实现共享 Redis、生命周期和 mock 恢复。验真实用户鉴权、Cookie/反向代理、状态 TTL、部署迁移、双副本切换及故障窗口。 [ISSUE-90](../issue/issue-90-plan-chat-web-lifecycle-prod.md) |
 | A10 | 验收 | 明确 MySQL Store 的有限数值写入域与范围过滤 | 现有后端方言和 conformance 已覆盖默认类型；验证边界、越界和下推过滤的真实 MySQL 行为，再固定告警、返回或约束。历史 TODO 502。 [SQL 方言](../../sql/dialect.go) |
-| A11 | 验收 | GraphAgent 多层脱离与嵌套调用的任务边界 | 图外钩子、外来 ctx、裸调及同一图的命名冲突各有窄路径。先固定有实际调用方的复现，再用同义 / 异义图和原任务恢复作对照。历史 TODO 540、547、564、566、575。 [任务隔离](../../agent_v2/detach_task.go) · [图身份](../../compose_v2/graph.go) |
+| A11 | 验收 | GraphAgent 多层脱离与嵌套调用的任务边界 | 已验证有名和匿名图拓扑冲突、显式快照、GraphAgent 包装名和跨后端的子树归属。复核图外钩子、外来 ctx、裸调及闭包逻辑版本的剩余变体。旧档部署验收归 A02。 [任务隔离](../../agent_v2/detach_task.go) · [图存档身份](../v2/checkpoint.md#43-graphid-防串台) |
 | A13 | 验收 | 解决禁止重做的入口否决在重试中反复沿用原输入 | AddSubgraphNode、成员主图、RunWithRetry 有不同所有权边界。核对上游调用次数、可否合法推进重做代际和取消时存档保留，按条件避免原地耗尽重试。历史 TODO 562、563。 [条件边](../../compose_v2/out_edges.go) |
 | A14 | 验收 | 低阶 BasicAgentBuilder 的工具 tracing 使用自身类型查表 | 嵌套节点运行同名工具时，验证观测分类来自自身的位置与工具绑定，而不是调用方的表。历史 TODO 532。 [构建器](../../agent_v2/basic_builder.go) |
 | A15 | 验收 | 把 Anthropic 回放的隐藏 thinking 纳入预算核对 | `ReasoningContent` 文本已计入，签名块可能仅存在标注。优先用真实回放的服务端 input usage 对照触发点。历史 TODO 329。 [估算](../../compose_v2/token_estimate.go) · [Anthropic](../../model/anthropic/client.go) |

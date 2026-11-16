@@ -147,7 +147,7 @@ func snapshotStepCheckpoint(g *Graph, cm *ChannelManager) (*Checkpoint, error) {
 		return nil, fmt.Errorf("durability step checkpoint snapshot failed: %w", err)
 	}
 	cp.Status = CPStatusPending
-	cp.GraphID = g.ID() // 同 Run-defer：防 cp 串台（SaveNS 冲突守卫据此 fail-fast）
+	cp.GraphID = g.CheckpointIdentity() // 同 Run-defer：防 cp 串台（SaveNS 冲突守卫据此 fail-fast）
 	return cp, nil
 }
 

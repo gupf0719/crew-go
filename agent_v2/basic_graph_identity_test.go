@@ -8,14 +8,15 @@ package agent_v2_test
 // ErrGraphIDConflict、什么都不执行，inner 的挂起档原样留着。
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"strings"
 	"sync/atomic"
 	"testing"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/hook"
 	"crew-go/schema"
 	"crew-go/tool"
 )
@@ -85,6 +86,7 @@ func TestShellBareCall_DoesNotLoadForwardedAgentsCheckpoint(t *testing.T) {
 	if !ok {
 		t.Fatalf("fixture 没搭对：inner 的 side 应停在问人上，实际 %v", err)
 	}
+	original := checkpointIdentityBytes(t, ctx, cp, sess.RunID, "shell")
 	answers := map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("执行")}
 
 	_, err = seq.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess), agent_v2.WithResumeUserInputs(answers))
@@ -101,7 +103,7 @@ func TestShellBareCall_DoesNotLoadForwardedAgentsCheckpoint(t *testing.T) {
 	if err != nil || got == nil {
 		t.Fatalf("inner 的挂起档应还在槽里，实际 cp=%v err=%v", got, err)
 	}
-	if !strings.HasPrefix(got.GraphID, "inner:") || len(got.PendingInterrupts) != 1 ||
+	if !bytes.Equal(original, checkpointIdentityBytes(t, ctx, cp, sess.RunID, "shell")) || len(got.PendingInterrupts) != 1 ||
 		got.PendingInterrupts[0].InterruptID != ie.AllQueries()[0].InterruptID {
 		t.Fatalf("槽里应是 inner 挂着那一问的档，实际 GraphID=%q 挂起 %d 条", got.GraphID, len(got.PendingInterrupts))
 	}
@@ -171,5 +173,86 @@ func TestBasicAgentGraphIdentity_RenamedAgentConflicts(t *testing.T) {
 		sideAskingAgent(true, agent_v2.WithName("helper")))
 	if !errors.Is(err, compose_v2.ErrGraphIDConflict) || n != 0 {
 		t.Fatalf("改名后续跑应撞 ErrGraphIDConflict、不执行，实际 err=%v side=%d", err, n)
+	}
+}
+
+func checkpointIdentityBytes(t *testing.T, ctx context.Context, cp compose_v2.Checkpointer, runID, ns string) []byte {
+	t.Helper()
+	saved, err := cp.LoadNS(ctx, runID, ns)
+	if err != nil || !saved.HasResumableWork() {
+		t.Fatalf("原存档应保留在 (%q, %q)，实际 err=%v, cp=%v", runID, ns, err, saved != nil)
+	}
+	raw, err := compose_v2.MarshalCheckpoint(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+type checkpointHookCounter struct {
+	hook.NoOpHooks
+	calls atomic.Int32
+}
+
+func (h *checkpointHookCounter) OnAgentStart(ctx context.Context, _ *hook.AgentInfo, _ *hook.AgentInput) (context.Context, error) {
+	h.calls.Add(1)
+	return ctx, nil
+}
+
+func TestCheckpointIdentity_GraphAgentWrapperNameProtectsCheckpoint(t *testing.T) {
+	out := compose_v2.LastValue[*schema.Message]("out")
+	builder := compose_v2.NewBuilder()
+	builder = compose_v2.WithChannel(builder, out)
+	var effects atomic.Int32
+	builder.AddNode("ask", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		answer, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "批准原任务？"})
+		if err != nil {
+			return nil, err
+		}
+		effects.Add(1)
+		return []compose_v2.ChannelWrite{compose_v2.Write(out, schema.AssistantMessage(answer.Content))}, nil
+	})
+	graph, err := builder.AddEdge(compose_v2.StartNode, "ask").AddEdge("ask", compose_v2.EndNode).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAgent := func(name string, hooks hook.Hooks) *agent_v2.GraphAgent {
+		return agent_v2.NewGraphAgent(graph, agent_v2.WithGraphAgentName(name), agent_v2.WithGraphAgentHooks(hooks),
+			agent_v2.WithGraphInputWriter(func(*schema.Message) []compose_v2.ChannelWrite { return nil }),
+			agent_v2.WithGraphOutputReader(func(chs compose_v2.Channels) *schema.Message {
+				result, _ := compose_v2.Get(chs, out)
+				return result
+			}))
+	}
+	h := &checkpointHookCounter{}
+	a, b := newAgent("wrapper-a", hook.NoOpHooks{}), newAgent("wrapper-b", h)
+	cp := compose_v2.NewInMemoryCheckpointer()
+	ctx := compose_v2.WithCheckpointerCtx(t.Context(), cp)
+	session := agent_v2.NewRunSession()
+	_, err = a.Run(ctx, session, schema.UserMessage("原任务"))
+	interrupted, ok := compose_v2.IsInterrupt(err)
+	if !ok || len(interrupted.AllQueries()) != 1 {
+		t.Fatalf("原任务应挂起一个问题，err=%v", err)
+	}
+	question := interrupted.AllQueries()[0].InterruptID
+	raw := checkpointIdentityBytes(t, ctx, cp, session.RunID, "")
+	answers := agent_v2.WithResumeUserInputs(map[string]*schema.Message{question: schema.UserMessage("批准原任务")})
+
+	_, err = b.Resume(ctx, session.RunID, answers)
+	if !errors.Is(err, compose_v2.ErrGraphIDConflict) || h.calls.Load() != 0 || effects.Load() != 0 {
+		t.Fatalf("包装名不同时应在副作用前拒绝，err=%v hook=%d, effects=%d", err, h.calls.Load(), effects.Load())
+	}
+	if !bytes.Equal(raw, checkpointIdentityBytes(t, ctx, cp, session.RunID, "")) {
+		t.Fatal("旧档应保持不变")
+	}
+	rebuilt := newAgent("wrapper-a", hook.NoOpHooks{})
+	events, err := rebuilt.Resume(ctx, session.RunID, answers)
+	final := agent_v2.FinalMessage(events)
+	if err != nil || final == nil || final.Content != "批准原任务" || effects.Load() != 1 {
+		t.Fatalf("同名重建应使用原答案，final=%v err=%v effects=%d", final, err, effects.Load())
+	}
+	saved, err := cp.LoadNS(ctx, session.RunID, "")
+	if err != nil || saved != nil {
+		t.Fatalf("成功后应清除旧档，err=%v saved=%v", err, saved != nil)
 	}
 }

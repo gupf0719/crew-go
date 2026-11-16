@@ -515,24 +515,25 @@ DetachTask 连会话 ID 与软取消信号一起剥。入口拒绝恒不可重�
 
 ### 4.3 GraphID 防串台
 
-同一个 sessionID 跑两个不同的 Graph 时，两份 cp 都写 `(sid, "")` 会后写覆盖前写。`cp.GraphID`
-由框架填（`g.ID()`），`SaveNS` 检测到不一致返 `ErrGraphIDConflict` fail-fast。确需换 graph 用
-`WithFreshRun()`。
+存档以 `(RunID, namespace)` 寻址。引擎签发的 `Checkpoint.GraphID` 是带版本的恢复身份。
+`Graph.ID()` 用于公开显示和诊断。编译时的恢复身份由 `Graph.CheckpointIdentity()` 提供，
+包括稳定图名、节点、有序出边、条件边失败策略、channel 类型和内置合并规则，以及显式挂载的子图。
+`GraphAgent` 的稳定名称参与计算。运行前注册到 ChannelManager 的额外 channel 也计入本次执行身份。
 
-`g.ID()` 三档：`WithName` 给的名字；`WithIdentityPrefix` 给的前缀 + `:` + 结构指纹；都没给时只有结构指纹（节点 ID 与
-channel 名 + 类型的哈希，不含节点函数与边）。9 个编排用名字；BasicAgent 显式给了名字（`agent_v2.WithName`）时用第二档，
-没给时用第三档——自动名每次构造都变，带上它的话每个请求重建 agent 的调用方续不上自己的档。第二档同时挡两件事：结构相同、
-名字不同的两个 BasicAgent 进了同一个槽（经 `EnterRun` 进入的壳在自己的阶段里裸调），同名的 agent 改了配置、图的结构变了。
-代价是改名之后还挂着的旧任务续不上，载入时报冲突。
+节点、工具或自定义 reducer 的业务逻辑变化由业务标记。构图时可用
+`GraphBuilder.WithCheckpointRevision`，或者在入口用 `compose_v2.WithCheckpointRevisionCtx`
+为整棵执行树提供稳定版本。Run 和 Resume 使用相同的版本。要传输可续跑的快照，用
+`cm.SnapshotForGraph(g.WithCheckpointContext(ctx))` 在生产侧绑定当时的图与版本。
 
-判冲突以存档里最新那份 GraphID 为准：存档的与本次的都非空且不同才冲突，这份档不动；否则整份
-替换，GraphID 跟着换（换成空也照换）。Run / Resume 入口的 fail-fast 读的也是这一份，所以两边对
-同一份档给出同一个答案。判定与写入是一个原子步骤：两个带不同 GraphID 的写入同时打同一
-(sid, ns) 时恰好一个成功——新键与已有的行都如此（已有的行上没有「插入」替两个写入者排队，全靠
-实现先锁住那一行再判）。自研后端把 GraphID 另存一列时，那一列只能是存档的副本、每次与存档
-一起写（conformance 的 `SaveNS_GraphID_Follows_Latest_Accepted_Write`、
-`Concurrent_SaveNS_Conflicting_GraphID_Exactly_One_Wins` 与
-`Concurrent_SaveNS_Conflicting_GraphID_On_Existing_Row_Exactly_One_Wins` 钉这几条）。
+回复应用前，自动载入和显式恢复都核对图身份。显式恢复还检查目标槽归属，已有可续目标时必须属于同一个任务。
+冲突返回 `ErrGraphIDConflict` 并保护目标档。子图冲突保留原问题和已经提交的兄弟进度。若图启动钩子改变存储分区，
+引擎复核实际目标。读失败保留原错误。低阶 `WithFreshRun` 表达调用方明确从头执行的意图。
+
+`SaveNS` 原子比较槽内两份非空的 GraphID。不同身份的写入被拒绝，原档保留。
+Redis 和 SQL 的索引身份列与完整存档一起更新。
+
+旧的名称、旧指纹和空身份仍可读取、导出和显式放弃。升级前由旧版完成在途任务，回退前由新版处理新档。
+需要迁移的任务先停写备份，核实原图配置和状态，再在隔离环境验证同一份原待答 ID 和提交结果。
 
 ## 5. 节点私有中断态（NodeStates）
 

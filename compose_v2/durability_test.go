@@ -275,13 +275,13 @@ func TestDurability_Sync_CheckpointContent(t *testing.T) {
 	if len(caps) == 0 {
 		t.Fatal("应捕获到每超步 cp")
 	}
-	gid := g.ID()
+	gid := g.CheckpointIdentity()
 	for i, c := range caps {
 		if !c.isPending {
 			t.Errorf("cp[%d] Status 应 Pending（挂起态供 Resume）", i)
 		}
 		if c.graphID == "" || c.graphID != gid {
-			t.Errorf("cp[%d] GraphID 应 = g.ID()=%q（防 cp 串台），实际 %q", i, gid, c.graphID)
+			t.Errorf("cp[%d] GraphID 应是图的存档身份 %q，实际 %q", i, gid, c.graphID)
 		}
 		if c.frontierLen == 0 {
 			t.Errorf("cp[%d] 应有 CurrentFrontier（崩溃从此 frontier Resume），实际空", i)
@@ -357,7 +357,7 @@ func TestDurability_Async_CleansOnSuccess(t *testing.T) {
 }
 
 // TestDurability_Async_CheckpointContent：async 后台 worker 写的 cp 结构也正确——Pending +
-// GraphID==g.ID()（防串台）+ 非空 frontier。async 与 sync 共享 snapshotStepCheckpoint，本测试
+// GraphID==g.CheckpointIdentity()（防串台）+ 非空 frontier。async 与 sync 共享 snapshotStepCheckpoint，本测试
 // 补回归守卫：防将来只改 async 路径漏设 GraphID/Status（sync CheckpointContent 测不到 async）。
 func TestDurability_Async_CheckpointContent(t *testing.T) {
 	g, _, maxCh := loopGraph(t, 5)
@@ -371,13 +371,13 @@ func TestDurability_Async_CheckpointContent(t *testing.T) {
 	if len(caps) == 0 {
 		t.Fatal("应捕获到 async 后台写的 cp")
 	}
-	gid := g.ID()
+	gid := g.CheckpointIdentity()
 	for i, c := range caps {
 		if !c.isPending {
 			t.Errorf("async cp[%d] 应 Pending", i)
 		}
 		if c.graphID != gid {
-			t.Errorf("async cp[%d] GraphID 应 = g.ID()=%q（防串台），实际 %q", i, gid, c.graphID)
+			t.Errorf("async cp[%d] GraphID 应是图的存档身份 %q，实际 %q", i, gid, c.graphID)
 		}
 		if c.frontierLen == 0 {
 			t.Errorf("async cp[%d] 应有 CurrentFrontier，实际空", i)

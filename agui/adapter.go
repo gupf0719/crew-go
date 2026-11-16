@@ -10,6 +10,7 @@ import (
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/internal/toolresult"
 	"crew-go/schema"
 )
 
@@ -28,7 +29,7 @@ import (
 //	OnNodeEvent(chunk)  → TextMessageStart/Content/End（按 chunk 的 run_id 分消息，多流交错在途）
 //	OnNodeEvent(reset_stream) → 收尾对应 run_id + Custom（前端清该 run_id 的 chunk buffer）
 //	OnToolStart         → ToolCallStart + ToolCallArgs + ToolCallEnd
-//	OnToolEnd           → ToolCallResult
+//	工具节点提交         → ToolCallResult（自研 Agent 通过 OnToolEnd 投递）
 //	OnModelEnd          → 按 run_id 收尾本轮流式 message（发 TextMessageEnd）/ 非流式补发完整 message
 //	OnError             → Custom("error")（中间错误观测，不占 RunError 终态语义）
 //
@@ -36,6 +37,7 @@ import (
 // adapter——保证 run 边界单一所有权。
 type sseAdapter struct {
 	hook.NoOpHooks // 未映射的 hook.Hooks 回调（OnAgentStart/End、OnModelStart 等）走 NoOp
+	resultObserver toolresult.Observer
 
 	w  eventWriter
 	mu sync.Mutex // 保护 w + openMsgs：并发 sub-agent 的 chunk / tool 回调经此串行化
@@ -115,6 +117,7 @@ var (
 func newSSEAdapter(w eventWriter, runID string, input []AGUIMessage) *sseAdapter {
 	a := &sseAdapter{w: w, runID: runID, openMsgs: map[string]bool{}, byID: map[string]*emittedMessage{},
 		inputIDs: map[string]bool{}, inputCallIDs: map[string]bool{}}
+	a.resultObserver.Deliver = a.emitCommittedToolResult
 	for _, m := range input {
 		if len(m.raw) == 0 {
 			continue
@@ -350,6 +353,8 @@ func (a *sseAdapter) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, output *
 	return ctx, nil
 }
 
+const toolCallStartedStep = "agui.tool_call_started"
+
 // OnToolStart 把一次工具调用映射为 ToolCallStart + Args + End。crew-go 的工具参数
 // 非流式（OnToolStart 一次拿到完整 ArgumentsJSON），故 Args 一次性发完整参数。
 // 框架工具调用和审批共享实例 ID。自研 Agent 可通过 CallId 提供自己的线上标识。
@@ -364,15 +369,21 @@ func (a *sseAdapter) OnToolStart(ctx context.Context, _ *hook.AgentInfo, in *sch
 		return ctx, nil
 	}
 	// 后续开始钩子可能在整批派发前挂起。工具钩子自己的存档记录已经写出的调用。
-	const startedStep = "agui.tool_call_started"
-	if sent, ok := compose_v2.GetStepResult[string](ctx, startedStep); ok && sent == callID {
+	startCtx, frameworkScope := toolresult.StartScope(ctx, in, callID)
+	if sent, ok := compose_v2.GetStepResult[string](startCtx, toolCallStartedStep); ok && sent == callID {
 		return ctx, nil
+	}
+	if frameworkScope {
+		// 旧版可能随前置业务钩子将发送记录写进派生相位。取回后补记到框架相位，提交时从那里查。
+		if sent, ok := compose_v2.GetStepResult[string](ctx, toolCallStartedStep); ok && sent == callID {
+			return ctx, compose_v2.SaveStepResult(startCtx, toolCallStartedStep, sent, compose_v2.WithStreams(nil))
+		}
 	}
 	if !a.emitToolCall(in, callID) {
 		return ctx, nil // SSE 连接失败时由请求取消收尾。
 	}
 	// 模型文本流由产出它的模型节点登记。
-	return ctx, compose_v2.SaveStepResult(ctx, startedStep, callID, compose_v2.WithStreams(nil))
+	return ctx, compose_v2.SaveStepResult(startCtx, toolCallStartedStep, callID, compose_v2.WithStreams(nil))
 }
 
 func (a *sseAdapter) emitToolCall(in *schema.ToolInput, callID string) bool {
@@ -398,16 +409,33 @@ func (a *sseAdapter) emitToolCall(in *schema.ToolInput, callID string) bool {
 	return true
 }
 
-// OnToolEnd 把工具执行结果映射为 ToolCallResult，沿用 OnToolStart 的线上 ID。失败时正文取错误码。
-//
-// 这一批 tool_call 没整体成功时（有调用挂起等人回答、或者硬失败）框架照样给已经有结局的调用触发 OnToolEnd，带
-// agent_v2.ToolBatchFailedExtraKey：那个结果不进历史，续跑时这个调用从工具账重放或重新执行，那一次才发——这里发的话
-// 同一个 toolCallId 在一个 thread 里会有两条结果（前端按 toolCallId 一个调用一条 tool 消息），硬失败后重跑成功的还会
-// 一条报错、一条成功。
+// OnToolEnd 登记 BasicAgent 结果的展示意图。自研 Agent 从这个入口直接发送。
 func (a *sseAdapter) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ToolOutput) (context.Context, error) {
-	if failed, _ := out.Extra[agent_v2.ToolBatchFailedExtraKey].(bool); failed {
+	if out == nil {
 		return ctx, nil
 	}
+	callID, _ := wireToolCallID(out.Extra, out.CallId)
+	if a.resultObserver.DeferDelivery(ctx, out, callID) {
+		return ctx, nil
+	}
+	if failed, _ := out.Extra[agent_v2.ToolBatchFailedExtraKey].(bool); !failed {
+		a.emitToolResult(out)
+	}
+	return ctx, nil
+}
+
+func (a *sseAdapter) emitCommittedToolResult(startCtx context.Context, out *schema.ToolOutput) {
+	if callID, hasInstance := wireToolCallID(out.Extra, out.CallId); hasInstance {
+		// 只有已展示的调用产生结果事件。没有注入 AG-UI 工具钩子的子 Agent 也可能继承提交观察者。
+		if sent, ok := compose_v2.GetStepResult[string](startCtx, toolCallStartedStep); !ok || sent != callID {
+			return
+		}
+	}
+	a.emitToolResult(out)
+}
+
+// emitToolResult 把接受的工具结果映射为 ToolCallResult，沿用调用的线上 ID。
+func (a *sseAdapter) emitToolResult(out *schema.ToolOutput) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.flushSnapshotLocked() // 在这次要改的状态记进去之前：快照里不能已经有这个入口接着要发的事件
@@ -443,7 +471,6 @@ func (a *sseAdapter) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, out *sche
 	}
 	a.recordLocked(&emittedMessage{id: resultID, producer: producerOf(out.Extra), role: "tool", toolCallID: callID}).content.WriteString(content)
 	a.writeLocked(NewToolCallResult(resultID, callID, content))
-	return ctx, nil
 }
 
 // OnError 把中间错误（model / tool 层）映射为 Custom([CustomEventError])——供前端观测，不占

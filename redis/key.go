@@ -1,6 +1,7 @@
 package redis
 
 import (
+	"encoding/base64"
 	"strings"
 
 	"crew-go/store"
@@ -107,32 +108,21 @@ func parseStoreItemKey(prefix, redisKey string) (ns store.Namespace, key string,
 	return splitNS(nsJoined), key, true
 }
 
-// cpItemKey 返 cp item (完整 payload) 的 Redis key.
-//
-//	{prefix}:cp:item:{sid}:{ns}    → SET 含 MarshalCheckpoint(cp) 完整 JSON
+// cpRecordKeyPrefix 把任务 ID 编成无分隔符的段。namespace 原样追加，子树删除可以直接拼索引成员。
+func cpRecordKeyPrefix(prefix, family, sid string) string {
+	return prefix + ":cp:" + family + "-v2:" + base64.RawURLEncoding.EncodeToString([]byte(sid)) + ":"
+}
+
 func cpItemKey(prefix, sid, ns string) string {
-	return prefix + ":cp:item:" + sid + ":" + ns
+	return cpRecordKeyPrefix(prefix, "item", sid) + ns
 }
 
-// cpMetaKey 返 cp metadata hash 的 Redis key.
-//
-// **iter-5-K 加 (Redis Hash 单字段查思路)**: 用 Redis Hash
-// 存 cp metadata (graph_id / status / created_at), 让 Lua 脚本 HGET
-// 单字段查不依赖 cjson 解析整 payload — 修 verification audit HIGH-1/HIGH-2
-// (cjson decode silent fallback) + 顺带优化性能 (不解析 MB 级 payload 拿几十字节
-// metadata).
-//
-//	{prefix}:cp:meta:{sid}:{ns}    → HSET graph_id <gid> status <s> created_at <ts>
-//
-// payload (`cpItemKey`) 仍存完整 cp JSON — LoadNS 路径不变, meta 是冗余索引仅
-// Lua 单字段查用.
 func cpMetaKey(prefix, sid, ns string) string {
-	return prefix + ":cp:meta:" + sid + ":" + ns
+	return cpRecordKeyPrefix(prefix, "meta", sid) + ns
 }
 
-// cpMetaKeyPrefix 返 meta hash key prefix for sid (DeleteSubtree Lua 拼 meta_key 用).
-func cpMetaKeyPrefix(prefix, sid string) string {
-	return prefix + ":cp:meta:" + sid + ":"
+func cpLegacyItemPrefix(prefix, sid string) string {
+	return prefix + ":cp:item:" + sid + ":"
 }
 
 // cpNSIndexKey 返 sid 下所有 ns 的 SET key.

@@ -19,6 +19,7 @@ import (
 	"crew-go/compose_v2"
 	"crew-go/hook"
 	"crew-go/internal/panicerr"
+	"crew-go/internal/toolresult"
 	"crew-go/schema"
 )
 
@@ -476,19 +477,19 @@ func recoverRequest(ctx context.Context, w eventWriter) {
 
 func (h *handler) serveRequest(ctx context.Context, sse eventWriter, in *RunAgentInput, key sessionKey) {
 	defer recoverRequest(ctx, sse)
-	if h.sessionStore != nil {
-		var activity *compose_v2.TaskActivity
-		var err error
-		ctx, activity, err = h.openSharedSession(ctx, key)
-		if err != nil {
-			rejectSharedSession(ctx, sse, err)
-			return
-		}
-		defer activity.Release()
-	}
 	ctx = withClientModelData(ctx, in)
 
 	if len(in.Resume) > 0 {
+		if h.sessionStore != nil {
+			var activity *compose_v2.TaskActivity
+			var err error
+			ctx, activity, err = h.openSharedSession(ctx, key)
+			if err != nil {
+				rejectSharedSession(ctx, sse, err)
+				return
+			}
+			defer activity.Release()
+		}
 		h.serveResume(ctx, sse, in, key)
 		return
 	}
@@ -518,13 +519,17 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 	h.warnClientMessages(ctx, rep)
 	ctx = agent_v2.WithCallerHistoryCtx(ctx, prior)
 
-	shared := sharedSessionFrom(ctx)
-	if shared != nil {
-		if err := h.reconcileSharedCancellation(ctx, shared); err != nil {
+	if h.sessionStore != nil {
+		var activity *compose_v2.TaskActivity
+		var err error
+		ctx, activity, err = h.openSharedSessionAfterCancellation(ctx, key, true)
+		if err != nil {
 			rejectSharedSession(ctx, sse, err)
 			return
 		}
+		defer activity.Release()
 	}
+	shared := sharedSessionFrom(ctx)
 	var stale, claimed *sessionEntry
 	started, replacing := false, false
 	if shared != nil {
@@ -599,6 +604,7 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 	}
 	// ctx 版 OrchHooks 让嵌套子 agent 也继承流式事件钩子。
 	ctx = agent_v2.WithCtxOrchHooks(ctx, adapter)
+	ctx = toolresult.WithObserver(ctx, &adapter.resultObserver)
 
 	sess := agent_v2.NewRunSession()
 	runID := in.RunID
@@ -862,6 +868,7 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 		return
 	}
 	ctx = agent_v2.WithCtxOrchHooks(ctx, adapter) // 同 serveRun，让 sub-agent 也真流式
+	ctx = toolresult.WithObserver(ctx, &adapter.resultObserver)
 
 	// 分类 resume entry：resolved 收集答案（按 InterruptID 配对），cancelled 记账。
 	answers := make(map[string]*schema.Message, len(in.Resume))

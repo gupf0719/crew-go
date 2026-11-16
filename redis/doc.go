@@ -96,10 +96,13 @@
 //	{prefix}:store:nsidx                     → SET (所有 ns_joined, ListNamespaces 主路径)
 //
 //	# Checkpointer
-//	{prefix}:cp:item:{sid}:{ns}              → JSON cp payload
+//	{prefix}:cp:item-v2:{sid_base64url}:{ns}              → JSON cp payload
 //	{prefix}:cp:nsidx:{sid}                   → SET (sid 下所有 ns)
 //	{prefix}:cp:pending:{sid}                 → SET (该 sid 下 pending 的 ns)
 //	{prefix}:cp:sids                          → SET (所有 sid, Cleanup 用)
+//
+// 存档 payload 和 metadata 的任务段使用无填充 base64url。升级已有数据时，停止同一前缀的所有
+// 存档读写者并完成备份，再调用 [Checkpointer.MigrateLegacyKeys]。迁移沿用 namespace、pending 和任务索引，需要 SSCAN、GET、HMGET、TYPE、EXISTS 和 RENAME。
 //
 // # 原子性 (iter-5-K 修)
 //

@@ -1,6 +1,7 @@
 package redis_test
 
 import (
+	"crypto/rand"
 	"testing"
 	"time"
 
@@ -19,10 +20,9 @@ import (
 // SaveBatch / GraphIDConflict / Cleanup / Concurrent).
 func TestRedisCheckpointer_Conformance(t *testing.T) {
 	checkpointer_conformance.RunCheckpointerTests(t, func() compose_v2.Checkpointer {
-		mr := miniredis.RunT(t)
-		rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+		rdb := goredis.NewClient(&goredis.Options{Addr: aguiRedisAddress(t)})
 		t.Cleanup(func() { _ = rdb.Close() })
-		return redis.NewCheckpointer(rdb)
+		return redis.NewCheckpointer(rdb, redis.WithCheckpointerPrefix("checkpoint-conformance:"+rand.Text()))
 	})
 }
 

@@ -12,6 +12,7 @@ import (
 	"crew-go/compose_v2"
 	"crew-go/hook"
 	"crew-go/internal/panicerr"
+	"crew-go/internal/toolresult"
 	"crew-go/model"
 	"crew-go/schema"
 )
@@ -387,8 +388,8 @@ const ToolCallErrCode = "tool_call_error"
 
 // ToolBatchFailedExtraKey 标「这一批 tool_call 没整体成功，这次 OnToolEnd 的结果不进历史」（OnToolEnd 的
 // `ToolOutput.Extra`，值为 true；规则见 [ToolCallErrCode]）。续跑时这个调用要么从工具账重放（跑完的），要么重新执行
-// （硬失败的、不进工具账的框架工具），那一次的 OnToolEnd 才是进历史、给模型看的结果——给用户展示结果的钩子（agui）
-// 据它跳过、等那一次；按执行计数或计时的钩子照常算这一次（它确实执行了）。
+// （硬失败的、不进工具账的框架工具）。按执行计数或计时的钩子照常算这一次（它确实执行了）。给用户展示的结果
+// 要等工具节点提交，届时已应用所有结束钩子的改写和批内裁决。
 const ToolBatchFailedExtraKey = "batch_failed"
 
 // ModelCallTimeoutErrCode / ModelContentFilteredErrCode 是模型调用失败时 OnError 的 Code：这次调用自身超时（错误链上有
@@ -503,13 +504,13 @@ func endSettledToolCalls(ctx context.Context, hooks hook.Hooks, info *hook.Agent
 		}
 		to.Extra[ToolBatchFailedExtraKey] = true
 		to.Extra = batch.withIdentity(to.Extra, i)
-		endOneSettled(ctx, hooks, info, toolCalls[i].Function.Name, to, callCtxs[i], i)
+		endOneSettled(ctx, hooks, info, toolCalls[i].Function.Name, to, callCtxs[i], i, batch.visibleCallID(i, to.CallId))
 	}
 }
 
 // endOneSettled 给一个已有结局的调用触发失败路径上的 OnToolEnd：钩子的 panic 当场兜住，跟返回的错误一样只记日志。
 func endOneSettled(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo, toolName string, to *schema.ToolOutput,
-	callCtx context.Context, idx int) {
+	callCtx context.Context, idx int, visibleID string) {
 	defer func() {
 		if r := recover(); r != nil {
 			panicerr.Log(ctx, slog.LevelError, "agent_v2: 这一批 tool_call 没整体成功，给已有结局的调用收尾时 OnToolEnd panic（只记日志）",
@@ -519,7 +520,12 @@ func endOneSettled(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo, 
 	_, hookErr := compose_v2.CallHook(callCtx, func(c context.Context) (context.Context, error) {
 		var newCtx context.Context
 		var err error
-		_, _ = compose_v2.CaptureSignals(toolHookCtx(c, "OnToolEnd", toolName, to.CallId, idx),
+		c = toolHookCtx(c, "OnToolEnd", toolName, to.CallId, idx)
+		if observer := toolresult.ObserverFrom(c); observer != nil {
+			// 失败批次不能发送结果，即使业务钩子为展示另建了一份输出。
+			c, _ = toolresult.WithDeferredOutput(c, observer, to, visibleID)
+		}
+		_, _ = compose_v2.CaptureSignals(c,
 			func(cc context.Context) error {
 				newCtx, err = hooks.OnToolEnd(cc, info, to)
 				return err
@@ -929,6 +935,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	backgroundNotes, finishToolResult, useToolMemo := b.backgroundNotes, b.finishToolResult, b.useToolMemo
 
 	modelNode := func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		ctx = withBuiltInAutoCompactQuestion(ctx)
 		msgs, _ := compose_v2.Get(chs, basicMessagesCh)
 		round, _ := compose_v2.Get(chs, basicRoundCh)
 		// **每个任务至多一个软降落轮**（同一个预算下；续跑时调大了预算，新预算的最后一轮另算）：上一次模型调用就是
@@ -1303,6 +1310,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		modelRunID, _ := last.Annotations[compose_v2.RunIDAnnotationKey].(string)
 		batchID, _ := last.Annotations[toolCallBatchIDAnnotation].(string)
 		batch := &toolBatch{messages: msgs, modelRunID: modelRunID, batchID: batchID}
+		observer := toolresult.ObserverFrom(ctx)
+		var deliveries []*toolresult.Delivery
+		if observer != nil {
+			deliveries = make([]*toolresult.Delivery, len(toolCalls))
+		}
 
 		// 每个 tool_call 触发 OnToolStart——消费 hook 对 Name / ArgumentsJSON 的改写
 		// 后再调用业务工具（参数注入 / 重定向）。CallId 是 tool_call ↔ tool_result
@@ -1371,7 +1383,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			// ctx 时把节点体自己的那套相位铺回来。
 			startCtx := compose_v2.WithToolCallInstanceID(ctx, ti.CallId, batch.callInstanceID(i))
 			callCtx, startErr := compose_v2.CallHook(startCtx, func(c context.Context) (context.Context, error) {
-				return hooks.OnToolStart(toolHookCtx(c, "OnToolStart", toolCalls[i].Function.Name, ti.CallId, i), info, ti)
+				c = toolHookCtx(c, "OnToolStart", toolCalls[i].Function.Name, ti.CallId, i)
+				if observer != nil {
+					c = toolresult.WithStartScope(c, ti, batch.visibleCallID(i, ti.CallId))
+				}
+				return hooks.OnToolStart(c, info, ti)
 			})
 			if startErr != nil {
 				if _, isInt := compose_v2.IsInterrupt(startErr); !isInt && ctx.Err() == nil {
@@ -1461,6 +1477,9 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			if isFixed(i) {
 				hookSignals = append(hookSignals, batch.memo[i].Result.HookSignals)
 				failedAfterHook[i], codeAfterHook[i] = !before.Success, before.ErrorCode
+				if deliveries != nil {
+					deliveries[i] = batch.memo[i].Result.Delivery
+				}
 				continue
 			}
 			// 钩子里做出的决定单独收：它是看过这次调用的结果之后才做的，要排在这批调用的决定之后交。
@@ -1471,10 +1490,15 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			// OnToolEnd(i) 收的是这个调用自己的 ctx（OnToolStart(i) 采纳之后的），它的返回值不往后流——下一个调用的
 			// OnToolEnd、节点后面的工作都看不到（同 OnNodeEnd / OnGraphEnd）。
 			var hookSigs compose_v2.Signals
+			var deferred *toolresult.DeferredOutput
 			_, hookErr := compose_v2.CallHook(callCtxs[i], func(c context.Context) (context.Context, error) {
 				var newCtx context.Context
 				var err error
-				hookSigs, _ = compose_v2.CaptureSignals(toolHookCtx(c, "OnToolEnd", toolCalls[i].Function.Name, to.CallId, i),
+				c = toolHookCtx(c, "OnToolEnd", toolCalls[i].Function.Name, to.CallId, i)
+				if observer != nil {
+					c, deferred = toolresult.WithDeferredOutput(c, observer, to, batch.visibleCallID(i, to.CallId))
+				}
+				hookSigs, _ = compose_v2.CaptureSignals(c,
 					func(cc context.Context) error {
 						newCtx, err = hooks.OnToolEnd(cc, info, to)
 						return err
@@ -1494,6 +1518,9 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 					hooks.OnError(toolHookCtx(callCtxs[i], "OnError", toolCalls[i].Function.Name, to.CallId, i), info, &schema.CommError{Code: "tool_end_error", Message: hookErr.Error()})
 				}
 				return nil, fmt.Errorf("OnToolEnd: %w", hookErr)
+			}
+			if deferred != nil {
+				deliveries[i] = deferred.Delivery()
 			}
 			hookSignals = append(hookSignals, hookSigs)
 			// 消费改写：用改写后的 Result 重写 results[i] 的 content（in-place 改
@@ -1552,7 +1579,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 这一批处理完了：结果定进工具账（见 agent_v2 的 finalizeToolMemo）。被裁决换掉的那几条定下的是替换后的失败结果——
 		// 不定的话账里留着它转存前、钩子脱敏前的原文，节点之后作废时随出口存档落盘（审计实测）。
 		if useToolMemo {
-			finalizeToolMemo(ctx, toolCalls, batch.memo, results, hookSignals)
+			finalizeToolMemo(ctx, toolCalls, batch.memo, results, hookSignals, deliveries)
 		}
 		// 钩子做出的决定排在这批调用的决定之后交，按钩子的先后（理由见循环里收的那一处）。
 		for _, s := range hookSignals {
@@ -1737,6 +1764,22 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		}
 		if rdAnswer != nil {
 			writes = append(writes, compose_v2.Write(basicFinalCh, rdAnswer))
+		}
+		if observer != nil {
+			// 逐调用账的 Final 表示结果已定稿，写入可能尚未提交。续跑拿回的定稿也在这次提交时通知。
+			original := schema.GetToolCalls(last)
+			for i, result := range results[:min(len(results), len(toolCalls))] {
+				delivery := deliveries[i]
+				if result == nil || delivery == nil {
+					continue
+				}
+				out := toolOutputFor(result, toolCalls[i].ID, i < len(batch.ends) && batch.ends[i].replayed)
+				out.Extra = batch.withIdentity(out.Extra, i)
+				out.Result = delivery.Project(out.Result)
+				start := original[i]
+				startCtx := toolHookCtx(ctx, "OnToolStart", start.Function.Name, start.ID, i)
+				compose_v2.AfterNodeCommit(ctx, func() { observer.Deliver(startCtx, out) })
+			}
 		}
 		return writes, nil
 	}

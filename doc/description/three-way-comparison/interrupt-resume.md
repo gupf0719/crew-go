@@ -989,4 +989,12 @@ AG-UI 的 SQL 和 Redis 没有统一 watch 接口，采用启动分页发现、�
 本地 Kubernetes `d5e5f48b880` 的 namespace controller 只把带删除标记的对象入工作队列，worker 按键处理失败与重试。
 同一 controller 的重复部署可以用 client-go leader election 协调，领导权丢失会取消工作上下文。
 AG-UI 以共享存储中的待清理索引发现候选，以会话记录和原任务租约判断能否执行。
-轮询使用同一存储域的租约，单项失败不阻塞同页其他并发项。缺工作流或历史后端时让位。
+轮询使用独立于任务 ID 的固定期限租约。候选由有界 worker 处理，工厂构建期间不持有会话租约。
+构建完成后重读会话和工作流版本，再执行取消。单项失败或长期未返回时给其他实例接手的机会。
+
+### 2026-11-16 · Redis 存档分隔与迁移
+
+SQL saver 以独立列保存任务和 namespace。Redis 的 payload 和 metadata 键用 base64url 编码任务段，
+使 namespace 可以按原值进入子树前缀匹配。任务租约和会话索引各自保留独立的键空间。
+迁移依据索引枚举旧记录，按 payload 的归属和 metadata 校验源记录，再逐条迁移。
+部署按[升级说明](../../release/next.md#迁移现有-redis-存档)停写并备份。

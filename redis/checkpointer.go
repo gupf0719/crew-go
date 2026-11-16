@@ -13,8 +13,8 @@ import (
 // Checkpointer 是 compose_v2.Checkpointer 接口的 Redis 实现.
 //
 // **存储设计** (纯 Redis 原语 — 见 doc.go key 命名规范):
-//   - `{prefix}:cp:item:{sid}:{ns}` → SET 含完整 cp JSON payload (LoadNS 读)
-//   - `{prefix}:cp:meta:{sid}:{ns}` → HSET (graph_id / status / created_at)
+//   - `{prefix}:cp:item-v2:{sid_base64url}:{ns}` → SET 含完整 cp JSON payload (LoadNS 读)
+//   - `{prefix}:cp:meta-v2:{sid_base64url}:{ns}` → HSET (graph_id / status / created_at)
 //     metadata 冗余索引 (Lua 单字段查避 cjson 解析整 payload, iter-5-K 用 Redis
 //     Hash 存单字段思路)
 //   - `{prefix}:cp:nsidx:{sid}` → SET (sid 下所有 ns)
@@ -76,11 +76,6 @@ func (c *Checkpointer) cpSidsKey() string {
 	return c.prefix + ":cp:sids"
 }
 
-// cpItemKeyPrefix 返 item (payload) key prefix for sid (DeleteSubtree Lua 拼用).
-func (c *Checkpointer) cpItemKeyPrefix(sid string) string {
-	return c.prefix + ":cp:item:" + sid + ":"
-}
-
 // saveNSScript 是 SaveNS 的 Lua 脚本 — **服务端**原子 HGET-check-HSET-SET.
 //
 // **iter-5-K 修** (verification audit HIGH-1 "cjson decode silent fallback"):
@@ -100,6 +95,7 @@ func (c *Checkpointer) cpItemKeyPrefix(sid string) string {
 //	[4] = pending key
 //	[5] = sids key
 //	[6] = 任务租约 key
+//	[7] = 旧 payload key
 //
 // **ARGV**:
 //
@@ -134,6 +130,11 @@ end
 -- HGET meta graph_id (单字段, 不需 cjson 解析 — iter-5-K Redis Hash 思路)
 local existing_graph_id = redis.call("HGET", meta_key, "graph_id")
 if existing_graph_id == false then
+    -- 升级前写入不能让新版 payload 覆盖旧索引所指的存档。
+    if redis.call("SISMEMBER", nsidx_key, ns) == 1 and redis.call("EXISTS", item_key) == 0 and
+        redis.call("EXISTS", KEYS[7]) == 1 then
+        return "MIGRATION_REQUIRED"
+    end
     existing_graph_id = ""
 end
 
@@ -193,6 +194,7 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 		cpPendingKey(c.prefix) + ":" + sessionID,
 		c.cpSidsKey(),
 		taskLeaseKey(c.prefix, sessionID),
+		cpLegacyItemPrefix(c.prefix, sessionID) + ns,
 	}
 	args := []any{
 		ns, payload, cp.GraphID,
@@ -207,6 +209,8 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 	}
 
 	switch result {
+	case "MIGRATION_REQUIRED":
+		return errors.New("redis checkpoint requires legacy key migration")
 	case "TASK_LEASE_LOST":
 		return fmt.Errorf("redis cp SaveNS: %w", compose_v2.ErrTaskLeaseLost)
 	case "GRAPH_ID_CONFLICT":

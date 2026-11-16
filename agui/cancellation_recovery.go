@@ -2,15 +2,16 @@ package agui
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"log/slog"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/hook"
 	"crew-go/internal/panicerr"
 )
 
@@ -61,102 +62,177 @@ func WithCancellationHistory(resolve func(ctx context.Context, key agent_v2.Hist
 const (
 	cancellationPollInterval = 5 * time.Second
 	cancellationPageSize     = 64
+	cancellationConcurrency  = 4
 )
 
-// 租约随 Checkpointer 的存储域隔离，跨轮保留以免多个实例串行重复扫描。
-const cancellationWorkerID = "agui:cancel-recovery"
+// CancellationPollStore 可选地协调同一 SessionStore 存储域内的取消扫描。
+// TryAcquireCancellationPoll 在空闲时原子取得固定期限的租约，使用后端时间判断过期。
+// ReleaseCancellationPoll 仅释放 token 对应的租约。操作使用独立于任务 ID 的存储位置。
+// 未实现时，每个 Handler 独立发现候选，仍由会话及任务租约保护清理。
+type CancellationPollStore interface {
+	TryAcquireCancellationPoll(ctx context.Context, token string, ttl time.Duration) (bool, error)
+	ReleaseCancellationPoll(ctx context.Context, token string) error
+}
+
+type cancellationRecovery struct {
+	cursor    string
+	pending   []string
+	active    map[string]struct{}
+	completed chan cancellationResult
+	failed    bool
+	workers   sync.WaitGroup
+}
+
+type cancellationResult struct {
+	key    string
+	failed bool
+}
 
 func (h *handler) runCancellationRecovery(ctx context.Context) {
 	ctx = compose_v2.WithBoundCheckpointerCtx(ctx, h.cp)
+	store, _ := h.sessionStore.(CancellationPollStore)
+	recovery := &cancellationRecovery{
+		active:    make(map[string]struct{}, cancellationConcurrency),
+		completed: make(chan cancellationResult, cancellationConcurrency),
+	}
+	defer recovery.workers.Wait()
 	for ctx.Err() == nil {
-		leaderCtx, lease, err := compose_v2.BeginTaskActivity(ctx, cancellationWorkerID, nil)
-		if err == nil {
-			h.runCancellationLeader(leaderCtx, lease)
-			// 交还后给候补至少一个轮询周期，避免原持有者立即重新抢占。
-			if !waitCancellationPoll(ctx) {
-				return
+		var token string
+		var err error
+		recovery.failed = false
+		if len(recovery.active) < cancellationConcurrency {
+			token, err = h.scanCancellations(ctx, store, recovery)
+			if err != nil && ctx.Err() == nil {
+				slog.WarnContext(ctx, "agui: 发现待补偿的取消任务失败", "err", err)
 			}
-		} else if ctx.Err() == nil && !errors.Is(err, compose_v2.ErrTaskBusy) {
-			slog.WarnContext(ctx, "agui: 申请取消补偿租约失败", "err", err)
 		}
-		if !waitCancellationPoll(ctx) {
+		proceed := recovery.waitPoll(ctx)
+		if token != "" {
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancellationPollInterval)
+			if releaseErr := releaseCancellationPoll(releaseCtx, store, token); releaseErr != nil {
+				slog.WarnContext(ctx, "agui: 释放取消补偿轮询租约失败", "err", releaseErr)
+			}
+			cancel()
+		}
+		if !proceed {
+			return
+		}
+		// 失败或长时间未返回时，给其他实例至少一个轮询间隔。
+		if token != "" && (err != nil || recovery.failed || len(recovery.active) > 0) && !recovery.waitPoll(ctx) {
 			return
 		}
 	}
 }
 
-func (h *handler) runCancellationLeader(ctx context.Context, lease *compose_v2.TaskActivity) {
-	defer lease.Release()
-	for ctx.Err() == nil {
-		if err := h.recoverCancellationPass(ctx); err != nil && ctx.Err() == nil {
-			if !errors.Is(err, errCancellationIncomplete) {
-				slog.WarnContext(ctx, "agui: 列举待补偿的取消任务失败", "err", err)
-			}
-			// 本实例缺旧工厂或后端配置时，让其他实例接手。
-			return
-		}
-		if !waitCancellationPoll(ctx) {
-			return
-		}
-	}
-}
-
-func waitCancellationPoll(ctx context.Context) bool {
+func (r *cancellationRecovery) waitPoll(ctx context.Context) bool {
 	timer := time.NewTimer(cancellationPollInterval)
 	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		case result := <-r.completed:
+			r.complete(result)
+		}
 	}
 }
 
-var errCancellationIncomplete = errors.New("agui: some cancellations could not be recovered")
+func (r *cancellationRecovery) complete(result cancellationResult) {
+	delete(r.active, result.key)
+	r.failed = r.failed || result.failed
+}
 
-func (h *handler) recoverCancellationPass(ctx context.Context) error {
-	var incomplete atomic.Bool
-	// 慢项有独立的清理时限。分页之间共用并发预算，失败项留到下一轮。
-	var wg sync.WaitGroup
-	slots := make(chan struct{}, 4)
-	defer wg.Wait()
-	for cursor := ""; ctx.Err() == nil; {
-		pageCtx, cancel := context.WithTimeout(ctx, dropCPTimeout)
-		keys, next, err := h.listCancellations(pageCtx, cursor)
-		cancel()
+func (h *handler) scanCancellations(ctx context.Context, store CancellationPollStore, r *cancellationRecovery) (token string, err error) {
+	defer catchCancellationPollPanic(ctx, "agui: scan cancellations", &err)
+	// 从申请前计时并且不续约。即使读取索引卡住，其他实例仍可在租约到期后扫描。
+	scanCtx, cancel := context.WithTimeout(ctx, cancellationPollInterval)
+	defer cancel()
+	if store != nil {
+		token = rand.Text()
+		acquired, err := store.TryAcquireCancellationPoll(scanCtx, token, cancellationPollInterval)
 		if err != nil {
-			return err
+			// 返回丢失时后端可能已经取得租约，退出前按 token 尝试释放。
+			return token, err
 		}
-		for _, key := range keys {
-			select {
-			case slots <- struct{}{}:
-			case <-ctx.Done():
-				return ctx.Err()
+		if !acquired {
+			return "", nil
+		}
+	}
+	return token, h.discoverCancellations(ctx, scanCtx, r)
+}
+
+func releaseCancellationPoll(ctx context.Context, store CancellationPollStore, token string) (err error) {
+	defer catchCancellationPollPanic(ctx, "agui: release cancellation poll lease", &err)
+	return store.ReleaseCancellationPoll(ctx, token)
+}
+
+func catchCancellationPollPanic(ctx context.Context, operation string, err *error) {
+	if v := recover(); v != nil {
+		p := panicerr.New(v)
+		panicerr.Log(ctx, slog.LevelError, "agui: 取消扫描捕获 panic", p, "operation", operation)
+		*err = panicerr.WrapOpaque(operation, p)
+	}
+}
+
+func (h *handler) discoverCancellations(ctx, scanCtx context.Context, r *cancellationRecovery) error {
+	for scanCtx.Err() == nil {
+		if len(r.pending) == 0 {
+			keys, next, err := h.listCancellations(scanCtx, r.cursor)
+			if err != nil {
+				return err
 			}
-			wg.Go(func() {
-				defer func() { <-slots }()
-				if ctx.Err() != nil {
-					return
+			if next != "" && next == r.cursor {
+				return errors.New("agui: cancellation listing did not advance")
+			}
+			r.pending, r.cursor = keys, next
+		}
+		// 最多保留一页待派发候选。任务一旦开始便使用自己的时限，不受轮询租约替换影响。
+		for len(r.pending) > 0 && scanCtx.Err() == nil {
+			key := r.pending[0]
+			if _, busy := r.active[key]; busy {
+				r.pending = r.pending[1:]
+				continue
+			}
+			if len(r.active) == cancellationConcurrency {
+				select {
+				case <-scanCtx.Done():
+					return nil
+				case result := <-r.completed:
+					r.complete(result)
 				}
-				if err := h.recoverCancellation(ctx, key); err != nil && ctx.Err() == nil && !errors.Is(err, compose_v2.ErrTaskBusy) {
-					incomplete.Store(true)
+				continue
+			}
+			r.pending = r.pending[1:]
+			r.active[key] = struct{}{}
+			r.workers.Go(func() {
+				result := cancellationResult{key: key, failed: true}
+				defer func() { r.completed <- result }()
+				err := h.recoverCancellation(ctx, key)
+				result.failed = err != nil && ctx.Err() == nil && !errors.Is(err, compose_v2.ErrTaskBusy)
+				if result.failed {
 					slog.WarnContext(ctx, "agui: 后台取消补偿未完成", "session", key, "err", err)
 				}
 			})
 		}
-		if next == "" {
-			wg.Wait()
-			if incomplete.Load() {
-				return errCancellationIncomplete
-			}
+		if r.cursor == "" {
 			return nil
 		}
-		if next == cursor {
-			return errors.New("agui: cancellation listing did not advance")
-		}
-		cursor = next
 	}
-	return ctx.Err()
+	return nil
+}
+
+func (h *handler) buildCancellationAgent(version string) (agent_v2.Agent, error) {
+	factory := h.workflowFactory(version)
+	if factory == nil {
+		return nil, errWorkflowUnavailable
+	}
+	ag := factory(hook.NoOpHooks{})
+	if agent_v2.IsNilAgent(ag) {
+		return nil, errors.New("agui: AgentFactory returned nil agent")
+	}
+	return ag, nil
 }
 
 func (h *handler) listCancellations(ctx context.Context, cursor string) (keys []string, next string, err error) {
@@ -183,7 +259,22 @@ func (h *handler) recoverCancellation(ctx context.Context, key string) (err erro
 	}()
 	ctx, cancel := context.WithTimeout(ctx, dropCPTimeout)
 	defer cancel()
-	ctx = compose_v2.WithBoundCheckpointerCtx(ctx, h.cp)
+	// 构造工厂前只读工作流版本，未持有会话租约。其他实例可正常完成同一取消或替换。
+	candidate, err := h.sessionStore.LoadSession(ctx, key)
+	if err != nil || candidate == nil || candidate.Cancellation == nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ag, err := h.buildCancellationAgent(candidate.WorkflowVersion)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// 以持有会话租约时读到的进度和归属为准，只清理同一个任务。
 	lifecycle := ctx
 	ctx, activity, err := h.loadSharedSession(ctx, key)
 	if err != nil {
@@ -191,7 +282,7 @@ func (h *handler) recoverCancellation(ctx context.Context, key string) (err erro
 	}
 	defer activity.Release()
 	s := sharedSessionFrom(ctx)
-	if s.record == nil || s.record.Cancellation == nil {
+	if !sameCancellationTask(s.record, candidate) {
 		return nil
 	}
 	intent := s.record.Cancellation
@@ -208,5 +299,5 @@ func (h *handler) recoverCancellation(ctx context.Context, key string) (err erro
 	}
 	ctx = compose_v2.WithThreadIDCtx(ctx, thread)
 	ctx = compose_v2.WithOwner(ctx, intent.Owner)
-	return h.reconcileSharedCancellation(ctx, s, agent_v2.WithResumeAbortContext(lifecycle))
+	return cancelSharedSession(ctx, s, ag, nil, "", h.cancellationHistory, agent_v2.WithResumeAbortContext(lifecycle))
 }

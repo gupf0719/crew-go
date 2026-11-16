@@ -72,14 +72,22 @@ func TestPendingSnapshot_VoidThenSiblingTool(t *testing.T) {
 	rec := postAGUI(h, `{"threadId":"t1","runId":"r1","messages":[{"id":"u1","role":"user","content":"go"}]}`)
 	evs := parseSSE(rec.Body.String())
 	assertNoResendAfterSnapshot(t, evs)
-	snapshots := 0
+	var snapshots, results int
 	for _, e := range evs {
-		if e["type"] == "MESSAGES_SNAPSHOT" {
+		switch e["type"] {
+		case "MESSAGES_SNAPSHOT":
 			snapshots++
+		case "TOOL_CALL_RESULT":
+			if e["toolCallId"] == "c1" && e["content"] == "R" {
+				results++
+			}
 		}
 	}
 	if snapshots != 1 {
 		t.Fatalf("X 被撤回后应发一份快照，实际 %d 份", snapshots)
+	}
+	if results != 1 {
+		t.Fatalf("自研 Agent 通过 OnToolEnd 发送的结果应有一条，实际事件 %v", evs)
 	}
 }
 

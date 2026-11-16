@@ -149,7 +149,7 @@ else
     check_command("SET", KEYS[7], ARGV[10])
 end
 if ARGV[1] ~= "" then
-    deleted = delete_subtree()
+    deleted = delete_subtree(ARGV[13])
 end
 if ARGV[10] == "" then
     redis.call("DEL", KEYS[7])
@@ -190,7 +190,7 @@ func (s *AGUISessionStore) SaveSession(ctx context.Context, key string, record *
 	if record != nil && record.Cancellation != nil {
 		pending = "1"
 	}
-	args = append(args, threadToken, recordTask, compose_v2.CheckpointTaskLeaseToken(ctx, leases, recordTask), string(payload), key, pending)
+	args = append(args, threadToken, recordTask, compose_v2.CheckpointTaskLeaseToken(ctx, leases, recordTask), string(payload), key, pending, cpLegacyItemPrefix(s.prefix, dropTask))
 	deleted, err := saveAGUISessionScript.Run(ctx, s.rdb, keys, args...).Int64()
 	if err != nil {
 		return 0, fmt.Errorf("redis agui session save: %w", err)

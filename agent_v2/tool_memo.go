@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"crew-go/compose_v2"
+	"crew-go/internal/toolresult"
 	"crew-go/schema"
 	"crew-go/tool"
 )
@@ -48,6 +49,8 @@ type toolMemoEntry struct {
 	// HookSignals 是定下时这次调用的 OnToolEnd 钩子做出的上行信号（只在 Final 时有意义）：定下了的续跑时不再交给
 	// 钩子，这里记的原样交出。
 	HookSignals compose_v2.Signals `json:"hook_signals,omitzero"`
+	// Delivery 记下定稿时宿主的展示选择，供节点提交前作废时续跑。
+	Delivery *toolresult.Delivery `json:"delivery,omitempty"`
 }
 
 // shouldMemoize 判断这次 tool_call 的产出能不能进重放记账。
@@ -152,13 +155,17 @@ func loadToolMemo(ctx context.Context, calls []schema.ToolCall) ([]*toolCallReco
 
 // finalizeToolMemo 逐项保存钩子改写、批内裁决和转存后的结果。此后节点提交若失败，恢复时直接
 // 重放定稿及 OnToolEnd 产生的信号。批次提前中断时，账里仍是工具刚返回的内容，供下一次钩子处理。
-func finalizeToolMemo(ctx context.Context, calls []schema.ToolCall, records []*toolCallRecord, results []*schema.Message, hookSignals []compose_v2.Signals) {
+func finalizeToolMemo(ctx context.Context, calls []schema.ToolCall, records []*toolCallRecord, results []*schema.Message,
+	hookSignals []compose_v2.Signals, deliveries []*toolresult.Delivery) {
 	for i, record := range records {
 		if record == nil || record.Result == nil || record.Result.Final || i >= len(results) || results[i] == nil {
 			continue
 		}
 		final := *record.Result
 		final.ToolMsg, final.Final, final.HookSignals = results[i], true, hookSignals[i]
+		if i < len(deliveries) {
+			final.Delivery = deliveries[i]
+		}
 		next := *record
 		next.Result = &final
 		if err := compose_v2.SaveNodeState(toolMemoContext(ctx, calls[i], i), &next); err != nil {

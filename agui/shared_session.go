@@ -15,7 +15,6 @@ import (
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
-	"crew-go/hook"
 	"crew-go/schema"
 )
 
@@ -288,19 +287,53 @@ func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agen
 	return err
 }
 
-func (h *handler) reconcileSharedCancellation(ctx context.Context, s *sharedSession, opts ...agent_v2.ResumeOption) error {
-	if s.record == nil || s.record.Cancellation == nil {
-		return nil
+// openSharedSessionAfterCancellation 让新 Run 和查询协助已接受的取消。
+// 工厂构造释放会话租约，重新取得租约后只处理原任务。新 Run 遇到接管产生的新任务时请调用方重试。
+func (h *handler) openSharedSessionAfterCancellation(ctx context.Context, key sessionKey, beforeRun bool) (context.Context, *compose_v2.TaskActivity, error) {
+	locked, activity, err := h.openSharedSession(ctx, key)
+	if err != nil {
+		return locked, nil, err
 	}
-	factory := h.workflowFactory(s.record.WorkflowVersion)
-	if factory == nil {
-		return errWorkflowUnavailable
+	candidate := sharedSessionFrom(locked).record
+	if candidate == nil || candidate.Cancellation == nil {
+		return locked, activity, nil
 	}
-	ag := factory(hook.NoOpHooks{})
-	if agent_v2.IsNilAgent(ag) {
-		return errors.New("agui: AgentFactory returned nil agent")
+	activity.Release()
+	ag, buildErr := h.buildCancellationAgent(candidate.WorkflowVersion)
+	if err := ctx.Err(); err != nil {
+		return ctx, nil, err
 	}
-	return cancelSharedSession(ctx, s, ag, nil, "", h.cancellationHistory, opts...)
+
+	locked, activity, err = h.openSharedSession(ctx, key)
+	if err != nil {
+		return locked, nil, err
+	}
+	var opened bool
+	defer func() {
+		if !opened {
+			activity.Release()
+		}
+	}()
+	s := sharedSessionFrom(locked)
+	switch {
+	case s.record == nil:
+	case sameCancellationTask(s.record, candidate):
+		if buildErr != nil {
+			return locked, nil, buildErr
+		}
+		if err := cancelSharedSession(locked, s, ag, nil, "", h.cancellationHistory); err != nil {
+			return locked, nil, err
+		}
+	case beforeRun || s.record.Cancellation != nil:
+		return locked, nil, compose_v2.ErrTaskBusy
+	}
+	opened = true
+	return locked, activity, nil
+}
+
+func sameCancellationTask(record, candidate *SessionRecord) bool {
+	return record != nil && record.Cancellation != nil && record.TaskID == candidate.TaskID &&
+		record.WorkflowVersion == candidate.WorkflowVersion
 }
 
 func (s *sharedSession) accept(ctx context.Context, answers map[string]*schema.Message) (map[string]*schema.Message, error) {
@@ -361,7 +394,7 @@ func (h *handler) servePending(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx, key := h.requestContext(r, threadID)
-	ctx, activity, err := h.openSharedSession(ctx, key)
+	ctx, activity, err := h.openSharedSessionAfterCancellation(ctx, key, false)
 	if err != nil {
 		status, code, message := sharedSessionError(ctx, err)
 		_ = writeReject(w, status, code, message)
@@ -369,11 +402,6 @@ func (h *handler) servePending(w http.ResponseWriter, r *http.Request) {
 	}
 	defer activity.Release()
 	s := sharedSessionFrom(ctx)
-	if err := h.reconcileSharedCancellation(ctx, s); err != nil {
-		status, code, message := sharedSessionError(ctx, err)
-		_ = writeReject(w, status, code, message)
-		return
-	}
 	if s.record != nil {
 		taskCtx, lease, err := compose_v2.BeginTaskActivity(ctx, s.record.TaskID, nil)
 		if err != nil {

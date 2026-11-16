@@ -37,7 +37,7 @@ func TestAGUICancellationLoad(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() {
-				if _, err := db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+table+", "+table+"_task_lease, "+table+"_agui_session, "+table+"_agui_cancel"); err != nil {
+				if _, err := db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+table+", "+table+"_task_lease, "+table+"_agui_session, "+table+"_agui_cancel, "+table+"_agui_cancel_poll"); err != nil {
 					t.Error(err)
 				}
 			}()

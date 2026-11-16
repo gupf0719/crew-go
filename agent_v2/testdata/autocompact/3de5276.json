@@ -1,0 +1,66 @@
+{
+  "checkpoint": {
+    "id": "legacy-basic-auto-compact",
+    "status": 1,
+    "schema_ver": 19,
+    "graph_id": "compact:074755ef1695d773",
+    "task_id": "5e203a081afcaef6",
+    "channels": {
+      "__basic_agent_messages__": {
+        "type": "[]*schema.Message",
+        "data": [
+          {
+            "id": "00fbb9e113f113998671b60aedd364b2",
+            "role": "user",
+            "content": "file history: abcdef abcdef abcdef abcdef abcdef abcdef abcdef abcdef abcdef abcdef"
+          },
+          {
+            "id": "2a84533c5aa11906d95318e53c3bfc6b",
+            "role": "assistant",
+            "content": "file notes"
+          },
+          {
+            "id": "5935c8d163d9a8acda90cc40e7e998ac",
+            "role": "user",
+            "content": "latest built-in question"
+          }
+        ]
+      },
+      "__basic_agent_preamble_input__": {
+        "type": "*BasicAgentPreambleInput",
+        "data": {
+          "UserInput": {
+            "id": "5935c8d163d9a8acda90cc40e7e998ac",
+            "role": "user",
+            "content": "latest built-in question"
+          }
+        }
+      }
+    },
+    "pending_interrupts": [
+      {
+        "question": "accept previous history?",
+        "interrupt_id": "a7336c79e9a4f625"
+      }
+    ],
+    "current_frontier": [
+      {
+        "node_id": "model"
+      }
+    ],
+    "frontier_started": true,
+    "node_visits": {
+      "preamble": 1
+    },
+    "node_states": {
+      "2e3d58b47374d44e:scope:5783f7b56ca7e3d2b0487082049ea0ee:redo0:fb5f8c1862fd34564e27336c9374ffbe": {
+        "type": "bool",
+        "data": true
+      },
+      "2e3d58b47374d44e:scope:5783f7b56ca7e3d2b0487082049ea0ee:redo0:fb5f8c1862fd34564e27336c9374ffbe:streams": {
+        "type": "compose_v2.nodeStreams",
+        "data": null
+      }
+    }
+  }
+}

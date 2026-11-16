@@ -225,13 +225,16 @@ func TestRedisAGUICancelProcessWorker(t *testing.T) {
 	phase, dir := os.Getenv("CREW_TEST_REDIS_CANCEL_PHASE"), os.Getenv("CREW_TEST_REDIS_CANCEL_DIR")
 	client := goredis.NewClient(&goredis.Options{Addr: addr})
 	t.Cleanup(func() { _ = client.Close() })
-	cp := crewredis.NewCheckpointer(client, crewredis.WithCheckpointerPrefix(filepath.Base(dir)))
+	// TempDir 的最后一段是测试内序号，不同子测试都可能得到 001。
+	prefix := filepath.Base(filepath.Dir(dir))
+	cp := crewredis.NewCheckpointer(client, crewredis.WithCheckpointerPrefix(prefix))
 	s := crewredis.NewAGUISessionStore(cp)
 	ref := filepath.Join(dir, "task.txt")
 	key := fmt.Sprintf("agui-thread:%x", sha256.Sum256([]byte("6:tenantshared")))
 	if phase == "idle" {
 		// 模拟升级前仅有持久会话，要求首次发现能重建候选索引。
-		if err := client.Del(t.Context(), filepath.Base(dir)+":agui:cancel").Err(); err != nil {
+		index := prefix + ":agui:cancel"
+		if err := client.Del(t.Context(), index, index+":ready").Err(); err != nil {
 			t.Fatal(err)
 		}
 		before, err := s.LoadSession(t.Context(), key)

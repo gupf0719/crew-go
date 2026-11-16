@@ -281,8 +281,10 @@ func UnmarshalTagged(data []byte) (any, error) {
 
 //   - v21：BasicAgent 将工具账按调用写入 NodeStates。恢复旧批次时迁移其审批、结果和信号。
 
-// CheckpointSchemaVer 是 Checkpoint 当前 schema 版本号, 仅供观测 / 业务 debug
-// 用 — 框架不在 Marshal/Unmarshal 路径校验.
+//   - v22：公开 AutoCompact 的旧固定相位恢复以存档版本为界。恢复旧相位后在 NodeStates 记住调用归属。
+
+// CheckpointSchemaVer 是 Checkpoint 当前存档版本号。恢复时可据此识别旧版运行状态的语义。
+// Marshal 和 Unmarshal 不按版本拒绝存档。
 //
 // **设计决策** (Option D):
 //   - Checkpoint 是 exported, 业务 ad-hoc `&Checkpoint{...}` 漏填 `SchemaVer`
@@ -296,7 +298,7 @@ func UnmarshalTagged(data []byte) (any, error) {
 //   - 业务侧迁移逻辑负责按 cp.SchemaVer 分支决定 unmarshal 字段
 //   - framework 加 `Migrate(v Old, vNew int) (*Checkpoint, error)` 类工具
 //   - 不在 Unmarshal 路径加 fail-fast
-const CheckpointSchemaVer = 21
+const CheckpointSchemaVer = 22
 
 // checkpointSchemaVer (private alias 保 framework 内部 reference 兼容).
 const checkpointSchemaVer = CheckpointSchemaVer

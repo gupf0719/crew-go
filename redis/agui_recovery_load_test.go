@@ -4,6 +4,7 @@ package redis_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -38,7 +39,7 @@ func TestAGUICancellationLoad(t *testing.T) {
 				_, err := client.Pipelined(ctx, func(p goredis.Pipeliner) error {
 					for i := from; i < min(from+500, aguiload.Sessions); i++ {
 						p.Set(ctx, fmt.Sprintf("%s:agui:session:agui-thread:%064x", prefix, i), payload, 0)
-						p.Set(ctx, fmt.Sprintf("%s:cp:item:normal-%d:", prefix, i), "{}", 0)
+						p.Set(ctx, fmt.Sprintf("%s:cp:item-v2:%s:", prefix, base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("normal-%d", i)))), "{}", 0)
 					}
 					return nil
 				})

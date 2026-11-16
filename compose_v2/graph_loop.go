@@ -617,6 +617,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 进一张新图 ⟹ 外层图的节点位置作废。不清的话子图的 OnNodeStart 会读到父节点的
 	// 身份（普通 ctx value 跨边界继承），算出的中断身份跨 Resume 会漂。
 	ctx = clearInheritedNodePosition(ctx)
+	ctx = withRestoredResume(ctx, nil)
 	// 出口读写的宽限状态：外层 Run 放过就沿用（后端在这个任务的出口挂住过，各层都不再等，见 exitGrace）
 	ctx, releaseExitGrace := withExitGrace(ctx)
 	defer releaseExitGrace()
@@ -1490,6 +1491,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		if err := cm.Restore(cfg.resumeFrom); err != nil {
 			return fmt.Errorf("auto-restore: %w", err)
 		}
+		ctx = withRestoredResume(ctx, cfg.resumeFrom)
 		restoreRejected = false
 		// 从存档续跑：已提交的进度原样拿回、不重新交出流，所在那段执行取代的东西一个都不撤（见 stream_attempt.go）
 		markStreamsUncertain(ctx)
@@ -1852,6 +1854,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				// commitSuperstepAdvance 里保留现场，由下面单独返回。
 				var sendErr *sendPayloadApplyErr
 				if errors.As(commitErr, &sendErr) {
+					notifyNodeCommits(ctx, res.afterCommit)
 					return fmt.Errorf("apply send directives: %w", commitErr)
 				}
 				cm.updateFrontier(frontier) // 整 frontier 重跑（含成功分支）
@@ -1875,6 +1878,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		//     已提交、且进 CompletedFrontier 后**永不重跑** ⟹ 它的代际再没机会推进。
 		//     后果实测：该节点被回边重访时的**新提问**算出与上一轮**完全相同**的
 		//     InterruptID，业务累积传的旧答案把它静默满足——用户根本没被问，`err == nil`。
+		notifyNodeCommits(ctx, res.afterCommit)
 
 		// 失败/中断 return（已 record 完 interrupts + 更新 frontier + 记完成兄弟）
 		if res.FirstErr != nil {
@@ -1954,6 +1958,8 @@ type frontierResult struct {
 	// ——**现在可复现了**。但 channel.go 的 reducer 约定（要求满足交换律）不因此放松：
 	// 确定的是**框架这一侧**的合并次序，业务仍不该把语义压在它上面（比如靠顺序做 last-win）。
 	SuccessWrites []ChannelWrite
+	// afterCommit 只收当前已成功成员的观测通知。先前已提交的兄弟不再通知。
+	afterCommit []func()
 	// FailedBranches 失败分支 ID（含 InterruptError + 业务错 + hook 错）
 	// 仅 Resume 时用——下次 Run 从这些分支重跑（不重跑成功分支）
 	FailedBranches []FrontierMember
@@ -2211,7 +2217,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 			}
 		}
 		chs := cm.channelsForMember(frontier[0])
-		ws, directives, consumed, signals, err := runNodeWithHooks(ctx, id, fn, g.nodeComponents[id], g.nodePolicies[id], chs, hooks, cm, frontier[0].InstanceID)
+		ws, directives, consumed, signals, afterCommit, err := runNodeWithHooks(ctx, id, fn, g.nodeComponents[id], g.nodePolicies[id], chs, hooks, cm, frontier[0].InstanceID)
 		var targets []NodeID
 		if err == nil {
 			// 出边算在**提交之前**、且算在这个成员名下——失败即本成员失败。
@@ -2254,6 +2260,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 		owners, conflict := cm.recordMemberWrites(writeOwners, frontier[0], ws)
 		return frontierResult{
 			SuccessWrites:           ws,
+			afterCommit:             afterCommit,
 			SendDirectives:          directives,
 			SucceededBranches:       []FrontierMember{frontier[0]},
 			Targets:                 targets,
@@ -2268,13 +2275,14 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 	// （ISSUE-96）——原先用"在 frontier 里的位置"当序号，部分失败时 frontier 缩成
 	// 失败子集、位置重排，身份跟着漂。
 	type branchOutput struct {
-		member     FrontierMember
-		writes     []ChannelWrite
-		directives []SendDirective
-		targets    []NodeID
-		consumed   []string
-		signals    []SignalRecord
-		err        error
+		member      FrontierMember
+		writes      []ChannelWrite
+		directives  []SendDirective
+		targets     []NodeID
+		consumed    []string
+		signals     []SignalRecord
+		afterCommit []func()
+		err         error
 	}
 	results := make([]branchOutput, len(frontier))
 	started := fanout.Run(ctx, len(frontier), limit, func(i int) {
@@ -2333,7 +2341,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 			}
 		}()
 		chs := cm.channelsForMember(m)
-		ws, directives, consumed, signals, err := runNodeWithHooks(ctx, m.NodeID, fn, g.nodeComponents[m.NodeID], g.nodePolicies[m.NodeID], chs, hooks, cm, m.InstanceID)
+		ws, directives, consumed, signals, afterCommit, err := runNodeWithHooks(ctx, m.NodeID, fn, g.nodeComponents[m.NodeID], g.nodePolicies[m.NodeID], chs, hooks, cm, m.InstanceID)
 		var targets []NodeID
 		if err == nil {
 			// **每个实例各算各的出边**，视图只含它自己的写入——兄弟实例的写入看不见。
@@ -2349,7 +2357,8 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 			}
 		}
 		applyNestedEntryRejections(ctx, cm, m, err)
-		results[i] = branchOutput{member: m, writes: ws, directives: directives, targets: targets, consumed: consumed, signals: signals, err: err}
+		results[i] = branchOutput{member: m, writes: ws, directives: directives, targets: targets, consumed: consumed, signals: signals,
+			afterCommit: afterCommit, err: err}
 		normalReturn = true
 	})
 	for i := started; i < len(frontier); i++ {
@@ -2406,6 +2415,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 		}
 
 		out.SuccessWrites = append(out.SuccessWrites, r.writes...)
+		out.afterCommit = append(out.afterCommit, r.afterCommit...)
 		out.SendDirectives = append(out.SendDirectives, r.directives...)
 		out.SucceededBranches = append(out.SucceededBranches, r.member)
 		out.Targets = append(out.Targets, r.targets...)
@@ -2600,14 +2610,13 @@ func notifyNodeEnd(logCtx context.Context, hooks OrchestrationHooks, hookCtx con
 //  2. ctx 注入 EventSink + sendSink + node interrupt counter + visit + 实例身份
 //  3. NodeFunc panic 由 safeNodeRun 转 error
 //  4. OnNodeEnd 总会调（含失败路径）传 nodeErr 让 hook 知晓原因
-//  5. 节点 return 后 drain sendSink 收 directives——失败时 directives 不返出（自然丢弃）
-//  6. **节点成功完成后**递增 cm.visitCount[id]——失败/中断时不递增让 Resume 重跑
-//     时 visit 不变保 InterruptID 稳定（audit Round 3 Bug #1 修复）
+//  5. 节点和钩子成功返回后取出动态投递与提交后通知，随该成员的写入交给提交点。
+//  6. 超步提交时推进访问计数，失败或中断时保留当前 visit 和 InterruptID。
 //
 // instanceID：本次执行的实例身份（caller 从 FrontierMember 取，ISSUE-96）——
 // SendFrom 同 Target 投递多次时每个并发 worker 拿到各自的 token，业务工具算
 // InterruptID 时编入此维度防串台；静态边节点恒空串（它们本就单实例）。
-func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind string, policy nodePolicy, chs Channels, hooks OrchestrationHooks, cm *ChannelManager, instanceID string) (writes []ChannelWrite, directives []SendDirective, consumed []string, signals []SignalRecord, err error) {
+func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind string, policy nodePolicy, chs Channels, hooks OrchestrationHooks, cm *ChannelManager, instanceID string) (writes []ChannelWrite, directives []SendDirective, consumed []string, signals []SignalRecord, afterCommit []func(), err error) {
 	// audit² 修 (B-HIGH-3 + C-HIGH-2): 整函数 defer recover 兜底 hook panic. 跨
 	// goroutine (fan-out frontier N>=2 时 executeFrontier 内 spawn worker
 	// goroutine 调本函数) 不能依赖 compose_v2.Run 入口 outer recover (cross-
@@ -2763,10 +2772,10 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 		// 彼此不可区分。那正是空 ID 拒绝要消灭的形态，从这个入口原样存活。
 		if ie, isInt := IsInterrupt(startErr); isInt {
 			if vErr := validateInterrupt(ctx, id, startErr, ie); vErr != nil {
-				return nil, nil, nil, nil, vErr
+				return nil, nil, nil, nil, nil, vErr
 			}
 		}
-		return nil, nil, nil, nil, fmt.Errorf("node %q OnNodeStart: %w", id, startErr)
+		return nil, nil, nil, nil, nil, fmt.Errorf("node %q OnNodeStart: %w", id, startErr)
 	}
 	// **框架的 ctx 值不由业务 hook 决定存亡**。
 	//
@@ -2830,19 +2839,18 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 		// 共用同一份**，别在任何一处另写一遍。
 		if ie, isInt := IsInterrupt(err); isInt {
 			if vErr := validateInterrupt(nodeCtx, id, err, ie); vErr != nil {
-				return nil, nil, nil, nil, vErr
+				return nil, nil, nil, nil, nil, vErr
 			}
 			// InterruptError 是控制流——保持 fmt.Errorf wrap 让 IsInterrupt 链可读，不包 GraphNodeError
-			return nil, nil, nil, nil, fmt.Errorf("node %q: %w", id, err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("node %q: %w", id, err)
 		}
 		// 业务错 / ctx 错 / safeNodeRun panic-转-error → typed *GraphNodeError 携带定位信息：
 		// caller errors.As(&GraphNodeError) 拿 NodeID/GraphNS（嵌套子图定位）；Unwrap 让
 		// errors.Is(ctx.Canceled) / errors.As(bizErr) 穿透原错。
-		return nil, nil, nil, nil, &GraphNodeError{NodeID: id, GraphNS: GetGraphNS(nodeCtx), Err: err}
+		return nil, nil, nil, nil, nil, &GraphNodeError{NodeID: id, GraphNS: GetGraphNS(nodeCtx), Err: err}
 	}
-	// 成功路径才 drain sink + 递增 visitCount——失败时不递增让 Resume 重跑时
-	// visit 不变保 InterruptID 稳定（同位置 ID 跨 retry 一致）
-	directives = drainSendSink(sink)
+	// 仅从成功尝试取出动态投递与提交后通知。后续出边计算及写入提交决定它们是否生效。
+	directives, afterCommit = drainSendSink(sink)
 	// 本次执行兑付掉的答案位——只在该成员最终成功、且本超步提交成功时才并入 cm
 	consumed = drainAnswerLedger(ledger)
 	// 上行信号同一档：成员最终成功（出边也算得出来）且本超步提交成功时才并入 cm

@@ -42,7 +42,7 @@ func setupAGUI(t *testing.T, dialect crewsql.Dialect, open func() *dbsql.DB) agu
 	table := "agui_" + strings.ToLower(rand.Text())
 	dbA, dbB := open(), open()
 	t.Cleanup(func() {
-		for _, tbl := range []string{table + "_agui_events", table + "_agui_runs", table + "_agui_session", table + "_agui_cancel", table + "_task_lease", table} {
+		for _, tbl := range []string{table + "_agui_events", table + "_agui_runs", table + "_agui_session", table + "_agui_cancel", table + "_agui_cancel_poll", table + "_task_lease", table} {
 			if _, err := dbB.Exec("DROP TABLE IF EXISTS " + tbl); err != nil {
 				t.Error(err)
 			}

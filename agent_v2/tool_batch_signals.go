@@ -79,6 +79,13 @@ func (b *toolBatch) callInstanceID(index int) string {
 	return b.batchID + "/tool/" + strconv.Itoa(index)
 }
 
+func (b *toolBatch) visibleCallID(index int, callID string) string {
+	if instance := b.callInstanceID(index); instance != "" {
+		return instance
+	}
+	return callID
+}
+
 func (b *toolBatch) withIdentity(extra map[string]any, index int) map[string]any {
 	instanceID := b.callInstanceID(index)
 	if instanceID == "" && b.modelRunID == "" {

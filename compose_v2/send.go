@@ -2,7 +2,10 @@ package compose_v2
 
 import (
 	"context"
+	"log/slog"
 	"sync"
+
+	"crew-go/internal/panicerr"
 )
 
 // SendDirective 节点运行时动态产生的 fan-out 指令（运行时动态 map-reduce）。
@@ -96,10 +99,11 @@ type SendDirective struct {
 // sendSinkKey 是 ctx 注入键（私有避免碰撞）。
 type sendSinkKey struct{}
 
-// sendSink 持节点执行期间收的 SendDirective——节点 return 后框架 drain。
+// sendSink 收集一次节点尝试的动态投递与提交后通知。
 type sendSink struct {
-	mu         sync.Mutex
-	directives []SendDirective
+	mu          sync.Mutex
+	directives  []SendDirective
+	afterCommit []func()
 }
 
 // SendFrom 在节点函数（NodeFunc）内调用——动态向下一超步投递 fan-out 指令。
@@ -131,17 +135,45 @@ func withSendSink(ctx context.Context, sink *sendSink) context.Context {
 	return context.WithValue(ctx, sendSinkKey{}, sink)
 }
 
-// drainSendSink 取出并清空 sink 的 directives——节点 return 后由 graph_loop 调用。
-func drainSendSink(s *sendSink) []SendDirective {
+// AfterNodeCommit 在节点函数内登记一个通知。节点的写入实际提交后，引擎在锁外同步调用 fn。
+// 重试、条件边失败或写入回滚时丢弃相应通知。部分提交时只通知提交成功的成员。
+// 通知仅供观测，随本次执行存于内存中。图外、条件边和钩子相位的调用无效。
+func AfterNodeCommit(ctx context.Context, fn func()) {
+	sink, _ := ctx.Value(sendSinkKey{}).(*sendSink)
+	if sink == nil || fn == nil || !inNodeExecution(ctx) || SubCallScope(ctx) != "" {
+		return
+	}
+	sink.mu.Lock()
+	sink.afterCommit = append(sink.afterCommit, fn)
+	sink.mu.Unlock()
+}
+
+// drainSendSink 取出成功尝试的投递与通知。
+func drainSendSink(s *sendSink) ([]SendDirective, []func()) {
 	if s == nil {
-		return nil
+		return nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.directives) == 0 {
-		return nil
+	directives, afterCommit := s.directives, s.afterCommit
+	s.directives, s.afterCommit = nil, nil
+	return directives, afterCommit
+}
+
+func notifyNodeCommits(ctx context.Context, notifications []func()) {
+	if len(notifications) == 0 {
+		return
 	}
-	out := s.directives
-	s.directives = nil
-	return out
+	// 等通知结束再进下一超步。观察方异常退出也不改变已提交的结局。
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if value := recover(); value != nil {
+				panicerr.Log(ctx, slog.LevelError, "compose_v2: 节点提交后通知异常", panicerr.New(value))
+			}
+		}()
+		panicerr.CallEach(ctx, len(notifications), func(i int) { notifications[i]() })
+	}()
+	<-done
 }

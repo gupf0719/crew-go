@@ -63,6 +63,9 @@ func (s *AGUISessionStore) Setup(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (sid %s NOT NULL PRIMARY KEY, ready SMALLINT NOT NULL)%s", s.cancelTable, keyType, suffix)); err != nil {
 		return fmt.Errorf("sql agui cancellation index setup: %w", err)
 	}
+	if err := s.setupCancellationPoll(ctx, keyType, suffix); err != nil {
+		return err
+	}
 	return s.backfillCancellations(ctx)
 }
 

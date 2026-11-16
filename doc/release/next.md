@@ -6,12 +6,15 @@
 - 对共用同一 Redis 或 SQL 存档域的进程，先停旧副本，再启动新版。新版用任务租约协调执行、续跑和清档。 [任务租约](../v2/checkpoint.md#61-共享存档的任务租约)
 - 升级前完成或放弃显式起名的 BasicAgent 的旧挂起任务，以及仍使用旧路由档位下标的任务。它们升级后会遇到 GraphID 冲突。新建路由升级链时给每个 `WithRouteDecider` 档位使用稳定名称。 [路由决策](../v2/route-decider.md)
 - 使用 `SendDirective.Input` 的部署应统一 Checkpoint 的读写版本。Schema 19 增加 `frontier_inputs` 和 `deferred_sends[].input`，缺少这两个字段的旧存档仍可读取。旧进程读取新存档会忽略这些字段，回退前先处理挂起的私有投递。 [存档结构](../v2/checkpoint.md)
+- Schema 22 支持继续回答旧版 AutoCompact 的挂起摘要问题。升级后用原问题 ID 续跑。需要回退时，先结束已经续跑过的旧摘要任务。 [摘要提问](../v2/context-compaction.md#压缩结果的复用单次-run-内的备忘与跨-run-的压缩边界)
 - A2A 使用 `a2a-go/v2 v2.7.0`。新版服务端要求请求携带 `A2A-Version: 1.0`。`server.Card` 默认声明 `text/plain` 和 `application/json`，按 `text` 匹配名片的客户端需更新。自装配服务端应按请求 owner 隔离任务读取、列表与重订阅。旧挂起档缺少答复投递状态时，续跑需能读取远端任务做对账。 [A2A 接入](../v2/a2a.md)
 - MCP stdio 通过 `WithStdioEnvAllowlist` 选择继承变量，服务明确需要的凭据也可用 `WithStdioEnv` 提供。 [MCP](../v2/mcp.md)
 
 ## 迁移现有 SQL 表
 
 以下语句使用默认表名 `crew_store`、`crew_checkpoint`。自定义表名按应用的配置替换。自定义 Checkpointer 表可用相同配置的 `Checkpointer.Setup` 建租约表，长表名的租约表名由框架派生。身份列按字节比较。先停写并备份，再执行迁移和读写验证。MySQL 旧排序规则已经合并的键只能从应用数据或备份核对。
+
+使用 SQL 共享 AG-UI 会话的部署重跑 `AGUISessionStore.Setup`，创建独立的取消补偿轮询租约表。 [持久化取消补偿](../v2/agui.md#持久化取消补偿)
 
 ### PostgreSQL
 
@@ -60,6 +63,16 @@ CREATE TABLE IF NOT EXISTS crew_checkpoint_task_lease (
 ### SQLite
 
 已有 Checkpointer 数据库重跑 `Checkpointer.Setup`，创建任务租约表。存档表的身份列沿用 SQLite 默认的 `BINARY` 排序规则。
+
+## 迁移现有 Redis 存档
+
+Redis Checkpointer 将任务 ID 编为独立的 base64url 键段，namespace 及三个枚举索引沿用原值。
+已有存档的部署先停止同一 Redis 前缀下的所有存档读写者并备份，再对每个使用中的前缀构造
+`redis.NewCheckpointer` 并调用 `(*Checkpointer).MigrateLegacyKeys(ctx)`。迁移成功后启动新版，
+查询已有挂起项并验证续跑。迁移中断后可重试，已迁移的记录会跳过。旧数据的记录归属或元数据不一致时，
+按错误中的任务与 namespace 核对备份后再继续。旧格式已经覆盖的内容只能从备份或应用数据恢复。
+需要回退时使用迁移前的备份。
+会话记录、任务租约及 Store 数据沿用原键。 [Redis Checkpointer](../../redis/checkpointer_migration.go)
 
 ## 发布检查
 

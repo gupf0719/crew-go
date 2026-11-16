@@ -16,8 +16,278 @@ import (
 	"crew-go/agui"
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/model"
+	"crew-go/schema"
 	"crew-go/tool"
 )
+
+var resultOnceSignal = compose_v2.NewSignalKind("agui.test.tool_result_once")
+
+type repeatedToolResultModel struct{}
+
+func (repeatedToolResultModel) Generate(_ context.Context, messages []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	var results []string
+	for _, message := range messages {
+		if message.Role == schema.RoleTool {
+			if id := schema.GetToolResultID(message); id != "shared" {
+				return nil, fmt.Errorf("unexpected provider call ID %q", id)
+			}
+			results = append(results, message.Content)
+		}
+	}
+	if len(results) == 0 {
+		return schema.AssistantToolCallMessage([]schema.ToolCall{
+			{ID: "shared", Type: "function", Function: schema.FunctionCall{Name: "lookup", Arguments: `{"label":"A"}`}},
+			{ID: "shared", Type: "function", Function: schema.FunctionCall{Name: "lookup", Arguments: `{"label":"B"}`}},
+		}), nil
+	}
+	if len(results) != 2 || results[0] != "checked A" ||
+		!strings.HasPrefix(results[1], "["+agent_v2.SupersededDecisionErrCode+"]") || !strings.Contains(results[1], "checked B") {
+		return nil, fmt.Errorf("model did not receive the settled tool results: %q", results)
+	}
+	return schema.AssistantMessage("done"), nil
+}
+
+func (m repeatedToolResultModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	out, err := m.Generate(ctx, in, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.NewSingleChunkReader(out), nil
+}
+
+func (m repeatedToolResultModel) WithTools([]*schema.ToolInfo) (model.ChatModel, error) {
+	return m, nil
+}
+
+type pauseToolEnd struct{ hook.NoOpHooks }
+
+type scopedToolStart struct{ hook.NoOpHooks }
+
+func (scopedToolStart) OnToolStart(ctx context.Context, _ *hook.AgentInfo, _ *schema.ToolInput) (context.Context, error) {
+	return compose_v2.EnterPhase(ctx, "lookup-observer"), nil
+}
+
+func (pauseToolEnd) OnToolEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ToolOutput) (context.Context, error) {
+	if out.Result.Output == "B" {
+		if _, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{
+			Question: "检查 B？", Reason: "tool_call", ToolCallID: out.CallId,
+		}); err != nil {
+			return ctx, err
+		}
+	}
+	out.Result.Output = "checked " + out.Result.Output
+	return ctx, nil
+}
+
+func TestToolResult_OncePerCall_OnToolEndInterrupt(t *testing.T) {
+	var executions atomic.Int32
+	h := ownedHandler(func(ui hook.Hooks) agent_v2.Agent {
+		tk := tool.NewToolkit()
+		tk.Register(tool.NewFuncTool("lookup", "查询", nil,
+			func(ctx context.Context, args map[string]any) (*tool.Result, error) {
+				label := args["label"].(string)
+				if !compose_v2.EmitSignal(ctx, resultOnceSignal, compose_v2.Signal{Dest: "selection", Value: label}) {
+					return nil, fmt.Errorf("could not record tool decision %s", label)
+				}
+				executions.Add(1)
+				return tool.Success(label), nil
+			}))
+		return agent_v2.NewBasicAgent(agent_v2.WithName("check_results"), agent_v2.WithModel(repeatedToolResultModel{}),
+			agent_v2.WithToolkit(tk), agent_v2.WithHooks(hook.NewChainHooks(scopedToolStart{}, ui, pauseToolEnd{})))
+	}, agui.WithCheckpointer(compose_v2.NewInMemoryCheckpointer()))
+	const thread = "result-review"
+	first := parseSSE(postAGUI(h, `{"threadId":"result-review","runId":"first","messages":[{"role":"user","content":"run"}]}`).Body.String())
+	var starts []string
+	for _, ev := range first {
+		switch ev["type"] {
+		case "TOOL_CALL_START":
+			starts = append(starts, ev["toolCallId"].(string))
+		case "TOOL_CALL_RESULT":
+			t.Errorf("整批钩子挂起前不能发送工具结果，实际 %v", ev)
+		}
+	}
+	queries := interruptsIn(first)
+	if executions.Load() != 2 || len(starts) != 2 || starts[0] == starts[1] || len(queries) != 1 || queries[0]["toolCallId"] != starts[1] {
+		t.Fatalf("应有两次实际执行，B 的提问对应自己的调用。执行 %d 次，调用 %v，问题 %v", executions.Load(), starts, queries)
+	}
+	resumed := resumeEntries(t, h, thread, "resume", resolved(queries[0]["id"].(string), "是"))
+	var resultIDs, content []string
+	for _, ev := range resumed {
+		switch ev["type"] {
+		case "TOOL_CALL_START":
+			t.Errorf("续跑不应重发已展示的调用，实际 %v", ev)
+		case "TOOL_CALL_RESULT":
+			resultIDs = append(resultIDs, ev["toolCallId"].(string))
+			content = append(content, ev["content"].(string))
+		case "TEXT_MESSAGE_START":
+			if len(resultIDs) != 2 {
+				t.Errorf("后续模型的流开始时应已收到两条工具结果，实际 %v", resultIDs)
+			}
+		}
+	}
+	if outcomeType(resumed) != "success" || executions.Load() != 2 || len(resultIDs) != 2 || resultIDs[0] != starts[0] || resultIDs[1] != starts[1] ||
+		content[0] != "checked A" || content[1] != "tool error: "+agent_v2.SupersededDecisionErrCode {
+		t.Fatalf("应复用两条实际调用，各发送一次定稿结果。执行 %d 次，调用 %v，结果 %v，事件 %v",
+			executions.Load(), resultIDs, content, eventTypes(resumed))
+	}
+}
+
+type pauseFinalReply struct{ askOnModelEndHook }
+
+func (h pauseFinalReply) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
+	if len(schema.GetToolCalls(out.Message)) > 0 {
+		return ctx, nil
+	}
+	return h.askOnModelEndHook.OnModelEnd(ctx, info, out)
+}
+
+func TestToolResult_OncePerCall_LaterModelInterrupt(t *testing.T) {
+	var calls atomic.Int32
+	h := ownedHandler(func(ui hook.Hooks) agent_v2.Agent {
+		tk := tool.NewToolkit()
+		tk.Register(tool.NewFuncTool("lookup", "查询", nil, func(context.Context, map[string]any) (*tool.Result, error) {
+			calls.Add(1)
+			return tool.Success("found"), nil
+		}))
+		return agent_v2.NewBasicAgent(agent_v2.WithName("lookup"), agent_v2.WithToolkit(tk),
+			agent_v2.WithModel(&callToolsOnce{names: []string{"lookup"}}), agent_v2.WithHooks(hook.NewChainHooks(ui, pauseFinalReply{})))
+	}, agui.WithCheckpointer(compose_v2.NewInMemoryCheckpointer()))
+	first := parseSSE(postAGUI(h, `{"threadId":"result-then-model","runId":"first","messages":[{"role":"user","content":"run"}]}`).Body.String())
+	var accepted int
+	for _, ev := range first {
+		if ev["type"] == "TOOL_CALL_RESULT" && ev["content"] == "found" {
+			accepted++
+		}
+	}
+	id := findInterruptID(first)
+	if id == "" || accepted != 1 || calls.Load() != 1 {
+		t.Fatalf("挂起发生在工具结果已经提交后，实际调用 %d 次，事件 %v", calls.Load(), first)
+	}
+	resumed := resumeEntries(t, h, "result-then-model", "resume", resolved(id, "批准"))
+	if outcomeType(resumed) != "success" || calls.Load() != 1 || contains(eventTypes(resumed), "TOOL_CALL_RESULT") {
+		t.Fatalf("续跑应直接完成且不再投递已提交的结果，实际调用 %d 次，事件 %v", calls.Load(), resumed)
+	}
+}
+
+type displayToolResult struct {
+	hook.Hooks
+	hide       bool
+	ask        bool
+	hideReplay bool
+}
+
+func (h displayToolResult) OnToolStart(ctx context.Context, info *hook.AgentInfo, in *schema.ToolInput) (context.Context, error) {
+	display := *in
+	return h.Hooks.OnToolStart(compose_v2.EnterPhase(ctx, "display"), info, &display)
+}
+
+func (h displayToolResult) OnToolEnd(ctx context.Context, info *hook.AgentInfo, out *schema.ToolOutput) (context.Context, error) {
+	replayed, _ := out.Extra[agent_v2.ToolReplayedExtraKey].(bool)
+	if !h.hide && !(replayed && h.hideReplay) {
+		// 前端只看脱敏副本。工具结果本身仍按业务契约交给模型。
+		display, result := *out, *out.Result
+		result.Output = "[redacted]"
+		if h.ask && !replayed {
+			result.Output = "[provisional]"
+		}
+		display.Result = &result
+		if _, err := h.Hooks.OnToolEnd(ctx, info, &display); err != nil {
+			return ctx, err
+		}
+	}
+	if h.ask {
+		_, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "继续处理工具批次？"})
+		return ctx, err
+	}
+	return ctx, nil
+}
+
+type displayedToolModel struct{}
+
+func (displayedToolModel) Generate(_ context.Context, messages []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	for _, message := range messages {
+		if message.Role == schema.RoleTool {
+			if message.Content != "model-only data" {
+				return nil, fmt.Errorf("model received display content: %q", message.Content)
+			}
+			return schema.AssistantMessage("done"), nil
+		}
+	}
+	return schema.AssistantToolCallMessage([]schema.ToolCall{{ID: "lookup", Type: "function",
+		Function: schema.FunctionCall{Name: "lookup", Arguments: `{}`}}}), nil
+}
+
+func (m displayedToolModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	out, err := m.Generate(ctx, in, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.NewSingleChunkReader(out), nil
+}
+
+func (m displayedToolModel) WithTools([]*schema.ToolInfo) (model.ChatModel, error) {
+	return m, nil
+}
+
+func TestToolResult_RespectsDisplayHook(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hook displayToolResult
+	}{
+		{name: "projected"},
+		{name: "hidden", hook: displayToolResult{hide: true}},
+		{name: "projected_after_resume", hook: displayToolResult{ask: true}},
+		{name: "hidden_after_resume", hook: displayToolResult{ask: true, hideReplay: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			h := ownedHandler(func(ui hook.Hooks) agent_v2.Agent {
+				tk := tool.NewToolkit()
+				tk.Register(tool.NewFuncTool("lookup", "查询", nil, func(context.Context, map[string]any) (*tool.Result, error) {
+					calls.Add(1)
+					return tool.Success("model-only data"), nil
+				}))
+				hooks := tc.hook
+				hooks.Hooks = ui
+				return agent_v2.NewBasicAgent(agent_v2.WithName("lookup"), agent_v2.WithToolkit(tk),
+					agent_v2.WithModel(displayedToolModel{}), agent_v2.WithHooks(hooks))
+			}, agui.WithCheckpointer(compose_v2.NewInMemoryCheckpointer()))
+			first := parseSSE(postAGUI(h, `{"threadId":"display-review","runId":"first","messages":[{"role":"user","content":"run"}]}`).Body.String())
+			last := first
+			events := first
+			if tc.hook.ask {
+				id := findInterruptID(first)
+				if id == "" || contains(eventTypes(first), "TOOL_CALL_RESULT") {
+					t.Fatalf("未提交的批次应挂起且不发结果，实际 %v", eventTypes(first))
+				}
+				last = resumeEntries(t, h, "display-review", "resumed", resolved(id, "继续"))
+				events = append(events, last...)
+			}
+			var start string
+			var resultIDs, contents []string
+			for _, ev := range events {
+				switch ev["type"] {
+				case "TOOL_CALL_START":
+					if start != "" {
+						t.Fatal("同一次工具调用重复展示")
+					}
+					start = ev["toolCallId"].(string)
+				case "TOOL_CALL_RESULT":
+					resultIDs = append(resultIDs, ev["toolCallId"].(string))
+					contents = append(contents, ev["content"].(string))
+				}
+			}
+			if start == "" || calls.Load() != 1 || outcomeType(last) != "success" {
+				t.Fatalf("测试应展示并执行一次工具，调用 %q，实际执行 %d 次，事件 %v", start, calls.Load(), eventTypes(events))
+			}
+			wantHidden := tc.hook.hide || tc.hook.hideReplay
+			if wantHidden && len(contents) != 0 || !wantHidden && (len(contents) != 1 || contents[0] != "[redacted]" || resultIDs[0] != start) {
+				t.Fatalf("展示结果应由工具结束钩子决定，调用 %v，内容 %q", resultIDs, contents)
+			}
+		})
+	}
+}
 
 // resultsAcrossApproval 跑一批 [first（只读）, refund（要审批）]：run1 停在审批上，run2 批准续跑。返回每个 toolCallId 在两次
 // run 里收到的 TOOL_CALL_RESULT 内容。

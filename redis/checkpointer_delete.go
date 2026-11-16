@@ -43,7 +43,7 @@ local function check_command(command, ...)
     end
 end
 
-local function delete_subtree()
+local function delete_subtree(legacy_item_prefix)
 local nsidx_key   = KEYS[1]
 local pending_key = KEYS[2]
 local sids_key    = KEYS[3]
@@ -91,6 +91,9 @@ end
 check_command("SCARD", nsidx_key)
 check_command("SREM", sids_key, sid)
 for i, ns in ipairs(matched) do
+    if redis.call("EXISTS", item_key_prefix .. ns) == 0 and redis.call("EXISTS", legacy_item_prefix .. ns) == 1 then
+        error("redis checkpoint requires legacy key migration")
+    end
     check_command("DEL", item_key_prefix .. ns)
     check_command("DEL", meta_key_prefix .. ns)
     check_command("SREM", nsidx_key, ns)
@@ -118,12 +121,13 @@ return deleted
 end
 `
 
+// 独立删除额外以 ARGV[7] 传递旧格式 payload 键前缀。
 var deleteSubtreeScript = redis.NewScript(deleteSubtreeLua + `
 local owner = ARGV[6]
 if owner ~= "" and redis.call("GET", KEYS[4]) ~= owner then
     return -1
 end
-return delete_subtree()
+return delete_subtree(ARGV[7])
 `)
 
 // DeleteSubtree 实现 compose_v2.Checkpointer.DeleteSubtree.
@@ -138,6 +142,7 @@ return delete_subtree()
 // **iter-5-K**: 全 Lua 原子, 不依赖 cjson 解析整 payload.
 func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix string) (int32, error) {
 	keys, args := c.subtreeDeleteArgs(ctx, sessionID, nsPrefix)
+	args = append(args, cpLegacyItemPrefix(c.prefix, sessionID))
 	n, err := deleteSubtreeScript.Run(ctx, c.rdb, keys, args...).Int64()
 	if err != nil {
 		return 0, fmt.Errorf("redis cp DeleteSubtree eval: %w", err)
@@ -158,8 +163,8 @@ func (c *Checkpointer) subtreeDeleteArgs(ctx context.Context, sessionID, nsPrefi
 	args := []any{
 		sessionID,
 		nsPrefix,
-		c.cpItemKeyPrefix(sessionID),
-		cpMetaKeyPrefix(c.prefix, sessionID),
+		cpRecordKeyPrefix(c.prefix, "item", sessionID),
+		cpRecordKeyPrefix(c.prefix, "meta", sessionID),
 	}
 	return keys, append(args, compose_v2.NSSubtreeSeparator(), compose_v2.CheckpointTaskLeaseToken(ctx, c.CheckpointTaskLeases(), sessionID))
 }

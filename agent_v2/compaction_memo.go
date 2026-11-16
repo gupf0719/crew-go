@@ -50,13 +50,11 @@ type compactionMemo struct {
 	Transient bool `json:"transient,omitempty"`
 }
 
-// prefixAnchor 是一段消息的指纹：逐条送给模型的全部内容——角色、身份、正文、推理文本、拒答、内容块（工具调用
-// 的名字与参数、工具结果、图片等）。跨存档往返稳定（不看指针）；插入、删除、换掉、改了其中任何一处都对不上。
+// prefixAnchor 是一段消息的指纹，包含模型接收的消息内容和影响压缩的框架标注。跨存档往返保持稳定。
 //
 // 送给模型的内容逐字都要进指纹，不能只看长度或配对 ID：钩子每轮往前缀里插一条「第 N 轮」这类长度不变的消息、
 // 改历史里某次工具调用的参数（脱敏）、改推理文本时，只比长度会把上一轮的结果套到这一轮上，钩子这一轮的改写
-// 就丢了（实测）。标注不进：它不发给模型，框架自己也会在后续步骤给消息补标注。算一遍是 O(前缀字节数)，每轮
-// 几毫秒，跟一次模型调用比可以忽略。
+// 就丢了。钩子只改了 Skill 正文的保护标注一类框架字段时，也要按这一轮的分组和保护规则重算。
 func prefixAnchor(msgs []*schema.Message) string {
 	h := fnv.New64a()
 	var b strings.Builder
@@ -85,6 +83,7 @@ func prefixAnchor(msgs []*schema.Message) string {
 			writeAnchorField(h, m.Content)
 			writeAnchorField(h, m.ReasoningContent)
 			writeAnchorField(h, m.Refusal)
+			writeCompactionAnnotations(h, m)
 			if len(m.ContentBlocks) > 0 {
 				blocks, err := json.Marshal(m.ContentBlocks)
 				if err != nil {
@@ -97,6 +96,32 @@ func prefixAnchor(msgs []*schema.Message) string {
 		}
 	}
 	return strconv.Itoa(len(msgs)) + ":" + strconv.FormatUint(h.Sum64(), 16)
+}
+
+// writeCompactionAnnotations 只接收压缩链路使用的分组、保护和取回标注。
+func writeCompactionAnnotations(h hash.Hash64, m *schema.Message) {
+	annotations := m.Annotations
+	for _, key := range [...]string{
+		SkillBodyAnnotation, StoreInjectedAnnotation, AutoCompactSummaryAnnotation,
+		MicroCompactClearedAnnotation, MicroCompactOffloadedAnnotation, autoCompactReinjectAnnotation,
+		InterjectionAnnotation, TurnGateFeedbackAnnotation,
+	} {
+		marked, _ := annotations[key].(bool)
+		writeAnchorField(h, strconv.FormatBool(marked))
+	}
+	for _, key := range [...]string{
+		compose_v2.RunIDAnnotationKey, HistoryTaskAnnotation, HistoryAgentAnnotation,
+		MicroCompactOffloadKeyAnnotation, ToolResultSpillAnnotation, toolResultSpillInfoAnnotation, spillIndexAnnotation,
+	} {
+		value, _ := annotations[key].(string)
+		writeAnchorField(h, value)
+	}
+	// 转存预览会标明内容是否截断。按与预览相同的规则读数值，保持存档往返后的指纹一致。
+	truncation := ""
+	if originalBytes, ok := annotationInt(m, TruncatedOriginalBytesAnnotation); ok {
+		truncation = strconv.Itoa(originalBytes)
+	}
+	writeAnchorField(h, truncation)
 }
 
 // writeAnchorField 把一段内容连同它的长度写进指纹：几段内容前后相接时，长度把边界分开（「ab」+「c」与「a」+「bc」

@@ -29,6 +29,7 @@ func Key(thread string) string {
 
 type countedStore struct {
 	agui.SessionStore
+	agui.CancellationPollStore
 	pages atomic.Int64
 }
 
@@ -71,7 +72,11 @@ func Run(t *testing.T, store agui.SessionStore, replicas int, counters func() st
 		}()
 		keys[key] = sid
 	}
-	wrapped := &countedStore{SessionStore: store}
+	coordinator, ok := store.(agui.CancellationPollStore)
+	if !ok {
+		t.Fatal("load test requires shared cancellation poll coordination")
+	}
+	wrapped := &countedStore{SessionStore: store, CancellationPollStore: coordinator}
 	// 预热发现路径，单独报告一次性迁移与周期扫描。
 	warmStart := time.Now()
 	var warmPages int

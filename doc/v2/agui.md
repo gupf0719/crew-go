@@ -62,7 +62,7 @@ adapter（`agui/adapter.go`）一个 struct 同时实现 `hook.Hooks` + `agent_v
 | `OnNodeEvent`（chunk，带 `run_id`） | `TextMessageStart/Content/End`（按 `run_id` 分消息，切换即收尾旧开新） |
 | `OnModelEnd`（Generate 非流式路径） | 补发完整 `TextMessage`——model 不支持 Stream 时无 chunk，最终答案在此不丢。续跑沿用原样的那一遍（`hook.ModelResponseReusedKey`，业务在 `OnModelEnd` 里问人之后）不再发：上一次 run 已经交给前端，再发是同一个 messageId 的第二条——适配层要排在会问人的钩子前面，否则非流式时那次没补发、这一遍也不补 |
 | `OnToolStart`（`CallId`/`Name`/`ArgumentsJSON`） | `ToolCallStart` + `ToolCallArgs` + `ToolCallEnd`（参数非流式，一次性发） |
-| `OnToolEnd`（`Result`） | `ToolCallResult`（沿用 `ToolCallStart` 的 `toolCallId`） |
+| BasicAgent 工具节点提交 · 自研 Agent 的 `OnToolEnd` | `ToolCallResult`（沿用 `ToolCallStart` 的 `toolCallId`） |
 | Run 开始 / 结束 / 出错 | `RunStarted` / `RunFinished` / `RunError` |
 | `InterruptError` | `RunFinished(outcome=interrupt, interrupts=[{id, reason, message, …}])`：工具审批 reason=`tool_call`（带 `toolCallId`、`responseSchema` 与 `metadata.options`），没有工具调用 ID 时 `confirmation`；普通提问默认使用 `input_required` 和字符串响应 schema，可用 `compose_v2.AskQuery.ResponseSchema` 覆盖 schema。框架断点使用 `crew-go:breakpoint` |
 | `EventSink.Send("state_snapshot")` | `StateSnapshot`（业务 opt-in，见 §6） |
@@ -73,6 +73,9 @@ adapter（`agui/adapter.go`）一个 struct 同时实现 `hook.Hooks` + `agent_v
 > 所有权，不重复。
 
 框架为模型答复内的每次工具调用分配实例 ID。`toolCallId` 在参数、结果和审批事件中保持一致，续跑沿用原实例。开始事件、参数和结束事件成功写出后才记录发送状态。客户端把 `toolCallId` 当作不透明值。模型消息中的调用与结果仍用 provider ID 配对。自研 Agent 可以在工具钩子的 `CallId` 中提供自己的唯一标识，并在相关提问中携带同一标识。
+
+BasicAgent 在工具节点写入提交后，按调用声明顺序发送结果。结束钩子改写、批内裁决和输出大小处理后生成事件，失败结果显示错误码。结束钩子挂起或节点写入回滚时，续跑在提交成功后发出结果。
+自定义钩子可以省略向 AG-UI 转发 `OnToolEnd` 来隐藏结果，或转发展示副本来单独替换前端内容。工具历史仍使用定稿结果。
 
 ---
 
@@ -187,14 +190,18 @@ sequenceDiagram
 2. 存储在同一操作中删除原任务的存档子树并记录清档进度。若该任务有根历史，框架在原分区补齐尚无结果的工具调用。历史后端故障或缺少配置时会保留关闭记录供重试。
 3. 历史收尾成功后，存储在两把租约的保护下移除会话记录。持久历史与存档可使用不同后端，重试会跳过已有结果的调用。
 
-共享 Handler 启动时竞争存储域的轮询租约，由一个实例分页读取待清理索引。每轮结束后间隔五秒再检查。
-最多并发补偿四项，每项仍在会话与任务的双租约下推进。单项失败后继续本轮，轮结束时让其他实例接手。原实例等待两个轮询间隔再竞争租约。
+共享 Handler 启动时申请存储域的轮询租约，获准后分页读取待清理索引。轮询租约独立于任务 ID，五秒到期，期间无续约。
+每个实例最多并发补偿四项，扫描下一页或下一轮可以沿用空闲名额。单项失败或长期未返回时，本实例让出一个轮询间隔。
+后台补偿先构造工厂，再在会话租约内核对原任务和工作流版本，随后申请任务放弃许可。
+其他实例可以在当前轮询租约到期后接手，已替换的任务按当前会话记录处理。
+自定义共享后端可实现 `agui.CancellationPollStore` 协调扫描，各实例也可独立发现候选并使用会话与任务租约协调清理。
 即使重启后没有 HTTP 请求，新实例也能在旧租约到期和后端恢复后继续删档、收尾。普通挂起审批保持可续。
 SQL 和 Redis 在写入取消意图、推进清理或删除会话时同时维护索引。周期轮询只读索引，在会话租约下以原记录为准。
-升级时先停止同一存储域的旧版写入者，再启动新版实例。SQL 重新运行 `AGUISessionStore.Setup` 创建索引表并导入旧记录。
+升级时先停止同一存储域的旧版写入者，再启动新版实例。SQL 重新运行 `AGUISessionStore.Setup` 创建索引和轮询租约表，并导入旧记录。
 Redis 第一次轮询时分页导入旧记录。导入完成后持久保存标记，正常重启不重复扫描。Redis 的会话、存档和索引应使用不会逐出持久键的存储配置。
 
-关闭期间续答返回 HTTP 409 `cleanup_pending`。同一取消批次可重试，挂起查询和同线程新 Run 也可参与补偿。
+关闭期间续答返回 HTTP 409 `cleanup_pending`。同一取消批次可重试。挂起查询和同线程新 Run 可在会话租约外构造原工厂后参与补偿。
+如果准备补偿期间其他实例已替换任务，挂起查询读取当前开放的问题，新 Run 返回 HTTP 409 `busy`，由调用方决定是否再次提交。
 如果保留的原工作流工厂不可用，后台保留进度，相关请求返回 `workflow_version_unavailable`。提供原版本后恢复。
 应用若只在 HTTP 中间件注入 HistoryStore，使用 `agui.WithCancellationHistory` 让补偿按已保存的 `HistoryKey` 取得相同逻辑存储。
 回调使用服务凭据。工厂自身提供 HistoryStore 时可直接使用该配置。后台补偿不会重新执行模型或工具。

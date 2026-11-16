@@ -327,7 +327,102 @@ type compactCut struct {
 	tailLen  int               // 输出：真做了一次摘要时尾部原样保留的条数（输入的后缀），否则保持 -1
 }
 
-const autoCompactAsked = "auto_compact_asked"
+const (
+	autoCompactPhase       = "auto_compact"
+	autoCompactAsked       = "auto_compact_asked"
+	autoCompactLegacyPhase = "auto_compact_legacy_phase"
+
+	// 这个存档版本的 BasicAgent 内置摘要按调用次序开相位，并在旧相位保存提问记录。
+	legacyBuiltInAutoCompactCheckpointVersion = 19
+
+	// v21 及以前的存档可能由使用固定相位的公开入口写出。
+	lastFixedPublicAutoCompactCheckpointVersion = 21
+)
+
+type builtInAutoCompactQuestionKey struct{}
+
+func (builtInAutoCompactQuestionKey) ExecutionState() {}
+
+func mayRestoreFixedPublicAutoCompact(ctx context.Context) bool {
+	version := compose_v2.RestoredCheckpointVersion(ctx)
+	return version > 0 && version <= lastFixedPublicAutoCompactCheckpointVersion
+}
+
+// withBuiltInAutoCompactQuestion 在进入模型钩子前，从内置相位核对它保存的待答问题。
+// 钩子里的公开摘要打开旧相位时算出的 ID 可能相同；内置摘要的问题由自己的记录认领。
+func withBuiltInAutoCompactQuestion(ctx context.Context) context.Context {
+	if !mayRestoreFixedPublicAutoCompact(ctx) {
+		return ctx
+	}
+	phase := compose_v2.EnterPhase(ctx, autoCompactPhase)
+	id, _ := compose_v2.RestoredPhaseQuestion(phase)
+	if id == "" {
+		return ctx
+	}
+	state := compose_v2.WithNodeStateSealed(phase, autoCompactAsked)
+	if asked, _ := compose_v2.GetStepResult[bool](state, autoCompactAsked); asked {
+		return context.WithValue(ctx, builtInAutoCompactQuestionKey{}, id)
+	}
+	return ctx
+}
+
+func rememberAutoCompactPhase(ctx context.Context) error {
+	return compose_v2.SaveStepResult(ctx, autoCompactLegacyPhase, true, compose_v2.Rerunnable(), compose_v2.WithStreams(nil))
+}
+
+func openBuiltInAutoCompactPhase(ctx context.Context, phaseKey string) (context.Context, error) {
+	fixed := compose_v2.EnterPhase(ctx, autoCompactPhase)
+	state := compose_v2.WithNodeStateSealed(fixed, autoCompactLegacyPhase)
+	useLegacy, _ := compose_v2.GetStepResult[bool](state, autoCompactLegacyPhase)
+	// 版本 19 曾给内置摘要分配动态相位。该节点的第一处内置摘要会在旧相位留下提问记录。
+	// 同名的动态相位在新存档里可能属于调用方自行调用的摘要。
+	if !useLegacy && compose_v2.RestoredCheckpointVersion(ctx) == legacyBuiltInAutoCompactCheckpointVersion {
+		prior := compose_v2.EnterPhase(ctx, identityString(phaseKey, "0"))
+		useLegacy, _ = compose_v2.GetStepResult[bool](compose_v2.WithNodeStateSealed(prior, autoCompactAsked), autoCompactAsked)
+		if useLegacy {
+			if err := rememberAutoCompactPhase(state); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if !useLegacy {
+		return fixed, nil
+	}
+	index := compose_v2.NextSubCallIndex(ctx, phaseKey)
+	return compose_v2.EnterPhase(ctx, identityString(phaseKey, strconv.Itoa(index))), nil
+}
+
+func openPublicAutoCompactPhase(ctx context.Context, phaseKey string) (phase context.Context, replaying bool, remember func(error) error) {
+	// 跳过的调用也保留次序，后续摘要的提问位置才稳定。
+	index := compose_v2.NextSubCallIndex(ctx, phaseKey)
+	phase = compose_v2.EnterPhase(ctx, identityString(phaseKey, strconv.Itoa(index)))
+	state := compose_v2.WithNodeStateSealed(phase, autoCompactLegacyPhase)
+	if saved, _ := compose_v2.GetStepResult[bool](state, autoCompactLegacyPhase); saved {
+		return compose_v2.EnterPhase(ctx, autoCompactPhase), true, nil
+	}
+	if !mayRestoreFixedPublicAutoCompact(ctx) {
+		return phase, false, nil
+	}
+	// 较早的公开入口使用固定相位。只有本图恢复的存档仍在等待这个相位时，才沿用它。
+	legacy := compose_v2.EnterPhase(ctx, autoCompactPhase)
+	id, answered := compose_v2.RestoredPhaseQuestion(legacy)
+	builtInID, _ := ctx.Value(builtInAutoCompactQuestionKey{}).(string)
+	if id == "" || id == builtInID {
+		return phase, false, nil
+	}
+	return legacy, true, func(err error) error {
+		// 接到旧答复，或再次交出同一问题的调用，才能在当前存档中认领旧相位。
+		if answered() {
+			return rememberAutoCompactPhase(state)
+		}
+		if interrupted, ok := compose_v2.IsInterrupt(err); ok && slices.ContainsFunc(interrupted.AllQueries(), func(q *compose_v2.AskQuery) bool {
+			return q != nil && q.InterruptID == id
+		}) {
+			return rememberAutoCompactPhase(state)
+		}
+		return nil
+	}
+}
 
 // autoCompactRun 是 [AutoCompactRun] 的本体。cut 非 nil 时按它处理上一次的压缩结果，并在**真做了一次
 // 摘要**（输出里有新的摘要消息）时写 cut.tailLen；其余所有出口（没触发、跳过、失败）都不写。
@@ -358,19 +453,21 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		defer cfg.breakers.release(sessionID, entry)
 	}
 
-	// BasicAgent 每次执行 model 节点只做一次内置摘要，沿用已有挂起问题的相位。
-	phase := "auto_compact"
+	phaseKey := identityString(autoCompactPhase, compose_v2.SubCallScope(ctx))
+	var phaseCtx context.Context
+	var asked bool
+	var rememberPhase func(error) error
 	if cut == nil {
-		// 公开入口可能在同一节点调用多次，按调用方相位和调用次序寻址。跳过压缩时也保留位置。
-		phaseKey := identityString(phase, compose_v2.SubCallScope(ctx))
-		index := compose_v2.NextSubCallIndex(ctx, phaseKey)
-		phase = identityString(phaseKey, strconv.Itoa(index))
+		phaseCtx, asked, rememberPhase = openPublicAutoCompactPhase(ctx, phaseKey)
+	} else {
+		phaseCtx, err = openBuiltInAutoCompactPhase(ctx, phaseKey)
+		if err != nil {
+			return messages, fmt.Errorf("auto compact: restore summary phase: %w", err)
+		}
 	}
-	phaseCtx := compose_v2.EnterPhase(ctx, phase)
 	stateCtx := compose_v2.WithNodeStateSealed(phaseCtx, autoCompactAsked)
 
-	var asked bool
-	if entry != nil && !entry.breaker.WouldAllow() {
+	if entry != nil && !asked && !entry.breaker.WouldAllow() {
 		// 摘要已经向用户提出的问题属于当前节点。兄弟分支触发熔断后，当前节点仍须把答复交给摘要。
 		asked, _ = compose_v2.GetStepResult[bool](stateCtx, autoCompactAsked)
 		if !asked {
@@ -630,6 +727,11 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		return messages, err
 	}
 	resp, err := cfg.Model.Generate(compose_v2.WithAddressedResumeOnly(phaseCtx), callInput)
+	if rememberPhase != nil {
+		if saveErr := rememberPhase(err); saveErr != nil {
+			err = fmt.Errorf("auto compact: remember summary phase: %w", errors.Join(err, saveErr))
+		}
+	}
 	if hasEventSink(ctx) {
 		generateAction := &CompactionGenerateAction{
 			Attempt:  1,

@@ -37,7 +37,7 @@ func TestSaveNS_Writes_Meta_Hash_All_Fields(t *testing.T) {
 	}
 
 	// 直接 HGETALL 验 meta hash 3 字段
-	metaKey := "crew:cp:meta:sid_test:ns_test"
+	metaKey := "crew:cp:meta-v2:c2lkX3Rlc3Q:ns_test"
 	meta, err := rdb.HGetAll(ctx, metaKey).Result()
 	if err != nil {
 		t.Fatalf("HGETALL meta: %v", err)
@@ -81,7 +81,7 @@ func TestDeleteSubtree_Removes_Meta_Hash(t *testing.T) {
 		t.Fatalf("SaveNS: %v", err)
 	}
 
-	metaKey := "crew:cp:meta:sid_d:ns_d"
+	metaKey := "crew:cp:meta-v2:c2lkX2Q:ns_d"
 
 	// 删前 meta 存在
 	if n, _ := rdb.Exists(ctx, metaKey).Result(); n != 1 {

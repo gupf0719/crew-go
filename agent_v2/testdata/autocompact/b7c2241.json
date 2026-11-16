@@ -1,0 +1,23 @@
+{
+  "first_answer_id": "d412c767264c6e16",
+  "checkpoint": {
+    "id": "legacy-public-auto-compact",
+    "status": 1,
+    "schema_ver": 21,
+    "graph_id": "legacy_public_auto_compact",
+    "task_id": "66e47e0a31dbef85",
+    "pending_interrupts": [
+      {
+        "question": "accept previous history?",
+        "interrupt_id": "8bf4da97a0ef11ef"
+      }
+    ],
+    "current_frontier": [
+      {
+        "node_id": "model"
+      }
+    ],
+    "frontier_started": true,
+    "completed_write_owners": null
+  }
+}

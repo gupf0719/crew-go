@@ -559,6 +559,7 @@ type resumeCtxKey struct{}
 type resumeDelivery struct {
 	context       *ResumeContext
 	addressedOnly bool
+	restored      *restoredResume
 }
 
 func resumeDeliveryFrom(ctx context.Context) resumeDelivery {

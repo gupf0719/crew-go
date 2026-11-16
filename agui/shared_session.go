@@ -26,17 +26,19 @@ type SessionRecord struct {
 	Closing         bool                       `json:"closing,omitempty"`
 	Cancellation    *SessionCancellation       `json:"cancellation,omitempty"`
 	HistoryKey      agent_v2.HistoryKey        `json:"history_key,omitzero"`
+	HistorySource   agent_v2.TaskHistorySource `json:"history_source,omitempty"`
 	ModelData       string                     `json:"model_data,omitempty"`
 	Answers         map[string]*schema.Message `json:"answers,omitempty"`
 }
 
-// SessionCancellation 保存已接受的取消批次、请求身份与历史归属。清理成功前随原 TaskID 保留。
+// SessionCancellation 保存已接受的取消或替换、请求身份与历史归属。清理成功前随原 TaskID 保留。
 type SessionCancellation struct {
 	Owner              string               `json:"owner,omitempty"`
 	ThreadID           string               `json:"thread_id,omitempty"`
 	InterruptIDs       []string             `json:"interrupt_ids"`
 	HistoryKey         *agent_v2.HistoryKey `json:"history_key,omitempty"`
 	CheckpointsDeleted bool                 `json:"checkpoints_deleted,omitempty"`
+	Replacement        bool                 `json:"replacement,omitempty"`
 }
 
 // SessionStore 在同一共享后端保存会话记录、任务租约及图存档。key 由 Handler 生成，代表
@@ -84,9 +86,10 @@ func (sharedSessionKey) ExecutionState() {}
 
 // sharedSession 只在持有会话租约的执行范围内使用。
 type sharedSession struct {
-	store  SessionStore
-	key    string
-	record *SessionRecord
+	store              SessionStore
+	key                string
+	record             *SessionRecord
+	settledReplacement string // 本次请求完成收尾的旧任务，供新 Run 进场复核。
 }
 
 const sharedSessionPrefix = "agui-thread:"
@@ -184,14 +187,15 @@ func (s *sharedSession) session() *agent_v2.RunSession {
 func (s *sharedSession) bindHistory(ctx context.Context) context.Context {
 	sid, key := s.record.TaskID, s.record.HistoryKey
 	if key != (agent_v2.HistoryKey{}) {
-		return agent_v2.WithTaskHistoryBinding(ctx, sid, key, nil)
+		return agent_v2.WithTaskHistoryBinding(ctx, sid, agent_v2.TaskHistoryDestination{Key: key}, nil)
 	}
-	return agent_v2.WithTaskHistoryBinding(ctx, sid, key, func(ctx context.Context, key agent_v2.HistoryKey) error {
+	return agent_v2.WithTaskHistoryBinding(ctx, sid, agent_v2.TaskHistoryDestination{}, func(ctx context.Context, destination agent_v2.TaskHistoryDestination) error {
 		if s.record == nil || s.record.TaskID != sid || s.record.Closing {
 			return errPendingChanged
 		}
 		next := *s.record
-		next.HistoryKey = key
+		next.HistoryKey = destination.Key
+		next.HistorySource = destination.Source
 		return s.save(ctx, &next, "")
 	})
 }
@@ -216,13 +220,20 @@ func (s *sharedSession) pending(ctx context.Context) (interruptBatch, error) {
 }
 
 var (
-	errAnswerAccepted      = errors.New("a different answer has already been accepted for an interrupt")
-	errPendingChanged      = errors.New("pending interrupts advanced before the task could be discarded")
-	errWorkflowUnavailable = errors.New("the task's workflow version is not available on this instance")
+	errAnswerAccepted          = errors.New("a different answer has already been accepted for an interrupt")
+	errPendingChanged          = errors.New("pending interrupts advanced before the task could be discarded")
+	errWorkflowUnavailable     = errors.New("the task's workflow version is not available on this instance")
+	errHistoryResolverRequired = errors.New("a resolver is required for the task's original history store")
 )
 
+type sharedCancellationRequest struct {
+	entries     []ResumeEntry
+	epoch       string
+	replacement bool
+}
+
 // cancelSharedSession 由会话租约保护，Abort 回调中的变更还持有旧任务的放弃许可。
-func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agent, entries []ResumeEntry, epoch string,
+func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agent, request sharedCancellationRequest,
 	resolveHistory func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error),
 	options ...agent_v2.ResumeOption,
 ) error {
@@ -233,6 +244,13 @@ func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agen
 	} else if key := s.record.HistoryKey; key != (agent_v2.HistoryKey{}) {
 		opts = append(opts, agent_v2.WithResumeAbortHistoryKey(&key))
 	}
+	if request.replacement || s.record.Cancellation != nil && s.record.Cancellation.Replacement {
+		// 中间件提供的存储会覆盖 Agent 配置。未知来源的旧记录也需要宿主定位原存储。
+		if resolveHistory == nil && s.record.HistorySource != agent_v2.TaskHistoryAgent {
+			return errHistoryResolverRequired
+		}
+		opts = append(opts, agent_v2.WithResumeAbortAgentHistory())
+	}
 	if resolveHistory != nil {
 		opts = append(opts, agent_v2.WithResumeAbortHistoryStore(resolveHistory))
 	}
@@ -241,23 +259,31 @@ func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agen
 			return 0, errors.New("agui: shared abort requires the root of the current task")
 		}
 		if s.record.Cancellation == nil {
-			batch, err := s.pending(ctx)
-			if err != nil {
-				return 0, err
-			}
-			if len(batch.open) == 0 || batch.epoch != epoch || coverageProblem(entries, batch.open) != "" {
-				return 0, errPendingChanged
+			if !request.replacement {
+				batch, err := s.pending(ctx)
+				if err != nil {
+					return 0, err
+				}
+				if len(batch.open) == 0 || batch.epoch != request.epoch || coverageProblem(request.entries, batch.open) != "" {
+					return 0, errPendingChanged
+				}
 			}
 			next := *s.record
 			next.Closing = true
 			next.Cancellation = &SessionCancellation{
 				Owner: compose_v2.GetOwner(ctx), ThreadID: compose_v2.GetThreadID(ctx),
-				HistoryKey: key, InterruptIDs: make([]string, len(entries)),
+				HistoryKey: key, InterruptIDs: make([]string, len(request.entries)),
+				Replacement: request.replacement,
 			}
-			for i, e := range entries {
+			for i, e := range request.entries {
 				next.Cancellation.InterruptIDs[i] = e.InterruptID
 			}
 			next.Prior, next.Answers, next.ModelData = nil, nil, ""
+			if request.replacement {
+				// 删除失败时原任务仍可续跑。删除成功后保留历史收尾进度，禁止回复原问题。
+				next.Cancellation.CheckpointsDeleted = true
+				return s.write(ctx, &next, sid)
+			}
 			if _, err := s.write(ctx, &next, ""); err != nil {
 				return 0, err
 			}
@@ -288,7 +314,7 @@ func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agen
 }
 
 // openSharedSessionAfterCancellation 让新 Run 和查询协助已接受的取消。
-// 工厂构造释放会话租约，重新取得租约后只处理原任务。新 Run 遇到接管产生的新任务时请调用方重试。
+// 工厂构造释放会话租约，重新取得租约后只处理原任务。原记录已变化时，新 Run 交由调用方重试。
 func (h *handler) openSharedSessionAfterCancellation(ctx context.Context, key sessionKey, beforeRun bool) (context.Context, *compose_v2.TaskActivity, error) {
 	locked, activity, err := h.openSharedSession(ctx, key)
 	if err != nil {
@@ -317,18 +343,58 @@ func (h *handler) openSharedSessionAfterCancellation(ctx context.Context, key se
 	s := sharedSessionFrom(locked)
 	switch {
 	case s.record == nil:
+		// 别的实例可能已接管、启动并完成替换任务，空记录无法证明线程在这段时间没有推进。
+		if beforeRun {
+			return locked, nil, compose_v2.ErrTaskBusy
+		}
 	case sameCancellationTask(s.record, candidate):
 		if buildErr != nil {
 			return locked, nil, buildErr
 		}
-		if err := cancelSharedSession(locked, s, ag, nil, "", h.cancellationHistory); err != nil {
+		if err := cancelSharedSession(locked, s, ag, sharedCancellationRequest{}, h.cancellationHistory); err != nil {
 			return locked, nil, err
+		}
+		if beforeRun && candidate.Cancellation.Replacement {
+			s.settledReplacement = candidate.TaskID
 		}
 	case beforeRun || s.record.Cancellation != nil:
 		return locked, nil, compose_v2.ErrTaskBusy
 	}
 	opened = true
 	return locked, activity, nil
+}
+
+// openSharedRunSession 为有历史的旧任务准备原工厂。工厂可以阻塞，释放会话
+// 租约后必须确认仍是准备处理的任务，才能执行替换。
+func (h *handler) openSharedRunSession(ctx context.Context, key sessionKey) (context.Context, *compose_v2.TaskActivity, agent_v2.Agent, error) {
+	locked, activity, err := h.openSharedSessionAfterCancellation(ctx, key, true)
+	if err != nil {
+		return locked, nil, nil, err
+	}
+	candidate := sharedSessionFrom(locked).record
+	if candidate == nil || candidate.HistoryKey == (agent_v2.HistoryKey{}) {
+		return locked, activity, nil, nil
+	}
+	activity.Release()
+	ag, buildErr := h.buildCancellationAgent(candidate.WorkflowVersion)
+	if err := ctx.Err(); err != nil {
+		return ctx, nil, nil, err
+	}
+	locked, activity, err = h.openSharedSession(ctx, key)
+	if err != nil {
+		return locked, nil, nil, err
+	}
+	current := sharedSessionFrom(locked).record
+	if current == nil || current.TaskID != candidate.TaskID || current.WorkflowVersion != candidate.WorkflowVersion ||
+		current.Cancellation != nil || current.HistoryKey != candidate.HistoryKey || current.HistorySource != candidate.HistorySource {
+		activity.Release()
+		return locked, nil, nil, compose_v2.ErrTaskBusy
+	}
+	if buildErr != nil {
+		activity.Release()
+		return locked, nil, nil, buildErr
+	}
+	return locked, activity, ag, nil
 }
 
 func sameCancellationTask(record, candidate *SessionRecord) bool {

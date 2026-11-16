@@ -134,34 +134,51 @@ func TestServeRun_RetainsPendingTaskWhenCheckpointCleanupIsBusy(t *testing.T) {
 }
 
 func TestServeRun_DoesNotRestoreEntryDeletedBeforeTaskConflict(t *testing.T) {
-	h, cp, hasCP := ttlFixture(t, 0)
-	key := sessionKey{owner: "o", threadID: "late-conflict"}
-	sid := seedPending(t, h, cp, key, 0)
-	h.build = func(hooks hook.Hooks) agent_v2.Agent {
-		return &beforeReplacementRun{
-			Agent: agent_v2.NewBasicAgent(agent_v2.WithName("busy-replace"), agent_v2.WithModel(&capModel{}), agent_v2.WithHooks(hooks)),
-			before: func() {
-				if hasCP(sid) {
-					t.Fatal("开始新 Run 前应已删掉旧存档")
-				}
-				_, activity, err := compose_v2.BeginTaskActivity(t.Context(), sid, nil)
-				if err != nil {
+	for _, retry := range []bool{false, true} {
+		name := "initial_replacement"
+		if retry {
+			name = "replacement_history_retry"
+		}
+		t.Run(name, func(t *testing.T) {
+			h, cp, hasCP := ttlFixture(t, 0)
+			key := sessionKey{owner: "o", threadID: "late-conflict"}
+			sid := seedPending(t, h, cp, key, 0)
+			if retry {
+				ctx := compose_v2.WithCheckpointerCtx(t.Context(), cp)
+				if err := h.dropCP(ctx, sid); err != nil {
 					t.Fatal(err)
 				}
-				t.Cleanup(activity.Release)
-			},
-		}
-	}
-	w := httptest.NewRecorder()
-	sse, ok := NewSSEWriter(w)
-	if !ok {
-		t.Fatal("测试需要支持 SSE 的 ResponseWriter")
-	}
-	ctx := compose_v2.WithCheckpointerCtx(t.Context(), cp)
-	h.serveRun(ctx, sse, &RunAgentInput{ThreadID: key.threadID,
-		Messages: []AGUIMessage{{Role: "user", Content: "开新任务"}}}, key)
-	if !strings.Contains(w.Body.String(), `"code":"busy"`) || h.sessions[key] != nil {
-		t.Fatalf("删档后的任务冲突应报 busy，旧入口应移除，实际 %s", w.Body.String())
+				entry := h.sessions[key]
+				entry.abortCtx = ctx
+				entry.replacementHistoryPending = true
+			}
+			h.build = func(hooks hook.Hooks) agent_v2.Agent {
+				return &beforeReplacementRun{
+					Agent: agent_v2.NewBasicAgent(agent_v2.WithName("busy-replace"), agent_v2.WithModel(&capModel{}), agent_v2.WithHooks(hooks)),
+					before: func() {
+						if hasCP(sid) {
+							t.Fatal("开始新 Run 前应已删掉旧存档")
+						}
+						_, activity, err := compose_v2.BeginTaskActivity(t.Context(), sid, nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						t.Cleanup(activity.Release)
+					},
+				}
+			}
+			w := httptest.NewRecorder()
+			sse, ok := NewSSEWriter(w)
+			if !ok {
+				t.Fatal("测试需要支持 SSE 的 ResponseWriter")
+			}
+			ctx := compose_v2.WithCheckpointerCtx(t.Context(), cp)
+			h.serveRun(ctx, sse, &RunAgentInput{ThreadID: key.threadID,
+				Messages: []AGUIMessage{{Role: "user", Content: "开新任务"}}}, key)
+			if !strings.Contains(w.Body.String(), `"code":"busy"`) || h.sessions[key] != nil {
+				t.Fatalf("删档后的任务冲突应报 busy，旧入口应移除，实际 %s", w.Body.String())
+			}
+		})
 	}
 }
 

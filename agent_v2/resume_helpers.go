@@ -24,6 +24,30 @@ type resumePrep struct {
 	activity  *compose_v2.TaskActivity // 续跑时由入口 defer 释放，覆盖历史写入器收尾
 }
 
+// resolveAbortHistoryStore 取得已确定历史分区对应的后端。
+func resolveAbortHistoryStore(ctx context.Context, key HistoryKey, cfg resumeConfig, hc *historyConfig, subs []Agent) (HistoryStore, error) {
+	if cfg.abortHistoryStore != nil {
+		store, err := cfg.abortHistoryStore(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if !isFrameworkNil(store) {
+			return store, nil
+		}
+	} else {
+		switch {
+		case cfg.abortAgentHistory:
+			hc, _ = borrowHistoryConfig(subs) // 缺失或不一致时拒绝使用其他来源。
+		case cfg.useAbortHistoryKey:
+			hc = resolveHistoryConfigForAbort(ctx, subs)
+		}
+		if hc != nil && !isFrameworkNil(hc.store) {
+			return hc.store, nil
+		}
+	}
+	return nil, errors.New("abort history store is unavailable")
+}
+
 // commonResumePrep 抽取 9 编排 Resume 共享 boilerplate (audit #5 阶段 1 补审 MED-2 fix).
 //
 // **处理范围**:
@@ -178,6 +202,14 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 				}
 			}
 		}
+		var historyStore HistoryStore
+		if historyKey != nil && rcfg.abortAgentHistory {
+			// 替换需要确认旧目标的后端，确认失败时原任务继续可答。
+			historyStore, err = resolveAbortHistoryStore(ctx, *historyKey, rcfg, hc, subs)
+			if err != nil {
+				return nil, ctx, fmt.Errorf("%s %q: resolve abort history store (sid=%q): %w", agentTypeName, agentName, sessionID, err)
+			}
+		}
 		// 先删档，成功后才为悬空工具调用补写放弃结果。
 		delStart := time.Now()
 		var delCount int32
@@ -194,25 +226,14 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 			return nil, ctx, fmt.Errorf("%s %q: abort cleanup (sid=%q ns=%q): %w", agentTypeName, agentName, sessionID, ns, dErr)
 		}
 		if historyKey != nil {
-			// 已固定历史归属的取消可以先落盘并清档，历史后端不可用时保留进度。
-			var store HistoryStore
-			if rcfg.abortHistoryStore != nil {
-				store, err = rcfg.abortHistoryStore(ctx, *historyKey)
+			if historyStore == nil {
+				// 显式取消先落盘并清档，随后解析后端。失败时宿主保留进度供补偿。
+				historyStore, err = resolveAbortHistoryStore(ctx, *historyKey, rcfg, hc, subs)
 				if err != nil {
 					return nil, ctx, fmt.Errorf("%s %q: resolve abort history store (sid=%q): %w", agentTypeName, agentName, sessionID, err)
 				}
-			} else {
-				if rcfg.useAbortHistoryKey {
-					hc = resolveHistoryConfigForAbort(ctx, subs)
-				}
-				if hc != nil {
-					store = hc.store
-				}
 			}
-			if isFrameworkNil(store) {
-				return nil, ctx, fmt.Errorf("%s %q: abort history store is unavailable (sid=%q)", agentTypeName, agentName, sessionID)
-			}
-			if err := closeUnansweredToolCalls(ctx, store, *historyKey, sessionID); err != nil {
+			if err := CloseAbandonedTaskHistory(ctx, TaskHistoryDestination{Key: *historyKey, Store: historyStore}, sessionID); err != nil {
 				if rcfg.abortFinalize != nil || errors.Is(err, compose_v2.ErrTaskLeaseLost) {
 					return nil, ctx, fmt.Errorf("%s %q: abort history (sid=%q): %w", agentTypeName, agentName, sessionID, err)
 				}

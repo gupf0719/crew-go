@@ -59,7 +59,6 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"iter"
 	"log/slog"
 	"sync"
@@ -68,6 +67,7 @@ import (
 	"crew-go/a2a"
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/internal/runoutcome"
 	"crew-go/observability"
 	"crew-go/schema"
 
@@ -264,9 +264,9 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 
 		// 续发（客户端带已存 task 的 taskID）→ Resume 挂起的 run
 		if execCtx.StoredTask != nil {
-			st, err := e.acquire(tkey)
-			if err != nil {
-				yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed, agentMsg(err.Error())), nil)
+			st, kind := e.acquire(tkey)
+			if st == nil {
+				yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed, failureMessage(kind)), nil)
 				return
 			}
 			// 按挂起提问校验答复（见 answers.go）：认不出的审批答复、挂多问时没按 interruptId 作答，都不调 Resume，
@@ -513,24 +513,24 @@ func (e *Executor) runStreaming(
 		return yield(a2atypes.NewArtifactUpdateEvent(execCtx, art.id, a2atypes.NewTextPart(p.text)), nil)
 	}
 
-	// abandon：客户端断开 / 父 ctx 取消——停收 chunk + cancel agent + 等 goroutine 退出，
-	// 仍走 conclude 把 cp/映射落到一致态（前端收不到，但服务端状态不悬空——修 audit MED）。
-	abandon := func() {
+	// 消费方结束迭代后只做本地收尾，避免再次调用已返回 false 的 yield。
+	discardEvent := func(a2atypes.Event, error) bool { return false }
+	abandon := func(send func(a2atypes.Event, error) bool) {
 		close(fw.stop)
 		cancel()
 		r := <-done
-		e.conclude(ctx, execCtx, yield, st, r, srvSpan)
+		e.conclude(runCtx, execCtx, send, st, r, srvSpan)
 	}
 
 	for {
 		select {
 		case c := <-fw.ch:
 			if !emit(c) {
-				abandon()
+				abandon(discardEvent)
 				return
 			}
 		case <-ctx.Done():
-			abandon()
+			abandon(yield)
 			return
 		case r := <-done:
 			// run 已结束不再有新 send——清掉缓冲里残留的 chunk 再发终态
@@ -539,7 +539,7 @@ func (e *Executor) runStreaming(
 				case c := <-fw.ch:
 					if !emit(c) {
 						close(fw.stop)
-						e.conclude(ctx, execCtx, yield, st, r, srvSpan)
+						e.conclude(runCtx, execCtx, discardEvent, st, r, srvSpan)
 						return
 					}
 				default:
@@ -547,7 +547,7 @@ func (e *Executor) runStreaming(
 				}
 			}
 			close(fw.stop)
-			e.conclude(ctx, execCtx, yield, st, r, srvSpan)
+			e.conclude(runCtx, execCtx, yield, st, r, srvSpan)
 			return
 		}
 	}
@@ -574,26 +574,15 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 
 	// owner 在 Execute 入口已 push 进 ctx——conclude 恒跑在那条 ctx 链下游。
 	tkey := taskKey{owner: compose_v2.GetOwner(ctx), taskID: execCtx.TaskID}
-	ie, isInterrupt := compose_v2.IsInterrupt(r.err)
-	var qs []*compose_v2.AskQuery
-	if isInterrupt {
-		qs = ie.AllQueries()
-	}
+	kind, interrupt := runoutcome.Classify(ctx, r.err)
 
 	// 一把锁内决定转移：再中断（有 query）→ 留条目等续发；否则（完成/失败/取消/空中断）→ 清条目。
 	e.mu.Lock()
 	canceled := st.canceled
-	// **陈旧写回 / 身份冲突 / 档没写成不能留条目等续发**：这次的结果没落盘，槽里是另一个执行者（或另一张图）
-	// 的档、或者没有档，客户端续发时载入的是别人的状态或更早那份，于是重新问一遍已经答过的问题（实测客户端
-	// 侧表现为"一直在问同一个问题"，不收敛）。引擎出口写档失败时返 `ErrCheckpointNotPersisted`、中断不在
-	// 链上，本来就不满足 isInterrupt；这里仍先排除，是防自研 agent 把它们跟中断绑在一条链上交过来。
-	stale := errors.Is(r.err, compose_v2.ErrCheckpointStale)
-	notResumable := errors.Is(r.err, compose_v2.ErrCheckpointNotResumable)
-	graphConflict := errors.Is(r.err, compose_v2.ErrGraphIDConflict)
-	notPersisted := errors.Is(r.err, compose_v2.ErrCheckpointNotPersisted)
-	keepPending := !canceled && !stale && !graphConflict && !notPersisted && isInterrupt && len(qs) > 0
+	// 只有合法中断能保留应答入口。存档错误与终局失败由统一判定排在中断前。
+	keepPending := !canceled && kind == runoutcome.Interrupted
 	if keepPending {
-		st.pending = qs
+		st.pending = interrupt.AllQueries()
 		st.busy = false
 		st.cancelRun = nil
 	} else if !canceled {
@@ -613,63 +602,38 @@ func (e *Executor) conclude(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		return
 	}
 
-	if r.err != nil {
-		if keepPending {
-			spanStatus = observability.OutcomeBlocked // 远程要更多输入，非错误（中间态）
-			// HITL：问题（多 query 编号合并）作 input-required 的 status message
-			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateInputRequired, pendingMessage(qs, "")), nil)
+	if keepPending {
+		spanStatus = observability.OutcomeBlocked
+		yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateInputRequired,
+			pendingMessage(interrupt.AllQueries(), "")), nil)
+		return
+	}
+
+	if kind != runoutcome.Success {
+		// 存档异常可能涉及诊断现场或别人的档。其余无法经协议续发的失败只清本任务自己的档。
+		switch kind {
+		case runoutcome.CheckpointStale, runoutcome.CheckpointNotResumable,
+			runoutcome.GraphIDConflict, runoutcome.CheckpointSaveFailed:
+		default:
+			if compose_v2.LeavesResumableCheckpoint(r.err) && !taskMayBeBusy(r.err, st.sess.RunID) {
+				e.discardFailed(ctx, st.sess.RunID)
+			}
+		}
+		if kind == runoutcome.Canceled {
+			spanStatus = observability.OutcomeCancelled
+			slog.DebugContext(ctx, "a2a server: agent 执行取消", "err", r.err)
+			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateCanceled, nil), nil)
 			return
 		}
-		if compose_v2.LeavesResumableCheckpoint(r.err) && !stale && !notResumable && !graphConflict && !notPersisted &&
-			!errors.Is(r.err, compose_v2.ErrTaskLeaseLost) && !taskMayBeBusy(r.err, st.sess.RunID) {
-			e.discardFailed(ctx, st.sess.RunID)
-		}
-		if notResumable {
-			// 同款脱敏：`ErrCheckpointNotResumable` 的文案含 sid / ns / graphID / 各字段
-			// 计数，那是给服务端日志排查用的，不该跨进程回传给远端对端。
-			spanStatus, spanErrType = observability.OutcomeError, "a2a_checkpoint_not_resumable"
-			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
-				agentMsg("the saved state for this session is inconsistent and cannot be resumed")), nil)
-			return
-		}
-		if stale {
-			// 脱敏：`ErrCheckpointStale` 的文案含 session id / ns / epoch token，是内部
-			// 信息，不该跨进程回传给远端对端。
-			spanStatus, spanErrType = observability.OutcomeError, "a2a_checkpoint_stale"
-			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
-				agentMsg("this session was concurrently advanced by another run; result was not persisted")), nil)
-			return
-		}
-		if graphConflict {
-			// 同款脱敏：`ErrGraphIDConflict` 的文案含 sid / ns / 两张图的 GraphID。它重跑必然撞同一个
-			// 槽（接线错误），对端换一个会话才走得通。
-			spanStatus, spanErrType = observability.OutcomeError, "a2a_graph_id_conflict"
-			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
-				agentMsg("the saved state for this session belongs to a different agent; start a new session")), nil)
-			return
-		}
-		if notPersisted {
-			// 档没写成（存储出错）：没有可以续的东西，引擎已经尽力清掉槽里更早的那份。脱敏：文案里有
-			// 后端的错误原文与 sid，不跨进程回传给远端对端。
-			spanStatus, spanErrType = observability.OutcomeError, "a2a_checkpoint_not_persisted"
-			yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
-				agentMsg("this run's state could not be saved, so it cannot be resumed; start a new task")), nil)
-			return
-		}
-		spanStatus, spanErrType = observability.OutcomeError, "a2a_agent_error"
-		// 跟 agent span 同一个口径：执行 ctx 已结束时按 ctx 判（到期是超时，取消不是失败）；ctx 还活着时错误链上
-		// 的软取消是取消、DeadlineExceeded 是超时，context.Canceled 不算（那是别处被连带取消，这次执行失败了）。
-		switch {
-		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+
+		spanStatus, spanErrType = observability.OutcomeError, "a2a_"+string(kind)
+		if kind == runoutcome.Timeout {
 			spanStatus, spanErrType = observability.OutcomeTimeout, "timeout"
-		case ctx.Err() != nil || errors.Is(r.err, compose_v2.ErrSoftCanceled):
-			spanStatus, spanErrType = observability.OutcomeCancelled, ""
-		case errors.Is(r.err, context.DeadlineExceeded):
-			spanStatus, spanErrType = observability.OutcomeTimeout, "timeout"
+		} else if kind == runoutcome.CheckpointSaveFailed {
+			spanErrType = "a2a_checkpoint_not_persisted" // 保留已有观测类型。
 		}
-		// 非中断 error，或中断但 query 列表空（不该发生，AllQueries 保证非空——防御性走 failed）
-		yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
-			agentMsg(fmt.Sprintf("agent %q run failed: %v", e.agent.Name(), r.err))), nil)
+		slog.WarnContext(ctx, "a2a server: agent 执行失败", "code", kind, "err", r.err)
+		yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed, failureMessage(kind)), nil)
 		return
 	}
 
@@ -710,23 +674,22 @@ func (e *Executor) discardFailed(ctx context.Context, sid string) {
 }
 
 // acquire 取出 task 状态并标 busy（防同 task 并发续发）。canceled tombstone 拒绝续发。
-func (e *Executor) acquire(k taskKey) (*taskState, error) {
+func (e *Executor) acquire(k taskKey) (*taskState, runoutcome.Kind) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	st, ok := e.tasks[k]
-	if !ok {
-		// **不区分「不存在」和「不属于你」**——那个区别本身就是信息泄漏（能拿它探测
-		// 别人的 taskId 存不存在）。两种情况同一句话。
-		return nil, fmt.Errorf("a2a server: task %s has no resumable state (already completed, canceled, or server restarted) — start a new task", k.taskID)
+	st := e.tasks[k]
+	if st == nil {
+		// 任务不存在与归属不匹配使用同一个公开结论。
+		return nil, runoutcome.NoPendingCheckpoint
 	}
 	if st.canceled {
-		return nil, fmt.Errorf("a2a server: task %s was canceled", k.taskID)
+		return nil, runoutcome.Canceled
 	}
 	if st.busy {
-		return nil, fmt.Errorf("a2a server: task %s resume already in progress", k.taskID)
+		return nil, runoutcome.Busy
 	}
 	st.busy = true
-	return st, nil
+	return st, runoutcome.Success
 }
 
 // ---- chunk → artifact 桥 ----
@@ -788,7 +751,13 @@ func inputMessage(execCtx *a2asrv.ExecutorContext) *schema.Message {
 	return m
 }
 
-// agentMsg 构造 agent 角色的 A2A 文本消息。
-func agentMsg(text string) *a2atypes.Message {
-	return a2atypes.NewMessage(a2atypes.MessageRoleAgent, a2atypes.NewTextPart(text))
+// failureMessage 将固定正文和错误码放进 A2A 状态消息。
+func failureMessage(kind runoutcome.Kind) *a2atypes.Message {
+	text := kind.Message()
+	if kind == runoutcome.CheckpointSaveFailed || kind == runoutcome.NoPendingCheckpoint {
+		text += "; start a new task"
+	}
+	msg := a2atypes.NewMessage(a2atypes.MessageRoleAgent, a2atypes.NewTextPart(text))
+	msg.Metadata = map[string]any{"crew.errorCode": string(kind)}
+	return msg
 }

@@ -987,8 +987,9 @@ func TestHandler_ReplacementStartupFailureKeepsPreviousQuestion(t *testing.T) {
 				cp.fail = true
 				rec := postAGUI(h, replacement)
 				cp.fail = false
-				if !strings.Contains(rec.Body.String(), "replacement storage panic") {
-					t.Fatalf("替换应在删档前触发测试异常，实际 %s", rec.Body.String())
+				body := rec.Body.String()
+				if !strings.Contains(body, `"code":"panic"`) || strings.Contains(body, "replacement storage panic") {
+					t.Fatalf("清档异常应报告固定错误且保留原问题，实际 %s", body)
 				}
 			}
 			resumed := postAGUI(h, `{"threadId":"t1","resume":[{"interruptId":"`+qid+`","status":"resolved","payload":"张三"}]}`)

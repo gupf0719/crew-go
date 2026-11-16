@@ -66,8 +66,11 @@ adapter（`agui/adapter.go`）一个 struct 同时实现 `hook.Hooks` + `agent_v
 | Run 开始 / 结束 / 出错 | `RunStarted` / `RunFinished` / `RunError` |
 | `InterruptError` | `RunFinished(outcome=interrupt, interrupts=[{id, reason, message, …}])`：工具审批 reason=`tool_call`（带 `toolCallId`、`responseSchema` 与 `metadata.options`），没有工具调用 ID 时 `confirmation`；普通提问默认使用 `input_required` 和字符串响应 schema，可用 `compose_v2.AskQuery.ResponseSchema` 覆盖 schema。框架断点使用 `crew-go:breakpoint` |
 | `EventSink.Send("state_snapshot")` | `StateSnapshot`（业务 opt-in，见 §6） |
-| `EventSink.Send("reset_stream")` | 收尾那条消息；作废时连同这次模型调用的工具调用与结果一起作废（按框架标在工具钩子 `Extra` 上的 `agent_v2.ToolModelRunIDExtraKey` 认），带 `replacement`（`OnModelEnd` 钩子改写了答复）时换成新正文；再发 AG-UI 标准的 `MessagesSnapshot`（请求带来的消息原样 + 这个 run 发出、没作废的消息）纠正前端——连着来的几个撤回与改写攒成一份，在适配层下一次往外写别的事件、或 run 收尾时发，有在途的流式消息时等它们都收尾（落在一条流中间时官方客户端的事件压缩回放把快照排到那条流之后，那条消息回放出来只剩半截），另立即发 `Custom(crew.reset_stream)` 给按 run_id 自管缓冲的前端。**请求没带 messages 时不发快照**（快照之外的消息会被前端丢掉，而适配层不知道它手上有什么），标准前端那时留着旧内容 |
-| `OnError` | `Custom`（前端可处理，标准组件忽略） |
+| `EventSink.Send("reset_stream")` | 收尾那条消息；作废时连同这次模型调用的工具调用与结果一起作废（按框架标在工具钩子 `Extra` 上的 `agent_v2.ToolModelRunIDExtraKey` 认），随后到达的同一模型调用的工具事件会被丢弃；带 `replacement`（`OnModelEnd` 钩子改写了答复）时换成新正文；再发 AG-UI 标准的 `MessagesSnapshot`（请求带来的消息原样 + 这个 run 发出、没作废的消息）纠正前端——连着来的几个撤回与改写攒成一份，在适配层下一次往外写别的事件、或 run 收尾时发，有在途的流式消息时等它们都收尾（落在一条流中间时官方客户端的事件压缩回放把快照排到那条流之后，那条消息回放出来只剩半截），另立即发 `Custom(crew.reset_stream)` 给按 run_id 自管缓冲的前端。**请求没带 messages 时不发快照**（快照之外的消息会被前端丢掉，而适配层不知道它手上有什么），标准前端那时留着旧内容 |
+| `OnError` | `Custom(crew.error)`，带阶段错误码和固定正文。 |
+
+运行失败以 `RunError.code` 区分存档不可续、写入失败、并发推进、终局错误及普通运行错误。客户端收到固定正文，服务端记录实际错误。
+运行时软取消或调用方取消与普通失败并存时，终态为 `RunFinished(outcome=cancelled)`。已落盘的合法中断保留续跑入口。
 
 > **run 边界（RunStarted/Finished/Error）由 handler 发**，中间事件由 adapter 发——单一
 > 所有权，不重复。
@@ -115,6 +118,8 @@ Run → 中断 → RunFinished(outcome=interrupt, interrupts=[{id, reason, messa
 - 默认进程内会话配 `agui.WithCheckpointer` 后支持多轮续跑。同一 `(owner, threadId)`
   在途时第二个请求收到 `busy`。新 Run 替换旧挂起会话时，确认旧档删除后才运行。
   开流前放弃许可存储故障时返回 HTTP 503。开流后清档失败时发 `RUN_ERROR`，两种情况都保留旧会话的续跑入口。
+  有历史的任务在运行时固定历史分区及后端。旧档清理后在原分区补齐尚无结果的工具调用，再启动新任务。
+  补写失败时返回 `cleanup_pending`。同线程新 Run 或会话回收可重试补写。
 
 - **上限防 OOM**：挂起会话超 `WithMaxSessions`（默认 10000）时淘汰一个空闲会话 + 清其
   cp——防前端放弃中断（关页面 / 断网）导致 sessions map 长跑 OOM。**淘汰按 owner 分摊**：
@@ -155,7 +160,9 @@ mux.Handle("/agui", h)
 续答时缺少该配置会保留挂起存档与已采纳的答复，可在配置恢复后重试。
 框架按任务 ID 写图存档。挂起集合以根存档为准，SSE 和查询接口都从根存档投影。
 同一 `(owner, threadId)` 的请求先取得共享会话租约，续跑在任务租约内校验当前中断 ID。
-替换时，后端原子核对租约、更新会话并清理旧存档。
+替换时，后端原子核对租约、更新会话并清理旧存档。有历史的旧任务会先在同一次原子写中进入收尾状态。
+旧档删除成功后，使用原工作流在已绑定的历史分区补齐工具结果，再启动新任务。原工厂构造时不持有会话租约，返回后重新核对旧任务身份。
+确认原历史后端失败时，原任务继续可答。清档后补写失败时，后续新 Run、挂起查询或后台轮询可接手已保存的收尾记录。
 
 ```mermaid
 sequenceDiagram
@@ -205,8 +212,9 @@ Redis 第一次轮询时分页导入旧记录。导入完成后持久保存标�
 关闭期间续答返回 HTTP 409 `cleanup_pending`。同一取消批次可重试。挂起查询和同线程新 Run 可在会话租约外构造原工厂后参与补偿。
 如果准备补偿期间其他实例已替换任务，挂起查询读取当前开放的问题，新 Run 返回 HTTP 409 `busy`，由调用方决定是否再次提交。
 如果保留的原工作流工厂不可用，后台保留进度，相关请求返回 `workflow_version_unavailable`。提供原版本后恢复。
-应用若只在 HTTP 中间件注入 HistoryStore，使用 `agui.WithCancellationHistory` 让补偿按已保存的 `HistoryKey` 取得相同逻辑存储。
-回调使用服务凭据。工厂自身提供 HistoryStore 时可直接使用该配置。后台补偿不会重新执行模型或工具。
+共享任务在实际选择历史后端时记录来源。由 HTTP 中间件选出的后端或未记录来源的旧任务，
+使用 `agui.WithCancellationHistory` 按保存的 `HistoryKey` 解析原逻辑存储，解析成功后才接受替换。
+由 Agent 工厂选择的后端可沿用原工厂配置。回调使用服务凭据，后台补偿只处理存档和历史。
 
 启用持久回执时，原 `runId` 继续回放原请求回执，手动重试使用新的 `runId`。取消意图写入失败且未提交时，可通过新请求重试取消。
 

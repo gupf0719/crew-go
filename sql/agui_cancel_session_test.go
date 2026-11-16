@@ -448,8 +448,16 @@ func TestSQLiteAGUIRecoveryRechecksTaskAfterFactoryReturns(t *testing.T) {
 }
 
 func TestSQLiteAGUIRequestRecoveryRechecksTaskAfterFactoryReturns(t *testing.T) {
-	for _, method := range []string{http.MethodPost, http.MethodGet} {
-		t.Run(method, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, method string
+		completed    bool
+	}{
+		{"post_while_replacement_pending", http.MethodPost, false},
+		{"get_while_replacement_pending", http.MethodGet, false},
+		{"post_after_replacement_completed", http.MethodPost, true},
+		{"get_after_replacement_completed", http.MethodGet, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "request-recovery.db")
 			f := setupAGUI(t, crewsql.SQLite{}, func() *dbsql.DB {
 				db, err := dbsql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_txlock=immediate")
@@ -477,12 +485,12 @@ func TestSQLiteAGUIRequestRecoveryRechecksTaskAfterFactoryReturns(t *testing.T) 
 			oldSID := old.id.Load().(string)
 
 			var body any
-			if method == http.MethodPost {
+			if tc.method == http.MethodPost {
 				input := aguiStart()
 				input["runId"] = "slow-replacement"
 				body = input
 			}
-			req := aguiRequest(t, owner, method, body)
+			req := aguiRequest(t, owner, tc.method, body)
 			ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
 			defer cancel()
 			resp := httptest.NewRecorder()
@@ -502,28 +510,49 @@ func TestSQLiteAGUIRequestRecoveryRechecksTaskAfterFactoryReturns(t *testing.T) 
 			}
 			id := onlyAGUIQuestion(t, aguiPending(t, healthy, owner), "q1")
 			newSID := current.id.Load().(string)
+			if tc.completed {
+				if r := aguiPost(t, healthy, owner, aguiAnswer(id, "resolved", "first")); !strings.Contains(r.Body.String(), `"type":"interrupt"`) {
+					t.Fatalf("健康实例应推进替换任务，实际 %s", r.Body)
+				}
+				second := onlyAGUIQuestion(t, aguiPending(t, healthy, owner), "q2")
+				if r := aguiPost(t, healthy, owner, aguiAnswer(second, "resolved", "second")); !strings.Contains(r.Body.String(), `"type":"RUN_FINISHED"`) {
+					t.Fatalf("健康实例应完成替换任务，实际 %s", r.Body)
+				}
+				if record, err := f.b.LoadSession(t.Context(), key); err != nil || record != nil {
+					t.Fatalf("结束后应移除会话记录，实际 %+v，错误 %v", record, err)
+				}
+			}
 			unblock()
 			select {
 			case <-done:
 			case <-time.After(3 * time.Second):
 				t.Fatal("旧请求未在释放工厂后返回")
 			}
-			if method == http.MethodPost {
-				if resp.Code != http.StatusConflict {
-					t.Fatalf("迟到的新 Run 应返回冲突，实际 %d %s", resp.Code, resp.Body)
+			if tc.method == http.MethodPost {
+				if resp.Code != http.StatusConflict || !strings.Contains(resp.Body.String(), `"code":"busy"`) || current.first.Load() != 1 {
+					t.Fatalf("迟到的新 Run 应返回冲突且不重复执行节点，实际 %d %s，节点执行 %d 次", resp.Code, resp.Body, current.first.Load())
 				}
 			} else {
 				var pending pendingAGUI
-				if resp.Code != http.StatusOK || json.Unmarshal(resp.Body.Bytes(), &pending) != nil || onlyAGUIQuestion(t, pending, "q1") != id {
-					t.Fatalf("挂起查询应返回新任务的问题，实际 %d %s", resp.Code, resp.Body)
+				if resp.Code != http.StatusOK || json.Unmarshal(resp.Body.Bytes(), &pending) != nil {
+					t.Fatalf("挂起查询应成功，实际 %d %s", resp.Code, resp.Body)
+				}
+				if tc.completed && len(pending.Interrupts) != 0 || !tc.completed && onlyAGUIQuestion(t, pending, "q1") != id {
+					t.Fatalf("挂起查询状态与替换任务不符，实际 %s", resp.Body)
 				}
 			}
 			record, err := f.b.LoadSession(t.Context(), key)
+			checkCancelCheckpoint(t, f.b, oldSID, false)
+			checkCancelCheckpoint(t, f.b, newSID, !tc.completed)
+			if tc.completed {
+				if err != nil || record != nil || current.consumed.Load() != "first+second" || old.second.Load() != 0 {
+					t.Fatalf("结束后的请求改变了会话或原任务，实际 %+v 错误 %v", record, err)
+				}
+				return
+			}
 			if err != nil || record == nil || record.TaskID != newSID || record.Cancellation != nil {
 				t.Fatalf("先完成替换的任务应保持挂起，记录 %v，err=%v", record, err)
 			}
-			checkCancelCheckpoint(t, f.b, oldSID, false)
-			checkCancelCheckpoint(t, f.b, newSID, true)
 			if got := onlyAGUIQuestion(t, aguiPending(t, healthy, owner), "q1"); got != id || old.second.Load() != 0 {
 				t.Fatalf("迟到的请求改变了替换任务：问题 %q，原任务第二步执行 %d 次", got, old.second.Load())
 			}

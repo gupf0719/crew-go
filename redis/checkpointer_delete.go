@@ -43,6 +43,14 @@ local function check_command(command, ...)
     end
 end
 
+local function checkpoint_exists(key)
+    -- Redis 7 的选择器可把 TYPE 限制在索引键上。为这类角色沿用原有 EXISTS 判据。
+    if redis.acl_check_cmd and not redis.acl_check_cmd("TYPE", key) then
+        return redis.call("EXISTS", key) == 1
+    end
+    return redis.call("TYPE", key).ok ~= "none"
+end
+
 local function delete_subtree(legacy_item_prefix)
 local nsidx_key   = KEYS[1]
 local pending_key = KEYS[2]
@@ -91,7 +99,8 @@ end
 check_command("SCARD", nsidx_key)
 check_command("SREM", sids_key, sid)
 for i, ns in ipairs(matched) do
-    if redis.call("EXISTS", item_key_prefix .. ns) == 0 and redis.call("EXISTS", legacy_item_prefix .. ns) == 1 then
+    -- 沿用清理脚本已有的 TYPE 权限来区分缺失的新版键与尚未迁移的旧键。
+    if not checkpoint_exists(item_key_prefix .. ns) and checkpoint_exists(legacy_item_prefix .. ns) then
         error("redis checkpoint requires legacy key migration")
     end
     check_command("DEL", item_key_prefix .. ns)

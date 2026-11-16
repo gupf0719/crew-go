@@ -744,10 +744,11 @@ func resolveHistoryConfigForAbort(ctx context.Context, subs []Agent) *historyCon
 	return chosen
 }
 
-// closeUnansweredToolCalls 按任务扫描历史，为尚无结果的工具调用补齐放弃结果。
-// 只在根存档删除后调用，重试时会跳过已有结果的调用。
-func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key HistoryKey, task string) error {
-	if task == "" || store == nil || key.Owner == "" || key.ConvID == "" {
+// CloseAbandonedTaskHistory 为原历史分区里该任务尚无结果的工具调用补齐放弃结果。
+// 调用方须持有该任务的放弃许可，且已删除根存档。重试会跳过已有结果的调用。
+func CloseAbandonedTaskHistory(ctx context.Context, destination TaskHistoryDestination, task string) error {
+	store, key := destination.Store, destination.Key
+	if task == "" || isFrameworkNil(store) || key.Owner == "" || key.ConvID == "" {
 		return nil
 	}
 	src := historySource{store: store, key: key, task: task}
@@ -782,8 +783,11 @@ func closeUnansweredToolCalls(ctx context.Context, store HistoryStore, key Histo
 }
 
 // beginRunActivity 校验放弃声明，再原子登记本次执行和要放弃的任务。排在建历史写入器和盖章之前。
-func beginRunActivity(ctx context.Context, ids []string, session *RunSession, agentName string) (context.Context, *compose_v2.TaskActivity, error) {
-	for _, id := range ids {
+func beginRunActivity(ctx context.Context, tasks []abandonedTask, session *RunSession, agentName string) (context.Context, *compose_v2.TaskActivity, error) {
+	ids := make([]string, len(tasks))
+	for i, task := range tasks {
+		id := task.id
+		ids[i] = id
 		if id == "" || id == session.RunID {
 			return ctx, nil, rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——放弃的是这次 Run 之前的任务，不能是空的，"+
 				"也不能是这次 Run 自己的任务（RunID %q）", agentName, id, session.RunID)
@@ -811,8 +815,8 @@ var abandonEntryTimeout = 10 * time.Second
 // Run 失败。先删档、删成功（或没配 checkpointer）才补结果，同 Resume 的放弃分支：「历史里写了被放弃」要推得出「档已删」，
 // 反过来档删了、补结果失败只留下悬空的调用，读侧兜得住（审计实测：共用预算在补完结果、删档之间到点时，任务还能续，续跑的
 // 真结果排在「被放弃」之后）。
-func abandonTasksAtEntry(ctx context.Context, ids []string, agentName string) {
-	if len(ids) == 0 {
+func abandonTasksAtEntry(ctx context.Context, tasks []abandonedTask, agentName string) {
+	if len(tasks) == 0 {
 		return
 	}
 	sctx, cancel := context.WithTimeout(ctx, abandonEntryTimeout)
@@ -822,7 +826,11 @@ func abandonTasksAtEntry(ctx context.Context, ids []string, agentName string) {
 	// 删被放弃任务的根：RunID 就是任务的身份、也是存档的主索引，它名下的存档整份属于它。不用这次调用所在的 ns——嵌套位置上
 	// （钩子或节点里经 RunSubAgent 透传这个选项）那是子 ns，删不到它的根档（审计实测）。
 	const ns = ""
-	for _, id := range ids {
+	for _, task := range tasks {
+		if task.settled {
+			continue
+		}
+		id := task.id
 		if cper != nil {
 			start := time.Now()
 			n, err := cper.DeleteSubtree(sctx, id, ns)
@@ -834,7 +842,7 @@ func abandonTasksAtEntry(ctx context.Context, ids []string, agentName string) {
 			}
 		}
 		if w != nil {
-			if err := closeUnansweredToolCalls(sctx, w.store, w.key, id); err != nil {
+			if err := CloseAbandonedTaskHistory(sctx, TaskHistoryDestination{Key: w.key, Store: w.store}, id); err != nil {
 				slog.WarnContext(ctx, "agent_v2: 放弃任务的历史收尾失败", "agent", agentName, "task", id, "err", err)
 			}
 		}

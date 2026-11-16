@@ -19,6 +19,7 @@ import (
 	"crew-go/compose_v2"
 	"crew-go/hook"
 	"crew-go/internal/panicerr"
+	"crew-go/internal/runoutcome"
 	"crew-go/internal/toolresult"
 	"crew-go/schema"
 )
@@ -353,8 +354,11 @@ type sessionEntry struct {
 	busy       bool                 // 有在途 Run/Resume 或正在回收
 	reclaiming bool                 // 正在回收的条目暂不计入淘汰配额
 	// abortCtx 记录取消时的值（包括业务历史归属），等待清档。由持有 busy 的请求读写。
-	abortCtx  context.Context
-	touchedAt int64 // 最后活动 Unix nano，LRU 淘汰用
+	abortCtx context.Context
+	// replacementHistoryPending 只在旧存档已经删除、但原历史尚未补齐时为真。
+	replacementHistoryPending bool
+	history                   agent_v2.TaskHistoryDestination
+	touchedAt                 int64 // 最后活动 Unix nano，LRU 淘汰用
 	// open 是挂起的那个 run 交给前端的全部中断（InterruptID → 是不是工具审批）。续跑的 resume 列表必须恰好覆盖它们
 	// （AG-UI：不支持只答一部分，也不能答不在其中的）；审批的答复先校验再开跑，认不出的整批拒绝、这些问题保持
 	// 挂起（交给审批层的话认不出就按拒绝处理，`{"approved":true}`、`Yes.` 曾都被当成拒绝）。
@@ -471,7 +475,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func recoverRequest(ctx context.Context, w eventWriter) {
 	if rec := recover(); rec != nil {
 		panicerr.Log(ctx, slog.LevelError, "agui: handler 兜住 panic，已给前端发 RUN_ERROR", panicerr.New(rec))
-		_ = w.Reject(http.StatusInternalServerError, "panic", fmt.Sprintf("agui: internal panic: %v", rec))
+		_ = w.Reject(http.StatusInternalServerError, "panic", "the server could not complete the request")
 	}
 }
 
@@ -519,10 +523,11 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 	h.warnClientMessages(ctx, rep)
 	ctx = agent_v2.WithCallerHistoryCtx(ctx, prior)
 
+	var previousAgent agent_v2.Agent
 	if h.sessionStore != nil {
 		var activity *compose_v2.TaskActivity
 		var err error
-		ctx, activity, err = h.openSharedSessionAfterCancellation(ctx, key, true)
+		ctx, activity, previousAgent, err = h.openSharedRunSession(ctx, key)
 		if err != nil {
 			rejectSharedSession(ctx, sse, err)
 			return
@@ -550,7 +555,7 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 			if started {
 				return
 			}
-			if stale != nil && (!replacing || h.hasTaskCheckpoint(ctx, stale.sess.RunID)) {
+			if stale != nil && (!replacing || stale.replacementHistoryPending || h.hasTaskCheckpoint(ctx, stale.sess.RunID)) {
 				h.restoreEntry(key, stale)
 				claimed = stale
 			} else {
@@ -562,17 +567,24 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 
 	// 先占旧任务的放弃许可，在开始事件成功送达后才删档。客户端断开或启动失败时恢复原入口。
 	const replacementCleanupError = "the previous suspended task could not be discarded"
-	var abandonOpts []agent_v2.RunOption
 	var dropCtx context.Context
 	var dropActivity *compose_v2.TaskActivity
 	var oldTask string
+	var runOpts []agent_v2.RunOption
 	if stale != nil && stale.abortCtx == nil && stale.sess != nil {
 		oldTask = stale.sess.RunID
-		abandonOpts = append(abandonOpts, agent_v2.WithAbandonedTasks(oldTask))
+		// 宿主负责清理并补写原历史，Agent 入场时仍核对旧任务的执行冲突。
+		runOpts = append(runOpts, agent_v2.WithSettledAbandonedTask(oldTask))
+	}
+	if shared != nil && shared.settledReplacement != "" {
+		runOpts = append(runOpts, agent_v2.WithSettledAbandonedTask(shared.settledReplacement))
 	}
 	if oldTask != "" && shared == nil {
 		var dropErr error
 		dropCtx, dropActivity, dropErr = h.beginDropCP(ctx, oldTask)
+		if dropErr == nil && dropActivity == nil && stale.history.Store != nil {
+			dropCtx, dropActivity, dropErr = compose_v2.BeginTaskActivity(context.WithoutCancel(ctx), "", []string{oldTask})
+		}
 		if dropErr != nil {
 			if errors.Is(dropErr, compose_v2.ErrTaskBusy) {
 				_ = sse.Reject(http.StatusConflict, "busy", "an operation on the previous task is in progress")
@@ -593,9 +605,13 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 			_ = sse.Reject(http.StatusConflict, "cleanup_pending", "the cancelled task still needs cleanup")
 			return
 		}
+		if stale.replacementHistoryPending {
+			runOpts = append(runOpts, agent_v2.WithSettledAbandonedTask(stale.sess.RunID))
+		}
 		stale = nil
 	}
 
+	cleanupCtx := ctx
 	adapter := newSSEAdapter(sse, in.RunID, in.Messages)
 	ag := h.build(adapter)
 	if agent_v2.IsNilAgent(ag) {
@@ -618,6 +634,18 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 		return
 	}
 	if shared != nil {
+		if previousAgent != nil {
+			if err := cancelSharedSession(cleanupCtx, shared, previousAgent, sharedCancellationRequest{replacement: true}, h.cancellationHistory); err != nil {
+				if shared.record != nil && shared.record.Cancellation != nil {
+					slog.WarnContext(ctx, "agui: 替换任务的历史收尾未完成", "sid", oldTask, "err", err)
+					_ = sse.Reject(http.StatusConflict, "cleanup_pending", "the previous task still needs cleanup")
+				} else {
+					rejectSharedSession(ctx, sse, err)
+				}
+				return
+			}
+			oldTask = ""
+		}
 		var abandoned []string
 		if oldTask != "" {
 			abandoned = []string{oldTask}
@@ -638,15 +666,30 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 		}
 		activity.FinishAbandon()
 		ctx = shared.bindHistory(ctx)
-	} else if dropActivity != nil {
-		replacing = true
-		if err := h.deleteCP(dropCtx, oldTask); err != nil {
-			// 前置清档失败时由 defer 恢复原续跑入口，等待存储恢复。
-			replacing = false
-			_ = sse.Reject(http.StatusServiceUnavailable, "agent_error", replacementCleanupError)
-			return
+	} else {
+		if dropActivity != nil {
+			replacing = true
+			if h.cp != nil {
+				if err := h.deleteCP(dropCtx, oldTask); err != nil {
+					// 前置清档失败时由 defer 恢复原续跑入口，等待存储恢复。
+					replacing = false
+					_ = sse.Reject(http.StatusServiceUnavailable, "agent_error", replacementCleanupError)
+					return
+				}
+			}
+			if stale.history.Store != nil {
+				stale.abortCtx = context.WithoutCancel(cleanupCtx)
+				stale.replacementHistoryPending = true
+				if err := closeReplacementHistory(dropCtx, stale, time.Time{}); err != nil {
+					slog.WarnContext(ctx, "agui: 替换任务的历史收尾未完成", "sid", oldTask, "err", err)
+					_ = sse.Reject(http.StatusConflict, "cleanup_pending", "the previous task still needs cleanup")
+					return
+				}
+				stale.replacementHistoryPending = false
+			}
+			dropActivity.Release()
 		}
-		dropActivity.Release()
+		ctx = claimed.bindLocalHistory(ctx, sess.RunID)
 	}
 	started = true
 	// **收尾必须挂在 defer 上，不能写成 ag.Run 之后的普通语句。**
@@ -684,22 +727,11 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 		_ = sse.WriteEvent(NewRunError("run terminated abnormally (goroutine exited without returning)", "agent_error"))
 	}()
 
-	_, err := ag.Run(ctx, sess, inputMsg, abandonOpts...)
+	_, err := ag.Run(ctx, sess, inputMsg, runOpts...)
 	settled = true
 	adapter.finish()
-	if errors.Is(err, compose_v2.ErrTaskBusy) {
-		// 内层任务也可能返回 busy，父图此时可能已给本次新任务写档。
-		if shared == nil {
-			h.dropCP(ctx, sess.RunID)
-			h.removeEntry(key)
-		} else if !h.finishSession(ctx, sse, key) {
-			return
-		}
-		_ = sse.Reject(http.StatusConflict, "busy", "an operation on this or the previous task is in progress")
-		return
-	}
 
-	h.handleOutcome(ctx, sse, key, runID, sess, prior, err)
+	h.handleOutcome(ctx, sse, key, runID, sess, prior, true, err)
 }
 
 // serveResume 处理 HITL 续跑——用上次中断挂起的 sess + cp 重建，把答案按 InterruptID
@@ -914,12 +946,16 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 	if allCancelled {
 		var err error
 		if shared != nil {
-			err = cancelSharedSession(ctx, shared, ag, in.Resume, pendingEpoch, h.cancellationHistory)
+			err = cancelSharedSession(ctx, shared, ag, sharedCancellationRequest{entries: in.Resume, epoch: pendingEpoch}, h.cancellationHistory)
 		} else {
 			if entry.abortCtx == nil {
 				entry.abortCtx = context.WithoutCancel(agent_v2.WithCallerHistoryCtx(abortBase, prior))
 			}
-			err = abortSession(entry, ag, time.Time{})
+			if entry.replacementHistoryPending {
+				err = h.retryAbort(entry, time.Time{})
+			} else {
+				err = abortSession(entry, ag, time.Time{})
+			}
 		}
 		settled = true
 		adapter.finish()
@@ -958,6 +994,7 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 		ctx = shared.bindHistory(ctx)
 	} else {
 		all = h.recordAnswers(key, answers)
+		ctx = entry.bindLocalHistory(ctx, sess.RunID)
 	}
 	// 历史答复仍参与节点重放，诊断只把本次提交视作新答复。
 	replayed := make([]string, 0, len(all)-len(answers))
@@ -976,145 +1013,100 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 		rejectSharedSession(ctx, sse, err)
 		return
 	}
-	if errors.Is(err, compose_v2.ErrTaskBusy) {
-		_ = sse.Reject(http.StatusConflict, "busy", "an operation on this task is in progress")
-		return
-	}
 
-	h.handleOutcome(ctx, sse, key, wireRunID, sess, prior, err)
+	h.handleOutcome(ctx, sse, key, wireRunID, sess, prior, false, err)
 }
 
 // handleOutcome 按 Run/Resume 结果发终态 + 更新挂起 entry——中断则 entry 留 sess 与 Run 时的前文（prior）待续发
 // （多轮 HITL），成功 / 错误则清 entry（会话结束）。
 // ⚠️ **发回前端的只能是 key.threadID 那一维**——owner 是服务端解析出来的身份，前端只认
 // 它自己给的那个 threadId，把整个键的内容发出去它就认不出来了（顺带把身份泄给了浏览器）。
-func (h *handler) handleOutcome(ctx context.Context, sse eventWriter, key sessionKey, runID string, sess *agent_v2.RunSession, prior []*schema.Message, err error) {
+func (h *handler) handleOutcome(ctx context.Context, sse eventWriter, key sessionKey, runID string, sess *agent_v2.RunSession, prior []*schema.Message, fresh bool, err error) {
 	shared := sharedSessionFrom(ctx)
-	// **陈旧写回**（`WithStaleWriteGuard` 开启时才可能出现）：这次的结果没落盘，槽里是另一个执行者
-	// 的状态，留 entry 等续发是徒劳——前端答完发回来，框架载入的是别人的状态，于是重新问一遍已经
-	// 答过的问题，来回不收敛（实测：问 q1 → 答 → 问 q2 → 答 → 又问 q1）。引擎出口写档撞上它时返
-	// `ErrCheckpointNotPersisted`、中断不在链上；判在 IsInterrupt 之前，是防自研 agent 把它跟中断绑在
-	// 一条链上交过来。
-	//
-	// 正确处置：不留 entry（续发没有意义），给前端一个专属 code 让它知道是并发冲突、
-	// 而不是"又一次正常提问"。
-	// **存档自相矛盾也要专属处置**，理由跟上面那条同源：落进通用兜底的话前端拿到的 code 是
-	// `agent_error`，而那一档的定义是「可能是瞬时的 ⟹ 原样重来是合理选项」——**框架自己在
-	// `IsRetryable` 里明确排掉了它**（重跑必然拿到同一份档）。同一个错，对内说别重试、对外
-	// 说可以重来，前端照做只会拿到一条与真实原因无关的 `no_session`。
-	//
-	// 正文同样脱敏：`ErrCheckpointNotResumable` 的错误信息带 sid / ns / graphID / 各字段
-	// 计数，那是给服务端日志排查用的，不该推给浏览器。
-	if errors.Is(err, compose_v2.ErrCheckpointNotResumable) {
-		// **句柄留着，不能 removeEntry**——这是这条分支跟上面那条 stale 分支最大的不同，
-		// 也是我第一版照抄 stale 形状踩的坑。
-		//
-		// stale 那条删 entry 是无损的：**它那种情况下存档根本没落盘**（见那条的注释），
-		// 删的是个已经没有指向的壳。而这条的整个卖点是**存档被引擎特意保住了**——保住是为了
-		// 排查，可保住之后总得有人能把它清掉。
-		//
-		// **清它的唯一一条路是「放弃」，而放弃跟「回答」是同一个端点**（AG-UI 协议如此：
-		// 全 `cancelled` 的 resume ⟹ `ResumeActionAbort`）。删了 entry，下一次请求在
-		// `acquireForResume` 就返 `no_session`，**回答和放弃一起没了** ⟹ 那份档变成谁也
-		// 够不着的孤儿，而且它 Status 是挂起，会永远留在业务的待处理会话列表里。
-		//
-		// 留着 entry 之后：放弃这条路**不经过坏掉的那个东西**——`agent_v2.Resume` 的 Abort
-		// 分支在载入存档之前就 `DeleteSubtree` 返回了（实测过），所以引擎那道守卫根本不会
-		// 再开火。而「用户再也不回来」由 `WithMaxSessions` 的淘汰兜底（淘汰时连 cp 一起清），
-		// 那本来就是这一层为「放弃的挂起」准备的机制。⚠️ 淘汰按 owner 分摊之后这道兜底
-		// **只由这个 owner 自己的下一个会话触发**——它再也不来的话这条 entry 就一直留着
-		// （每个 owner 至多一条，那正是 WithMaxSessions 说的软上限）。
-		//
-		// ⚠️ 前端照 code 再发一次**回答**会拿到同样的错——那是对的：确定性的错就该确定性地
-		// 报，而不是换一种说法。文案里点明另一条出路。
+	kind, interrupt := runoutcome.Classify(ctx, err)
+	if err != nil && kind != runoutcome.Interrupted && kind != runoutcome.Canceled {
+		slog.WarnContext(ctx, "agui: 运行失败", "code", kind, "err", err)
+	}
+	switch kind {
+	case runoutcome.Busy:
+		// 新任务可能是子任务忙后留下的失败档；续跑则保留当前挂起入口。
+		if fresh {
+			if shared == nil {
+				_ = h.dropCP(ctx, sess.RunID)
+				h.removeEntry(key)
+			} else if !h.finishSession(ctx, sse, key) {
+				return
+			}
+		}
+		_ = sse.Reject(http.StatusConflict, string(kind), kind.Message())
+		return
+	case runoutcome.CheckpointNotResumable:
+		// 保留放弃入口和引擎为诊断保留的存档。
 		if shared == nil {
 			h.keepSuspended(key, sess)
 		}
-		_ = sse.WriteEvent(NewRunError("the saved state for this session is inconsistent and cannot be resumed; "+
-			"send all interrupts as cancelled to discard it, or start a new session",
-			"checkpoint_not_resumable"))
+		_ = sse.WriteEvent(NewRunError(kind.Message()+"; send all interrupts as cancelled to discard it, or start a new session",
+			string(kind)))
 		return
-	}
-	if errors.Is(err, compose_v2.ErrCheckpointStale) || errors.Is(err, compose_v2.ErrTaskLeaseLost) {
+	case runoutcome.CheckpointStale, runoutcome.GraphIDConflict:
+		// 存档属于另一执行者或另一张图，只移除本地过期句柄。
 		if shared == nil {
 			h.removeEntry(key)
 		}
-		// 不回传 err.Error()——里面有 session id / ns / epoch token 等内部信息
-		_ = sse.WriteEvent(NewRunError("this session was concurrently advanced by another run; result was not persisted",
-			"checkpoint_stale"))
+		_ = sse.WriteEvent(NewRunError(kind.Message(), string(kind)))
 		return
-	}
-	// **身份冲突**：这个会话的存档属于另一张图（同一个 threadId 先后接了拓扑不同的 agent——接线错误）。
-	// 跟上面两条同理要专属 code：它重跑必然撞同一个槽（框架在 IsRetryable 里排掉了它），落进通用兜底
-	// 的 `agent_error` 会让前端原样重来。文案不回传 err.Error()——里面有 sid / ns / 两张图的 GraphID。
-	if errors.Is(err, compose_v2.ErrGraphIDConflict) {
-		if shared == nil {
-			h.removeEntry(key)
-		}
-		_ = sse.WriteEvent(NewRunError("this session's saved state belongs to a different agent; start a new session",
-			"graph_id_conflict"))
-		return
-	}
-	// **档没写成**（存储出错）：这次没有可以续的档，引擎已经尽力清掉槽里更早的那份。不留 entry——留着
-	// 的话前端续发要么找不到档，要么续进旧档（重问已经答过的问题）。文案不回传 err.Error()——里面有
-	// 后端的错误原文与 sid。
-	if errors.Is(err, compose_v2.ErrCheckpointNotPersisted) {
-		if !h.finishSession(ctx, sse, key) {
-			return
-		}
-		_ = sse.WriteEvent(NewRunError("this run's state could not be saved, so it cannot be resumed; start a new session",
-			"checkpoint_save_failed"))
-		return
-	}
-	if ie, isInterrupt := compose_v2.IsInterrupt(err); isInterrupt {
+	case runoutcome.Interrupted:
 		var batch interruptBatch
 		var projectErr error
 		if shared != nil {
-			batch, projectErr = shared.pending(ctx)
+			// 合法挂起已经落盘。连接此时断开也要给持久 Run 日志留下对应终态。
+			readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropCPTimeout)
+			batch, projectErr = shared.pending(readCtx)
+			cancel()
+			if leaseErr := compose_v2.CheckCheckpointTaskLease(ctx); leaseErr != nil {
+				kind = runoutcome.CheckpointStale
+				slog.WarnContext(ctx, "agui: 投影挂起时失去任务租约", "err", leaseErr)
+				_ = sse.WriteEvent(NewRunError(kind.Message(), string(kind)))
+				return
+			}
 			if projectErr == nil && len(batch.open) == 0 {
 				projectErr = fmt.Errorf("%w: no pending questions in the root checkpoint", errInvalidPending)
 			}
 		} else {
-			batch, projectErr = projectInterrupts(ie.AllQueries(), ie.Reason)
+			batch, projectErr = projectInterrupts(interrupt.AllQueries(), interrupt.Reason)
 		}
-		if projectErr != nil {
-			if errors.Is(projectErr, errInvalidPending) {
-				if shared == nil {
-					h.dropCP(ctx, sess.RunID)
-				}
-				if !h.finishSession(ctx, sse, key) {
-					return
-				}
-				slog.WarnContext(ctx, "agui: 无法投影挂起问题", "err", projectErr)
-				_ = sse.WriteEvent(NewRunError("the run has an invalid pending interrupt", "invalid_interrupt"))
-			} else {
-				rejectSharedSession(ctx, sse, projectErr)
+		if projectErr == nil {
+			if shared == nil {
+				h.storeInterrupt(key, sess, batch, prior)
 			}
+			_ = sse.WriteEvent(NewRunInterrupted(key.threadID, runID, batch.events))
 			return
 		}
-		if shared == nil {
-			h.storeInterrupt(key, sess, batch, prior)
+		if !errors.Is(projectErr, errInvalidPending) {
+			rejectSharedSession(ctx, sse, projectErr)
+			return
 		}
-		_ = sse.WriteEvent(NewRunInterrupted(key.threadID, runID, batch.events))
-		return
+		slog.WarnContext(ctx, "agui: 无法投影挂起问题", "err", projectErr)
+		kind = runoutcome.InvalidInterrupt
 	}
+
 	if !h.finishSession(ctx, sse, key) {
 		return
 	}
-	if shared == nil && sess != nil && compose_v2.LeavesResumableCheckpoint(err) {
-		h.dropCP(ctx, sess.RunID)
+	if shared == nil && sess != nil && kind != runoutcome.CheckpointSaveFailed && compose_v2.LeavesResumableCheckpoint(err) {
+		// 终态没有续跑入口。持有任务许可时尽力清理本次执行的存档。
+		_ = h.dropCP(ctx, sess.RunID)
 	}
-	if err != nil {
-		// **给 code**：这是最常走的一条错误分支，而它原先是这里唯一不填 code 的
-		// （其余每一处 `NewRunError` 都带一个字面量 code——**别在这儿抄一份清单**，
-		// 那份清单已经漂过两次；要全集就 grep `NewRunError(`）。前端拿到一个没有
-		// 机器可读代号的通用错误，就没法在**三条相反的动作**之间选：会话已经结束了该
-		// 开新的、这次是终局失败别再试、还是可以原样重来。协议侧 `code` 是可选字段，
-		// 但填上才谈得上编程处理。
-		_ = sse.WriteEvent(NewRunError(err.Error(), agentErrorCode(err)))
-		return
+	switch kind {
+	case runoutcome.Success:
+		_ = sse.WriteEvent(NewRunFinished(key.threadID, runID))
+	case runoutcome.Canceled:
+		_ = sse.WriteEvent(NewRunCancelled(key.threadID, runID))
+	case runoutcome.CheckpointSaveFailed:
+		_ = sse.WriteEvent(NewRunError(kind.Message()+"; start a new session", string(kind)))
+	default:
+		_ = sse.WriteEvent(NewRunError(kind.Message(), string(kind)))
 	}
-	_ = sse.WriteEvent(NewRunFinished(key.threadID, runID))
 }
 
 func (h *handler) finishSession(ctx context.Context, sse eventWriter, key sessionKey) bool {
@@ -1319,13 +1311,27 @@ func abortSession(entry *sessionEntry, ag agent_v2.Agent, deadline time.Time) er
 	}
 	ctx, cancel := context.WithDeadline(entry.abortCtx, deadline)
 	defer cancel()
-	_, err := ag.Resume(ctx, entry.sess.RunID, agent_v2.WithResumeSession(entry.sess),
-		agent_v2.WithResumeAction(agent_v2.ResumeActionAbort))
+	opts := []agent_v2.ResumeOption{agent_v2.WithResumeSession(entry.sess), agent_v2.WithResumeAction(agent_v2.ResumeActionAbort)}
+	if entry.history.Store != nil {
+		opts = append(opts, agent_v2.WithResumeAbortHistoryKey(&entry.history.Key),
+			agent_v2.WithResumeAbortHistoryStore(func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error) {
+				return entry.history.Store, nil
+			}))
+	}
+	_, err := ag.Resume(ctx, entry.sess.RunID, opts...)
 	return err
 }
 
 // retryAbort 构造清理用 agent，补偿无需连接任何 SSE 订阅者。
 func (h *handler) retryAbort(entry *sessionEntry, deadline time.Time) error {
+	if entry.replacementHistoryPending {
+		ctx, activity, err := compose_v2.BeginTaskActivity(entry.abortCtx, "", []string{entry.sess.RunID})
+		if err != nil {
+			return err
+		}
+		defer activity.Release()
+		return closeReplacementHistory(ctx, entry, deadline)
+	}
 	ag := h.build(hook.NoOpHooks{})
 	if agent_v2.IsNilAgent(ag) {
 		return errors.New("agui: AgentFactory returned nil agent")
@@ -1338,7 +1344,7 @@ func (h *handler) tryEvictLocked(key sessionKey, entry *sessionEntry) (evictedTa
 	task := evictedTask{key: key, entry: entry}
 	if entry.sess != nil {
 		task.sid = entry.sess.RunID
-		if h.cp != nil && task.sid != "" {
+		if task.sid != "" && (h.cp != nil || entry.replacementHistoryPending) {
 			if entry.abortCtx == nil {
 				_, activity, err := compose_v2.BeginTaskActivity(context.Background(), "", []string{task.sid})
 				if err != nil {
@@ -1540,6 +1546,9 @@ func (h *handler) beginDropCP(ctx context.Context, sid string) (context.Context,
 
 // hasTaskCheckpoint 核对异常退出的替换操作是否已经删掉了旧档。读取失败时保留原入口。
 func (h *handler) hasTaskCheckpoint(ctx context.Context, sid string) bool {
+	if h.cp == nil {
+		return false
+	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropCPTimeout)
 	defer cancel()
 	all, err := h.cp.LoadAllInSession(ctx, sid)
@@ -1730,43 +1739,5 @@ func (h *handler) warnClientMessages(ctx context.Context, rep clientMessageRepor
 	if rep.droppedParts > 0 && h.warnedMedia.CompareAndSwap(false, true) {
 		slog.WarnContext(ctx, "agui: 已跳过无法识别的内容部分或用户消息以外的媒体部分"+
 			"（本条每个 handler 只记一次）", "count", rep.droppedParts)
-	}
-}
-
-// agentErrorCode 把 agent 返回的错误映射成前端可编程处理的 code。
-//
-// 只认框架承诺过 `errors.Is` 友好的那几个哨兵，其余归一到 `agent_error`——**不按错误
-// 文本猜**：文本是给人读的，会随措辞变，拿它当判据等于建一份会漂的拷贝。
-//
-// 每个 code 对应前端一条**互不相同**的动作：
-//   - `checkpoint_not_resumable`：存档自相矛盾、当下续不了（典型是自研 backend 漏了
-//     字段）⟹ 别重发同一个续跑；出路是把全部中断标 cancelled 丢弃它，或开新会话；
-//   - `no_pending_checkpoint`：这个会话没有在等你的东西了（正常跑完 / 从未跑过 /
-//     上次带着错退出）⟹ 该开新会话，别重发续跑；
-//   - `graph_id_conflict`：这个会话的存档属于另一张图（接线错误）⟹ 别重试，开新会话；
-//   - `checkpoint_save_failed`：这次的档没写成（存储出错），没有可以续的东西 ⟹ 开新会话；
-//   - `run_aborted`：终局失败——框架判定本次重跑或续跑都走不通、并已清掉存档 ⟹ 该停，别重试；
-//     （**别在这里枚举它的来源**：2026-10-23 对账时这里写的「业务违反协议、参数非法」已覆盖不住，
-//     判据见 `compose_v2.ErrRunAborted` 的 godoc）
-//   - `agent_error`：其余，可能是瞬时的 ⟹ 原样重来是合理选项。
-//
-// 顺序跟 handleOutcome 的专属分支一致：档没写成多数时候同时带着 ErrRunAborted，因写档撞上身份冲突
-// 时同时带着 ErrGraphIDConflict，更具体的先判。
-func agentErrorCode(err error) string {
-	switch {
-	case errors.Is(err, compose_v2.ErrCheckpointNotResumable):
-		// 兜底里也留一路：这个错在 handleOutcome 有专属分支先接走，但 agentErrorCode
-		// 是纯函数、别处也可能调，判据得自洽。
-		return "checkpoint_not_resumable"
-	case errors.Is(err, compose_v2.ErrNoPendingCheckpoint):
-		return "no_pending_checkpoint"
-	case errors.Is(err, compose_v2.ErrGraphIDConflict):
-		return "graph_id_conflict"
-	case errors.Is(err, compose_v2.ErrCheckpointNotPersisted):
-		return "checkpoint_save_failed"
-	case errors.Is(err, compose_v2.ErrRunAborted):
-		return "run_aborted"
-	default:
-		return "agent_error"
 	}
 }

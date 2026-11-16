@@ -40,7 +40,7 @@ type sseAdapter struct {
 	resultObserver toolresult.Observer
 
 	w  eventWriter
-	mu sync.Mutex // 保护 w + openMsgs：并发 sub-agent 的 chunk / tool 回调经此串行化
+	mu sync.Mutex // 保护写入及消息投影状态，并发子 Agent 的回调经此串行化
 
 	// openMsgs 是当前打开（已发 TextMessageStart、未发 End）的流式 TextMessage 集合，
 	// key = messageId（= crew-go chunk 的 run_id）。**per-run_id open-set 而非单槽**：
@@ -56,8 +56,7 @@ type sseAdapter struct {
 	runID string
 
 	// input 是请求带来的消息原文（AG-UI 1.0：消费方每次都发完整的对话），emitted 是这个 run 发出的消息，按发出顺序；
-	// voided 是其中作废了的（流中途失败的那次模型调用，见 reset_stream）。撤回靠 MESSAGES_SNAPSHOT：消费方丢掉快照里
-	// 没有的消息，所以快照必须重述它手上的每一条——请求里的原样带回，这个 run 发出的按消费方落库时的 id 重建。
+	// 撤回靠 MESSAGES_SNAPSHOT：消费方丢掉快照里没有的消息，快照重述请求带来的原文和本次仍有效的消息。
 	input    []json.RawMessage
 	inputIDs map[string]bool
 	// inputCallIDs 是请求带来的消息里已有的工具调用 id（不论装着它的那条消息 id 是什么）：官方客户端的 TOOL_CALL_START 在
@@ -65,6 +64,8 @@ type sseAdapter struct {
 	inputCallIDs map[string]bool
 	emitted      []*emittedMessage
 	byID         map[string]*emittedMessage // 文本消息与工具结果按 id 认（工具调用每次发出单独一条，不进这里）
+	// voidedToolProducers 阻止已作废模型调用的工具增量。文本可复用请求兜底 ID，仍在快照中按已发送消息撤回。
+	voidedToolProducers map[string]bool
 	// snapshotPending 标「有撤回或改写，快照还没发」：攒到下一个入口（下一个钩子事件进来、改状态之前）、或这个 run 收尾时
 	// 发一份。一次尝试作废时每次模型调用各来一个撤回，逐个发的话每个都重述整场对话，长对话下发送量近似平方增长。
 	// 有在途的流式消息时不发、等它们都收尾：快照落在一条文本流中间时，官方客户端的事件压缩回放把它排到那条流之后，回放
@@ -116,7 +117,7 @@ var (
 // newSSEAdapter 构造 adapter。runID 是本次 AG-UI run 的 id，input 是请求带来的消息（撤回消息时重述它们）。
 func newSSEAdapter(w eventWriter, runID string, input []AGUIMessage) *sseAdapter {
 	a := &sseAdapter{w: w, runID: runID, openMsgs: map[string]bool{}, byID: map[string]*emittedMessage{},
-		inputIDs: map[string]bool{}, inputCallIDs: map[string]bool{}}
+		inputIDs: map[string]bool{}, inputCallIDs: map[string]bool{}, voidedToolProducers: map[string]bool{}}
 	a.resultObserver.Deliver = a.emitCommittedToolResult
 	for _, m := range input {
 		if len(m.raw) == 0 {
@@ -179,6 +180,8 @@ func (a *sseAdapter) voidLocked(runID string) {
 		return
 	}
 	changed := false
+	// 节点提交可能迟于撤回。记录作废的来源，即使当下还没有可从快照移除的工具消息。
+	a.voidedToolProducers[runID] = true
 	for _, e := range a.emitted {
 		if !e.voided && e.producer == runID {
 			e.voided, changed = true, true
@@ -380,7 +383,7 @@ func (a *sseAdapter) OnToolStart(ctx context.Context, _ *hook.AgentInfo, in *sch
 		}
 	}
 	if !a.emitToolCall(in, callID) {
-		return ctx, nil // SSE 连接失败时由请求取消收尾。
+		return ctx, nil // 作废的调用与写入失败的调用均不记录展示状态。
 	}
 	// 模型文本流由产出它的模型节点登记。
 	return ctx, compose_v2.SaveStepResult(startCtx, toolCallStartedStep, callID, compose_v2.WithStreams(nil))
@@ -389,6 +392,10 @@ func (a *sseAdapter) OnToolStart(ctx context.Context, _ *hook.AgentInfo, in *sch
 func (a *sseAdapter) emitToolCall(in *schema.ToolInput, callID string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	producer := producerOf(in.Extra)
+	if a.voidedToolProducers[producer] {
+		return false
+	}
 	a.flushSnapshotLocked() // 在记录本次调用之前发出已攒的快照。
 	if err := a.writeLocked(NewToolCallStart(callID, in.Name)); err != nil {
 		return false
@@ -403,7 +410,7 @@ func (a *sseAdapter) emitToolCall(in *schema.ToolInput, callID string) bool {
 	}
 	// 请求里已有该线上 ID 时，快照沿用请求原文中的消息。
 	if !a.inputIDs[callID] && !a.inputCallIDs[callID] {
-		a.recordLocked(&emittedMessage{id: callID, producer: producerOf(in.Extra), role: "assistant", isToolCall: true,
+		a.recordLocked(&emittedMessage{id: callID, producer: producer, role: "assistant", isToolCall: true,
 			toolCallID: callID, toolName: in.Name, toolArgs: in.ArgumentsJSON})
 	}
 	return true
@@ -438,6 +445,10 @@ func (a *sseAdapter) emitCommittedToolResult(startCtx context.Context, out *sche
 func (a *sseAdapter) emitToolResult(out *schema.ToolOutput) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	producer := producerOf(out.Extra)
+	if a.voidedToolProducers[producer] {
+		return
+	}
 	a.flushSnapshotLocked() // 在这次要改的状态记进去之前：快照里不能已经有这个入口接着要发的事件
 	content := ""
 	if out.Result != nil {
@@ -469,7 +480,7 @@ func (a *sseAdapter) emitToolResult(out *schema.ToolOutput) {
 	for n := 2; a.byID[resultID] != nil || a.inputIDs[resultID]; n++ {
 		resultID = a.runID + "/" + callID + "#" + strconv.Itoa(n)
 	}
-	a.recordLocked(&emittedMessage{id: resultID, producer: producerOf(out.Extra), role: "tool", toolCallID: callID}).content.WriteString(content)
+	a.recordLocked(&emittedMessage{id: resultID, producer: producer, role: "tool", toolCallID: callID}).content.WriteString(content)
 	a.writeLocked(NewToolCallResult(resultID, callID, content))
 }
 
@@ -482,7 +493,7 @@ func (a *sseAdapter) OnError(ctx context.Context, _ *hook.AgentInfo, err *schema
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.flushSnapshotLocked() // 在这次要改的状态记进去之前：快照里不能已经有这个入口接着要发的事件
-	a.writeLocked(NewCustom(CustomEventError, map[string]any{"code": err.Code, "message": err.Message}))
+	a.writeLocked(NewCustom(CustomEventError, map[string]any{"code": err.Code, "message": "an error occurred during agent execution"}))
 	return ctx
 }
 

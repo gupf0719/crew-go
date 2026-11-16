@@ -34,7 +34,7 @@ type runConfig struct {
 	routeGrant *routeGrant
 
 	// abandoned 见 WithAbandonedTasks。beginRunActivity 校验并登记，abandonTasksAtEntry 收尾。
-	abandoned []string
+	abandoned []abandonedTask
 
 	// callKey 见 WithCallKey——只有 RunSubAgent 读它。
 	callKey string
@@ -260,7 +260,24 @@ func WithRunMaxRounds(n int) RunOption {
 //	sess.NextTask()
 //	ag.Run(ctx, sess, schema.UserMessage("先别转了，查下余额"), agent_v2.WithAbandonedTasks(old))
 func WithAbandonedTasks(runIDs ...string) RunOption {
-	return func(c *runConfig) { c.abandoned = append(c.abandoned, runIDs...) }
+	return func(c *runConfig) {
+		for _, id := range runIDs {
+			c.abandoned = append(c.abandoned, abandonedTask{id: id})
+		}
+	}
+}
+
+type abandonedTask struct {
+	id      string
+	settled bool
+}
+
+// WithSettledAbandonedTask 在新 Run 入场时核对已由宿主收尾的旧任务是否仍在执行。
+// 宿主已按原分区完成清档和历史补写，框架获取相同的放弃许可并跳过重复收尾。
+func WithSettledAbandonedTask(runID string) RunOption {
+	return func(c *runConfig) {
+		c.abandoned = append(c.abandoned, abandonedTask{id: runID, settled: true})
+	}
 }
 
 // applyRunOptions 应用 RunOption 列表，返回最终 cfg。
@@ -411,6 +428,7 @@ type resumeConfig struct {
 	abortFinalize      func(context.Context, string) error
 	abortHistoryKey    HistoryKey
 	abortHistoryStore  func(context.Context, HistoryKey) (HistoryStore, error)
+	abortAgentHistory  bool
 	useAbortHistoryKey bool
 	userInputs         map[string]*schema.Message // by InterruptID
 	userText           string                     // 非寻址型「用户这轮说了什么」
@@ -454,8 +472,8 @@ func WithResumeAbortCleanup(
 }
 
 // WithResumeAbortHistoryKey 使用原执行或先前取消时记录的历史归属，适用于跨进程补偿。
-// key 为 nil 表示原取消无需补写历史。HistoryStore 仍来自这次 Resume 的配置，
-// 缺失时仍清理存档，随后返回错误并等待补写。
+// key 为 nil 表示原取消无需补写历史。HistoryStore 默认来自这次 Resume 的配置。
+// 配置缺失时先清档再返回错误，使用 [WithResumeAbortAgentHistory] 时先确认后端。
 func WithResumeAbortHistoryKey(key *HistoryKey) ResumeOption {
 	var saved HistoryKey
 	if key != nil {
@@ -466,8 +484,16 @@ func WithResumeAbortHistoryKey(key *HistoryKey) ResumeOption {
 	}
 }
 
-// WithResumeAbortHistoryStore 在存档清理后为宿主指定的历史分区取得 HistoryStore。
-// 用于独立于 HTTP 请求的补偿。解析失败时保留宿主的清档进度。
+// WithResumeAbortAgentHistory 在清档前确认原任务历史分区的后端，使用原 Agent 的配置。
+// 适用于宿主已选择原工作流，但当前请求中间件配置属于替换任务的场景。
+// 显式 [WithResumeAbortHistoryStore] 始终优先，解析失败保留原存档。
+func WithResumeAbortAgentHistory() ResumeOption {
+	return func(c *resumeConfig) { c.abortAgentHistory = true }
+}
+
+// WithResumeAbortHistoryStore 为宿主指定的历史分区取得 HistoryStore。
+// 默认在存档清理后取得，解析失败时保留宿主的清档进度。
+// 使用 [WithResumeAbortAgentHistory] 时会在清理前取得。
 func WithResumeAbortHistoryStore(resolve func(context.Context, HistoryKey) (HistoryStore, error)) ResumeOption {
 	return func(c *resumeConfig) { c.abortHistoryStore = resolve }
 }

@@ -133,6 +133,32 @@ func TestWithAbandonedTasks_ClosesDanglingCallsAndDropsCheckpoint(t *testing.T) 
 	}
 }
 
+func TestWithSettledAbandonedTask_DoesNotCloseCurrentHistory(t *testing.T) {
+	f := newAbandonFixture(t, nil)
+	old := f.pending.RunID
+	cleanupCtx, activity, err := compose_v2.BeginTaskActivity(f.ctx, "", []string{old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 旧任务已由宿主清理。当前 Agent 读取的是另一份历史投影，其中仍有旧任务的调用声明。
+	_, err = f.cp.DeleteSubtree(cleanupCtx, old, "")
+	activity.Release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := f.newAgent().Run(f.ctx, agent_v2.NewRunSession(), schema.UserMessage("查下余额"),
+		agent_v2.WithSettledAbandonedTask(old))
+	if final := agent_v2.FinalMessage(events); err != nil || final == nil || final.Content != "好的" {
+		t.Fatalf("新任务应执行并完成，实际 %v 错误 %v", final, err)
+	}
+	msgs := f.history(t)
+	if abandonIndexOf(msgs, func(m *schema.Message) bool { return len(schema.GetToolCalls(m)) > 0 }) < 0 ||
+		abandonIndexOf(msgs, func(m *schema.Message) bool { return schema.GetToolResultID(m) == "c1" }) >= 0 ||
+		f.executed.Load() != 0 {
+		t.Fatalf("新任务不应改写当前历史中的旧调用，实际 %+v", msgs)
+	}
+}
+
 // 不声明放弃时旧任务照样能续，框架不替调用方判它放没放弃：历史里不补结果、存档不动（补了的话续跑执行之后真结果排在后面，
 // 按先到的配对被当成多余的）。
 func TestWithAbandonedTasks_NotGivenLeavesPendingTaskResumable(t *testing.T) {

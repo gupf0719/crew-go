@@ -54,38 +54,67 @@ func (c *recordFailedSave) SaveNS(ctx context.Context, sid, ns string, cp *compo
 }
 
 func TestExecutor_FailedRunDiscardsCheckpoint(t *testing.T) {
-	b := compose_v2.NewBuilder().WithName("failed_task")
-	b.AddNode("work", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
-		return nil, errors.New("temporary work failure")
-	})
-	b.AddEdge(compose_v2.StartNode, "work")
-	b.AddEdge("work", compose_v2.EndNode)
-	g, err := b.Compile()
-	if err != nil {
-		t.Fatal(err)
-	}
-	ag := agent_v2.NewGraphAgent(g, agent_v2.WithGraphAgentName("failed_task"),
-		agent_v2.WithGraphInputWriter(func(*schema.Message) []compose_v2.ChannelWrite { return nil }),
-		agent_v2.WithGraphOutputReader(func(compose_v2.Channels) *schema.Message { return nil }))
-	e := NewExecutor(ag, WithOwnerResolver(func(context.Context) string { return "tenant" }))
-	cp := &recordFailedSave{Checkpointer: compose_v2.NewInMemoryCheckpointer(), saved: make(chan string, 8)}
-	e.cp = cp
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	events := drain(e.Execute(ctx, &a2asrv.ExecutorContext{
-		TaskID: "failed-task", ContextID: "thread",
-		Message: a2atypes.NewMessage(a2atypes.MessageRoleUser, a2atypes.NewTextPart("run")),
-	}))
-	if state := lastStatus(events); state != a2atypes.TaskStateFailed || !strings.Contains(lastMessageText(events), "temporary work failure") {
-		t.Fatalf("任务应以节点的业务错误结束，实际 %s %q", state, lastMessageText(events))
-	}
-	select {
-	case sid := <-cp.saved:
-		if all, err := cp.LoadAllInSession(t.Context(), sid); err != nil || len(all) != 0 {
-			t.Fatalf("失败任务没有续接入口，应删掉已写入的档，实际 %v，%v", all, err)
-		}
-	default:
-		t.Fatal("测试应实际写入失败存档")
+	const detail = "temporary work failure with internal detail"
+	for _, tc := range []struct {
+		name         string
+		err          error
+		cancelCaller bool
+		wantState    a2atypes.TaskState
+		wantCode     string
+	}{
+		{"普通失败", errors.New(detail), false, a2atypes.TaskStateFailed, "agent_error"},
+		{"内层取消", fmt.Errorf("%s: %w", detail, context.Canceled), false, a2atypes.TaskStateFailed, "agent_error"},
+		{"调用方取消与普通失败并存", errors.New(detail), true, a2atypes.TaskStateCanceled, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			b := compose_v2.NewBuilder().WithName("failed_task")
+			b.AddNode("work", func(context.Context, compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+				if tc.cancelCaller {
+					cancel()
+				}
+				return nil, tc.err
+			})
+			b.AddEdge(compose_v2.StartNode, "work")
+			b.AddEdge("work", compose_v2.EndNode)
+			g, err := b.Compile()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ag := agent_v2.NewGraphAgent(g, agent_v2.WithGraphAgentName("failed_task"),
+				agent_v2.WithGraphInputWriter(func(*schema.Message) []compose_v2.ChannelWrite { return nil }),
+				agent_v2.WithGraphOutputReader(func(compose_v2.Channels) *schema.Message { return nil }))
+			e := NewExecutor(ag, WithOwnerResolver(func(context.Context) string { return "tenant" }))
+			cp := &recordFailedSave{Checkpointer: compose_v2.NewInMemoryCheckpointer(), saved: make(chan string, 8)}
+			e.cp = cp
+			events := drain(e.Execute(ctx, &a2asrv.ExecutorContext{
+				TaskID: "failed-task", ContextID: "thread",
+				Message: a2atypes.NewMessage(a2atypes.MessageRoleUser, a2atypes.NewTextPart("run")),
+			}))
+			if state := lastStatus(events); state != tc.wantState || strings.Contains(lastMessageText(events), detail) {
+				t.Fatalf("终态应为 %s，且不携带内部错误。实际 %s %q", tc.wantState, state, lastMessageText(events))
+			}
+			terminal, ok := events[len(events)-1].(*a2atypes.TaskStatusUpdateEvent)
+			if !ok {
+				t.Fatalf("缺少任务状态更新，实际 %T", events[len(events)-1])
+			}
+			var code string
+			if msg := terminal.Status.Message; msg != nil {
+				code, _ = msg.Metadata["crew.errorCode"].(string)
+			}
+			if code != tc.wantCode {
+				t.Errorf("公开错误码应为 %q，实际 %q", tc.wantCode, code)
+			}
+			select {
+			case sid := <-cp.saved:
+				if all, err := cp.LoadAllInSession(t.Context(), sid); err != nil || len(all) != 0 {
+					t.Fatalf("任务没有续接入口，应删掉已写入的档，实际 %v，%v", all, err)
+				}
+			default:
+				t.Fatal("测试应实际写过存档")
+			}
+		})
 	}
 }
 
@@ -387,42 +416,86 @@ func (m *askThenDone) Stream(ctx context.Context, msgs []*schema.Message, opts .
 
 func (m *askThenDone) WithTools(_ []*schema.ToolInfo) (model.ChatModel, error) { return m, nil }
 
-// notPersistedComboAgent 是自研 agent：把中断跟 ErrCheckpointNotPersisted 绑在一条链上交回来。
-type notPersistedComboAgent struct{}
+// failedInterruptAgent 模拟自研 agent 把中断和失败放在同一错误链。
+type failedInterruptAgent struct{ failure error }
 
-func (notPersistedComboAgent) Name() string { return "combo" }
-func (notPersistedComboAgent) Description() string {
-	return "returns an interrupt bound with ErrCheckpointNotPersisted"
-}
+func (failedInterruptAgent) Name() string        { return "failed_interrupt" }
+func (failedInterruptAgent) Description() string { return "returns an interrupt with a failure" }
 
-func (notPersistedComboAgent) Run(context.Context, *agent_v2.RunSession, *schema.Message, ...agent_v2.RunOption) ([]*agent_v2.AgentEvent, error) {
+func (a failedInterruptAgent) Run(context.Context, *agent_v2.RunSession, *schema.Message, ...agent_v2.RunOption) ([]*agent_v2.AgentEvent, error) {
 	ie := &compose_v2.InterruptError{Query: &compose_v2.AskQuery{InterruptID: "q1", Question: "Q?"}}
-	return nil, fmt.Errorf("%w (%w)", ie, compose_v2.ErrCheckpointNotPersisted)
+	return nil, fmt.Errorf("%w (%w)", ie, a.failure)
 }
 
-func (notPersistedComboAgent) Resume(context.Context, string, ...agent_v2.ResumeOption) ([]*agent_v2.AgentEvent, error) {
+func (failedInterruptAgent) Resume(context.Context, string, ...agent_v2.ResumeOption) ([]*agent_v2.AgentEvent, error) {
 	return nil, errors.New("not implemented")
 }
 
-// TestExecute_NotPersistedComboNotKeptPending：自研 agent 把中断跟档没写成绑在一条链上交回来时，task 不挂成
-// input-required（远端答了也续不上），跟陈旧写回、身份冲突同样处置。
-func TestExecute_NotPersistedComboNotKeptPending(t *testing.T) {
-	e := NewExecutor(notPersistedComboAgent{}, WithOwnerResolver(func(context.Context) string { return "owner" }))
-	tid := a2atypes.TaskID("t-combo")
-	evs := drain(func(y func(a2atypes.Event, error) bool) {
-		e.Execute(context.Background(), &a2asrv.ExecutorContext{
-			TaskID: tid, ContextID: "c-combo",
-			Message: a2atypes.NewMessage(a2atypes.MessageRoleUser, a2atypes.NewTextPart("hi")),
-		})(y)
-	})
-	if got := lastStatus(evs); got != a2atypes.TaskStateFailed {
-		t.Fatalf("档没写成的中断不该挂成 input-required，实际 %s", got)
+func TestExecute_FailedInterruptNotKeptPending(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code string
+	}{
+		{compose_v2.ErrCheckpointNotPersisted, "checkpoint_save_failed"},
+		{compose_v2.ErrCheckpointNotResumable, "checkpoint_not_resumable"},
+		{compose_v2.ErrTaskLeaseLost, "checkpoint_stale"},
+		{compose_v2.ErrRunAborted, "run_aborted"},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			e := NewExecutor(failedInterruptAgent{failure: tc.err}, WithOwnerResolver(func(context.Context) string { return "owner" }))
+			evs := drain(e.Execute(t.Context(), &a2asrv.ExecutorContext{
+				TaskID: "t-combo", ContextID: "c-combo",
+				Message: a2atypes.NewMessage(a2atypes.MessageRoleUser, a2atypes.NewTextPart("hi")),
+			}))
+			last, ok := evs[len(evs)-1].(*a2atypes.TaskStatusUpdateEvent)
+			if !ok || last.Status.State != a2atypes.TaskStateFailed || last.Status.Message == nil ||
+				last.Status.Message.Metadata["crew.errorCode"] != tc.code {
+				t.Fatalf("失败后的中断不该挂起，应以 %q 终结，实际 %+v", tc.code, evs[len(evs)-1])
+			}
+			e.mu.Lock()
+			n := len(e.tasks)
+			e.mu.Unlock()
+			if n != 0 {
+				t.Fatalf("不该留着待续发的 task 条目，实际 %d 条", n)
+			}
+		})
 	}
-	e.mu.Lock()
-	n := len(e.tasks)
-	e.mu.Unlock()
-	if n != 0 {
-		t.Fatalf("不该留着待续发的 task 条目，实际 %d 条", n)
+}
+
+func TestExecute_ResumeRejectionKeepsTaskAdmissionState(t *testing.T) {
+	const id a2atypes.TaskID = "task-known-to-client"
+	key := taskKey{owner: "owner", taskID: id}
+	for _, tc := range []struct {
+		code string
+		st   *taskState
+	}{
+		{"no_pending_checkpoint", nil},
+		{"busy", &taskState{busy: true}},
+		{"cancelled", &taskState{canceled: true}},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			e := NewExecutor(failedInterruptAgent{}, WithOwnerResolver(func(context.Context) string { return "owner" }))
+			var busy, canceled bool
+			if tc.st != nil {
+				busy, canceled = tc.st.busy, tc.st.canceled
+				e.tasks[key] = tc.st
+			}
+			events := drain(e.Execute(t.Context(), &a2asrv.ExecutorContext{
+				TaskID: id, ContextID: "thread", StoredTask: &a2atypes.Task{ID: id, ContextID: "thread"},
+				Message: a2atypes.NewMessage(a2atypes.MessageRoleUser, a2atypes.NewTextPart("answer")),
+			}))
+			if len(events) != 1 {
+				t.Fatalf("拒绝续发应只报告一次状态，实际 %d 次", len(events))
+			}
+			failed, ok := events[0].(*a2atypes.TaskStatusUpdateEvent)
+			if !ok || failed.Status.State != a2atypes.TaskStateFailed || failed.Status.Message == nil ||
+				failed.Status.Message.Metadata["crew.errorCode"] != tc.code || strings.Contains(lastMessageText(events), string(id)) {
+				t.Fatalf("拒绝续发应返回固定正文和 %q，实际 %+v", tc.code, events[0])
+			}
+			if st := e.tasks[key]; st != tc.st || st != nil && (st.busy != busy || st.canceled != canceled) {
+				t.Fatalf("拒绝续发改写了原任务的执行状态：%+v", st)
+			}
+		})
 	}
 }
 

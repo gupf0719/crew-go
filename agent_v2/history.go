@@ -858,17 +858,36 @@ type taskHistoryBindingKey struct{}
 // 已挂起的任务可以在恢复历史配置后重试，宿主应保留其存档和答复。
 var ErrTaskHistoryBinding = errors.New("task history binding failed")
 
+// TaskHistorySource 标识选中的 HistoryStore 配置来源，空值表示没有可用来源记录。
+type TaskHistorySource string
+
+const (
+	// TaskHistoryAgent 表示从 Agent 声明的配置选择 HistoryStore。
+	TaskHistoryAgent TaskHistorySource = "agent"
+	// TaskHistoryRequest 表示从请求上下文声明的配置选择 HistoryStore。
+	TaskHistoryRequest TaskHistorySource = "request"
+)
+
+// TaskHistoryDestination 是一个任务的已选历史分区。持久宿主保存 Key 和 Source，
+// 恢复时从同一逻辑存储取得 Store。
+type TaskHistoryDestination struct {
+	Key    HistoryKey
+	Store  HistoryStore
+	Source TaskHistorySource
+}
+
 type taskHistoryBinding struct {
-	task string
-	key  HistoryKey
-	bind func(context.Context, HistoryKey) error
+	task        string
+	destination TaskHistoryDestination
+	bind        func(context.Context, TaskHistoryDestination) error
 }
 
 // WithTaskHistoryBinding 让宿主在任务开始写历史前固定写入分区。
-// key 非零时使用已有分区；bind 在创建写入器前持久化新分区，失败时停止执行。
+// destination 为已有分区。未提供 Store 时，从调用方的历史配置取得后端。
+// bind 在创建写入器前保存实际分区，失败时停止执行。
 // 绑定只作用于指定 task，子 agent 沿用原写入器，脱离执行时清除绑定。
-func WithTaskHistoryBinding(ctx context.Context, task string, key HistoryKey, bind func(context.Context, HistoryKey) error) context.Context {
-	return context.WithValue(ctx, taskHistoryBindingKey{}, taskHistoryBinding{task: task, key: key, bind: bind})
+func WithTaskHistoryBinding(ctx context.Context, task string, destination TaskHistoryDestination, bind func(context.Context, TaskHistoryDestination) error) context.Context {
+	return context.WithValue(ctx, taskHistoryBindingKey{}, taskHistoryBinding{task: task, destination: destination, bind: bind})
 }
 
 // startHistory 在 Run / Resume 入口装配本次调用的历史写入器。
@@ -889,19 +908,32 @@ func startHistory(ctx context.Context, hc *historyConfig, agentName string) (con
 		return ctx, noop, nil
 	}
 	binding, _ := ctx.Value(taskHistoryBindingKey{}).(taskHistoryBinding)
-	_, nested := enclosingTask(ctx)
-	if nested || binding.task != compose_v2.GetSessionID(ctx) {
+	sid := compose_v2.GetSessionID(ctx)
+	owner, nested := enclosingTask(ctx)
+	// EnterRun 的根级自研壳与转发的 Agent 处理同一个任务，复用宿主绑定。
+	if binding.task != sid || nested && (owner != sid || compose_v2.GetGraphNS(ctx) != "" || compose_v2.WithinNodeScope(ctx)) {
 		binding = taskHistoryBinding{}
 	}
-	if hc == nil || hc.store == nil {
-		if binding.key != (HistoryKey{}) {
+	destination := binding.destination
+	if destination.Store == nil && hc != nil {
+		destination.Store = hc.store
+		destination.Source = TaskHistoryAgent
+		if hc == historyCfgFromCtx(ctx) {
+			destination.Source = TaskHistoryRequest
+		}
+	}
+	if isFrameworkNil(destination.Store) {
+		if destination.Key != (HistoryKey{}) {
 			return ctx, noop, fmt.Errorf("agent %q: %w: history store is unavailable", agentName, ErrTaskHistoryBinding)
 		}
 		return ctx, noop, nil
 	}
-	key, ok := binding.key, binding.key != (HistoryKey{})
+	key, ok := destination.Key, destination.Key != (HistoryKey{})
 	if ok && (key.Owner == "" || key.ConvID != compose_v2.GetThreadID(ctx)) {
 		return ctx, noop, fmt.Errorf("agent %q: %w: invalid destination", agentName, ErrTaskHistoryBinding)
+	}
+	if !ok && hc == nil {
+		return ctx, noop, fmt.Errorf("agent %q: %w: history destination lacks a key", agentName, ErrTaskHistoryBinding)
 	}
 	if !ok {
 		key, ok = historyKeyFrom(ctx, hc)
@@ -915,12 +947,13 @@ func startHistory(ctx context.Context, hc *historyConfig, agentName string) (con
 			"owner", hc.resolveOwner(ctx))
 		return ctx, noop, nil
 	}
+	destination.Key = key
 	if binding.bind != nil {
-		if err := binding.bind(ctx, key); err != nil {
+		if err := binding.bind(ctx, destination); err != nil {
 			return ctx, noop, fmt.Errorf("agent %q: %w: %w", agentName, ErrTaskHistoryBinding, err)
 		}
 	}
-	w := newHistoryWriter(ctx, hc.store, key)
+	w := newHistoryWriter(ctx, destination.Store, key)
 	// 调用方提供了前文时定下这次运行以谁为准（见 caller_history.go）。拥有者 = 建写入器时还不在任何正在执行的任务里：
 	// 各个 agent 入口都在盖自己的任务章之前建写入器，所以这里看到的任务只能是外面的（节点里、钩子里、嵌套调用里调起的）
 	if prior, declared := callerPrior(ctx); declared {

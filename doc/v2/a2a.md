@@ -91,6 +91,10 @@ A2A 的 `canceled` 状态表示任务已取消。在途 Run 或 Resume 退出后
 取消记录与用于续跑的存档同属 Executor 的进程内状态。
 配置持久协议 TaskStore 会保存 A2A 状态与任务历史。Executor 为任务及其嵌套执行绑定内存 Checkpointer，进程退出时释放存档。
 
+Run 或 Resume 失败时，任务状态为 `failed`，错误码位于状态消息的 `metadata["crew.errorCode"]`。
+状态消息以固定正文供远端和任务查询阅读，服务端日志记录内部错误详情。存档异常和终局失败分别报告，
+合法待答任务仍为 `input-required`。执行被调用方取消或软取消时，任务状态为 `canceled`。
+
 ### 服务注册发现（跨进程 / 跨语言）
 
 ```go

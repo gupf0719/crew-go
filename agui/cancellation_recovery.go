@@ -52,9 +52,9 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// WithCancellationHistory 为已接受的取消按保存的历史分区提供 HistoryStore。
-// 仅在 HistoryStore 来自 HTTP 中间件时需要，工厂已有历史配置时可沿用工厂。
-// 回调使用服务凭据，并遵守 ctx 取消。返回错误时保留清理记录，后续继续尝试。
+// WithCancellationHistory 按已绑定的历史分区解析取消或替换所需的 HistoryStore。
+// 共享任务使用请求选择的历史后端，或旧记录中未注明后端来源时，替换需要此回调。
+// 回调使用服务凭据，并遵守 ctx 取消。替换在清档前解析，已有清理记录可继续重试。
 func WithCancellationHistory(resolve func(ctx context.Context, key agent_v2.HistoryKey) (agent_v2.HistoryStore, error)) Option {
 	return func(h *handler) { h.cancellationHistory = resolve }
 }
@@ -299,5 +299,5 @@ func (h *handler) recoverCancellation(ctx context.Context, key string) (err erro
 	}
 	ctx = compose_v2.WithThreadIDCtx(ctx, thread)
 	ctx = compose_v2.WithOwner(ctx, intent.Owner)
-	return cancelSharedSession(ctx, s, ag, nil, "", h.cancellationHistory, agent_v2.WithResumeAbortContext(lifecycle))
+	return cancelSharedSession(ctx, s, ag, sharedCancellationRequest{}, h.cancellationHistory, agent_v2.WithResumeAbortContext(lifecycle))
 }

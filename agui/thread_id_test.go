@@ -123,7 +123,7 @@ func (a *zzErrAgent) Description() string { return "" }
 // 前端要在**三条相反的动作**之间选：会话结束了该开新的 / 终局失败别再试 / 可以原样重来。
 // 没有 code 就只剩一段人读的文本，这三条分不出来。
 //
-// sanity-revert：把 `agentErrorCode(err)` 换回 `""` → 三个子用例全红。
+// sanity-revert：把终态错误码换回空串 → 三个子用例全红。
 func TestRunError_HasMachineReadableCode(t *testing.T) {
 	cases := []struct {
 		name string

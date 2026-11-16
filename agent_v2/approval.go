@@ -528,7 +528,7 @@ func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, arg
 			// 单工具审批时 cp 里连「这是审批挂起」都读不出来，多工具时反而读得出，
 			// 同一语义两条路径行为分叉。
 			Reason: ApprovalInterruptReason,
-			// 供调用方按协议 ID 和实例 ID 定位审批对应的工具。放弃时按会话历史补结果，见 closeUnansweredToolCalls。
+			// 供调用方按协议 ID 和实例 ID 定位审批对应的工具。放弃时按会话历史补结果，见 CloseAbandonedTaskHistory。
 			ToolCallID:         tc.ID,
 			ToolCallInstanceID: toolBatchFrom(ctx).callInstanceID(compose_v2.GetCurrentToolCallIndex(ctx)),
 			ToolName:           name,

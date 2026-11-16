@@ -676,9 +676,24 @@ go run ./example/decision/routing_eval -cases requests.jsonl -scenarios routes.j
 ```
 
 在同一批标注上比较不同阈值的自动承接率、升级率、自动承接错路由率和端到端 P95。
-混合方案模拟只用两条路径都判定过的样本，真实 cascade 数据用实际执行的阶段与耗时。
-改变标注可复用输入指纹命中的模型预测，修改输入或分支说明会重跑。
-线上复核可以按请求抽样挂 `agent_v2.WithShadow` 并设短超时，影子与线上结果交给人工标注复核。
+混合方案模拟只用两条路径都有结果的中文样本，升级样本的模拟耗时为首档与备选耗时之和。
+报告把 P95 模拟值和 cascade 实际执行的 P95 分开列出。
+
+保留原样本、分支定义、系统、模型、服务地址、语言条件和轮次，加上 `-replay` 可在本地重算报告。
+每个适用样本都需要一条输入指纹匹配的缓存记录。回放无需模型凭据。百炼的 `-bailian-workspace` 和
+`-bailian-region` 参与端点的指纹校验。请求失败的缓存记录仍计入报告概况，混合方案只配对两边均成功的记录。
+
+`-thresholds` 为混合模拟表指定多个 0 到 1 之间的门槛，用逗号连接。实际 cascade 运行的门槛由
+`-cascade-threshold` 指定，回放 cascade 结果时使用运行时相同的值。
+
+```bash
+go run ./example/decision/routing_eval -cases requests.jsonl -scenarios routes.json \
+  -systems jev,qwen,cascade -conds zh -cascade-threshold 0.85 \
+  -replay -thresholds 0.75,0.85,0.9,0.95 -out /tmp/crew-routing-eval
+```
+
+改变标注可复用已有预测。输入或分支说明改变后，联机模式更新不再匹配的缓存。
+业务标注与模型实测数据就绪后才适合选部署门槛。线上复核可以按请求抽样挂 `agent_v2.WithShadow` 并设短超时。
 
 ## 6. 决策记录
 
@@ -727,4 +742,4 @@ go run ./example/decision/routing_eval -cases requests.jsonl -scenarios routes.j
 
 ## 7. 限制与待办
 
-开放项见 [中心 backlog](../code/todo.md)，包括 LLM classifier 置信度、线上样本回放和其它决策点。
+开放项见 [中心 backlog](../code/todo.md)，包括 LLM classifier 置信度、线上样本标注和其它决策点。

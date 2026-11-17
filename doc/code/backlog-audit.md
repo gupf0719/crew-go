@@ -15,8 +15,17 @@
 | 扇出身份冲突与终局失败并存 | 已关闭。父档封存，冲突子档保留，原错误链可查。跨层回归覆盖切回原图后外部写入仍为一次。 [扇出回归](../../agent_v2/terminal_checkpoint_conflict_test.go) |
 | 根档封存和 AG-UI 解绑同时失败 | 已关闭。确认两个收尾失败后，SQLite 另一实例换请求 ID 或直接 Resume 都被拒绝。子图 Sync 和 Async 过程档沿用已准入状态。 [AG-UI 回归](../../sql/agui_terminal_conflict_test.go) · [过程档回归](../../compose_v2/checkpoint_resume_test.go) |
 | 跨分区误删与清档竞态 | 已关闭。钩子把 Resume 路由到另一分区时，即使两份档完全相同也会拒绝。SQLite 独立连接在清档取样后插入新后代，条件删除保留两份档。 [分区回归](../../agent_v2/graph_checkpoint_late_backend_test.go) · [条件清档回归](../../sql/checkpointer_atomic_graph_test.go) |
-| D06、D10 的存档 API 问题 | 仍开放。`SaveNS` 仍会保存原输入指针，`SaveBatch` 仍同时写有原子和 best-effort 两种承诺。两者可在本机复测。 [内存实现与接口](../../compose_v2/checkpointer.go) |
+| D06、D10 的存档 API 问题 | 在该合并基线仍开放，后续修复见[四项缺陷修复](#2026-11-17-四项缺陷修复)。 |
 | A02、A09 的部署验收 | 共用存档部分暂缓。目标发布 CI、实际使用的后端升级和 Plan Web 单实例生产入口仍待验收。 [升级说明](../release/next.md) · [ISSUE-90](../issue/issue-90-plan-chat-web-lifecycle-prod.md) |
+
+## 2026-11-17 四项缺陷修复
+
+| ID | 关闭依据 |
+| --- | --- |
+| D06 | 三种后端在副本上填写寻址字段。双槽测试复用同一输入，验证第一槽的身份及世代保持，输入的字段不被后端修改。 [共用回归](../../compose_v2/checkpointer_conformance/save_load.go) |
+| D11 | 根任务结算或确认放弃后按 RunID 回收规则。跨层回归覆盖非空根 namespace、挂起续答、子图单独结束、清档失败、错误分区及不同本机分区的在途子图。 [生命周期回归](../../agent_v2/approval_retirement_internal_test.go) · [真实审批回归](../../agent_v2/approval_test.go) |
+| D08 | Raw 和 Rewrite 绑定到直接候选。内层成员用各自历史，三跳送模视图按原始消息 ID 合并同一用户输入，各归属的审计记录保留。回归也覆盖使用新 session 续跑时恢复本轮输入。 [跨层回归](../../agent_v2/handoff_modelb_test.go) |
+| D10 | 批量按 namespace 字节序调用 `SaveNS`。中项冲突时保留成功前缀，冲突槽和尾部槽保持旧值。 [共用回归](../../compose_v2/checkpointer_conformance/save_batch.go) |
 
 ## 最近复审、发布与设计入口
 
@@ -33,7 +42,7 @@
 | 合并后复审 P2 · Redis 清档权限 | D04 已修 | Redis 7.4.2 验证无 EXISTS 的运行角色可清档，仅索引允许 TYPE 的角色也可走原有权限。权限不足时存档和会话保留。 [回归](../../redis/checkpointer_delete_acl_test.go) |
 | 合并后复审 P3 · 慢后端取消补偿 | 开放 D05 | `agui/cancellation_recovery.go:150`。逐页第 6 秒返回的守约 backend 在 5 秒预算下持续超时，旧版能推进。 |
 | 合并后复审 P3 · Redis 旧 GraphID | 开放 D07 | `redis/checkpointer_migration.go:55`。真实 Redis 对照，普通 Unicode 成功，旧 writer 存入带非 UTF-8 字节的 GraphID 后迁移失败。 |
-| ISSUE-24 · 内存存档引用 | 开放 D06 | 本轮临时探针在 `e185749` 上同步 Save 同一输入到两个任务。第一槽从 `alpha/left` 变成 `beta/right`。两个独立输入时仍为 `alpha/left`。未主动修改读出的对象。 |
+| ISSUE-24 · 内存存档引用 | D06 已修 | 基线把同一输入写入 `alpha/left`、`beta/right` 后，第一槽读出第二槽身份。现在各槽保存自己的顶层值，按 [D06 回归](#2026-11-17-四项缺陷修复)复核。 |
 | 后台子 Agent · 原 defer | 关闭 | `e185749` 实现显式派单、独立任务及跨进程恢复。提交与 [SQL 后台恢复回归](https://github.com/gupf0719/crew-go/blob/e18574950566e8b5a52f1f9ebff0f3da50028bca/sql/background_recovery_test.go) 有写入重试、崩溃恢复、父任务唤醒证据。不同于普通嵌套工具自动转后台。 |
 | 离线路由评测 · 原线上回放缺口 | 回放框架已关闭，验收 A03 | `e185749` 的 `TestReplayScansThresholdsWithoutCredentials` 验缓存回放。真实标签流量与上线门槛仍待。 |
 | OTel `Status.Message` 原查漏 | 关闭 | `observability/handle.go:255` 先脱敏再按 1024 字符截断，同一正文进入 status/exception。当前 `TestErrorMessage_RedactedBeforeTruncated` 同时检验两个出口。 |
@@ -79,8 +88,8 @@ A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合�
 | ISSUE-20 · doc/issue/issues.md:1829 | 决策，关闭提案 | compose_v2/graph.go:347、subgraph.go:138 继续用 AddNode / AddSubgraphNode 注册，NodeFunc 为公开执行入口。TestGraph_SimpleLinear、TestSubgraph_ImportFromParent。 |
 | ISSUE-21 · doc/issue/issues.md:1812 | 关闭 | compose_v2/checkpointer.go:664–670 的 SaveNS 仅要求非空 sid 和 cp，Checkpointer conformance 用无 owner 的上下文，TestCheckpointer_SaveLoad_BasicRoundTrip。 |
 | ISSUE-22 · doc/issue/issues.md:1798 | 关闭 | agent_v2/session.go:159–168 的 NewRunSession 生成 RunID，NextTask 换任务 ID。agent_v2/cross_task_isolation_test.go 核对新任务输入。 |
-| ISSUE-23 · doc/issue/issues.md:1747 | 关闭 | 现行 [WithCheckpointerCtx](../../compose_v2/checkpointer.go#L778)，与 compose_v2/checkpointer_integration_test.go 的 TestCheckpointer_InjectionViaCtx / BusinessUseFromNode / BoundCheckpointerControlsGraphAndDetaches。 |
-| ISSUE-24 · doc/issue/issues.md:1722 | H 项关闭或转入后续，L4 开放缺陷见 24-L4 | agent_v2/session.go:534 的 lane 提交、run_subagent.go 的嵌套身份、history_slot.go 的历史归属、compose_v2/graph_loop.go 的分支恢复分别有 member_history_scope、nested_call_identity、history_e2e 和 partial_failure_successor 回归。旧 H3 的事件托管见 ISSUE-40，M3 压缩见 ISSUE-45。 |
+| ISSUE-23 · doc/issue/issues.md:1747 | 关闭 | 现行 [WithCheckpointerCtx](../../compose_v2/checkpointer.go#L777)，与 compose_v2/checkpointer_integration_test.go 的 TestCheckpointer_InjectionViaCtx / BusinessUseFromNode / BoundCheckpointerControlsGraphAndDetaches。 |
+| ISSUE-24 · doc/issue/issues.md:1722 | H 项关闭或转入后续，L4 已关闭，见 24-L4 | agent_v2/session.go:534 的 lane 提交、run_subagent.go 的嵌套身份、history_slot.go 的历史归属、compose_v2/graph_loop.go 的分支恢复分别有 member_history_scope、nested_call_identity、history_e2e 和 partial_failure_successor 回归。旧 H3 的事件托管见 ISSUE-40，M3 压缩见 ISSUE-45。 |
 | ISSUE-25 · doc/issue/issues.md:1701 | 关闭 | compose_v2/retry.go:145 的 ExponentialBackoff，TestRetry_BackoffDelayBasics 与 agent_v2/retry_integration_test.go 的 TestRetry_UsesExponentialBackoff。 |
 | ISSUE-26 · doc/issue/issues.md:1685 | 关闭 | compose_v2/exit_checkpoint.go 的退出存档与有界 grace。TestNodeTimeout_SiblingKeptAndCheckpointFailed、TestExitGrace_InnerTimeoutDoesNotConsumeCallerGrace / SlowBackendStillCompletes。 |
 | ISSUE-27 · doc/issue/issues.md:1663 | 决策，v2 拓扑校验范围已收敛 | compose_v2/graph.go:249、509 核对节点名、断点、入口和静态边。out_edges.go:39 允许无出边自然结束，动态 Send 和条件可决定连接，循环由 maxVisit 有界。TestCompile_RejectsStaticEdgeBackToStart、TestGraph_MaxVisit_Defense。 |
@@ -128,7 +137,7 @@ A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合�
 
 ### 24-L4
 
-开放缺陷，主台账 D06，建议 P3。ISSUE-24 曾为内存存档保存时复制修复指针别名。现在 compose_v2/checkpointer.go:687–694 在 SaveNS 原地填 ID/NS/ParentNS 后保存同一指针。连续把同一 cp 变量写入不同槽，第二次 SaveNS 会使旧槽同时变化。在 e185749 实测，先写 alpha/left 再写 beta/right，前一槽读出 beta/right，换成两个独立指针对照则保持 alpha/left。LoadNS 的只读返回约定覆盖不了 SaveNS 自己修改已保存对象。TestCheckpointer_NestedNS 使用不同指针，未覆盖保存输入所有权。
+D06 已关闭。基线 `e185749` 连续以同一指针写入 `alpha/left` 和 `beta/right` 后，第一槽读出 `beta/right`。独立输入的对照保留了第一槽。三个内置后端现已采用独立顶层副本，共用回归核对两个槽和原输入。 [共用测试](../../compose_v2/checkpointer_conformance/save_load.go)
 
 ### 47-A
 
@@ -153,7 +162,7 @@ A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合�
 | ISSUE-67 | issues.md:152、:167 · issue-67-autocompact.md:10 | 已闭合，有待集成的后续修复 | `agent_v2/autocompact.go:313`、`issue76_autocompact_memory_internal_test.go:55`、`compaction_boundary_test.go:39,83`。摘要触发、受保护输入 fallback、下一 Run 按归属读摘要边界均实现。本地 `fb1f22e` 有摘要审批视图修复，仍在 `e185749` 之外。 |
 | ISSUE-68 | issues.md:152、:170 · issue-68-reactive-compact.md:10 | 已闭合 | `agent_v2/reactive_compact.go:351`、`reactive_progress_token_test.go:75`、`reset_stream_test.go:53` 验证 token 进展和重试流复位。 |
 | ISSUE-69 | issues.md:138 · issue-69-compaction-audit-retrospective.md:10 | 已闭合，长期项转 71 | Retrospective 保留历史缺陷集合。专题 :123–127 的 Seq/Loop/Reflect/Handoff HITL 缺口已由统一嵌套入口与各编排 Resume 解决，见 ISSUE-71、`doc/v2/hitl-resume.md` 与 `example/orchestration/nested_smoke`。 |
-| ISSUE-70 | issues.md:116、:131–134 · issue-70-checkpoint-evolution.md:11 | 主体已闭合，Phase 4 分项见下 | `compose_v2/checkpointer.go` 的 `LoadNS/SaveNS/DeleteSubtree` 和 `checkpointer_conformance`，Redis 与 SQL 同跑 conformance。后续 SaveBatch 契约仍开放。 |
+| ISSUE-70 | issues.md:116、:131–134 · issue-70-checkpoint-evolution.md:11 | 主体已闭合，Phase 4 分项见下 | `compose_v2/checkpointer.go` 的 `LoadNS/SaveNS/DeleteSubtree` 和 `checkpointer_conformance`，Redis 与 SQL 同跑 conformance。SaveBatch 契约由 D10 固定，见下。 |
 | ISSUE-71 | issues.md:80 · issue-71-pa-ra-plan-nestable-agent.md:1 | 已闭合 | `agent_v2/run_subagent.go:125`、`member_dispatch.go`、`example/orchestration/nested_smoke` 和 `doc/v2/hitl-resume.md` 覆盖统一 Agent.Run/Resume 及子图寻址。专题标题的 NestableAgent 是旧提案，专题 :3 和索引已说明最终删除。 |
 | ISSUE-72 | issues.md:54–76 | 已闭合，无独立专题 | 原提交链保存在索引 :64–73。当前 `compose_v2/checkpointer.go` 的精确 namespace 与子树，`agent_v2/compaction_boundary.go`、`compose_v2/instance_identity_test.go:69,149`、`agent_v2/microcompact_offload_test.go:521` 和 nested smoke 可核对继承后的主行为。编排追踪与 71 同一事项。 |
 | ISSUE-73 | issues.md:17 · issue-73-v2-doc-audit-tracking.md:9 | 核心已闭合，保留文档清理和可选续审 | 专题 :72–118、:216–279 与已存在的 `doc/v2/{context-compaction,architecture-overview,hooks-and-streaming,migration-history,usage-guide}.md` 对照。旧 :271–272 未完成示例现有 `example/store/v2_store_demo`、`example/graph/v2_graphagent_demo` 和 `v2_typedgraph_demo`。详见下。 |
@@ -176,7 +185,7 @@ A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合�
 | ISSUE-90 | issues.md:34 · issue-90-plan-chat-web-lifecycle-prod.md:1 | 已实现，有部署接受边界 | 专题 :5–34、`example/orchestration/plan_chat_web` 与 `615c4d1`、`d609bd5`。规划器同步 checkpoint 与再规划回归见 `planner_internal_test.go:28,109`。完成清档与会话索引终态之间仍有已文档化窗口，生产 Redis 持久化、跨副本故障恢复和入口身份是独立验收。 |
 | ISSUE-91 | issues.md:35 · issue-91-external-agent-adapter.md:1 | 已闭合，适配器限定文本函数 | `agent_v2/agent_func.go:13` 和 `agent_func_test.go:14` 验证文本函数作为成员运行及失败后的存档续跑。外部框架的全部状态和流协议不属于该适配器现有契约。 |
 | ISSUE-92 | issues.md:36 · issue-92-skill-source-layering.md:1、:4、:67–144 | 已闭合 | `skill/references.go:25,63`、`references_test.go:33–46`、`agent_v2/skill_references.go:20,71,331`、`skill_references_test.go:36,101,150` 与 `615c4d1` 覆盖 frontmatter、路由、预算、激活权限、去重。正文的提议表系实施前分析，固定的默认 token 预算见 `agent_v2/config.go:1042`。 |
-| ISSUE-93 | issues.md:37 · issue-93-handoff-modelb-audit-low.md:1 | 混合。①作用域风险仍开放，②③已闭合或被替代 | `agent_v2/handoff_agent.go:584` 把视图放入 ctx，`member_dispatch.go:90` 与 `run_subagent.go` 没有该语义的重置。`basic_agent.go:959,1077,1112` 会据此选择 prior、事件投影和输入认领。②已有压缩边界，③信号由提交与裁决确定。具体拆分见下。 |
+| ISSUE-93 | issues.md:39 · issue-93-handoff-modelb-audit-low.md:1 | ① D08 已修，②③已闭合或被替代 | 历史模式属于直接候选的一次执行，跨层回归核对送模、事件和持久历史。②已有压缩边界，③信号由提交与裁决确定。 |
 | ISSUE-94 | issues.md:38 · issue-94-dangling-cp-nonterminal-error.md:1 | 已闭合 | `compose_v2/checkpointer.go:406,481,752` 和 `graph_loop.go:986–1010` 区分真正挂起与失败现场。见 `failed_cp_test.go`、`resumable_by_content_test.go:79`、`agent_v2/resume_from_failure_test.go:84`。失败档若仍有 frontier，显式重试保持支持。 |
 | ISSUE-95 | issues.md:43 · issue-95-graphloop-sendfrom-double-send.md:1、:4 | 已闭合，finding 2 并入 96 | 专题记录历史 F1 `90a94d2` / `7d6b913` 与 F3 `bca57e8`。基准证据为 `compose_v2/multi_instance_test.go` 按执行实例清理 deferred send，以及 `agent_v2/basic_builder.go:425`、`tool_failure_visibility_test.go:75,304` 的 `OnToolEnd.Success` 和钩子改写。专题旧「待修」应指向 96。 |
 | ISSUE-96 | issues.md:42 · issue-96-branch-instance-identity.md:1 | 已闭合 | `compose_v2/instance_identity_test.go:69,149,191` 验跨 Resume、静态边空 token 及 wire，`send_target_validation_test.go:53` 验未注册目标，`multi_instance_test.go` 验同目标成功兄弟保留。 |
@@ -190,12 +199,12 @@ A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合�
 |---|---|---|
 | 66、98 · issue-98-conversation-history.md:416、:507–511 | 决策，重复 `doc/code/todo.md:343` | 持久摘要已落地，保留原始历史并通过 `agent_v2/compaction_boundary.go` 投影，`compaction_boundary_test.go:39,83,117,143`。MicroCompact 的缺省 namespace 随 sid，`microcompact.go:132–149`，同 Run 去重见 `microcompact_offload_dedup_test.go:45,100`。独立定义跨 Run 内容寻址、TTL/配额及向部署方交付会话级回收责任，独立于摘要。 |
 | 67、99 信号相关 · 本地 `fb1f22e` | 实现待集成 | `git log e185749..fb1f22e` 只有隔离 AG-UI 展示结果并绑定摘要审批视图的提交。它解决摘要启用前后审批的授权范围、AG-UI 展示副本与旧 memos 的重放边界。`e185749` 不包含该修复。分支回归见 `autocompact_approval_resume_test.go:16,113,171,244`、`autocompact_nested_approval_test.go:18`、`agui/tool_result_once_test.go:324` 及 `agui/tool_result_legacy_memo_test.go`。作为集成项跟踪，避免把旧摘要主体或 ISSUE-99 控制信号重新打开。 |
-| 70 · issues.md:132–134，issue-70-checkpoint-evolution.md 的 Phase 4 | 设计或未实现 | 通用业务 typed state 迁移和 `SelfHistoryByNS` 的历史 API 方案没有当前提供者。保留真实业务触发条件。历史归属槽和执行 namespace 有不同寿命，按现有 API 不能假定可互换。PostgreSQL/Redis 已接入，因此不能继续用“未来接入”延期 SaveBatch。 |
-| 70 · SaveBatch | 契约缺陷，合并 `doc/code/todo.md:344` | `compose_v2/checkpointer.go:123` 公共 godoc 承诺原子，:778–784 内存逐条返回，`redis/checkpointer_batch.go:16` 与 `sql/checkpointer_batch.go:22` 也逐条跑 `SaveNS`，直接按 map 迭代。接口后续句与 `checkpointer_conformance/save_batch.go:43–66` 允许 best-effort，且后者只断言报错。生产没有内部 `.SaveBatch` 调用。明确去留或统一契约，再验证失败时存档状态。 |
+| 70 · issues.md:132–134，issue-70-checkpoint-evolution.md 的 Phase 4 | 设计或未实现 | 通用业务 typed state 迁移和 `SelfHistoryByNS` 的历史 API 方案没有当前提供者。保留真实业务触发条件。历史归属槽和执行 namespace 有不同寿命，按现有 API 不能假定可互换。SaveBatch 的现行契约由 D10 固定。 |
+| 70 · SaveBatch | D10 已关闭 | 内存、Redis、SQL 按 namespace 字节序落档，遇错停止且保留此前写入。旧文的批量原子承诺由现行接口和中项失败回归替代。 [接口](../../compose_v2/checkpointer.go) |
 | 73 · issue-73-v2-doc-audit-tracking.md:111–118、:216–279 | 文档欠账与可选续审 | 核心 P0/P1 文档、速查项与旧缺失的 Store/Graph/TypedGraph 示例已有入口。专题仍列“未写”“剩余 P1”、以及 R7/R4 审计版次与前面状态矛盾。清正文漂移。可选的决策合集、审计方法独立文档和新一轮边际审计仍是编辑决策。现有规则入口为 `AGENTS.md`、`CLAUDE.md` 及 `doc/description/three-way-comparison`，quickstart 和 SDK guide 已有文件。 |
 | 88、92 · issue-88-skill-schema-dead-code.md:4、issue-92-skill-source-layering.md:73–133 | 已实现与明确边界 | 参考层正式功能、Go action 和 Skill 覆盖门禁已经上线。旧 `RunSkillScript/ErrActionNotImplemented` 被删除，仓库没有通用脚本执行承诺。92 中动态按模型空窗算预算、Vercel 数字作为触发点、每 ref 样式与可观测建议均属于原提案。当前 `config.go:1042–1043` 固定可配置两级预算和强制读取规则。真实触发率的定量验收可作为能力评估，未见当前覆盖声称达成旧论文数字。 |
 | 90 · issue-90-plan-chat-web-lifecycle-prod.md:27–34 | 部署验收与明确限制 | 共享 Redis、同步存档已实现。文档公开了图端成功清档与会话元数据更新之间的进程故障窗口，过期前 running 索引可能恢复成 error。上线如需更强一致性，应单列终态 reconciliation 方案与跨副本重启验收。演示应用仍以 Cookie 和反向代理作为边界。 |
-| 93① · issue-93-handoff-modelb-audit-low.md 的 ① | 源码确认的开放作用域风险 | 顶层 Handoff 授予的是某一跳的 intended view。非 Handoff 编排内层 BasicAgent 仍能读到继承值，当前 `handoff_agent.go:132–133` 的 godoc 明示。嵌套叶子的 prompt、事件、输入去重行为均受影响。在决定更改前用 Handoff(Sequential/Reflect/Parallel(Basic)) 的对照探针核实共享投影与独立子成员的边界，防止误关由 Handoff 有意透传的树形候选。此轮未跑新的运行时探针。 |
+| 93① · issue-93-handoff-modelb-audit-low.md 的 ① | D08 已关闭 | Handoff 共享视图绑定到对应的候选调用。两跳和三跳的真实编排回归区分直接接手与内层成员，并核对事件回退及 HistoryStore 的投影。 [回归](../../agent_v2/handoff_modelb_test.go) |
 | 93② · issue-93-handoff-modelb-audit-low.md 的 ② | 已由持久压缩边界替代 | `agent_v2/session.go:744,779–826` 的 `SelfHistoryCompacted` 只读业务显式写入的 summary marker，默认框架 AutoCompact 走 `compaction_boundary.go`、`basic_builder.go:1253–1260` 和按视图查找。旧的“系统根本不产持久摘要”现已过时。 |
 | 93③、Raw 候选 · issue-93-handoff-modelb-audit-low.md 的 ③、:69–74 | 已闭合 | `agent_v2/handoff_agent.go:650–660` 只消费已提交 typed signal，`handoff_grant.go:314` 验证程序化来源，`tool_memo_framework_test.go:34`、`conflict_abort_test.go:154` 覆盖 Commit/Resume。Raw 中悬空 tool call 经 `basic_agent.go:1118–1127` 与会话投影的标准配对修复。原先结论的“稳定 400”不代表当前路径。 |
 | 97 · issues.md:41，doc/v2/checkpoint.md:636–642 | 明确边界与验收 | 内置 SQL/Redis 的任务租约覆盖同一会话的 Run/Resume/Abort，Save/Delete 有 fencing。自研 backend 需实现 `TaskLeaseProvider` / `TaskLeaseStore`（或调用方串行化）。隐式的运行检测不能把已启动外部副作用或异步 HistoryStore 变成跨系统 exactly-once。旧 “核心危害防不住” 应收敛为这些条件。 |
@@ -262,7 +271,7 @@ A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合�
 
 - agent_v2。ApprovalPrompt_InSystemPreamble，HandoffBatchVisibility_HistoryCarriesSiblingToolResults，RepeatTool_DeniedCallsStillCount，SoftLanding_HardToolCallNotExecutedAfterResume，ToolSearch_RevealedSurvivesResume。
 - observability。HalfInstall_WarnsOnce，ErrorMessage_RedactedBeforeTruncated。
-- compose_v2。C2_SaveBatch，仅覆盖既有成功路径，未决定部分失败是否原子。
+- compose_v2。历史 C2_SaveBatch 只覆盖成功路径。D10 的中项冲突回归已固定部分失败契约。
 - mcp。Hub_ReconnectFinishingAfterClose_DiscardsNewClient。
 
 未访问 GitLab，未调用真模型，未重新执行发版门禁。fb1f22e 使用提交和配套回归作为历史证据。
@@ -419,7 +428,7 @@ A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合�
 | L341 | 🔍 tool_call ID 含非法 UTF-8 时 InterruptID 跨续跑漂移（2026-10-14 审计实测，改动前就有）：tc.ID 经 channel 存档往返… | 🔍 记录 | 观察 | A17 | 旧探针对非法 UTF-8 tool call ID 的 JSON 往返。provider 正常 JSON 有 UTF-8 保障，需当前自定义入口证可达。 · 现存入口 [agent_v2/approval.go](../../agent_v2/approval.go) · 原文溯源 877aea13（仅文档溯源） |
 | L342 | 🟡 顶层 GraphAgent 的用户输入到出口才写进历史，排在子 agent 问答之后 已修（2026-10-29）：入口把原始输入登记成待补（deferRootInput）… | ✅ 已修 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/graph_agent.go](../../agent_v2/graph_agent.go) · 基线缺旧引用 5b8d7ba7 · 原文溯源 82c0802c（仅文档溯源） |
 | L343 | 🔨 压缩产物存不存、谁来回收，没有决策（2026-09-18 核验新增。原埋在 ISSUE-98 §7 与对照文档，从没进本表）：摘要每次 Run 都重算、不落盘 摘要这一半 … | 🔨 待拍板 | 契约 | Q03 | MicroCompact 转存用 Store Put，无通用 TTL/回收。工具外溢配置不覆盖。与 L499 读取语义为伴。 · 现存入口 [doc/issue/issue-98-conversation-history.md](../../doc/issue/issue-98-conversation-history.md)、[agent_v2/microcompact.go](../../agent_v2/microcompact.go)、[doc/v2/context-compaction.md](../../doc/v2/context-compaction.md) · 原文溯源 0facd299（仅文档溯源） |
-| L344 | 🔨 Checkpointer.SaveBatch：生产零调用，接口说「原子」而实现都是逐条 best-effort（2026-09-18 核验新增）：生产代码（排除测试与 co… | 🔨 待拍板 | 契约 | D10 | compose_v2/checkpointer.go:123–127 同时承诺一次原子及逐条失败。mem/redis/sql SaveBatch 都 best-effort，无仓内生产调用。并 ISSUE-70。 · 现存入口 [compose_v2/checkpointer.go](../../compose_v2/checkpointer.go) · 原文溯源 877aea13（仅文档溯源） |
+| L344 | 🔨 Checkpointer.SaveBatch：生产零调用，接口说「原子」而实现都是逐条 best-effort（2026-09-18 核验新增）：生产代码（排除测试与 co… | 🔨 待拍板 | 已修 | D10 | 内置实现和接口统一为按 namespace 字节序逐项写入，首个错误后停止。中项失败回归见上。并 ISSUE-70。 · 现存入口 [compose_v2/checkpointer.go](../../compose_v2/checkpointer.go) · 原文溯源 877aea13（仅文档溯源） |
 | L345 | RemoteAgent 的 span 类型与 operation.name 取值（2026-09-18 核验新增）：OTel 重写后远端调用是 invoke_agent {远端… | ✅ 已解决（OTel 重写） | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [observability/a2a.go](../../observability/a2a.go) · 原文溯源 0ccf7c8e（仅文档溯源） |
 | L346 | 🔨 AgenticMessage 双格式（原生 ContentBlock 树）要不要跟进（2026-09-18 补登记）：架构方向题，industry-survey-2026h… | 🔨 待拍板 | 设计 | Q05 | 原生 ContentBlock 模型牵涉 JSON/存档/API provider 映射，按用例立项。 · 现存入口 [doc/description/three-way-comparison/industry-survey-2026h1.md](../../doc/description/three-way-comparison/industry-survey-2026h1.md) · 原文溯源 877aea13（仅文档溯源） |
 | L347 | 🔨 第 3 层是否优先复用 AutoCompact 摘要（PreferAutoCompact）（2026-09-18 补登记）：原设计稿有、没实现、也没决策。ReactiveC… | 🔨 待拍板 | 设计 | Q10 | ReactiveCompact 已有裁剪/无空间兜底。第三层是否优先 AutoCompact，需同步核预算和延迟。 · 现存入口 [agent_v2/reactive_compact.go](../../agent_v2/reactive_compact.go)、[doc/v2/context-compaction.md](../../doc/v2/context-compaction.md) · 原文溯源 877aea13（仅文档溯源） |
@@ -631,7 +640,7 @@ A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合�
 | L553 | A2A 对账按真实 HTTP 401/403 识别 GetTask 拒绝。REST 随 a2a-go v2.7.0 修复，JSON-RPC 默认传输已接入。首次答复可发，已尝试… | ✅ 已修 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [doc/v2/a2a.md](../../doc/v2/a2a.md)、[a2a/reconcile_jsonrpc_status_test.go](../../a2a/reconcile_jsonrpc_status_test.go) · 原文溯源 615c4d1b（仅文档溯源） |
 | L554 | A2A human gate 在终局错误后带回旧任务引用。引擎钩子中收到无法承接的远端提问时，已尽力取消远端任务。终局后新请求携带 referenceTaskIds 的协议增强… | 🟢 OPEN（协议增强） | 功能 | C14 | A2A 终局错误携带旧任务 referenceTaskIds。公开安全投影独立见 L477。 · 现存入口 [a2a/remote_agent.go](../../a2a/remote_agent.go) · 原文溯源 552685b0（仅文档溯源） |
 | L555 | 🟡 approve_always 规则不分 agent 已修（2026-10-20，分支 fix/approval-rule-owner）：范围仍是一个任务，规则的键带上答应它… | ✅ 已修 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/approval.go](../../agent_v2/approval.go) · 基线缺旧引用 926303e、5c77ffb0 · 原文溯源 877aea13（仅文档溯源） |
-| L556 | 🟢 approve_always 规则集按 RunID 各存一份、永不回收（2026-09-29 第五轮审计实测）：按推荐写法（一个 session 对象 + 每任务 Next… | 🟢 OPEN | 缺口 | D11 | agent_v2/approval.go:243–283 只回收当前 RunID，session.go:195 的 NextTask 换 ID。跨任务泄漏已由 L555 修，旧桶增长独立。 · 现存入口 [agent_v2/approval.go](../../agent_v2/approval.go) · 原文溯源 877aea13（仅文档溯源） |
+| L556 | 🟢 approve_always 规则集按 RunID 各存一份、永不回收（2026-09-29 第五轮审计实测）：按推荐写法（一个 session 对象 + 每任务 Next… | 🟢 OPEN | 已修 | D11 | 确认根任务结算或放弃后删除对应 RunID 的审批状态。挂起与在途执行保留规则。 · 现存入口 [agent_v2/approval.go](../../agent_v2/approval.go) · 原文溯源 877aea13（仅文档溯源） |
 | L557 | 🟢 调用方现拼输入、被调方中断过时，续跑完成后被调方的输入在历史里记两份 已修（2026-09-30 第六轮）：暂停时结算过的输入按调用身份记进父节点这次执行的步骤记录（age… | ✅ 已修 | 完成（当前回归） | — | 原行已关闭，当前树仍有对应回归入口。 · 现存回归 [TestHistory_AgentAsToolInNodeBody_PauseThenDone_InputOnce](../../agent_v2/handover_phase_test.go#L560) · 定义 877aea13、[TestHistory_CalleeAsksTwice_FreshInput_InputOnce](../../agent_v2/handover_phase_test.go#L592) · 定义 877aea13 · 现存入口 [agent_v2/run_subagent.go](../../agent_v2/run_subagent.go) · 原文溯源 877aea13（仅文档溯源） |
 | L558 | 🟢 编排成员经 runMember 拿到的输入不拷贝 已修（2026-10-23）：成员、内部决策 agent、转交候选拿到的都是 cloneCalleeInput 的拷贝。各… | ✅ 已修 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/member_dispatch.go](../../agent_v2/member_dispatch.go) · 原文溯源 c194ade2（仅文档溯源） |
 | L559 | 🟢 a2a 发送数据块时认不出接口里的 typed nil（2026-09-29 第五轮审计顺带观察，独立加固点）：a2a/convert.go 的守卫 cb.Data.Dat… | ✅ 已修 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [a2a/convert.go](../../a2a/convert.go) · 原文溯源 c35ef98b（仅文档溯源） |

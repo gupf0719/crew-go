@@ -505,16 +505,11 @@ msgs 汇合层统一剥离悬空 tool_call（`dropDanglingToolCalls`——重建
 > 跨层 feature 必须真实 LLM 端到端验证（`example/tutorial/adv_06_handoff_agent_test.go`），
 > 纯 mock + audit reasoning 会得出错误结论（这次 audit agent 选 Raw 即被真实 LLM 推翻）。
 
-### 落地：ctx 注入 mode + BasicAgent prior 切换
+### 历史视图的调用范围
 
-HandoffAgent stepFn push `WithHandoffHistoryModeCtx(subCtx, h.historyMode)` → BasicAgent
-`buildInitialMessages` 的 `prior` 据 mode 在 `HistoryFor`/`HistoryForRaw`/`SelfHistoryCompacted`
-间切换。复用 BasicAgent prior 管线 + 4 层压缩配对防护（`GroupMessagesByAPIRound`/`AdjustIndexToPreserveAPIInvariants`）。
+HandoffAgent 为每一跳的直接候选设置历史视图，续跑时为恢复的候选重新绑定。候选若是 Sequential、GraphAgent 或其他编排，其内层成员默认读取自己的历史。调用方可在目标成员入口显式使用 `WithHandoffHistoryModeCtx` 配置视图。
 
-- **零回归**：`GetHandoffHistoryMode` 缺省 SelfOnly（零值）——非 handoff 场景（BasicAgent 单独用 /
-  其他编排嵌 BasicAgent）prior 仍读自己历史，行为不变。
-- **input-dup 防护**：Rewrite/Raw 模式 input 已由 HandoffAgent 写进 session、经 prior 可见，
-  BasicAgent **不重复 append + 不重复 AddEvent**（否则每 hop 写一份 → HistoryFor 捞多份 dup）。
+Raw 和 Rewrite 投影在截断前按消息 ID 保留同一用户输入最近的副本，工具声明和结果仍按原顺序呈现。模型从已有历史或本轮存档取得一次当前输入。每个独立归属的审计记录仍由相应成员写入。
 
 ---
 

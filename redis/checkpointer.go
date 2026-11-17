@@ -200,20 +200,18 @@ func (c *Checkpointer) saveNS(ctx context.Context, sessionID, ns string, cp *com
 		return errors.New("sessionID is empty")
 	}
 
-	// 自动填 ID / NS / ParentNS
-	cp.ID = sessionID
-	cp.NS = ns
-	if cp.ParentNS == "" && ns != "" {
-		cp.ParentNS = compose_v2.ParentNS(ns)
+	saved := *cp
+	saved.ID, saved.NS = sessionID, ns
+	if saved.ParentNS == "" {
+		saved.ParentNS = compose_v2.ParentNS(ns)
 	}
-
-	payload, err := compose_v2.MarshalCheckpoint(cp)
+	payload, err := compose_v2.MarshalCheckpoint(&saved)
 	if err != nil {
 		return fmt.Errorf("redis cp SaveNS marshal: %w", err)
 	}
 
 	isPending := "0"
-	if cp.Status == compose_v2.CPStatusPending {
+	if saved.Status == compose_v2.CPStatusPending {
 		isPending = "1"
 	}
 
@@ -227,9 +225,9 @@ func (c *Checkpointer) saveNS(ctx context.Context, sessionID, ns string, cp *com
 		cpLegacyItemPrefix(c.prefix, sessionID) + ns,
 	}
 	args := []any{
-		ns, payload, cp.GraphID,
-		fmt.Sprintf("%d", int(cp.Status)),
-		fmt.Sprintf("%d", cp.CreatedAt),
+		ns, payload, saved.GraphID,
+		fmt.Sprintf("%d", int(saved.Status)),
+		fmt.Sprintf("%d", saved.CreatedAt),
 		isPending, sessionID, compose_v2.CheckpointTaskLeaseToken(ctx, c.CheckpointTaskLeases(), sessionID),
 	}
 	if expected != nil {
@@ -252,7 +250,7 @@ func (c *Checkpointer) saveNS(ctx context.Context, sessionID, ns string, cp *com
 		return compose_v2.ErrCheckpointStale
 	case "GRAPH_ID_CONFLICT":
 		return fmt.Errorf("%w: sid=%q ns=%q new=%q",
-			compose_v2.ErrGraphIDConflict, sessionID, ns, cp.GraphID)
+			compose_v2.ErrGraphIDConflict, sessionID, ns, saved.GraphID)
 	}
 	return fmt.Errorf("redis cp SaveNS: unexpected script reply %v", result)
 }

@@ -103,11 +103,15 @@ func testPartialWriteOwners(t *testing.T, scenario string) {
 			t.Fatal(err)
 		}
 		if scenario == "missing_owners" {
+			before, err := cper.LoadNS(ctx, sid, "")
+			if err != nil || before == nil || len(before.CompletedWriteOwners) != 0 {
+				t.Fatalf("未保存缺少归属的部分存档：cp=%+v err=%v", before, err)
+			}
 			if err := run(preloaded); !errors.Is(err, compose_v2.ErrCheckpointNotResumable) {
 				t.Fatalf("缺归属的部分存档应拒绝恢复，实际 %v", err)
 			}
 			after, err := cper.LoadNS(ctx, sid, "")
-			if err != nil || after != copyCP || aCalls.Load() != 1 || bCalls.Load() != 1 {
+			if err != nil || after != before || aCalls.Load() != 1 || bCalls.Load() != 1 {
 				t.Fatalf("恢复拒绝覆盖了原档或执行了节点，A=%d B=%d err=%v", aCalls.Load(), bCalls.Load(), err)
 			}
 			return

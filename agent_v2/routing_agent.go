@@ -296,7 +296,7 @@ func (r *RoutingAgent) Run(ctx context.Context, session *RunSession, input *sche
 	if err != nil {
 		return nil, err
 	}
-	defer activity.Release()
+	defer func() { activity.finish(ctx, session) }()
 	ctx = WithSession(ctx, session)
 	// 历史写入器由**编排这一层**拥有：子里可能有不是 BasicAgent 的执行体（远程 / 自研 /
 	// 别的框架的壳），它们不会建也不会写。见 startHistoryForOrchestration。
@@ -389,7 +389,7 @@ func (r *RoutingAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	if prep.AbortDone {
 		return nil, nil
 	}
-	defer prep.activity.Release()
+	defer func() { prep.finish(ctx) }()
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	// MED-1 fail-fast：composite Resume 同样不透传 per-call 覆盖给 inner step。
 	if err := rejectCompositeOverride(rcfg.overrides()); err != nil {

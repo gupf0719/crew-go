@@ -240,7 +240,7 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	if err != nil {
 		return nil, err
 	}
-	defer activity.Release()
+	defer func() { activity.finish(ctx, session) }()
 	if err := g.checkBreakpointsResumable(ctx); err != nil {
 		return nil, err
 	}
@@ -436,7 +436,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	if prep.AbortDone {
 		return nil, nil
 	}
-	defer prep.activity.Release()
+	defer func() { prep.finish(ctx) }()
 	if err := g.graph.WithCheckpointContext(newCtx).CheckCheckpointIdentity(prep.Checkpoint); err != nil {
 		return nil, err
 	}

@@ -32,7 +32,7 @@ func TestCheckpointer_SaveLoad_BasicRoundTrip(t *testing.T) {
 	if got == nil {
 		t.Fatal("LoadNS returned nil")
 	}
-	// SaveNS 自动填 ID/NS（覆盖入参 cp）
+	// SaveNS 给保存的快照填写 ID 和 NS。
 	if got.ID != "sid_1" {
 		t.Fatalf("ID 应自动填 sid_1，实际 %q", got.ID)
 	}

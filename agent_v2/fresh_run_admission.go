@@ -32,6 +32,13 @@ func (a *runActivity) Release() {
 	a.TaskActivity.Release()
 }
 
+func (a *runActivity) finish(ctx context.Context, session *RunSession) {
+	defer a.Release()
+	if a.runID != "" {
+		finishRootTaskApprovals(ctx, session, a.runID)
+	}
+}
+
 func (a *runActivity) callAgentStart(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo, input *hook.AgentInput) (context.Context, error) {
 	ctx, err := CallAgentStart(ctx, hooks, info, input)
 	if err != nil {

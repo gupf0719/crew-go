@@ -21,7 +21,9 @@ type RunOption func(*runOptions)
 
 type runOptions struct {
 	// slotClaim 见 WithSlotClaim——这次 Run 就是占着这个槽的那次 agent 调用自己的。
-	slotClaim *SlotClaim
+	slotClaim   *SlotClaim
+	slotSettled bool
+	slotHasWork atomic.Bool
 	// importOverlay 见 withImportOverlay——**两条路径都摆**成 baseline（子图同步父图 import 值）。
 	importOverlay []ChannelWrite
 	// initialWrites 见 WithInitialWrites——**只在新开路径** apply 的种子写入。
@@ -702,7 +704,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	cfg.checkpointer = partition
 	if cfg.sessionID != "" {
 		var err error
-		ctx, activity, err = beginTaskActivity(ctx, cfg.checkpointer, cfg.sessionID, nil, false)
+		ctx, activity, err = beginTaskActivity(ctx, cfg.checkpointer, cfg.sessionID, nil, taskActivityShared)
 		if err != nil {
 			return fmt.Errorf("graph %q (ns=%q): %w", g.ID(), cfg.graphNS, err)
 		}
@@ -1020,6 +1022,13 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 恢复被拒时还没有接管存档。即使调用方传入已有值的 ChannelManager，出口也不得改写原档。
 	restoreRejected := initialScopeUnverified
 	defer func() {
+		if cfg.slotClaim != nil {
+			defer func() {
+				if !restoreRejected && (cfg.slotSettled || cfg.slotHasWork.Load() || cfg.checkpointStart.HasResumableWork()) {
+					cfg.slotClaim.exit.Store(&slotExit{partition: cfg.checkpointer, ns: cfg.graphNS, settled: cfg.slotSettled})
+				}
+			}()
+		}
 		// **F4 修复**（Phase 5.1.a Step 5）：Run 出口自动持久化根 graph cp，
 		// 让根 graph cp 协议与子图 cp 协议对称（之前只有子图 cp 自动 SaveNS，
 		// 根 graph 失败时业务必须手动 cm.Snapshot + 自管 save——不一致）。
@@ -1032,6 +1041,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		//     （含本 graph 自身 + 任何残留子图 cp）
 		//   - 要写的档没写成 → ErrCheckpointNotPersisted（见 newCheckpointNotPersisted）
 		if cfg.checkpointer == nil || cfg.sessionID == "" {
+			if runErr == nil || errors.Is(runErr, ErrRunAborted) {
+				cfg.slotSettled = true
+			}
 			return
 		}
 		terminalConflict := errors.Is(runErr, ErrRunAborted) && errors.Is(runErr, ErrGraphIDConflict)
@@ -1427,7 +1439,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				if rootCp.HasResumableWork() || cfg.resumeFrom != nil || boundResumeTarget {
 					return RejectCheckpointIdentity(rootCp, "graph start hook changed the admitted checkpoint partition")
 				}
-				selected, extra, err := beginTaskActivity(ctx, partition, cfg.sessionID, nil, false)
+				selected, extra, err := beginTaskActivity(ctx, partition, cfg.sessionID, nil, taskActivityShared)
 				if err != nil {
 					return err
 				}
@@ -2819,8 +2831,28 @@ func (s *runningSlot) conflict(sessionID, ns string) *runningSlot {
 	return nil
 }
 
-// SlotClaim 是 OccupySlot 发的凭证：占着槽的那次 agent 调用自己跑图时经 WithSlotClaim 出示，证明这次 Run 是它的。
-type SlotClaim struct{ _ byte }
+// SlotClaim 供一次 Agent 调用标识自己的图执行，并读取图退出时的存档归属。
+type SlotClaim struct {
+	exit atomic.Pointer[slotExit]
+}
+
+type slotExit struct {
+	partition Checkpointer
+	ns        string
+	settled   bool
+}
+
+// CheckpointOutcome 返回确认过的存档分区、namespace 和退出结算结果。
+// 退出时没有确认的存档或结算结果时返回零值。
+// settled 表示存档子树已确认清理，或未启用存档的图已终结。
+func (c *SlotClaim) CheckpointOutcome() (partition Checkpointer, ns string, settled bool) {
+	if c != nil {
+		if result := c.exit.Load(); result != nil {
+			return result.partition, result.ns, result.settled
+		}
+	}
+	return nil, "", false
+}
 
 // OccupySlot 声明 ctx 往下这段执行（一次 agent 调用，从入口到出口）占着存档槽 (sessionID, GetGraphNS(ctx))：这段执行里——
 // 它的 agent 级钩子、钩子里调起的别的 agent、直接跑的嵌套图——发起、落进同一个槽的嵌套 Run 在入口被拒，那时槽里放着它

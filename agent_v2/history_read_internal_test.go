@@ -138,6 +138,41 @@ func TestHistoryPrior_TailReadMatchesFullRead(t *testing.T) {
 	}
 }
 
+func TestHistoryPrior_SharedDuplicateAtPageBoundary(t *testing.T) {
+	store := &countingLoadStore{InMemoryHistoryStore: NewInMemoryHistoryStore()}
+	key := HistoryKey{Owner: "owner", ConvID: "paged-shared-history"}
+	ctx := compose_v2.WithThreadIDCtx(t.Context(), key.ConvID)
+	input := schema.UserMessage("第一次出现的提问")
+	all := []*schema.Message{stampHistoryAgent(input, "first", "first", "history")}
+	for i := range 90 {
+		all = append(all, stampHistoryAgent(schema.AssistantMessage(fmt.Sprintf("进度 %d", i)), "last", "last", "history"))
+	}
+	recent := stampHistoryAgent(input, "nested/leaf", "leaf", "history")
+	latest := stampHistoryAgent(schema.AssistantMessage("最新答复"), "last", "last", "history")
+	all = append(all, recent, latest)
+	if err := store.Append(ctx, key, all); err != nil {
+		t.Fatal(err)
+	}
+	config := &historyConfig{store: store, owner: key.Owner}
+	for _, mode := range []HandoffHistoryMode{HandoffHistoryRaw, HandoffHistoryRewrite} {
+		store.msgs.Store(0)
+		tail, ok := historyPrior(ctx, config, "last", mode, 2)
+		if !ok || store.msgs.Load() >= int64(len(all)) {
+			t.Fatalf("共享模式 %v 应只读尾页，读回 %d 条", mode, store.msgs.Load())
+		}
+		full, ok := historyPrior(ctx, config, "last", mode, 0)
+		if !ok {
+			t.Fatal("无法读取全量历史")
+		}
+		want := []*schema.Message{recent, latest}
+		for _, prior := range [][]*schema.Message{tail, full} {
+			if got := truncatePriorPreservingMarkers(prior, 2); !sameMessageSeq(got, want) {
+				t.Fatalf("共享模式 %v 的尾页和全量应保留同一份近期输入和答复：%s", mode, ids(got))
+			}
+		}
+	}
+}
+
 // hasOlderSkillBody 报：视图里有没有比读回来的那一段更早的 skill 正文。
 func hasOlderSkillBody(all []*schema.Message, owner string, mode HandoffHistoryMode, window []*schema.Message) bool {
 	if len(window) == 0 {

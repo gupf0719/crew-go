@@ -151,15 +151,15 @@ func NormalizeApprovalAnswer(text string) (option string, ok bool) {
 // 工具级（覆盖该工具全部调用）保留为**显式的第二档**，见 ApprovalOptionApproveAlwaysTool。
 const approvedToolsKey = "crew.approved_tools"
 
-// approvalRulesKey 是 session s 当前任务的规则集在 RunSession KV 里的 key。
+// approvalRulesKey 是给定任务的审批状态在 RunSession KV 里的 key。
 //
 // **按任务分，任务的身份是 RunID**（见 RunSession.RunID）。values 表活得比任务长（`NextTask`
 // 换 RunID、保留 values），也可能被几个 session 共用（半共享子 session、ForkLane）；规则集只按
 // session 放一份的话，它的边界就得靠「新任务开始时清一下」来维持——而那一刻不一定经过框架
 // （业务换了 RunID 自己接着跑），经过了又会把共用这张表的另一个任务的规则一起清掉。按 RunID
 // 分之后换任务自然是一套新的规则，别的任务的规则也碰不到。旧任务那份留在 values 表里，每个用过
-// approve_always 的任务一小份。
-func approvalRulesKey(s *RunSession) string { return approvedToolsKey + "\x00" + s.RunID }
+// approve_always 的任务一小份，整任务结算或放弃时回收。
+func approvalRulesKey(runID string) string { return approvedToolsKey + "\x00" + runID }
 
 // approvalRuleKey 把「工具 + 这次的参数」拼成规则 key。
 //
@@ -197,6 +197,12 @@ const approvalToolWildcard = "\x01*"
 // get-modify-put 序列需整体串行。
 var approvalMu sync.Mutex
 
+type taskApprovalState struct {
+	rules     map[string]bool
+	partition compose_v2.Checkpointer
+	rootNS    string
+}
+
 // isToolApproved 查这次调用有没有被 don't-ask-again 规则覆盖。
 //
 // 两档都查：**这件事**（工具+参数指纹）和**这个工具**（通配）。
@@ -206,12 +212,12 @@ func isToolApproved(s *RunSession, cfg *Config, tc schema.ToolCall, scope string
 	}
 	approvalMu.Lock()
 	defer approvalMu.Unlock()
-	v, _ := s.GetValue(approvalRulesKey(s))
-	m, _ := v.(map[string]bool)
-	if m == nil {
+	v, _ := s.GetValue(approvalRulesKey(s.RunID))
+	state, _ := v.(*taskApprovalState)
+	if state == nil || len(state.rules) == 0 {
 		return false
 	}
-	return m[approvalRuleKey(cfg, tc, scope)] || m[approvalToolKey(cfg, tc.Function.Name, scope)+"\x00"+approvalToolWildcard]
+	return state.rules[approvalRuleKey(cfg, tc, scope)] || state.rules[approvalToolKey(cfg, tc.Function.Name, scope)+"\x00"+approvalToolWildcard]
 }
 
 // markToolApproved 记一条 don't-ask-again 规则。toolWide=true 时覆盖该工具全部调用。
@@ -221,69 +227,114 @@ func markToolApproved(s *RunSession, cfg *Config, tc schema.ToolCall, scope stri
 	}
 	approvalMu.Lock()
 	defer approvalMu.Unlock()
-	key := approvalRulesKey(s)
+	key := approvalRulesKey(s.RunID)
 	v, _ := s.GetValue(key)
-	m, _ := v.(map[string]bool)
-	if m == nil {
-		m = map[string]bool{}
+	state, _ := v.(*taskApprovalState)
+	if state == nil {
+		state = &taskApprovalState{}
+		s.SetValue(key, state)
+	}
+	if state.rules == nil {
+		state.rules = make(map[string]bool)
 	}
 	if toolWide {
-		m[approvalToolKey(cfg, tc.Function.Name, scope)+"\x00"+approvalToolWildcard] = true
+		state.rules[approvalToolKey(cfg, tc.Function.Name, scope)+"\x00"+approvalToolWildcard] = true
 	} else {
-		m[approvalRuleKey(cfg, tc, scope)] = true
+		state.rules[approvalRuleKey(cfg, tc, scope)] = true
 	}
-	s.SetValue(key, m)
 }
 
-// clearApprovalRulesForNewTask 在**新任务开始**那一刻丢弃这个任务名下的 don't-ask-again 规则。
-//
-// **它只管规则集，而且是产品决策不是正确性补丁**——规则的 key 是「agent 实例身份 + 工具名 + 参数指纹」
-// （跨任务不会误命中），它该活多久是个取舍：对照下来各家从「一次 run」到「跨进程落盘」都有，我们取最保守
-// 的那档：一个任务。
-//
-// 规则集本来就按 RunID 分（[approvalRulesKey]），换了 RunID 的新任务碰不到旧的；这里管的是
-// **复用同一个 RunID 开新任务**的写法（顶层 Run 被判成新任务，而 session 没换 RunID）。
-//
-// 「这次调用批过没有」那份**不在这里**：它已经搬进 tools 节点的私有中断态
-// （`toolCallRecord.Approved`），新任务是新 cp、天然为空，**隔离不依赖这个函数**
-// （有专门的用例把清除点删掉仍绿）。它原先在这里，而那时这个函数是正确性补丁
-// ——谁忘了调、或判据跟别处走岔，跨任务泄漏立刻静默复现。
-//
-// **为什么要清**：授权的时间维度不该长于「用户还能预期到这个动作会发生」的范围。用户在
-// 任务 A 里说「以后别再问这个工具了」，语境是任务 A（"读这个项目的文件"）；他放弃 A、
-// 转头发起任务 B 时，那句话不该继续生效。实测过：任务 A 里答的 approve_always，在任务 B
-// 里让同一个工具**静默执行、不再询问**。
-//
-// **本函数不自带判据**，调用点只有两处：
-//
-//   - `enterRunTask` 判定这次 Run 是新任务时（判据是「上面有没有这个 RunID 所属的任务」，见
-//     inTask，不是 ns 字符串）：那一刻同时宣告忽略旧存档，授权跟着清是同一语义的补完。不清
-//     就是**存档认为是新任务、授权认为是老任务**——那正是这个缺陷的形状；
-//   - [ClearApprovalRules]：业务自己宣告语境变了。
-//
-// **嵌套不清**（inTask 为真的那条路）：子 agent 的 Run 是父任务的一部分，清了等于每个子
-// agent 各问一遍。
-func clearApprovalRulesForNewTask(s *RunSession) {
+// ClearApprovalRules 丢弃当前任务的长期审批规则。单次工具调用的批准
+// 仍随该调用的执行记录保存。
+func ClearApprovalRules(s *RunSession) {
 	if s == nil {
 		return
 	}
 	approvalMu.Lock()
 	defer approvalMu.Unlock()
-	key := approvalRulesKey(s)
-	// 这个 RunID 名下没有规则就不写：每个新任务都写一个空键的话，长期复用一个 session、每条消息 NextTask 的
-	// 聊天循环里会话 KV 随消息数线性增长（审计实测），而那些键什么都不装。
-	if _, ok := s.GetValue(key); !ok {
-		return
+	v, _ := s.GetValue(approvalRulesKey(s.RunID))
+	if state, ok := v.(*taskApprovalState); ok {
+		state.rules = nil
 	}
-	s.SetValue(key, nil)
 }
 
-// ClearApprovalRules 让业务主动丢弃 session 当前任务（它的 RunID）名下的 don't-ask-again 规则。
-//
-// 规则本来只在一个任务里有效（换 RunID 就是一套新的，见 approvalRulesKey），框架判定新任务时
-// 也会清（见 clearApprovalRulesForNewTask）。这个导出函数是给「语境变了但任务没换」的业务用
-// 的——比如一个长 Run 里跨了多个用户意图，业务自己知道。
-func ClearApprovalRules(s *RunSession) { clearApprovalRulesForNewTask(s) }
+func clearTaskApprovalRules(s *RunSession, runID string) {
+	if s == nil || runID == "" {
+		return
+	}
+	approvalMu.Lock()
+	defer approvalMu.Unlock()
+
+	s.ensureValues()
+	s.valuesMu.Lock()
+	defer s.valuesMu.Unlock()
+	delete(s.values, approvalRulesKey(runID))
+}
+
+// rememberTaskApprovalRoot 记录待续根图的实际存档位置。工具可以等到 Resume 才拿到
+// 第一条授权，因此初次挂起时也保存位置。
+func rememberTaskApprovalRoot(s *RunSession, runID string, partition compose_v2.Checkpointer, ns string) {
+	approvalMu.Lock()
+	defer approvalMu.Unlock()
+	key := approvalRulesKey(runID)
+	v, _ := s.GetValue(key)
+	state, _ := v.(*taskApprovalState)
+	if state == nil {
+		state = &taskApprovalState{}
+		s.SetValue(key, state)
+	}
+	state.partition, state.rootNS = partition, ns
+}
+
+func taskApprovalRoot(s *RunSession, runID string) (compose_v2.Checkpointer, string) {
+	if s == nil {
+		return nil, ""
+	}
+	approvalMu.Lock()
+	defer approvalMu.Unlock()
+	v, _ := s.GetValue(approvalRulesKey(runID))
+	if state, ok := v.(*taskApprovalState); ok {
+		return state.partition, state.rootNS
+	}
+	return nil, ""
+}
+
+// finishRootTaskApprovals 使用引擎结论回收规则，或记下确实留下的根存档。
+func finishRootTaskApprovals(ctx context.Context, session *RunSession, runID string) {
+	claim, _ := ctx.Value(slotClaimKey{}).(*compose_v2.SlotClaim)
+	partition, ns, settled := claim.CheckpointOutcome()
+	if settled {
+		clearTaskApprovalRules(session, runID)
+	} else if partition != nil {
+		rememberTaskApprovalRoot(session, runID, partition, ns)
+	}
+}
+
+// taskApprovalRootMatches 用真实存档位置确认根任务归属。放弃操作可以从根的祖先删除。
+func taskApprovalRootMatches(s *RunSession, runID string, partition compose_v2.Checkpointer, ns string, abandoning bool) bool {
+	rootPartition, rootNS := taskApprovalRoot(s, runID)
+	if rootPartition == nil {
+		return ns == ""
+	}
+	coversRoot := ns == rootNS || (abandoning && compose_v2.IsNSInSubtree(ns, rootNS))
+	return coversRoot && compose_v2.SameCheckpointPartition(rootPartition, partition)
+}
+
+// retireAbandonedTaskApprovals 在原删除路径返回成功后检查审批域。
+// 路由型后端的 DeleteSubtree 可能按旧 RunID 选分区，用已绑定根槽确认是否真的删除。
+func retireAbandonedTaskApprovals(ctx context.Context, s *RunSession, runID string, cper compose_v2.Checkpointer) {
+	partition, ns := taskApprovalRoot(s, runID)
+	if partition != nil && !compose_v2.SameCheckpointPartition(partition, cper) {
+		if _, routed := cper.(compose_v2.CheckpointPartitionResolver); !routed {
+			return
+		}
+		lookup := compose_v2.WithGraphNS(compose_v2.WithSessionIDCtx(ctx, runID), ns)
+		if cp, err := partition.LoadNS(lookup, runID, ns); err != nil || cp != nil {
+			return
+		}
+	}
+	clearTaskApprovalRules(s, runID)
+}
 
 // callApprovalFns 是「这次调用的审批记录」的读写回调——由调用方（tools 节点的 runOne）注入。
 // 两样记录：审批结论（`decided` / `decide`，见 [approvalDecisionOf]）与「用户批过没有」

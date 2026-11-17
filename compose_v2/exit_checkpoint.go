@@ -404,8 +404,11 @@ func purgeExitSlot(ctx context.Context, cfg *runOptions, cm *ChannelManager, rea
 		p.count, p.duration, err = deleteCpSubtree(c, cfg, cm, ownEpoch)
 		return err
 	})
-	if errors.Is(p.delErr, ErrCheckpointStale) {
+	switch {
+	case errors.Is(p.delErr, ErrCheckpointStale):
 		p.staleErr, p.delErr = p.delErr, nil
+	case p.delErr == nil:
+		cfg.slotSettled = true
 	}
 	return p
 }

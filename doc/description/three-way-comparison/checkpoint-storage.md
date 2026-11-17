@@ -506,10 +506,7 @@ class CheckpointNotLatest(Exception):
    - 暂定 A，等出现 time-travel 调试需求再升 B
 2. ~~**持久化后端（PG / Redis）支持**何时做？~~ ✅ **已做**：`redis/`（Redis Checkpointer + Store，独立 module，含 conformance + smoke）+ `sql/`（Postgres + MySQL 双方言 Checkpointer，独立 module，dialect-specific UPSERT + sqlmock/mysql 测试）。InMemoryCheckpointer 仅默认 / 测试用。
    - ~~**遗留 gap**：框架仅在 error 出口 defer 调 `SaveNS`（非每超步）——硬崩溃 mid-run 仍丢~~ ✅ **已闭合**：`WithDurability(sync/async)`（`compose_v2/durability.go`）每超步边界落盘——配持久后端 + sync/async 即可硬崩从最近超步**完整恢复**（单节点超步 = per-task）。fan-out 超步 mid-execution 硬崩的 per-task 重算是**可选优化、非缺口**（见 §不足 #4）
-3. **`SaveBatch` 真原子性**怎么保证？（2026-09-18 核验：生产代码零调用 `SaveBatch`；三个实现都是逐条 best-effort，下面「InMemory 持锁全程」不成立；接口 godoc 说「原子」与实现自相矛盾——删掉还是定语义已进中心 backlog）
-   - 当前 InMemory 持锁全程算近原子
-   - PG 后端要靠事务，Redis 要 Lua 脚本
-   - 接口签名预留了，实现细节后端各自处理
+3. ~~**`SaveBatch` 契约**~~ 已定。内置后端按 namespace 的字节序逐项调用 `SaveNS`。成功的前缀保留，中项报错后停止，后续槽不尝试。引擎继续按图写入独立存档。 [共用回归](../../../compose_v2/checkpointer_conformance/save_batch.go)
 
 ---
 
@@ -517,7 +514,7 @@ class CheckpointNotLatest(Exception):
 
 两条附带处置：
 
-- **同进程互斥**（业务直调 `agent_v2`/`compose_v2` 的缺口）→ **非目标**。写回世代校验对同进程并发同样生效（两个 goroutine 各自 `Run` 同 sid，写回时一样撞世代），额外加 per-sid 互斥只是"更早 fail-fast"，收益不抵复杂度——且嵌套子图是同一 Run 树内的多次 `Run`，per-sid 互斥会自锁，需能识别同一 Run 树才安全。
+- **同进程互斥**。内置 Agent 新任务和根 Resume 取得任务许可，沿同一执行上下文的嵌套图借用许可。活动的根 Resume 与同 RunID 的独立续跑互斥，由此保护任务级审批规则的结算。 [Resume 契约](../../v2/hitl-resume.md#52-三模式语义)
 - **`CreatedAt` 框架生产代码零处赋值**（`redis` 拿它当 thread score、`Cleanup` 拿它当 GC 排序键，而框架从不写）→ **已修**：盖章点就落在 mint `Epoch` 的同一个函数（`guardedSaveNS`），只在 caller 没给时盖。修之前 `Cleanup(keepLastN)` 的排序键恒等、落到 sid 字典序，而 sid 是 UUIDv4——实测保留的是**最先创建**的那批，GC 方向整个反过来。
 
 
@@ -850,9 +847,8 @@ N 个 tool_call（下单 / 扣款 / 发消息）。那格我们有 `compose_v2.S
 盘上压根没有已完成成员的记录，多留几个版本也留不出一份不存在的记录。
 
 **「存储侧真的从不撕裂？」** 单条记录：shipped 后端原子（`sql` 单行 UPSERT / redis 单键），
-但**契约没承诺**（`Checkpointer.SaveNS` godoc：「返 error 时 cp 状态未定义」）——业务自研
-后端写多行不带事务就能撕，而 WAL 同样受这条契约、救不了。跨记录：`DeleteSubtree` 明写允许
-不原子；父/子 cp 是两次独立 `SaveNS`。**但跨记录不一致的形态是「陈旧」不是「损坏」**——
+`SaveNS` 对当前槽原子检查 GraphID 并整份替换。批量和嵌套存档仍使用多次独立写入。
+跨记录清理若需要核对并原子删除，使用带条件的 `DeleteSubtree`。**但跨记录不一致的形态是「陈旧」不是「损坏」**——
 实测（删掉根 cp 只留子 cp，模拟崩在两次 `SaveNS` 之间）：重启后父 fresh run 铸新任务代号，
 子档 `BelongsToTask` 不匹配 ⟹ 不被静默捡起，子图重跑一次、旧孤儿档被同 key 覆盖，不残留。
 守这条的是**任务代号维**。陈旧的代价还是重执行，回到 (二)。

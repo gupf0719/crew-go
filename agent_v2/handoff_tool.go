@@ -232,16 +232,33 @@ const (
 
 type handoffHistoryModeKey struct{}
 
-// WithHandoffHistoryModeCtx push 历史视图模式到 ctx——HandoffAgent stepFn 注入让后接
-// BasicAgent 的 prior 据此在「只自己 / 看前接保 role / 看前接改写」间切换。
-// 带 Ctx 后缀（对齐 WithThreadIDCtx 惯例）区分业务 option WithHandoffHistoryMode。
-func WithHandoffHistoryModeCtx(ctx context.Context, mode HandoffHistoryMode) context.Context {
-	return context.WithValue(ctx, handoffHistoryModeKey{}, mode)
+type handoffHistoryView struct {
+	mode HandoffHistoryMode
+	ns   string
+	call *compose_v2.SlotClaim
 }
 
-// GetHandoffHistoryMode 读历史视图模式。**拿不到返 HandoffHistorySelfOnly（零值）**——
-// 保证非 handoff 场景（BasicAgent 单独用 / 其他编排嵌 BasicAgent）prior 仍读自己历史，零回归。
+// WithHandoffHistoryModeCtx 为当前图位置配置历史视图。内置 Agent 进入该位置时
+// 会将视图绑定到自己的执行凭证，供本次调用的钩子和模型读取。
+func WithHandoffHistoryModeCtx(ctx context.Context, mode HandoffHistoryMode) context.Context {
+	return context.WithValue(ctx, handoffHistoryModeKey{}, handoffHistoryView{mode: mode, ns: compose_v2.GetGraphNS(ctx)})
+}
+
+func bindHandoffHistoryMode(ctx context.Context, call *compose_v2.SlotClaim) context.Context {
+	view, ok := ctx.Value(handoffHistoryModeKey{}).(handoffHistoryView)
+	if !ok || view.call != nil || view.ns != compose_v2.GetGraphNS(ctx) {
+		return ctx
+	}
+	view.call = call
+	return context.WithValue(ctx, handoffHistoryModeKey{}, view)
+}
+
+// GetHandoffHistoryMode 返回当前调用拥有的转交历史视图，默认是 HandoffHistorySelfOnly。
 func GetHandoffHistoryMode(ctx context.Context) HandoffHistoryMode {
-	v, _ := ctx.Value(handoffHistoryModeKey{}).(HandoffHistoryMode)
-	return v // 零值 = HandoffHistorySelfOnly
+	view, ok := ctx.Value(handoffHistoryModeKey{}).(handoffHistoryView)
+	call, _ := ctx.Value(slotClaimKey{}).(*compose_v2.SlotClaim)
+	if !ok || view.ns != compose_v2.GetGraphNS(ctx) || view.call != nil && view.call != call {
+		return HandoffHistorySelfOnly
+	}
+	return view.mode
 }

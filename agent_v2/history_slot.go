@@ -841,11 +841,13 @@ func abandonTasksAtEntry(ctx context.Context, tasks []abandonedTask, agentName s
 	// 删被放弃任务的根：RunID 就是任务的身份、也是存档的主索引，它名下的存档整份属于它。不用这次调用所在的 ns——嵌套位置上
 	// （钩子或节点里经 RunSubAgent 透传这个选项）那是子 ns，删不到它的根档（审计实测）。
 	const ns = ""
+	session := GetSession(ctx)
 	for _, task := range tasks {
+		id := task.id
 		if task.settled {
+			clearTaskApprovalRules(session, id)
 			continue
 		}
-		id := task.id
 		if cper != nil {
 			start := time.Now()
 			n, err := cper.DeleteSubtree(sctx, id, ns)
@@ -856,6 +858,7 @@ func abandonTasksAtEntry(ctx context.Context, tasks []abandonedTask, agentName s
 				continue
 			}
 		}
+		retireAbandonedTaskApprovals(sctx, session, id, cper)
 		if w != nil {
 			if err := CloseAbandonedTaskHistory(sctx, TaskHistoryDestination{Key: w.key, Store: w.store}, id); err != nil {
 				slog.WarnContext(ctx, "agent_v2: 放弃任务的历史收尾失败", "agent", agentName, "task", id, "err", err)

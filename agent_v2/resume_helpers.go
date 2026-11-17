@@ -23,6 +23,28 @@ type resumePrep struct {
 	Session    *RunSession              // 已初始化 (nil 时 helper 新建 RunID = sessionID)
 	AbortDone  bool                     // ResumeActionAbort 已处理 (caller 直接 return nil, nil)
 	activity   *compose_v2.TaskActivity // 续跑时由入口 defer 释放，覆盖历史写入器收尾
+	root       bool
+}
+
+func (p *resumePrep) finish(ctx context.Context) {
+	defer p.activity.Release()
+	if p.root {
+		finishRootTaskApprovals(ctx, p.Session, p.Session.RunID)
+	}
+}
+
+// resumeApprovalRootWithoutSessionState 检查从存档重建 session 的命名空间是否为根。
+// 同任务的祖先仍有存档时，当前调用只拥有子树。
+func resumeApprovalRootWithoutSessionState(ctx context.Context, cper compose_v2.Checkpointer, sid, ns string, saved *compose_v2.Checkpoint) bool {
+	for parent := compose_v2.ParentNS(ns); ; parent = compose_v2.ParentNS(parent) {
+		cp, err := cper.LoadNS(compose_v2.WithGraphNS(ctx, parent), sid, parent)
+		if err != nil || (cp != nil && (cp.TaskID == "" || saved.TaskID == "" || cp.TaskID == saved.TaskID)) {
+			return false
+		}
+		if parent == "" {
+			return true
+		}
+	}
 }
 
 // resolveAbortHistoryStore 取得已确定历史分区对应的后端。
@@ -167,7 +189,21 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 	if err != nil {
 		return nil, ctx, err
 	}
-	ctx, activity, err := compose_v2.BeginTaskActivity(compose_v2.WithCheckpointerCtx(ctx, cper), runID, abandoned)
+	ns := compose_v2.GetGraphNS(ctx)
+	approvalSession := rcfg.session
+	if approvalSession == nil && rcfg.action == ResumeActionAbort {
+		approvalSession = GetSession(ctx)
+	}
+	root := taskApprovalRootMatches(approvalSession, sessionID, cper, ns, rcfg.action == ResumeActionAbort)
+	rootPartition, _ := taskApprovalRoot(approvalSession, sessionID)
+	unknownRoot := ns != "" && rootPartition == nil && approvalSession != nil && rcfg.action != ResumeActionAbort
+	activityCtx := compose_v2.WithCheckpointerCtx(ctx, cper)
+	var activity *compose_v2.TaskActivity
+	if (root || unknownRoot) && rcfg.action != ResumeActionAbort {
+		ctx, activity, err = compose_v2.BeginRootResumeActivity(activityCtx, runID)
+	} else {
+		ctx, activity, err = compose_v2.BeginTaskActivity(activityCtx, runID, abandoned)
+	}
 	if err != nil {
 		return nil, ctx, fmt.Errorf("%s %q: %w", agentTypeName, agentName, err)
 	}
@@ -188,7 +224,6 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		ctx = compose_v2.WithSessionIDCtx(ctx, sessionID)
 		// review-v6 H-03 fix: forward 父 graphNS 让 Abort 只删本 sub-agent 子树
 		// 不误删父 cp / sibling sub-agent / 其他业务在同 sid 下的 cp.
-		ns := compose_v2.GetGraphNS(ctx)
 		var historyKey *HistoryKey
 		var hc *historyConfig
 		if ns == "" {
@@ -230,6 +265,9 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		compose_v2.EmitCpCleanupHelper(ctx, sessionID, ns, "resume_abort", delCount, time.Since(delStart).Milliseconds(), dErr)
 		if dErr != nil {
 			return nil, ctx, fmt.Errorf("%s %q: abort cleanup (sid=%q ns=%q): %w", agentTypeName, agentName, sessionID, ns, dErr)
+		}
+		if root {
+			clearTaskApprovalRules(approvalSession, sessionID)
 		}
 		if historyKey != nil {
 			if historyStore == nil {
@@ -283,7 +321,6 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 	// 失败分支（成功兄弟不重放）；带答案 = 答问题，两者可叠加（混合档一次调用把两件
 	// 事都办了）。「重跑必然一样」的终局失败不在此列——那类档在 Run 出口就被
 	// `ErrRunAborted` 主动清掉了，走不到这儿。
-	ns := compose_v2.GetGraphNS(ctx)
 	savedCp, exErr := cper.LoadNS(ctx, sessionID, ns)
 	if exErr != nil {
 		return nil, ctx, fmt.Errorf("%s %q: resume check checkpoint (sid=%q ns=%q): %w", agentTypeName, agentName, sessionID, ns, exErr)
@@ -305,6 +342,10 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 			agentTypeName, agentName, sessionID, ns, savedCp.Status, compose_v2.ErrNoPendingCheckpoint)
 	}
 
+	if unknownRoot {
+		root = resumeApprovalRootWithoutSessionState(ctx, cper, sessionID, ns, savedCp)
+	}
+
 	// 5. session init（与 sessionID 一致与否已在步骤 2 之后核对过）
 	session := rcfg.session
 	if session == nil {
@@ -315,5 +356,5 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 	newCtx := compose_v2.BindResumeCheckpointTarget(WithSession(ctx, session), cper, sessionID, ns, savedCp)
 
 	transferActivity = true
-	return &resumePrep{Checkpoint: savedCp, Cper: configured, Rcfg: rcfg, Session: session, activity: activity}, newCtx, nil
+	return &resumePrep{Checkpoint: savedCp, Cper: configured, Rcfg: rcfg, Session: session, activity: activity, root: root}, newCtx, nil
 }

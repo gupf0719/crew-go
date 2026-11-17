@@ -77,8 +77,7 @@ func NewCheckpointer(db *dbsql.DB, dialect Dialect, opts ...CheckpointerOption) 
 
 // SaveNS 实现 compose_v2.Checkpointer.SaveNS.
 //
-// 填 cp.ID = sessionID、cp.NS = ns（覆盖入参），ParentNS 为空且 ns 非空时补成
-// `compose_v2.ParentNS(ns)`，与 InMemoryCheckpointer.SaveNS 同协议。
+// 在保存的副本中填写 ID、NS 和缺省 ParentNS。
 //
 // # GraphID 只有一把尺：存档里那份
 //
@@ -107,13 +106,12 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 		return errors.New("sessionID is empty")
 	}
 
-	cp.ID = sessionID
-	cp.NS = ns
-	if cp.ParentNS == "" && ns != "" {
-		cp.ParentNS = compose_v2.ParentNS(ns)
+	saved := *cp
+	saved.ID, saved.NS = sessionID, ns
+	if saved.ParentNS == "" {
+		saved.ParentNS = compose_v2.ParentNS(ns)
 	}
-
-	payload, err := compose_v2.MarshalCheckpoint(cp)
+	payload, err := compose_v2.MarshalCheckpoint(&saved)
 	if err != nil {
 		return fmt.Errorf("sql cp SaveNS marshal: %w", err)
 	}
@@ -152,12 +150,12 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 	).Scan(&stored); err != nil {
 		return fmt.Errorf("sql cp SaveNS read graph_id: %w", err)
 	}
-	if stored != "" && cp.GraphID != "" && stored != cp.GraphID {
+	if stored != "" && saved.GraphID != "" && stored != saved.GraphID {
 		return fmt.Errorf("%w: sid=%q ns=%q existing=%q new=%q",
-			compose_v2.ErrGraphIDConflict, sessionID, ns, stored, cp.GraphID)
+			compose_v2.ErrGraphIDConflict, sessionID, ns, stored, saved.GraphID)
 	}
 
-	if err := c.writeCheckpointRow(ctx, tx, sessionID, ns, cp, payload); err != nil {
+	if err := c.writeCheckpointRow(ctx, tx, sessionID, ns, &saved, payload); err != nil {
 		return fmt.Errorf("sql cp SaveNS: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

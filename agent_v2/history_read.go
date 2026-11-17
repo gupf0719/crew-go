@@ -335,8 +335,11 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 	}
 	// 「只看自己」的视图就是归属为自己的那些记录（别人的一概不进视图），直接让后端按归属过滤
 	var filter HistoryQuery
+	var seenInputs map[string]struct{}
 	if mode == HandoffHistorySelfOnly {
 		filter.Agent = ownerAgentName
+	} else {
+		seenInputs = make(map[string]struct{})
 	}
 	err := src.scanBackward(ctx, filter, first, true, func(m *schema.Message) bool {
 		if isCompactionBoundary(m) {
@@ -357,7 +360,7 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 			return false
 		}
 		v := projectHistoryForView(m, ownerAgentName, mode)
-		if v == nil {
+		if v == nil || seenInputs != nil && !firstHandoffInput(seenInputs, v) {
 			return false
 		}
 		rev = append(rev, v)
@@ -405,6 +408,33 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 		}
 	}
 	return append(dedupCallers(reversed(callers)), reversed(rev)...), true
+}
+
+// dedupHandoffInputs 在会话事件回退及拼接历史边界后应用共享投影。
+// 从最近的副本反向选取，读取尾页或完整历史时保留相同的副本。
+func dedupHandoffInputs(prior []*schema.Message) []*schema.Message {
+	seen := make(map[string]struct{})
+	unique := make([]*schema.Message, len(prior))
+	next := len(unique)
+	for i := len(prior) - 1; i >= 0; i-- {
+		if firstHandoffInput(seen, prior[i]) {
+			next--
+			unique[next] = prior[i]
+		}
+	}
+	return unique[next:]
+}
+
+// firstHandoffInput 放行用户输入第一次出现的位置，保留受保护的消息和所有工具配对。
+func firstHandoffInput(seen map[string]struct{}, msg *schema.Message) bool {
+	if msg == nil || msg.Role != schema.RoleUser || msg.ID == "" || isPriorProtected(msg) {
+		return true
+	}
+	if _, found := seen[msg.ID]; found {
+		return false
+	}
+	seen[msg.ID] = struct{}{}
+	return true
 }
 
 // dedupCallers 按 ID 给写进历史层的前文去重（按写入顺序，留最早那份）：几个写入器同时写过时有不止一份，ID 相同

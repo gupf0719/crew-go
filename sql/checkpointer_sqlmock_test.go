@@ -112,8 +112,8 @@ func TestCheckpointer_SaveNS_AutoFills_ParentNS(t *testing.T) {
 	if err := cp.SaveNS(context.Background(), "sid_1", "parent/child", c); err != nil {
 		t.Errorf("SaveNS: %v", err)
 	}
-	if c.ParentNS != "parent" {
-		t.Errorf("expected ParentNS='parent' auto-fill, got %q", c.ParentNS)
+	if c.ID != "" || c.NS != "" || c.ParentNS != "" {
+		t.Errorf("SaveNS 应只填充持久化副本，入参 ID=%q NS=%q ParentNS=%q", c.ID, c.NS, c.ParentNS)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("expectations: %v", err)

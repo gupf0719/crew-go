@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 )
 
@@ -17,7 +19,8 @@ import (
 // 业务会话历史由 agent_v2 的 HistoryStore 保存。
 type Checkpointer interface {
 	// SaveNS 按 (sessionID, ns) 持久化 cp。
-	// cp.ID/cp.NS 自动填入 sessionID/ns。返 error 时 cp 状态未定义。
+	// 后端在存档中填写 ID、NS 和缺省 ParentNS，入参字段保持原样。
+	// 调用方可复用 Checkpoint 值。内存后端共享其中引用的快照内容，map、切片等应视为只读。
 	SaveNS(ctx context.Context, sessionID, ns string, cp *Checkpoint) error
 
 	// ClaimResume 原子核对 expected 并将当前槽推进到 [CPStatusResuming]，返回新世代。
@@ -76,10 +79,8 @@ type Checkpointer interface {
 	// 性能注意：N 大时开销显著，业务自行决定调用频率。
 	LoadAllInSession(ctx context.Context, sessionID string) ([]NSCheckpoint, error)
 
-	// SaveBatch 一次原子写多个 cp（同 sessionID 下不同 ns）。
-	//
-	// 内存实现走顺序 SaveNS；事务后端可优化为真原子。best-effort 失败时返 error，
-	// caller 需自行处理部分成功状态。
+	// SaveBatch 按 namespace 的字节序逐条写入同一任务的存档，遇到第一个错误即返回。
+	// 之前写成的槽保留，后续槽保持原样。每项使用 [Checkpointer.SaveNS] 的写入契约。
 	SaveBatch(ctx context.Context, sessionID string, batch map[string]*Checkpoint) error
 
 	// Cleanup 按 sid 维度保留最新 keepLastN 个 sid（按 sid 下所有 ns cp 中最大的
@@ -567,14 +568,12 @@ func (c *InMemoryCheckpointer) SaveNS(_ context.Context, sessionID, ns string, c
 		}
 	}
 
-	// 自动填 ID/NS（覆盖 cp 自带值）
-	cp.ID = sessionID
-	cp.NS = ns
-	if cp.ParentNS == "" && ns != "" {
-		cp.ParentNS = ParentNS(ns)
+	saved := *cp
+	saved.ID, saved.NS = sessionID, ns
+	if saved.ParentNS == "" {
+		saved.ParentNS = ParentNS(ns)
 	}
-
-	c.data[sessionID][ns] = cp
+	c.data[sessionID][ns] = &saved
 	return nil
 }
 
@@ -671,11 +670,11 @@ func (c *InMemoryCheckpointer) LoadAllInSession(_ context.Context, sessionID str
 	return out, nil
 }
 
-// SaveBatch 顺序写——内存实现 best-effort，SaveNS 失败立即返。
+// SaveBatch 按 namespace 顺序写入，遇到第一个错误即返回。
 func (c *InMemoryCheckpointer) SaveBatch(ctx context.Context, sessionID string, batch map[string]*Checkpoint) error {
-	for ns, cp := range batch {
-		if err := c.SaveNS(ctx, sessionID, ns, cp); err != nil {
-			return fmt.Errorf("SaveBatch sid=%q ns=%q: %w", sessionID, ns, err)
+	for _, ns := range slices.Sorted(maps.Keys(batch)) {
+		if err := c.SaveNS(ctx, sessionID, ns, batch[ns]); err != nil {
+			return fmt.Errorf("save batch checkpoint sid=%q ns=%q: %w", sessionID, ns, err)
 		}
 	}
 	return nil

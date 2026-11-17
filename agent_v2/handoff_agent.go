@@ -129,8 +129,7 @@ func WithHandoffMaxHops(n int) HandoffOption {
 // 中性记账文本——看重接力叙述用默认 Rewrite）。
 // 见 doc/v2/handoff.md §9。
 //
-// **已知 LOW（ISSUE-93 遗留①）**：若 handoff 候选是非 handoff 编排（Sequential 等）包
-// BasicAgent，该 mode 经 ctx 透传会被内层 BasicAgent 继承（信息可见性扩大，不丢数据/不破协议）。
+// 配置作用于本次直接接手的成员。成员再调起的 Agent 按自己的历史归属读取。
 func WithHandoffHistoryMode(mode HandoffHistoryMode) HandoffOption {
 	return func(h *HandoffAgent) { h.historyMode = mode }
 }
@@ -269,7 +268,7 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 	if err != nil {
 		return nil, err
 	}
-	defer activity.Release()
+	defer func() { activity.finish(ctx, session) }()
 	ctx = WithSession(ctx, session)
 	// 历史写入器由**编排这一层**拥有：子里可能有不是 BasicAgent 的执行体（远程 / 自研 /
 	// 别的框架的壳），它们不会建也不会写。见 startHistoryForOrchestration。
@@ -357,7 +356,7 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	if prep.AbortDone {
 		return nil, nil
 	}
-	defer prep.activity.Release()
+	defer func() { prep.finish(ctx) }()
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	// MED-1 fail-fast：composite Resume 同样不透传 per-call 覆盖给 inner step。
 	if err := rejectCompositeOverride(rcfg.overrides()); err != nil {

@@ -5,9 +5,8 @@ package checkpointer_conformance_test
 //
 // # 为什么需要这一层
 //
-// `InMemoryCheckpointer` 存的是裸 `*Checkpoint` 指针、Load 原样返回同一个指针——
-// `loaded == original`，所以拿它跑 conformance 时**每一条 round-trip 断言都恒真**。
-// 断言写得再全，用 InMemory 自测也证明不了它们有效。真正会掉字段的是跨进程 backend
+// `InMemoryCheckpointer` 保存 Checkpoint 的顶层副本。字段无需序列化，
+// round-trip 断言无法发现 wire 丢字段。真正会掉字段的是跨进程 backend
 // （PG JSONB / Redis bytes / 其它语言 runtime）。
 //
 // 下面用一个强制过 JSON 的装饰器再跑一遍同一套 conformance，让 fixture 覆盖到的
@@ -34,6 +33,9 @@ package checkpointer_conformance_test
 
 import (
 	"context"
+	"fmt"
+	"maps"
+	"slices"
 	"testing"
 
 	"crew-go/compose_v2"
@@ -98,15 +100,12 @@ func (w *jsonWireCheckpointer) LoadNS(ctx context.Context, sid, ns string) (*com
 }
 
 func (w *jsonWireCheckpointer) SaveBatch(ctx context.Context, sid string, cps map[string]*compose_v2.Checkpoint) error {
-	out := make(map[string]*compose_v2.Checkpoint, len(cps))
-	for ns, cp := range cps {
-		rt, err := roundTrip(cp)
-		if err != nil {
-			return err
+	for _, ns := range slices.Sorted(maps.Keys(cps)) {
+		if err := w.SaveNS(ctx, sid, ns, cps[ns]); err != nil {
+			return fmt.Errorf("save batch checkpoint sid=%q ns=%q: %w", sid, ns, err)
 		}
-		out[ns] = rt
 	}
-	return w.inner.SaveBatch(ctx, sid, out)
+	return nil
 }
 
 func (w *jsonWireCheckpointer) LoadAllInSession(ctx context.Context, sid string) ([]compose_v2.NSCheckpoint, error) {

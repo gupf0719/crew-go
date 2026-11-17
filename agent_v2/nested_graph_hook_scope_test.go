@@ -82,6 +82,9 @@ func TestNestedCall_FromNestedGraphStartHookIsNotTopLevel(t *testing.T) {
 				s := agent_v2.GetSession(ctx)
 				s.SetValue("crew.approved_tools\x00"+s.RunID, map[string]bool{"transfer\x00*": true})
 				events, err := agent_v2.RunSubAgent(ctx, "mid", mid, schema.UserMessage("x"), agent_v2.WithOrchHooks(hooks))
+				if v, _ := s.GetValue("crew.approved_tools\x00" + s.RunID); v == nil {
+					t.Error("钩子内的同任务调用提前清空了父任务的审批规则")
+				}
 				if err != nil {
 					return "", err
 				}
@@ -99,9 +102,6 @@ func TestNestedCall_FromNestedGraphStartHookIsNotTopLevel(t *testing.T) {
 			}
 			answers := map[string]*schema.Message{ie.Query.InterruptID: schema.UserMessage("批准")}
 			_, err = host.Resume(ctx, sess.RunID, agent_v2.WithResumeUserInputs(answers), agent_v2.WithResumeSession(sess))
-			if v, _ := sess.GetValue("crew.approved_tools\x00" + sess.RunID); v == nil {
-				t.Errorf("任务里的 approve_always 规则被清空了——钩子里的调用被当成了顶层新任务")
-			}
 
 			hooks.mu.Lock()
 			outs := append([]string(nil), hooks.outs...)

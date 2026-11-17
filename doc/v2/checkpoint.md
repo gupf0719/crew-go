@@ -330,6 +330,10 @@ type Checkpointer interface {
 }
 ```
 
+`SaveNS` 在存下的副本上填写 ID、NS 和缺省 ParentNS，原输入可以复用。内存后端与调用方共享快照引用的 map、切片等内容，按只读使用。
+
+`SaveBatch` 按 namespace 的字节序逐项使用 `SaveNS`。首个错误立即返回，之前的成功写入保留，后续槽保持原样。整批无事务边界。
+
 ### 4.2 嵌套物理分离
 
 每个嵌入运行的 sub-agent 通过 ctx push graphNS，子 cp 物理写到 `(parentSID, parentNS/childName)`

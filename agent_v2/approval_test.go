@@ -306,7 +306,7 @@ func TestApproval_ApproveAlways_CrossResume(t *testing.T) {
 		})),
 	)
 	cp := compose_v2.NewInMemoryCheckpointer()
-	ctx := compose_v2.WithCheckpointerCtx(context.Background(), cp)
+	ctx := compose_v2.WithGraphNS(compose_v2.WithCheckpointerCtx(t.Context(), cp), "tenant/queue")
 	sess := agent_v2.NewRunSession()
 
 	_, err := ag.Run(ctx, sess, schema.UserMessage("hi"))
@@ -314,6 +314,8 @@ func TestApproval_ApproveAlways_CrossResume(t *testing.T) {
 	if !ok || ie.Reason != "tool_approval" {
 		t.Fatalf("round 1 应审批中断, got %v", err)
 	}
+	// 从旧存档恢复，模拟应用重新创建同一任务的 session。
+	sess = &agent_v2.RunSession{RunID: sess.RunID}
 	// Resume #1（WithResumeSession 复用 session 让规则持久）approve_always → round 2 ask_user 中断
 	_, err = ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess), agent_v2.WithResumeUserInputs(
 		map[string]*schema.Message{ie.Query.InterruptID: schema.UserMessage(agent_v2.ApprovalOptionApproveAlways)}))
@@ -335,6 +337,9 @@ func TestApproval_ApproveAlways_CrossResume(t *testing.T) {
 	}
 	if rt.calls.Load() != 2 {
 		t.Errorf("round 3 工具应规则命中执行（共 2 次）, 实际 %d", rt.calls.Load())
+	}
+	if _, exists := sess.GetValue("crew.approved_tools\x00" + sess.RunID); exists {
+		t.Fatal("使用非空 namespace 的根任务成功续跑后应回收规则")
 	}
 }
 

@@ -2,6 +2,7 @@ package checkpointer_conformance
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"crew-go/compose_v2"
@@ -40,30 +41,41 @@ func testSaveBatch(t *testing.T, factory CheckpointerFactory) {
 		}
 	})
 
-	// audit iter-3 视角 3 H4: SaveBatch partial failure contract — checkpointer.go:71-75
-	// godoc 写 "best-effort 失败时返 error, caller 需自行处理部分成功状态".
-	// 业务 backend 实现可能 silent rollback 全部 (PG TX) vs best-effort 部分成功
-	// (Redis pipeline)— conformance 强制业务 backend 返 err 非 nil + 业务 caller
-	// 必判 err. 不强制 atomic vs best-effort 选择 (godoc 允业务自定).
-	t.Run("SaveBatch_Partial_Failure_Returns_Error", func(t *testing.T) {
-		cp := factory()
-		ctx := context.Background()
-
-		// 第 2 cp GraphID 跟已存在的不同 → SaveNS 应返 ErrGraphIDConflict
-		// (业务 backend 必触发 partial failure 路径)
-		_ = cp.SaveNS(ctx, "sid", "ns_a", newCheckpoint("graph_x", compose_v2.CPStatusUnset))
-
-		// batch 含: ns_b OK + ns_a 跟现有 GraphID 冲突 (graph_x vs graph_y)
-		batch := map[string]*compose_v2.Checkpoint{
-			"ns_b": newCheckpoint("graph_y", compose_v2.CPStatusUnset),
-			"ns_a": newCheckpoint("graph_y", compose_v2.CPStatusUnset), // conflict!
+	t.Run("SaveBatch_MiddleFailureKeepsSuccessfulPrefix", func(t *testing.T) {
+		store := factory()
+		ctx := t.Context()
+		const sid, first, conflict, last = "batch", "A", "a", "a "
+		for _, ns := range []string{conflict, last} {
+			if err := store.SaveNS(ctx, sid, ns, newCheckpoint("existing", compose_v2.CPStatusUnset)); err != nil {
+				t.Fatal(err)
+			}
 		}
-		err := cp.SaveBatch(ctx, "sid", batch)
-		if err == nil {
-			t.Error("SaveBatch with GraphID conflict in any cp should return error (not silent skip)")
+		batch := make(map[string]*compose_v2.Checkpoint)
+		batch[last] = newCheckpoint("existing", compose_v2.CPStatusPending)
+		rejected := newCheckpoint("different", compose_v2.CPStatusPending)
+		rejected.ID, rejected.NS = "caller", "input"
+		batch[conflict] = rejected
+		batch[first] = newCheckpoint("new", compose_v2.CPStatusPending)
+
+		if err := store.SaveBatch(ctx, sid, batch); !errors.Is(err, compose_v2.ErrGraphIDConflict) {
+			t.Fatalf("首个失败须保留 GraphID 冲突错误链：%v", err)
 		}
-		// 不强制 atomic vs best-effort — 业务 backend 自选, 但必须返 err 非 nil
-		// 让 caller 知道 batch 不完全成功. 业务 silent return nil 是协议违反.
+		if rejected.ID != "caller" || rejected.NS != "input" || rejected.ParentNS != "" {
+			t.Fatalf("失败项的输入也应保持原样：id=%q ns=%q parent=%q", rejected.ID, rejected.NS, rejected.ParentNS)
+		}
+		for _, want := range []struct {
+			ns, graph string
+			status    compose_v2.CheckpointStatus
+		}{
+			{first, "new", compose_v2.CPStatusPending},
+			{conflict, "existing", compose_v2.CPStatusUnset},
+			{last, "existing", compose_v2.CPStatusUnset},
+		} {
+			cp, err := store.LoadNS(ctx, sid, want.ns)
+			if err != nil || cp == nil || cp.GraphID != want.graph || cp.Status != want.status {
+				t.Fatalf("槽 %q 的预期 graph=%q status=%v，当前=%+v err=%v", want.ns, want.graph, want.status, cp, err)
+			}
+		}
 	})
 }
 

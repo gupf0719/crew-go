@@ -21,6 +21,7 @@ var taskActivities = struct {
 // TaskActivity 持有一次调用的执行登记与放弃许可。由取得它的调用串行释放。
 type TaskActivity struct {
 	sid            string
+	mode           taskActivityMode
 	fresh          *freshTaskCheckpoints
 	abandoned      []string
 	sharedRun      *checkpointTaskLease
@@ -34,21 +35,35 @@ type TaskActivity struct {
 //
 // 给图引擎和 Agent 入口使用：在读写存档或历史之前调用，结束时 Release。放弃操作完成后可先调用 FinishAbandon。
 func BeginTaskActivity(ctx context.Context, sid string, abandoned []string) (context.Context, *TaskActivity, error) {
-	return beginConfiguredTaskActivity(ctx, sid, abandoned, false)
+	return beginConfiguredTaskActivity(ctx, sid, abandoned, taskActivityShared)
 }
 
 // BeginFreshTaskActivity 保护新任务对存档的独占使用。沿同一 ctx 派生的执行可借用登记，
 // 其他存档调用在本次任务退出前得到 [ErrTaskBusy]。每个实际使用的后端在持有租约时检查该 sid 下的可续存档。
 func BeginFreshTaskActivity(ctx context.Context, sid string, abandoned []string) (context.Context, *TaskActivity, error) {
-	return beginConfiguredTaskActivity(ctx, sid, abandoned, true)
+	return beginConfiguredTaskActivity(ctx, sid, abandoned, taskActivityFresh)
 }
 
-func beginConfiguredTaskActivity(ctx context.Context, sid string, abandoned []string, fresh bool) (context.Context, *TaskActivity, error) {
+// BeginRootResumeActivity 在续跑根任务期间独占本进程的任务登记。
+// 通过返回的 ctx 发起的嵌套执行可借用该登记。其他执行返回 [ErrTaskBusy]。
+func BeginRootResumeActivity(ctx context.Context, sid string) (context.Context, *TaskActivity, error) {
+	return beginConfiguredTaskActivity(ctx, sid, nil, taskActivityRootResume)
+}
+
+type taskActivityMode uint8
+
+const (
+	taskActivityShared taskActivityMode = iota
+	taskActivityFresh
+	taskActivityRootResume
+)
+
+func beginConfiguredTaskActivity(ctx context.Context, sid string, abandoned []string, mode taskActivityMode) (context.Context, *TaskActivity, error) {
 	partition, err := ResolveCheckpointPartition(ctx, GetCheckpointer(ctx))
 	if err != nil {
 		return ctx, nil, err
 	}
-	return beginTaskActivity(ctx, partition, sid, abandoned, fresh)
+	return beginTaskActivity(ctx, partition, sid, abandoned, mode)
 }
 
 type taskActivityKey struct{}
@@ -60,19 +75,21 @@ type taskActivityBinding struct {
 	activity *TaskActivity
 }
 
-func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandoned []string, fresh bool) (context.Context, *TaskActivity, error) {
+func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandoned []string, mode taskActivityMode) (context.Context, *TaskActivity, error) {
 	executionCtx := ctx
 	if sid != "" && !WithinNodeScope(ctx) {
 		executionCtx = withoutDetachedFrom(ctx, sid)
 	}
 	abandoned = slices.Clone(abandoned)
 	parent, _ := ctx.Value(taskActivityKey{}).(*taskActivityBinding)
-	activity := &TaskActivity{sid: sid, abandoned: abandoned}
+	activity := &TaskActivity{sid: sid, mode: mode, abandoned: abandoned}
 	taskActivities.Lock()
 	state := taskActivities.byID[sid]
 	inherited, freshOwner, ownsExclusive := inheritedActivity(state, parent, sid)
-	claimsStorage := cp != nil && (fresh || (freshOwner != nil && state.exclusive == nil))
-	if state.abandoning || (cp != nil && !ownsExclusive) || (claimsStorage && inherited != state.running) {
+	claimsStorage := mode == taskActivityRootResume ||
+		(cp != nil && (mode == taskActivityFresh || (freshOwner != nil && state.exclusive == nil)))
+	conflicts := !ownsExclusive && (cp != nil || state.exclusive.mode == taskActivityRootResume)
+	if state.abandoning || conflicts || (claimsStorage && inherited != state.running) {
 		taskActivities.Unlock()
 		return ctx, nil, &TaskBusyError{TaskID: sid, operation: "cannot execute task"}
 	}
@@ -87,12 +104,15 @@ func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandon
 		}
 	}
 	if sid != "" {
-		if fresh {
+		if mode == taskActivityFresh {
 			activity.fresh = &freshTaskCheckpoints{checked: make(map[freshCheckpointPartition]string)}
 			freshOwner = activity
 		}
-		if claimsStorage {
+		if claimsStorage && state.exclusive == nil {
 			state.exclusive = freshOwner
+			if mode == taskActivityRootResume {
+				state.exclusive = activity
+			}
 		}
 		state.running++
 		taskActivities.byID[sid] = state

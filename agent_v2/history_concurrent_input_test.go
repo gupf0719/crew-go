@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
@@ -43,23 +44,21 @@ func TestHistory_ConcurrentFanout_SharedInputRecordedOnce(t *testing.T) {
 	}
 
 	mk := func(name, reply string) agent_v2.Agent {
-		return agent_v2.NewBasicAgent(
+		leaf := agent_v2.NewBasicAgent(
 			agent_v2.WithName(name),
 			agent_v2.WithModel(newStubModel([]*schema.Message{schema.AssistantMessage(reply)})),
-			agent_v2.WithHistory(hs, "acme"), agent_v2.WithMaxRounds(2))
+			agent_v2.WithMaxRounds(2))
+		return historyViewAgent{Agent: leaf, mode: agent_v2.HandoffHistoryRaw}
 	}
 	par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("par")).
 		AddBranch("br1", mk("a1", "答案一")).
 		AddBranch("br2", mk("a2", "答案二")).
 		AddBranch("br3", mk("a3", "答案三"))
-	// 共享视图（转交模式）才有「同一条输入交给多个执行体」这回事；SelfOnly 下每个分支
-	// 记自己名下的一份是**有意的**——那样每条分支流各自完整（有问有答）。
-	ho := agent_v2.NewHandoffAgent(
-		agent_v2.WithHandoffName("ho"), agent_v2.WithHandoffInitial("front"),
-	).AddAgent("front", par)
 
-	ctx := compose_v2.WithThreadIDCtx(context.Background(), "conv-cc")
-	if _, err := ho.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("原始问题")); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	ctx = agent_v2.WithHistoryCtx(compose_v2.WithThreadIDCtx(ctx, "conv-cc"), hs, "acme")
+	if _, err := par.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("原始问题")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -98,6 +97,16 @@ func TestHistory_ConcurrentFanout_SharedInputRecordedOnce(t *testing.T) {
 	}
 }
 
+// historyViewAgent 显式给一个指定成员配置历史视图。
+type historyViewAgent struct {
+	agent_v2.Agent
+	mode agent_v2.HandoffHistoryMode
+}
+
+func (a historyViewAgent) Run(ctx context.Context, sess *agent_v2.RunSession, input *schema.Message, opts ...agent_v2.RunOption) ([]*agent_v2.AgentEvent, error) {
+	return a.Agent.Run(agent_v2.WithHandoffHistoryModeCtx(ctx, a.mode), sess, input, opts...)
+}
+
 // gatedHistoryStore 在**读**历史时撞屏障：三个分支的 Load 都到齐了才一起返回。
 // 写照常透传（屏障只钉读窗口，不影响写入器的单 worker 语义）。
 type gatedHistoryStore struct {
@@ -107,11 +116,17 @@ type gatedHistoryStore struct {
 }
 
 func (s *gatedHistoryStore) Load(ctx context.Context, key agent_v2.HistoryKey, q agent_v2.HistoryQuery) (agent_v2.HistoryPage, error) {
+	var gate *fanoutBarrier
 	switch {
 	case q.MessageID == "" && q.Task == "" && q.Agent == "":
-		s.gate.wait()
-	case q.MessageID != "" && s.gateByID != nil:
-		s.gateByID.wait()
+		gate = s.gate
+	case q.MessageID != "":
+		gate = s.gateByID
+	}
+	if gate != nil {
+		if err := gate.wait(ctx); err != nil {
+			return agent_v2.HistoryPage{}, err
+		}
 	}
 	return s.HistoryStore.Load(ctx, key, q)
 }
@@ -129,14 +144,18 @@ func newFanoutBarrier(n int) *fanoutBarrier {
 }
 
 // wait 记一次到达；人齐了关闸放行所有人。超出 n 的调用（后续轮次）直接通过。
-func (b *fanoutBarrier) wait() {
+func (b *fanoutBarrier) wait(ctx context.Context) error {
 	b.mu.Lock()
 	b.arrived++
 	full := b.arrived == b.n
 	b.mu.Unlock()
 	if full {
 		close(b.ready)
-		return
 	}
-	<-b.ready
+	select {
+	case <-b.ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

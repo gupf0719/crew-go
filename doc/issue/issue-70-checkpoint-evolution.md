@@ -22,9 +22,9 @@ depends: ISSUE-46, ISSUE-59, ISSUE-62, ISSUE-64, ISSUE-69
 
 
 > **状态**：Phase 1-3 全部落地（嵌入式 cp → ns 物理分离 + 嵌套 HITL 闭环 +
-> 三方对照沉淀 + SSE ns 字段）；Phase 4（StateFactory migrate / SelfHistoryByNS
-> / 性能优化 / SaveBatch 真原子）推迟到业务踩到或 PG 后端接入时实施。详见
-> [Phase 4 推迟决策](#phase-4-推迟决策) + [收尾总结](#收尾总结)。
+> 三方对照沉淀 + SSE ns 字段）；Phase 4 的业务状态迁移和 `SelfHistoryByNS` 仍待产品契约。
+> 2026-11-17 更新：`SaveBatch` 按 namespace 字节序逐项提交，首个失败后停止，已提交的前缀保留。
+> 下文保留原 Phase 4 计划，当前约定见[存档接口](../v2/checkpoint.md#41-sessionid-ns-二级-key)。
 >
 > **方法论**：5 轮方案迭代 + 6 轮交叉审核（共派 14 个独立 agent + 2 轮 binary
 > 冒烟），按 CLAUDE.md "多层系统 bug 审计方法论" + "拒绝短期方案只做根因修复"
@@ -471,7 +471,7 @@ OnNodeEvent(ctx, ns, nodeID, event)
 修复方向：ResumeGraph 仅回放本 ns 的 events，子 ns events 由子 ns Resume
 时各自回放（ns 隔离的天然好处）。
 
-## 隐藏不变量清单（必须文档化到 doc/description/checkpointer-invariants.md）
+## 历史不变量清单
 
 <!-- 下面 1-2 描述的 Memory API 已由 store 体系替代（PR 3.3 commit e6505f9）：
      Memory.Read → store.Search / Memory.Write → store.Put / WithMemory → WithStore + WithStoreMemory；
@@ -534,7 +534,7 @@ OnNodeEvent(ctx, ns, nodeID, event)
 - `agent/reactive_compact.go`：加 mu（与 AutoCompact 对齐）
 - `compose/checkpoint.go`：saveCheckpointOnError 写 Status=pending
 - `compose/checkpoint.go`：cp.Events 序列化时过滤 IsChunk
-- `doc/description/checkpointer-invariants.md`：13 个不变量文档
+- 存档不变量文档。现行约定见 [Checkpoint](../v2/checkpoint.md)。
 
 **验收**：所有现有测试改完后绿，仅签名变化无行为变化。
 

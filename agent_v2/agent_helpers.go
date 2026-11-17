@@ -162,7 +162,7 @@ func enterRunTask(ctx context.Context, session *RunSession) context.Context {
 	// 对授权必须同时成立（规则按 RunID 分，换了 RunID 本来就是一套新的；这里管的是业务复用同一个
 	// RunID 开新任务的写法）。**只清规则集**——「这次调用批过没有」那份已搬进 tools 节点的私有
 	// 中断态（见 `toolCallRecord.Approved`），跨任务隔离靠容器不靠这里。
-	clearApprovalRulesForNewTask(session)
+	clearTaskApprovalRules(session, session.RunID)
 	return stampTask(ctx, session.RunID, true)
 }
 
@@ -188,8 +188,8 @@ func enterGraphResumeTask(ctx context.Context, session *RunSession) context.Cont
 	return enterResumeTask(occupySlot(ctx, session), session)
 }
 
-// slotClaimKey 存这次 agent 调用占槽的凭证（见 compose_v2.OccupySlot）；每个 agent 入口都重写它——占不到时写 nil，宿主钩子里
-// 裸调的 agent 就拿不到宿主的凭证。执行状态（见 detach_task.go）：钩子换不掉、伪造不了。
+// slotClaimKey 存本次 Agent 的图执行凭证。每个内置 Agent 入口分配独立凭证，
+// 调用结束后用它读取本图的结算状态。
 type slotClaimKey struct{}
 
 // occupySlot 在 9 个编排的入口（OnAgentStart 之前）占住这次调用的存档槽：从这里到出口，钩子与钩子里调起的执行落进同一个槽的
@@ -197,12 +197,16 @@ type slotClaimKey struct{}
 // OnAgentEnd 里拿自己的 session 裸调别的 agent 时，子层把宿主的挂起档读进来接着跑、成功时删掉（审计实测）。
 func occupySlot(ctx context.Context, session *RunSession) context.Context {
 	ctx, claim := compose_v2.OccupySlot(ctx, session.RunID)
-	return context.WithValue(ctx, slotClaimKey{}, claim)
+	if claim == nil {
+		// 无存档时仍需取得本调用的退出结论。
+		claim = &compose_v2.SlotClaim{}
+	}
+	return bindHandoffHistoryMode(context.WithValue(ctx, slotClaimKey{}, claim), claim)
 }
 
 // slotClaimOpt 是这次 agent 调用跑自己的图时出示的占槽凭证。
 func slotClaimOpt(ctx context.Context) compose_v2.RunOption {
-	c, _ := ctx.Value(slotClaimKey{}).(*compose_v2.SlotClaim) // 没占（没有槽）时为 nil，等于不出示
+	c, _ := ctx.Value(slotClaimKey{}).(*compose_v2.SlotClaim)
 	return compose_v2.WithSlotClaim(c)
 }
 

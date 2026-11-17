@@ -73,6 +73,33 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 		}
 	})
 
+	t.Run("SaveNS_ReusedInputKeepsIndependentSlots", func(t *testing.T) {
+		store := factory()
+		ctx := t.Context()
+		input := newCheckpoint("graph", compose_v2.CPStatusPending)
+		input.Epoch = "first"
+		if err := store.SaveNS(ctx, "task-a", "a/leaf", input); err != nil {
+			t.Fatal(err)
+		}
+		input.Epoch = "second"
+		if err := store.SaveNS(ctx, "task-b", "b/leaf", input); err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []struct{ sid, ns, parent, epoch string }{
+			{"task-a", "a/leaf", "a", "first"},
+			{"task-b", "b/leaf", "b", "second"},
+		} {
+			loaded, err := store.LoadNS(ctx, want.sid, want.ns)
+			if err != nil || loaded == nil || loaded.ID != want.sid || loaded.NS != want.ns ||
+				loaded.ParentNS != want.parent || loaded.Epoch != want.epoch {
+				t.Fatalf("存档 %s/%s 应保留写入时的身份和世代，结果=%+v err=%v", want.sid, want.ns, loaded, err)
+			}
+		}
+		if input.ID != "" || input.NS != "" || input.ParentNS != "" {
+			t.Fatalf("派生的寻址字段只应写入后端自己的副本，入参=%+v", input)
+		}
+	})
+
 	t.Run("SaveNS_Zero_CreatedAt_Not_Filled_By_Backend", func(t *testing.T) {
 		cp := factory()
 		ctx := context.Background()

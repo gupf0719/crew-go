@@ -278,7 +278,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	if err != nil {
 		return nil, err
 	}
-	defer activity.Release()
+	defer func() { activity.finish(ctx, session) }()
 	ctx = WithSession(ctx, session)
 	ctx = pushStoreCtx(ctx, a.config.Store)
 	ctx = withOffloadDedup(ctx) // MicroCompact offload 的 per-Run 跨轮去重集合
@@ -449,7 +449,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	if prep.AbortDone {
 		return nil, nil
 	}
-	defer prep.activity.Release()
+	defer func() { prep.finish(ctx) }()
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	ctx = newCtx
 	// ResumeActionReplan：BasicAgent 自身无 plan 节点，但内嵌 sub-agent（如
@@ -985,6 +985,9 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	//
 	// 注意：这一层只动 prior（跨 Run 历史），不动当前 input + system + StoreMemory——
 	// 后三者属于本轮必带，截不得。
+	if mode != HandoffHistorySelfOnly {
+		prior = dedupHandoffInputs(prior)
+	}
 	if a.config.HistoryCompactor != nil {
 		keep := a.config.MaxHistoryPairs
 		if keep <= 0 {
@@ -1019,94 +1022,21 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	}
 
 	msgs = append(msgs, prior...)
-	// 本轮 input 要不要再 append 一次，取决于 **prior 里有没有它**——这个问题的答案只跟
-	// prior 从哪来有关，跟 handoff 视图无关：
-	//
-	//   - prior 来自**历史层**：恒不含。写入点就在下面几行（preamble 记 in.UserInput），
-	//     而 prior 是在写之前读的——顺序决定的，不是巧合。所以必须 append。
-	//   - prior 来自 **session events** 且 handoff 共享历史（Raw/Rewrite）：含。
-	//     HandoffAgent 在 Run 入口就把 input 写进 session 了，HistoryForRaw / HistoryFor
-	//     捞得到，再 append 就是 input dup（doc/v2/handoff.md §9）。
-	//   - prior 来自 session events 且 SelfOnly（默认 / 非 handoff）：不含，要 append。
-	//
-	// 这里曾经只判 handoff 视图——那在 prior 只有 events 一个来源时是等价的，换源之后
-	// 就成了「Handoff + WithHistory 时模型收不到本轮问题」：第一轮拿到空 prompt，第二轮
-	// 拿到的是**上一轮**的问题，于是它对着旧问题给出一个看起来挺合理的答案，**错位一轮
-	// 且全程无报错**。
-	// **「prior 恒不含 input」这个不变量只在单 agent 内成立**：它靠的是「写入点在下面
-	// 几行、prior 在写之前读」这个顺序。转交第 2 跳起就不成立了——前一跳的 agent 已经把
-	// 同一条 input 写进**共享**历史，这一跳读 prior 时它就在里面，再 append 就是第二遍。
-	//
-	// 实测（Handoff(front→billing) + WithHistory + Rewrite）：billing 收到的 prompt 是
-	// [user 我要退款][user For context: front said ...][user 我要退款]——用户的问题出现
-	// 两遍，而 store 里只有 1 份。**错的不是存储是喂给模型的那份**，所以按 store 断言的
-	// 测试全绿。
-	//
-	// 判据就照着上面那个问题问：**扫 prior 找这条输入的身份**。两个维度都靠 prior 自己
-	// 带对：
-	//
-	//   - **流**：SelfOnly 下 `historyPrior` 已经按归属过滤过，兄弟分支 / 前一跳记的那份
-	//     根本不在我的 prior 里 ⟹ 我照样 append。换成「这个 Run 里有人记过吗」就错了：
-	//     那是全局的，兄弟一记我就被判「有了」，而我的 prior 里一个字都没有——实测
-	//     Parallel 三分支里有 1~2 条拿到**空 prompt**，Handoff SelfOnly 第 2/3 跳全空。
-	//   - **载体**：用身份不用指针。指针过一次 cp 就换对象，而 Resume 后 prior 是从历史
-	//     反序列化出来的——按指针判在所有跨 cp 的路径上结构性失明（实测 Resume 后本轮
-	//     问题在 prompt 里出现两遍）。
-	//
-	// ⚠️ **业务复用同一个消息对象二次提交时会被判成「已经有了」**。这是**契约不是 bug**：
-	// 一个消息对象 = 一次出现，复用它就是声明「这是同一条」。要表达「新的一轮」就新建
-	// 一条消息（`schema.UserMessage` 每次调用铸新身份）。这跟成熟框架的取法一致——它们
-	// 同样按消息身份判，复用对象同样塌成一条。
-	//
-	// 不能简单去掉 `fromHistory` ——那会让第一跳的 prompt 空掉，正是上面那段注释在防的 bug。
-	alreadyInPrior := fromHistory && priorHasRootInputID(prior, rootInputID(input))
-	if (fromHistory || mode == HandoffHistorySelfOnly) && !alreadyInPrior {
+	// 当前输入按消息 ID 与实际送模历史对账。被截掉或没有恢复到会话事件时及时补入。
+	id := rootInputID(input)
+	if !priorHasRootInputID(prior, id) {
 		msgs = append(msgs, input)
 	}
 
-	// **R29 audit HIGH-1 (regression of ISSUE-74) fix**：input AddEvent 推迟到 prior
-	// 取出之后——避免本轮 input 在 prior 里重复出现。同 R14 listing 推迟思路。
-	// preamble 节点失败（InterruptError）时本行未跑，input 不进 sess.events——
-	// 业务期望"input 真消费 LLM 才算审计"语义对称。
-	// **handoff 共享历史模式**（Raw/Rewrite）：input 已由 HandoffAgent 写进 session（owner=
-	// HandoffAgent），sub-agent 不重复 AddEvent——否则每 hop 写一份让 HistoryForRaw 捞到多份
-	// input dup（doc/v2/handoff.md §9）。SelfOnly（默认/非 handoff）照常 AddEvent。
-	if GetHandoffHistoryMode(ctx) == HandoffHistorySelfOnly {
+	// 自有历史记录完整问答。直接转交的共享事件由 HandoffAgent 汇总。
+	if mode == HandoffHistorySelfOnly {
 		session.AddEvent(NewOutputEvent(a.config.Name, input))
 	}
 
-	// 会话历史层记原始 input——放这里而不是 preamble 节点，是因为判据要看 prior（就在上面
-	// 几行读的）：
-	//
-	//   - **只记 user 角色**：编排喂给 sub-agent 的 input 不一定是「这一轮新发生的事」。
-	//     LoopAgent 把上轮产出原样转手当下轮 input（那是 assistant 消息），按角色挡得住。
-	//   - **跳过派生输入**（DerivedInputAnnotation）：Sequential 拼的「原始目标+上一步产出」
-	//     成分全可重算，不记；Reflect/Plan 拼的含被摘除 LLM 的产出、不可重算，照记（编排
-	//     在源头决定打不打标）。
-	//   - **共享视图下只记一份**：HandoffAgent 每跳 input 恒为同一条原始输入，第一跳记的对
-	//     后续所有跳可见。判「记过没」靠 input 自带的 nonce + 扫 prior（跨嵌套/跨进程都对，
-	//     见 rootInputID）。SelfOnly 每跳各记自己名下的。
-	//
-	// 跟上面 events 侧的 AddEvent 是两条独立记录，判据不同：events 侧靠 HandoffAgent 兜底、
-	// 只 SelfOnly 写；历史层没有那个兜底写入者，得自己按 nonce 去重。
-	// **跟 prompt 侧同一个判据**（`alreadyInPrior`）：append 进 prompt 的才记。两侧各判各的
-	// 会必然分叉——实测过两种方向：prompt 说「已经有了」而记录侧照记（历史里同一身份多份，
-	// 下一轮 prior 里那句话出现两遍），以及反过来。
-	if input.Role == schema.RoleUser && !isDerivedInput(input) && !alreadyInPrior {
-		// 去重**只信 history**（fromHistory）。读失败回落 events 时 prior 是 events，
-		// 而 events 里有 HandoffAgent 自己 AddEvent 的那份带 nonce input（它不写 history
-		// store）——若也认它，会让每一跳都误判「已记过」，front 和 billing 谁都不记，input
-		// 在降级路径彻底丢失（实测 0 份）。降级时宁可重复不丢失：回退到每跳记。
-		//
-		// 扫的是 priorForDedup（截断/压缩**之前**的那份）——见它的声明处。
-		//
-		// 判据是「读历史 + 抢认领」两段（见 claimSharedRootInput）：只读历史在顺序多跳
-		// 成立、在并发扇出不成立——分支同时起跑时谁都还没写完，三个都判「没记过」于是
-		// 都记（实测连跑八次记了 1/2/2/3/1/2/2/3 份，每次都不一样）。
-		// 读侧那一半已经由 alreadyInPrior 做过（扫的是同一份 prior）。这里只剩**抢认领**——
-		// 它管的是同一个 Run 内的并发：扇出分支同时起跑时谁都还没写完，只读历史三个都判
-		// 「没记过」于是都记。认领在写入器的锁里做，那是这条流上唯一天然串行的点。
-		shared := GetHandoffHistoryMode(ctx) != HandoffHistorySelfOnly
+	// 落库只认持久历史，保留每个独立归属的记录。共享视图另外向写入器原子认领同一条输入。
+	// 用未截断历史去重，回落到会话事件时仍写入，避免把仅出现在事件里的输入当成已落库。
+	if input.Role == schema.RoleUser && !isDerivedInput(input) && !(fromHistory && priorHasRootInputID(priorForDedup, id)) {
+		shared := mode != HandoffHistorySelfOnly
 		if !shared || !fromHistory || claimSharedRootInput(ctx, priorForDedup, input) {
 			recordHistory(ctx, historyOwner(ctx, a.config.Name), a.config.Name, []*schema.Message{input})
 		}

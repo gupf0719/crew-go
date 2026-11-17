@@ -1,10 +1,10 @@
 # 项目待办
 
-2026-11-17 对照 `test` 的 `0588906` 更新。本轮合入的终局扇出、持久续跑准入和跨分区清档已登记关闭。[GitHub](https://github.com/gupf0719/crew-go/issues) 当前没有开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
+2026-11-17 在 `test` 的 `0588906` 基础上核对。终局扇出、持久续跑准入和跨分区清档已合入 `test`。D06、D11、D08、D10 已在修复分支关闭。基线核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **66 项**。P1 **0**、P2 **5**、P3 **61**。缺陷 **6**、能力缺口 **18**、待决 **26**、验收 **16**。
+共 **62 项**。P1 **0**、P2 **5**、P3 **57**。缺陷 **2**、能力缺口 **18**、待决 **26**、验收 **16**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -28,11 +28,7 @@
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
 | D05 | 缺陷 | 修复慢后端的 AG-UI 后台取消补偿超时 | 启用 `WithSessionStore` 时，守约的 6 秒逐页返回后端在现行 5 秒扫描预算下从不派发。恢复列表调用的有效预算，并保证轮询租约到期后其他副本仍可接手。 [取消扫描](../../agui/cancellation_recovery.go) |
-| D06 | 缺陷 | 修复内存 Checkpointer 复用输入指针导致的存档身份覆盖 | `SaveNS` 原地填写 ID、NS 后保存同一指针，重复使用输入对象会改动上一槽的存档。用独立输入做对照，核对两个槽的身份与内容。 [内存实现](../../compose_v2/checkpointer.go#L547) · [ISSUE-24](../issue/issues.md#-issue-24--数据流转-bug-专项审查2026-04-15) |
 | D07 | 缺陷 | Redis 迁移兼容旧 GraphID 的 JSON 字节归一化 | 旧 writer 允许含非 UTF-8 字节的 GraphID，元数据使用原字节。真实 Redis 对照中迁移对普通 Unicode 成功，对该存档报错中止。验证迁移保留原元数据和结果可继续枚举。 [迁移校验](../../redis/checkpointer_migration.go#L55) |
-| D08 | 缺陷 | 限制 Handoff 历史模式的继承范围 | 源码及 ISSUE-93 记录显示 Handoff 模式随 ctx 进入内层非 Handoff 成员。复测成员选择的 prompt、事件和历史去重，再为拥有该配置的调用限定边界。 [ISSUE-93](../issue/issue-93-handoff-modelb-audit-low.md) · [成员派发](../../agent_v2/member_dispatch.go) |
-| D10 | 缺陷 | 统一 Checkpointer.SaveBatch 的文档承诺与行为 | 接口同时写了原子批量和逐条报错，三个后端实际逐条执行。当前内部没有生产调用者。用中间项失败的 conformance 固定选定的契约。 [接口](../../compose_v2/checkpointer.go) · [持久化决策](../description/three-way-comparison/checkpoint-storage.md) |
-| D11 | 缺陷 | 回收已结束任务的 `approve_always` 记录 | `NextTask` 切换任务后，复用的 Session 仍持有旧规则。回收只针对终结任务，并与挂起、嵌套共享和在途审批对照。 [审批](../../agent_v2/approval.go) |
 | C01 | 能力缺口 | MCP Streamable HTTP 的独立 GET 推送和 SSE 断线续订 | POST 响应 SSE、会话协商、过期重建和 DELETE 已覆盖。余下 GET/事件续订按同一会话和游标对账。 [MCP 已知缺口](../v2/mcp.md#9-已知缺口) · [现有会话回归](../../mcp/http_session_test.go) |
 | C02 | 能力缺口 | MCP 工具的图片、音频结果透传 | 现行适配器生成文字说明。各支持媒体的模型适配器需要保留工具结果的内容块和调用配对。 [适配器](../../mcp/tool_adapter.go) · [MCP 已知缺口](../v2/mcp.md#9-已知缺口) |
 | C03 | 能力缺口 | 从协议层报告细粒度断点信息 | 核心已有断点。按协议分别定义 AG-UI 和 A2A 的调试暂停事件、节点身份、续跑地址和状态映射。 [中断契约](../v2/hitl-resume.md) |
@@ -90,6 +86,8 @@
 | Q27 | 待决 | 持久化业务状态演进与按执行 namespace 查历史 | ISSUE-70 Phase 4 的通用状态迁移需要版本化调用方。SelfHistoryByNS 希望按执行 namespace 查写入记录，先核对执行位置能否成为历史身份。 [ISSUE-70](../issue/issue-70-checkpoint-evolution.md) |
 
 ## 已关闭及归并去向
+
+- **D06、D11、D08、D10 已修。** 写档保留调用方输入，确认整任务收尾后回收审批规则，Handoff 共享历史只在直接候选调用生效，批量写档按 namespace 字节序停止在首个错误。 [回归与关闭记录](backlog-audit.md#2026-11-17-四项缺陷修复)
 
 - **终局扇出与跨分区清档已修。** `0f72f6b` 保留终局失败和图身份冲突两条错误链，封存本层存档并保留冲突子档。`0588906` 把续跑绑定到实际分区，由后端原子核对清档范围。取得清档清单后出现新后代时，整次删除被拒绝。 [扇出回归](../../agent_v2/terminal_checkpoint_conflict_test.go) · [分区回归](../../agent_v2/graph_checkpoint_late_backend_test.go) · [条件清档回归](../../sql/checkpointer_atomic_graph_test.go)
 - **持久 Resume 准入已完成。** `0588906` 在派发节点之前领取存档世代。根档封存与 AG-UI 会话解绑都失败时，新请求或直接 Resume 都不能重复执行旧写入。Sync 和 Async 的子图过程档也有回归。合并态 `make test` 四个模块通过，`make cover` 的 10 个核心包达标，总覆盖率 88.2%。 [双失败回归](../../sql/agui_terminal_conflict_test.go) · [过程档回归](../../compose_v2/checkpoint_resume_test.go) · [本轮核验](backlog-audit.md#2026-11-17-合入-test-后的核验)

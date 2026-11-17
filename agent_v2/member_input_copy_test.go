@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
@@ -118,19 +119,19 @@ func TestMemberInput_SharedViewIDLessInputRecordedOnce(t *testing.T) {
 		gate:         newFanoutBarrier(branches),
 	}
 	mk := func(name, reply string) agent_v2.Agent {
-		return agent_v2.NewBasicAgent(agent_v2.WithName(name),
-			agent_v2.WithModel(newStubModel([]*schema.Message{schema.AssistantMessage(reply)})),
-			agent_v2.WithHistory(hs, "acme"), agent_v2.WithMaxRounds(2))
+		leaf := agent_v2.NewBasicAgent(agent_v2.WithName(name),
+			agent_v2.WithModel(newStubModel([]*schema.Message{schema.AssistantMessage(reply)})), agent_v2.WithMaxRounds(2))
+		return historyViewAgent{Agent: leaf, mode: agent_v2.HandoffHistoryRaw}
 	}
 	par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("par")).
 		AddBranch("br1", mk("a1", "答案一")).
 		AddBranch("br2", mk("a2", "答案二")).
 		AddBranch("br3", mk("a3", "答案三"))
-	ho := agent_v2.NewHandoffAgent(agent_v2.WithHandoffName("ho"), agent_v2.WithHandoffInitial("front")).
-		AddAgent("front", par)
-	ctx := compose_v2.WithThreadIDCtx(context.Background(), "conv-noid")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	ctx = agent_v2.WithHistoryCtx(compose_v2.WithThreadIDCtx(ctx, "conv-noid"), hs, "acme")
 	in := &schema.Message{Role: schema.RoleUser, Content: "没有身份的问题"}
-	if _, err := ho.Run(ctx, agent_v2.NewRunSession(), in); err != nil {
+	if _, err := par.Run(ctx, agent_v2.NewRunSession(), in); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	msgs, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "acme", ConvID: "conv-noid"})

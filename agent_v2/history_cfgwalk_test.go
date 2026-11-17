@@ -139,7 +139,7 @@ func TestHistory_CtxDeclaredConfig_SingleWriter(t *testing.T) {
 			// 夹一层 Sequential：Parallel 向直接子借配置借不到（子是 Sequential 不是
 			// BasicAgent），这正是「靠借」失效的形状。
 			return agent_v2.NewSequentialAgent(
-				agent_v2.WithSequentialName(fmt.Sprintf("s%d", n))).AddStep("s1", leaf)
+				agent_v2.WithSequentialName(fmt.Sprintf("s%d", n))).AddStep("s1", historyViewAgent{Agent: leaf, mode: agent_v2.HandoffHistoryRaw})
 		}
 		par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("par")).
 			AddBranch("br1", mkSeq(1)).AddBranch("br2", mkSeq(2)).AddBranch("br3", mkSeq(3))

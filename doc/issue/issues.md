@@ -36,7 +36,7 @@
 | **ISSUE-90** | ✅ 已实现 | Plan Web 会话查询、Redis 多副本续跑、删除与完成即清理 | [会话生命周期](issue-90-plan-chat-web-lifecycle-prod.md) |
 | **ISSUE-91** | ✅ 已实现 | `agent_v2.NewAgentFunc` 将文本函数接入编排及存档 | [外部 Agent 接入](issue-91-external-agent-adapter.md) |
 | **ISSUE-92** | ✅ 已实现 | Skill 参考分层、匹配、读取预算、授权和去重 | [参考文档分层](issue-92-skill-source-layering.md) |
-| **ISSUE-93** | ① 历史模式作用域待处理，②③关闭 | Handoff 模式进入内层编排的历史边界，旧压缩边界与转交数量问题见复核。 | [专题](issue-93-handoff-modelb-audit-low.md) |
+| **ISSUE-93** | ① D08 已修，②③关闭 | Handoff 历史模式仅用于直接候选。旧压缩边界与转交数量问题见复核。 | [专题](issue-93-handoff-modelb-audit-low.md) |
 | **ISSUE-94** | ✅ 已关闭 · 失败档与待答档分离 | `CPStatusFailed` 记录失败现场，`ListPending` 排除失败档。仍有 frontier 或 pending work 的失败档可按内容恢复，由 `HasResumableWork` 判断。 | [ISSUE-94 专题](issue-94-dangling-cp-nonterminal-error.md) |
 | **ISSUE-98** | 历史存储主体关闭，残余事项拆分 | HistoryStore、归属、查询和回归已经实现。重做审计、转存生命周期等独立事项见逐条台账。 | [专题](issue-98-conversation-history.md) |
 | **ISSUE-99** | ⚪ **CLOSED**（2026-07-24）—— 随 `WithIncrementalSkillListing` 一并删除，触发路径不再存在 | **增量 skill listing 的静默失效**（同编号其他专题在核验台账单列）：「已宣布过哪些 skill」有两个真相源（session KV / prior 消息上的名单）取并集 ⟹ 不变量「回收到的名字其宣布消息这轮真在 prompt 里」可以不成立而框架不知道。业务 `WithHistoryCompactor` 砍掉 listing 后 KV 仍说"发过"→ 不补发，而增量模式下工具描述里本就没有 skill 名 ⟹ 模型失去所有获知渠道且零报错。**没有单独修，而是删掉了整个功能**——这是同一根因的第 6 次表现（前 5 次：deac747 / c26b7d2 / R14 HIGH-1 / R17 MED-2 / R19 HIGH-2），根因是「一份必须一直在模型眼前的状态被放进了会被压缩的对话流」，删除前需 5 文件 14 处单独保护、漏一处即静默失效。实测框架层同侪零家这么放。**留作决策实证 + 通用教训**（状态存放位置决定防护代码量 / 两个真相源取并集 = 不变量可失效而无人知 / 静默失效比报错严重） | [issue-99-listing-invariant-broken-by-kv.md](issue-99-listing-invariant-broken-by-kv.md) |
@@ -133,7 +133,7 @@ InterruptCtx 三态 + Phase 4 推迟）。完整 18 commit + retrospective 见 i
 Phase 4 推迟项触发条件：
 * StateFactory migrate：业务 typed state schema 演进
 * SelfHistoryByNS：同名 agent 跨嵌套层 OR 按 ns 子树审计
-* 性能优化 / Step Ⅲ SaveBatch：PG/Redis 后端接入（2026-09-18 核验：触发条件已满足——`redis/` `sql/` 已内置；但生产代码零调用 `SaveBatch`，接口 godoc 说「原子」而实现是逐条 best-effort，去留见 `doc/code/todo.md` 同名条目）
+* `SaveBatch` 契约由 D10 固定。按 namespace 字节序逐项写入，已经成功的写入保留。见[现行存档接口](../v2/checkpoint.md#41-sessionid-ns-二级-key)。
 
 ---
 
@@ -1723,7 +1723,7 @@ FanOut 只支持编译期静态声明目标，节点运行时无法根据输出�
 
 ## ✅ ISSUE-24 · 数据流转 Bug 专项审查（2026-04-15）
 
-> 2026-11-16 复核：L4 已复现并重新打开，见 [D06](../code/todo.md#p3--窄路径扩展与设计决策)。其余历史分项见[编号台账](../code/backlog-audit.md#issue-0164-核验台账)。
+> 2026-11-17 更新：L4 已随 D06 修复，复用写入输入时各槽仍保有自己的寻址和版本。其余历史分项见[编号台账](../code/backlog-audit.md#issue-0164-核验台账)。
 
 **优先级**：高  
 **状态**：已修复（全量）—— v1 历史档案，H4 文中 `Memory.Write` 已由 PR 3.3 commit `e6505f9` 替代为 `store.Put`

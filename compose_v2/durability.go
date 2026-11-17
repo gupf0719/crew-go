@@ -635,6 +635,9 @@ func writeCp(ctx context.Context, cfg *runOptions, cm *ChannelManager, cp *Check
 	saveErr := cfg.checkpointer.SaveNS(ctx, cfg.sessionID, cfg.graphNS, cp)
 	if saveErr == nil {
 		cm.setCpEpochBaseline(cp.Epoch) // 我写的这代成为新基线
+		if cfg.slotClaim != nil {
+			cfg.slotHasWork.Store(cp.HasResumableWork())
+		}
 	}
 	return saveStart, saveErr
 }

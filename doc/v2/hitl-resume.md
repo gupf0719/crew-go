@@ -584,6 +584,7 @@ const (
 内建 Agent 的 `Run`、`Resume` 和图执行按任务 ID 登记。显式 `Abort` 与 `WithAbandonedTasks` 在删档及补历史期间占用放弃许可。
 共享 Redis 或内建 SQL Checkpointer 时，这些入口同时使用 [存储端任务租约](checkpoint.md#61-共享存档的任务租约)。
 执行与放弃在登记或申请租约时冲突，后到的调用返回 `compose_v2.ErrTaskBusy`。调用方可在在途操作结束后重试。
+根任务 Resume 在本进程持有独占的任务登记，嵌套调用沿执行上下文借用。其他独立调用正在执行同一 RunID 时，根 Resume 会返回 `compose_v2.ErrTaskBusy`，即使存档位于不同分区。
 显式 Abort 独立于请求取消，清理期限至多 10 秒，并沿用仍有效且更早的调用方截止时间。
 删除失败时保留任务 ID 供下一次 Abort 重试。清档成功后才补写悬空的工具调用历史。
 宿主可用 `agent_v2.WithResumeAbortCleanup` 接管删档与完成确认。两个阶段都持有任务的放弃许可。

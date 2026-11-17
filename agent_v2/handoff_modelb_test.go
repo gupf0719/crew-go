@@ -437,3 +437,191 @@ func TestHistoryFor_SkipsEmptyCrossAgentMessage(t *testing.T) {
 		t.Error("有内容的 cross-agent 消息应被改写保留，实际丢失")
 	}
 }
+
+func TestHandoffHistoryModeScopedToDirectMember(t *testing.T) {
+	for _, fixture := range []struct {
+		name   string
+		mode   agent_v2.HandoffHistoryMode
+		nested bool
+		store  bool
+	}{
+		{name: "direct_rewrite", mode: agent_v2.HandoffHistoryRewrite},
+		{name: "nested_rewrite", mode: agent_v2.HandoffHistoryRewrite, nested: true},
+		{name: "direct_raw_store", mode: agent_v2.HandoffHistoryRaw, store: true},
+		{name: "nested_raw_store", mode: agent_v2.HandoffHistoryRaw, nested: true, store: true},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			const marker = "前接私有历史"
+			const request = "请处理当前请求"
+			const reply = "处理完成"
+			msg := transferToolCall("transfer", "target")
+			msg.Content = marker
+			hs := agent_v2.NewInMemoryHistoryStore()
+			const owner, thread = "tenant", "history-mode-scope"
+			frontOpts := []agent_v2.Option{agent_v2.WithName("front"), agent_v2.WithHandoffTransfer(),
+				agent_v2.WithModel(newStubModel([]*schema.Message{msg}))}
+			var prompts [][]*schema.Message
+			targetOpts := []agent_v2.Option{agent_v2.WithName("receiver"),
+				agent_v2.WithModel(&dupProbeModel{reply: reply, captured: &prompts})}
+			if fixture.store {
+				frontOpts = append(frontOpts, agent_v2.WithHistory(hs, owner))
+				targetOpts = append(targetOpts, agent_v2.WithHistory(hs, owner))
+			}
+			front := agent_v2.NewBasicAgent(frontOpts...)
+			var target agent_v2.Agent = agent_v2.NewBasicAgent(targetOpts...)
+			if fixture.nested {
+				target = agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("handler")).AddStep("member", target)
+			}
+			workflow := agent_v2.NewHandoffAgent(agent_v2.WithHandoffName("support"),
+				agent_v2.WithHandoffInitial("front"), agent_v2.WithHandoffHistoryMode(fixture.mode)).
+				AddAgent("front", front).AddAgent("target", target)
+			ctx := compose_v2.WithThreadIDCtx(t.Context(), thread)
+			events, err := workflow.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage(request))
+			if err != nil || agent_v2.FinalMessageByAgent(events, "receiver").GetContent() != reply || len(prompts) != 1 {
+				t.Fatalf("应由后接模型完成任务，err=%v 模型调用=%d", err, len(prompts))
+			}
+
+			var inputCount, markerCount int
+			for _, item := range prompts[0] {
+				if item.Role == schema.RoleUser && item.GetContent() == request {
+					inputCount++
+				}
+				if strings.Contains(item.GetContent(), marker) {
+					markerCount++
+				}
+			}
+			if inputCount != 1 || (markerCount > 0) == fixture.nested {
+				t.Fatalf("模型应恰好收到一次当前输入，只有直接接手才看前接标记：输入=%d 前接=%d", inputCount, markerCount)
+			}
+
+			if fixture.store {
+				stored, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: owner, ConvID: thread})
+				if err != nil {
+					t.Fatal(err)
+				}
+				inputs := map[string]int{}
+				for _, item := range stored {
+					if item.Role == schema.RoleUser && item.GetContent() == request {
+						slot, _ := item.Annotations[agent_v2.HistoryAgentAnnotation].(string)
+						inputs[slot]++
+					}
+				}
+				wantSlots := 1
+				if fixture.nested {
+					wantSlots = 2 // 前接共享视图与内层成员自有视图各保留一次输入。
+				}
+				if len(inputs) != wantSlots {
+					t.Fatalf("输入应落入 %d 个历史归属，实际 %v", wantSlots, inputs)
+				}
+				for slot, count := range inputs {
+					if count != 1 {
+						t.Fatalf("归属 %q 重复写入 %d 份输入", slot, count)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestHandoffHistoryProjectsSharedInputOnceAcrossThreeHops(t *testing.T) {
+	for _, persistent := range []bool{false, true} {
+		name := "events"
+		if persistent {
+			name = "store"
+		}
+		t.Run(name, func(t *testing.T) {
+			const userText, firstMark, secondMark = "用户原话", "前接标记", "内层产出"
+			transfer := transferToolCall("transfer", "middle")
+			transfer.Content = firstMark
+			front := agent_v2.NewBasicAgent(agent_v2.WithName("front"), agent_v2.WithHandoffTransfer(),
+				agent_v2.WithModel(newStubModel([]*schema.Message{transfer})))
+			var innerPrompts, finalPrompts [][]*schema.Message
+			leaf := agent_v2.NewBasicAgent(agent_v2.WithName("leaf"),
+				agent_v2.WithModel(&dupProbeModel{reply: secondMark, captured: &innerPrompts}))
+			last := agent_v2.NewBasicAgent(agent_v2.WithName("last"),
+				agent_v2.WithModel(&dupProbeModel{reply: "完成", captured: &finalPrompts}))
+
+			inputCh := compose_v2.LastValue[*schema.Message]("input")
+			outCh := compose_v2.LastValue[*schema.Message]("output")
+			var middle *agent_v2.GraphAgent
+			builder := compose_v2.NewBuilder().WithName("middle")
+			compose_v2.WithChannel(builder, inputCh)
+			compose_v2.WithChannel(builder, outCh)
+			g, err := builder.AddNode("delegate", func(ctx context.Context, ch compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+				in, _ := compose_v2.Get(ch, inputCh)
+				events, err := agent_v2.RunSubAgent(ctx, "leaf", leaf, in)
+				if err != nil {
+					return nil, err
+				}
+				if err := agent_v2.HandoffTo(ctx, agent_v2.RegrantFromNode(ctx, middle), middle, "last"); err != nil {
+					return nil, err
+				}
+				return []compose_v2.ChannelWrite{compose_v2.Write(outCh, agent_v2.FinalMessage(events))}, nil
+			}).AddEdge(compose_v2.StartNode, "delegate").AddEdge("delegate", compose_v2.EndNode).Compile()
+			if err != nil {
+				t.Fatal(err)
+			}
+			middle = agent_v2.NewGraphAgent(g, agent_v2.WithGraphAgentName("middle"),
+				agent_v2.WithGraphInputWriter(func(m *schema.Message) []compose_v2.ChannelWrite {
+					return []compose_v2.ChannelWrite{compose_v2.Write(inputCh, m)}
+				}),
+				agent_v2.WithGraphOutputReader(func(ch compose_v2.Channels) *schema.Message {
+					out, _ := compose_v2.Get(ch, outCh)
+					return out
+				}))
+			workflow := agent_v2.NewHandoffAgent(agent_v2.WithHandoffName("three-hops"),
+				agent_v2.WithHandoffInitial("front"), agent_v2.WithHandoffHistoryMode(agent_v2.HandoffHistoryRaw)).
+				AddAgent("front", front).AddAgent("middle", middle).AddAgent("last", last)
+			ctx := t.Context()
+			hs := agent_v2.NewInMemoryHistoryStore()
+			if persistent {
+				ctx = agent_v2.WithHistoryCtx(compose_v2.WithThreadIDCtx(ctx, "thread"), hs, "owner")
+			}
+			events, err := workflow.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage(userText))
+			if err != nil || agent_v2.FinalMessageByAgent(events, "last").GetContent() != "完成" || len(innerPrompts) != 1 || len(finalPrompts) != 1 {
+				t.Fatalf("应执行内层模型并由末跳完成：err=%v 内层调用=%d 末跳调用=%d", err, len(innerPrompts), len(finalPrompts))
+			}
+			if strings.Contains(inputText(innerPrompts[0]), firstMark) {
+				t.Fatal("内层模型读到了前接消息")
+			}
+			prompt := inputText(finalPrompts[0])
+			if strings.Count(prompt, userText) != 1 || !strings.Contains(prompt, firstMark) || !strings.Contains(prompt, secondMark) {
+				t.Fatalf("末跳模型应收到两跳产出和一份用户原话：%q", prompt)
+			}
+			if persistent {
+				stored, err := agent_v2.LoadAllHistory(ctx, hs, agent_v2.HistoryKey{Owner: "owner", ConvID: "thread"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if count := strings.Count(inputText(stored), userText); count != 2 {
+					t.Fatalf("审计记录应保留两份独立归属，实际 %d 份：%s", count, inputText(stored))
+				}
+			}
+		})
+	}
+}
+
+func TestHandoffHistoryKeepsCurrentInputOnFreshSessionResume(t *testing.T) {
+	ctx, cancel := context.WithTimeout(compose_v2.WithCheckpointerCtx(t.Context(), compose_v2.NewInMemoryCheckpointer()), 5*time.Second)
+	defer cancel()
+	var prompts [][]*schema.Message
+	receiver := agent_v2.NewBasicAgent(agent_v2.WithName("receiver"), agent_v2.WithHooks(branchStartQuestion{}),
+		agent_v2.WithModel(&dupProbeModel{reply: "完成", captured: &prompts}))
+	handoff := agent_v2.NewHandoffAgent(agent_v2.WithHandoffName("resume-input"), agent_v2.WithHandoffInitial("receiver")).
+		AddAgent("receiver", receiver)
+	session := agent_v2.NewRunSession()
+	const question = "用户本轮问题"
+	_, err := handoff.Run(ctx, session, schema.UserMessage(question))
+	id := compactionQuestionID(t, err, "批准 B 开始")
+	if len(prompts) != 0 {
+		t.Fatal("启动钩子挂起时还不能调用模型")
+	}
+	events, err := handoff.Resume(ctx, session.RunID,
+		agent_v2.WithResumeUserInputs(map[string]*schema.Message{id: schema.UserMessage("继续")}))
+	if err != nil || agent_v2.FinalMessageByAgent(events, "receiver").GetContent() != "完成" || len(prompts) != 1 {
+		t.Fatalf("续跑应该由同一个候选完成：err=%v 模型调用=%d", err, len(prompts))
+	}
+	if got := strings.Count(inputText(prompts[0]), question); got != 1 {
+		t.Fatalf("使用新 session 续跑时应恢复一次当前输入，实际 %d 次", got)
+	}
+}

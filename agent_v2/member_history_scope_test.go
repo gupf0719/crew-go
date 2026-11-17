@@ -28,9 +28,9 @@ func TestParallel_ResumeIsolatesCompletedSiblingEvents(t *testing.T) {
 			defer cancel()
 			ctx = compose_v2.WithCheckpointerCtx(ctx, compose_v2.NewInMemoryCheckpointer())
 			// Raw 会保留其他成员的消息，确保本用例实测并行隔离，而非仅靠 SelfOnly 的归属过滤。
-			ctx = agent_v2.WithHandoffHistoryModeCtx(ctx, agent_v2.HandoffHistoryRaw)
 			a, b, mb := sameNameWorkers(branchStartQuestion{})
-			par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("parallel")).AddBranch("a", a).AddBranch("b", b)
+			par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("parallel")).
+				AddBranch("a", a).AddBranch("b", historyViewAgent{Agent: b, mode: agent_v2.HandoffHistoryRaw})
 			sess := agent_v2.NewRunSession()
 			sess.AddEvent(agent_v2.NewOutputEvent("worker", schema.UserMessage("EARLIER-CALLER-EVENT")))
 			_, err := par.Run(ctx, sess, schema.UserMessage(laneQ))

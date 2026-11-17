@@ -1,6 +1,6 @@
 # ISSUE-93 · HandoffAgent 模型 B audit 遗留 3 LOW
 
-> **状态**：📋 记录跟踪（2026-06-05）
+> **状态**：D08 已修复遗留①（2026-11-17）。历史审计记录于 2026-06-05。
 > **来源**：HandoffAgent 模型 B 阶段 2（历史可见性 WithHandoffHistoryMode）提交后，
 > spawn 4 个独立单视角 audit agent 并发审 + worktree 隔离 cross-verify。
 > **已修（同批）**：doc/godoc stale（commit `6bc28bf`）+ MED 级 pending key 碰撞
@@ -15,6 +15,8 @@
 ---
 
 ## 遗留① · historyMode ctx-value 泄漏到非 handoff 编排内层 BasicAgent（视角 1）
+
+**已修（D08）**。历史视图绑定到直接候选的一次执行。内层成员沿用独立历史归属，后续共享投影合并同一用户消息的多份记录。跨层验证见 [Handoff 回归](../../agent_v2/handoff_modelb_test.go)。以下保留 2026-06-05 的缺陷与备选方案。
 
 `HandoffAgent.stepFn` 经 `WithHandoffHistoryModeCtx(subCtx, h.historyMode)` push historyMode
 给 active sub-agent。若 active sub-agent 是**非 handoff 编排**（Sequential/Parallel/Loop/

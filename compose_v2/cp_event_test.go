@@ -274,10 +274,6 @@ func TestPhase2Sub3_AuditHIGH2_CtxFlagPropagation(t *testing.T) {
 // TestPhase2Sub3_AuditFollowUp_HelperEmitCpCleanup 验 EmitCpCleanupHelper 把
 // DeleteSubtree 的结果如实转成 cp.cleanup event（删了几条、耗时、错），业务订阅
 // 可统一处理。
-//
-// sanity-revert: 删 EmitCpCleanupHelper → 它的调用点（subgraph.go 与
-// agent_v2/resume_helpers.go）编译失败。⚠️ 原说明写的是「9 编排 abort 编译失败」，
-// 那些 abort 路径早已收敛进 commonResumePrep 一处。
 func TestPhase2Sub3_AuditFollowUp_HelperEmitCpCleanup(t *testing.T) {
 	hooks := &cpEventOrchHooks{}
 	cper := compose_v2.NewInMemoryCheckpointer()

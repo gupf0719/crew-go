@@ -1052,6 +1052,16 @@ func (h *handler) handleOutcome(ctx context.Context, sse eventWriter, key sessio
 		// 存档属于另一执行者或另一张图，只移除本地过期句柄。
 		if shared == nil {
 			h.removeEntry(key)
+		} else if shared.record != nil && kind == runoutcome.GraphIDConflict && errors.Is(err, compose_v2.ErrRunAborted) {
+			// 终局任务无法继续应答。只解绑会话，避免封存根档失败时重放旧问题，保留冲突子档。
+			if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
+				rejectSharedSession(ctx, sse, err)
+				return
+			}
+			if err := shared.save(ctx, nil, ""); err != nil {
+				rejectSharedSession(ctx, sse, err)
+				return
+			}
 		}
 		_ = sse.WriteEvent(NewRunError(kind.Message(), string(kind)))
 		return

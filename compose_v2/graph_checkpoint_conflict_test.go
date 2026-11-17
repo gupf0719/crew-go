@@ -743,7 +743,17 @@ func TestCheckpointIdentity_RuntimeChannelMerge(t *testing.T) {
 	}
 }
 
-func TestLateIdentityConflictPreservesOriginalQuestion(t *testing.T) {
+func TestLateIdentityConflictPreservesChild(t *testing.T) {
+	t.Run("保留祖先原问题", func(t *testing.T) {
+		testLateIdentityConflict(t, false)
+	})
+	t.Run("兄弟终局失败", func(t *testing.T) {
+		testLateIdentityConflict(t, true)
+	})
+}
+
+func testLateIdentityConflict(t *testing.T, terminalSibling bool) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	cp := compose_v2.NewInMemoryCheckpointer()
@@ -760,6 +770,8 @@ func TestLateIdentityConflictPreservesOriginalQuestion(t *testing.T) {
 	}
 	child, replacement := mk("original-child"), mk("replacement")
 	changed := false
+	var terminalCalls atomic.Int32
+	terminalCause := errors.New("兄弟分支写入后失败")
 	g, err := compose_v2.NewBuilder().WithName("parent").
 		AddNode("child", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 			opts := []compose_v2.RunOption{compose_v2.WithRunNS("child")}
@@ -771,8 +783,9 @@ func TestLateIdentityConflictPreservesOriginalQuestion(t *testing.T) {
 			return nil, compose_v2.Run(ctx, selected, compose_v2.NewChannelManager(), opts...)
 		}).
 		AddNode("sibling", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
-			if changed {
-				return nil, compose_v2.ErrRunAborted
+			if changed && terminalSibling {
+				terminalCalls.Add(1)
+				return nil, fmt.Errorf("%w: %w", compose_v2.ErrRunAborted, terminalCause)
 			}
 			_, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "继续兄弟？"})
 			return nil, err
@@ -782,24 +795,59 @@ func TestLateIdentityConflictPreservesOriginalQuestion(t *testing.T) {
 		t.Fatal(err)
 	}
 	const sid = "late-write-conflict"
-	run := func() error {
-		return compose_v2.Run(ctx, g, compose_v2.NewChannelManager(), compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID(sid))
+	run := func(opts ...compose_v2.RunOption) error {
+		return compose_v2.Run(ctx, g, compose_v2.NewChannelManager(), append(
+			[]compose_v2.RunOption{compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID(sid)}, opts...)...)
 	}
 	initial := run()
 	ie, ok := compose_v2.IsInterrupt(initial)
 	if !ok || len(ie.AllQueries()) != 2 {
 		t.Fatalf("首次应留下两个问题，实际 %v", initial)
 	}
-	oldChild, before := graphConflictCheckpoint(t, ctx, cp, sid, "child")
+	oldParent, _ := graphConflictCheckpoint(t, ctx, cp, sid, "")
+	_, before := graphConflictCheckpoint(t, ctx, cp, sid, "child")
 	changed = true
 	err = run()
-	if !errors.Is(err, compose_v2.ErrGraphIDConflict) || errors.Is(err, compose_v2.ErrRunAborted) {
-		t.Fatalf("晚到写冲突应阻止祖先清档，实际 %v", err)
+	if !errors.Is(err, compose_v2.ErrGraphIDConflict) || !errors.Is(err, compose_v2.ErrCheckpointNotPersisted) {
+		t.Errorf("错误链应保留晚到写冲突，实际 %v", err)
 	}
 	parent, _ := graphConflictCheckpoint(t, ctx, cp, sid, "")
 	_, after := graphConflictCheckpoint(t, ctx, cp, sid, "child")
-	id := oldChild.PendingInterrupts[0].InterruptID
-	if !bytes.Equal(before, after) || !slices.Contains(fanoutQuestions(parent.PendingInterrupts), id) {
-		t.Fatalf("冲突后应保留原子档和祖先已公开的问题 %q", id)
+	if parent == nil {
+		t.Fatal("晚到写冲突应保留本层存档")
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("晚到写冲突不得修改原子档")
+	}
+	if !terminalSibling {
+		want, got := fanoutQuestions(ie.AllQueries()), fanoutQuestions(parent.PendingInterrupts)
+		slices.Sort(want)
+		slices.Sort(got)
+		if errors.Is(err, compose_v2.ErrRunAborted) || !parent.HasResumableWork() || !slices.Equal(want, got) {
+			t.Errorf("仅有身份冲突时应保留祖先原待答项，实际 err=%v IDs=%v 期望 %v", err, got, want)
+		}
+		return
+	}
+	if !errors.Is(err, compose_v2.ErrRunAborted) || !errors.Is(err, terminalCause) {
+		t.Errorf("错误链应保留兄弟终局失败，实际 %v", err)
+	}
+	if parent.Status != compose_v2.CPStatusAborted || parent.HasResumableWork() {
+		t.Errorf("终局失败后父档应封存，实际 status=%s 可续=%t", parent.Status, parent.HasResumableWork())
+	}
+	answers := make(map[string]*schema.Message)
+	for _, q := range ie.AllQueries() {
+		answers[q.InterruptID] = schema.UserMessage("同意")
+	}
+	if err := run(compose_v2.WithResumeAnswers(answers)); !errors.Is(err, compose_v2.ErrNoPendingCheckpoint) {
+		t.Errorf("自动载入不应从终局档续跑，实际 %v", err)
+	}
+	if err := run(); !errors.Is(err, compose_v2.ErrNoPendingCheckpoint) {
+		t.Errorf("默认 Run 也不应误从终局档重开同一任务，实际 %v", err)
+	}
+	if err := run(compose_v2.WithResumeFrom(oldParent)); !errors.Is(err, compose_v2.ErrNoPendingCheckpoint) {
+		t.Errorf("显式旧快照不应覆盖终局档，实际 %v", err)
+	}
+	if calls := terminalCalls.Load(); calls != 1 {
+		t.Errorf("终局分支的副作用只允许一次，实际 %d", calls)
 	}
 }

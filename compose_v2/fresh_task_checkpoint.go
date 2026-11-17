@@ -50,6 +50,23 @@ func (f *freshTaskCheckpoints) check(ctx context.Context, cp Checkpointer, sid s
 			return nil
 		}
 	}
+	if err := checkFreshTaskCheckpoints(ctx, cp, sid); err != nil {
+		return err
+	}
+	if comparable {
+		f.mu.Lock()
+		f.checked[partition] = token
+		f.mu.Unlock()
+	}
+	return nil
+}
+
+// checkFreshTaskCheckpoints 检查实际存储上下文。钩子可用私有上下文值路由分区，
+// 即使 Checkpointer 和 owner 都没变，也不能借用入口的检查结果。
+func checkFreshTaskCheckpoints(ctx context.Context, cp Checkpointer, sid string) error {
+	if err := CheckCheckpointTaskLease(ctx); err != nil {
+		return err
+	}
 	saved, loadErr := cp.LoadAllInSession(ctx, sid)
 	if err := CheckCheckpointTaskLease(ctx); err != nil {
 		return err
@@ -59,19 +76,29 @@ func (f *freshTaskCheckpoints) check(ctx context.Context, cp Checkpointer, sid s
 	}
 	taskID := getRunTaskID(ctx)
 	for _, slot := range saved {
-		if !slot.Checkpoint.HasResumableWork() {
+		if !checkpointRequiresTaskOwnership(slot.Checkpoint) {
 			continue
 		}
 		if taskID != "" && slot.Checkpoint.TaskID == taskID {
 			continue
 		}
+		if slot.Checkpoint.Status == CPStatusAborted {
+			return RejectCheckpointIdentity(slot.Checkpoint, fmt.Sprintf("run id %q has a terminal checkpoint at %q", sid, slot.NS))
+		}
 		return fmt.Errorf("run id %q (checkpoint namespace %q): %w (call Resume or use a new RunID)",
 			sid, slot.NS, ErrRunIDHasResumableCheckpoint)
 	}
-	if comparable {
-		f.mu.Lock()
-		f.checked[partition] = token
-		f.mu.Unlock()
-	}
 	return nil
+}
+
+func hasFreshTaskAdmission(ctx context.Context, sid string) bool {
+	binding, _ := ctx.Value(taskActivityKey{}).(*taskActivityBinding)
+	taskActivities.Lock()
+	defer taskActivities.Unlock()
+	for ; binding != nil; binding = binding.parent {
+		if a := binding.activity; a.sid == sid && a.fresh != nil {
+			return true
+		}
+	}
+	return false
 }

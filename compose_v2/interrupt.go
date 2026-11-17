@@ -242,7 +242,9 @@ func (e *InterruptError) Error() string {
 
 // PickFanoutError 从一组**并行子调用**的错误里挑出返给调用方的那**一个**。
 //
-// 判据是 `终局失败 > 坏存档 > 档没写成 > 中断 > 第一个业务错`。为什么中断优先、为什么业务错绝不聚合成多错误树，
+// 判据是 `终局失败 > 存档身份拒绝 > 坏存档 > 档没写成 > 中断 > 第一个业务错`。终局失败同时有身份冲突时，
+// 两条原因一并返回，使图退出时可以终止本次执行并保护冲突存档。
+// 为什么中断优先、为什么业务错绝不聚合成多错误树，
 // 完整理由在 `frontierResult.exitErr` 的 godoc——那是这套判据的权威说明。
 //
 // **这不是那份判据的拷贝，是同一份**：图引擎的超步仲裁和它一起走下面的
@@ -264,7 +266,7 @@ func (e *InterruptError) Error() string {
 //
 // 含多个中断的错误树会先校验每个中断的形状，非法中断使本次聚合返回 [ErrRunAborted]。
 func PickFanoutError(errs []error) error {
-	if err := fanoutCheckpointIdentityError(errs); err != nil {
+	if err := pickFanoutTerminalOrIdentityError(errs); err != nil {
 		return err
 	}
 	var raws []error
@@ -272,18 +274,6 @@ func PickFanoutError(errs []error) error {
 	for _, e := range errs {
 		if e == nil {
 			continue
-		}
-		// **终局失败严格支配中断**，理由见 exitErr 的 godoc。
-		//
-		// 这一档曾经外包给调用方（godoc 写「自己在调用之前先判」），实测那是错的：
-		// 框架自己的第一个调用方就没照做，而漏掉的后果完全静默——返中断 ⟹ 落 Pending 档
-		// ⟹ **人被问了、人答了** ⟹ Resume 时 abort 赢 ⟹ 出口 purge 把刚给的答案连同
-		// 兄弟分支的工作一起清掉。一次白问 + 一次销毁，信息量为零。
-		//
-		// 按本仓规约，「每个调用方各留一份框架判据的拷贝」是设计债的自白；判据搬进来，
-		// 义务连同它必然产生的拷贝一起消失。
-		if errors.Is(e, ErrRunAborted) {
-			return e
 		}
 		if firstErr == nil {
 			firstErr = e
@@ -518,6 +508,8 @@ func walkInterrupts(err error, visit func(*InterruptError) bool) bool {
 			return visit(e)
 		case *fanoutInterruptError:
 			return visit(e.projection)
+		case *terminalCheckpointConflictError:
+			return false
 		case *detachedInterruptError:
 			if e.marked != nil {
 				return visit(e.marked)

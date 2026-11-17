@@ -117,8 +117,9 @@ func (e *MaxRoundsError) Error() string {
 // NonRetryable 实现 [NonRetryable]——预算耗尽属「重放代价已知是最大值」那一类。
 func (e *MaxRoundsError) NonRetryable() {}
 
-// ErrRunAborted 标记本次 Run **终局失败、不可 Resume**——Run 出口 defer 据此**主动**
-// `DeleteSubtree(sid, graphNS)` 清掉该子树的全部 cp，而非仅仅"跳过写"。
+// ErrRunAborted 标记本次 Run **终局失败、不可 Resume**。Run 出口通常调用
+// `DeleteSubtree(sid, graphNS)` 清理该子树。同时发现 [ErrGraphIDConflict] 时，
+// 出口将归属已确认的本层存档替换为 [CPStatusAborted]，以保护冲突子档。
 //
 // **为什么必须主动删、跳过写不够**：cp 是 (sid, ns) **单槽覆盖式**——"跳过写"只是不覆盖，
 // **先前已存在的 cp 原样幸存且 Status=Pending**：
@@ -133,8 +134,7 @@ func (e *MaxRoundsError) NonRetryable() {}
 // （业务跨 Run 持久化用不同 sid，见 WithSessionID godoc）。
 //
 // **子图终局性自动向上传播**：子图 Run 返回的 abort 错沿错误链冒泡进父图 NodeFunc →
-// 父图 Run 出口 defer 同样 `errors.Is` 命中 → 父 cp 子树一并清 → 逐层向上，不需要每层
-// 显式协调。
+// 父图 Run 出口用同一规则结束本层。两种错误同时出现时逐层封存，保留终局失败及冲突原链。
 //
 // # 来源：别找清单，用判据加 grep
 //

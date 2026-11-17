@@ -150,7 +150,7 @@ type Checkpoint struct {
 	ID        string           `json:"id,omitempty"`         // session ID（SaveNS 自动填）
 	NS        string           `json:"ns,omitempty"`         // 本 cp 的 ns 路径
 	ParentNS  string           `json:"parent_ns,omitempty"`  // 父 ns（O(1) 反查祖先）
-	Status    CheckpointStatus `json:"status,omitempty"`     // Unset / Pending / Failed（只是报告位）
+	Status    CheckpointStatus `json:"status,omitempty"`     // 存档状态
 	SchemaVer int              `json:"schema_ver,omitempty"` // schema 版本（migration 用）
 	GraphID   string           `json:"graph_id,omitempty"`   // ISSUE-50 P0：防串台
 
@@ -437,6 +437,9 @@ const (
 	// **不需要区分确定性错和瞬时错**——那个判断框架做不了（它看到的只是一个 error，
 	// 判不了下次会不会好），也不必做：标出「这是失败现场」就够了，要不要再试是业务的事。
 	CPStatusFailed
+	// CPStatusAborted 标记遇到身份冲突的终局退出。只保存本层任务身份，
+	// frontier 和挂起清单留空，供续跑入口拒绝本任务的旧快照。
+	CPStatusAborted
 )
 
 // Resumable 报这个**档位**能不能用来恢复执行——[CPStatusPending] 和 [CPStatusFailed]
@@ -469,8 +472,7 @@ func (s CheckpointStatus) Resumable() bool {
 //  3. **与出口同源**。引擎出口的「没 frontier 也没挂起就不写档」早退、
 //     `SnapshotForGraph` 的按内容盖章，用的都是这同一个谓词——判据只有一份，不漂。
 //
-// 档位（`Status`）从此只承担**报告**（观测事件、`ListPending` 过滤、debug dump），
-// 不承担控制流。曾按档位挡「失败档别自动捡」——那道 gate 的立论（隐式 auto-load 会
+// 内容判据适用于普通快照，终局标记不保存任何可续内容。曾按档位挡「失败档别自动捡」——那道 gate 的立论（隐式 auto-load 会
 // 静默捡起失败档再撞同错）在顶层已被 `agent_v2` 的新任务判定（恒 fresh）结构性覆盖，
 // 而它在嵌套层挡掉的恰恰是**合法的续跑**：Resume 重跑失败分支时子图捡不起自己的
 // 失败子档 ⟹ fresh run ⟹ 已完成超步的副作用重放（实测扣款 1→2；只把档位掰成
@@ -511,6 +513,8 @@ func (s CheckpointStatus) String() string {
 		return "pending"
 	case CPStatusFailed:
 		return "failed"
+	case CPStatusAborted:
+		return "aborted"
 	default:
 		return "unset"
 	}

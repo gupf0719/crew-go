@@ -310,6 +310,47 @@ func exitStaleCheck(ctx context.Context, cfg *runOptions, cm *ChannelManager, op
 	return staleErr, nil
 }
 
+// persistTerminalCheckpoint 仅封住本层续跑入口。冲突子档的所有权未确认，
+// 不能随终局失败做递归删除。先确认现存槽的归属，再替换为没有可续内容的标记。
+func persistTerminalCheckpoint(ctx context.Context, cfg *runOptions, cm *ChannelManager, graphID, taskID string, terminal error) error {
+	marker := &Checkpoint{Status: CPStatusAborted, SchemaVer: CheckpointSchemaVer, GraphID: graphID, TaskID: taskID}
+	var notes exitNotes
+	var current *Checkpoint
+	saveStart := time.Now()
+	err := exitStorageOp(ctx, exitOpRead, "terminal checkpoint ownership", func(c context.Context) error {
+		var err error
+		current, err = cfg.checkpointer.LoadNS(c, cfg.sessionID, cfg.graphNS)
+		return err
+	})
+	if err == nil && current != nil && (current.GraphID != graphID || current.TaskID != taskID) {
+		err = RejectCheckpointIdentity(current, "terminal checkpoint target belongs to a different graph or task")
+	}
+	if err == nil {
+		needCheck, note := staleProbe(cfg, cm, "save-terminal")
+		notes.add(note)
+		if needCheck {
+			err, note = judgeStale(cfg, cm, "save-terminal", current, nil, "")
+			notes.add(note)
+		}
+	}
+	if err == nil {
+		err = exitStorageOp(ctx, exitOpWrite, "terminal checkpoint save", func(c context.Context) error {
+			if err := CheckCheckpointTaskLease(c); err != nil {
+				return err
+			}
+			var err error
+			saveStart, err = writeCp(c, cfg, cm, marker)
+			return err
+		})
+	}
+	if err != nil {
+		terminal = errors.Join(terminal, fmt.Errorf("%w: save terminal checkpoint: %w", ErrCheckpointNotPersisted, err))
+	}
+	notes.flush(ctx)
+	emitCpSaveEvent(ctx, cfg, marker, saveStart, err)
+	return terminal
+}
+
 // attachPanicOf 在 src 带着兜住的 panic（[PanicError]）时把它并列挂到 err 上。src 只以文本进 err 的地方用：
 // 不让 src 整条进链（它可能带着后端返回的 ctx 错），panic 的记录仍能 errors.As 取到。
 func attachPanicOf(err, src error) error {

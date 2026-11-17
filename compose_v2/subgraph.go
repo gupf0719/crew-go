@@ -3,7 +3,6 @@ package compose_v2
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"time"
 )
 
@@ -304,16 +303,9 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 			return nil, fmt.Errorf("subgraph %q: %w", id, runErr)
 		}
 
-		// 7. export：先构造 export ChannelWrite——稍后由父 graph_loop 在超步合并
-		// 点 ApplyAll（与 sibling writes 一起 atomic）
-		//
-		// **audit Round 9 Bug D4**：原顺序"先 DeleteSubtree → 再返 export writes"
-		// 在父 reducer panic 时（父 cm.values 整批不提交）让子 cp 已被删
-		// 而父未真正接收 export → Resume 时父重跑子图从头（子图副作用可能不幂等）。
-		// 改为"先建 export writes → 再 DeleteSubtree"——即使 reorder 也无法在
-		// subNodeFunc 内等待父 ApplyAll 结果（写实际由 graph_loop 后续做），但保
-		// 证至少 export writes 在 cp 删之前**完整构造**：业务自定义子 cm.read 时
-		// 不会因子 cp 已删导致 read 异常。
+		// 7. export：父图在超步提交时和其他分支一起应用这些写入。
+		// 存档由子图 Run 按实际采用的上下文清理。父图提交失败时子图可能重跑，
+		// 子图中的外部副作用仍需按调用身份做幂等处理。
 		// **只送子图自己写的部分**（ownValue，不含 import 摆进来的 baseline）。用 read
 		// 的话，import 进来又没被碰过的 channel 会被原样回送，父图 Sum 5→10、Append
 		// [a]→[a a]，err 全程 nil（实测）——read 分不清「子图产出的」和「刚灌进去的」。
@@ -324,26 +316,6 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 				continue
 			}
 			writes = append(writes, &exportWrite{ch: ech, value: subVal})
-		}
-
-		// 8. 子图成功完成 → 清子 cp 子树（含本子图自身 cp + 任何 grandchild cp）
-		// 清失败仅 warn——不影响成功路径（audit Round 2：兑现注释承诺加 slog.Warn）
-		//
-		// **D4 残留 caveat**：父 ApplyAll 后续若因 reducer panic 整批不提交，子
-		// cp 此时已删 → Resume 时父重跑此 subgraph node 时子图从 scratch 重建。
-		// 若业务 subgraph 非幂等（如调外部 RPC 计费），可能重复执行一次。生产场景
-		// LLM agent subgraph 通常幂等可重入，影响有限。彻底修需让 graph_loop 把
-		// "subgraph DeleteSubtree" 推迟到自己 ApplyAll 成功后——成本过大，留作
-		// 已知设计取舍。
-		if cper != nil && sid != "" {
-			// Phase 2 Sub-3 audit fix: subgraph DeleteSubtree fire cp.cleanup event (统一 helper)
-			cleanupStart := time.Now()
-			delCount, delErr := cper.DeleteSubtree(ctx, sid, childNS)
-			EmitCpCleanupHelper(ctx, sid, childNS, "success", delCount, time.Since(cleanupStart).Milliseconds(), delErr)
-			if delErr != nil {
-				slog.WarnContext(ctx, "compose_v2: subgraph cp DeleteSubtree on success failed",
-					"sid", sid, "childNS", childNS, "subID", id, "err", delErr)
-			}
 		}
 
 		return writes, nil

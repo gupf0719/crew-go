@@ -221,3 +221,30 @@ func checkpointScopeSnapshot(t *testing.T, ctx context.Context, store compose_v2
 	}
 	return saved, wire
 }
+
+func TestCheckpointLowLevelRestartWithGraphStartContext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	f := newKeyDurFixture(t, "restart-with-graph-context", askTail)
+	cp := &topFailOnceCP{keyDurCP: newKeyDurCP("")}
+	const sid = "restart-with-graph-context"
+	opts := []compose_v2.RunOption{compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID(sid)}
+	err := compose_v2.Run(ctx, f.g, compose_v2.NewChannelManager(), opts...)
+	if !errors.Is(err, compose_v2.ErrCheckpointNotPersisted) || !cp.failedDeleteTop.Load() || !cp.savedNS("cg/inner") {
+		t.Fatalf("测试需要根写删失败后留下真实子档，实际 %v", err)
+	}
+
+	// 装饰上下文的钩子增加业务值，后端仍读写原来的分区。
+	hooks := &checkpointScopeHook{selectScope: setCheckpointPartition}
+	opts = append(opts, compose_v2.WithHooks(hooks))
+	err = compose_v2.Run(ctx, f.g, compose_v2.NewChannelManager(), opts...)
+	interrupt, ok := compose_v2.IsInterrupt(err)
+	if !ok || len(interrupt.AllQueries()) != 1 || f.wRuns.Load() != 2 || hooks.starts != 1 {
+		t.Fatalf("空根槽应从头执行并重新提问，实际 err=%v runs=%d hooks=%d", err, f.wRuns.Load(), hooks.starts)
+	}
+	answers := map[string]*schema.Message{interrupt.AllQueries()[0].InterruptID: schema.UserMessage("是")}
+	err = compose_v2.Run(ctx, f.g, compose_v2.NewChannelManager(), append(opts, compose_v2.WithResumeAnswers(answers))...)
+	if err != nil || f.last() != "took:billing" {
+		t.Fatalf("重开任务应能用新问题续跑，实际 err=%v result=%q", err, f.last())
+	}
+}

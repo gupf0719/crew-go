@@ -47,13 +47,68 @@ func CanAutoResumeCheckpoint(ctx context.Context, cp *Checkpoint) bool {
 	return !IsFreshRunCtx(ctx) && cp.HasResumableWork() && cp.BelongsToTask(getRunTaskID(ctx))
 }
 
-// checkForeignCheckpointSubtree 保护续跑时临时选用的后端。当前任务只可清理
-// 已接管的子树，要检查完整命名空间，包括只有后代存档的场景。
-func checkForeignCheckpointSubtree(ctx context.Context, cp Checkpointer, sid, ns string) error {
-	taskID := getRunTaskID(ctx)
-	if cp == nil || sid == "" || taskID == "" || IsFreshRunCtx(ctx) || sameCheckpointPartition(ctx, cp, sid) {
-		return nil
+type checkpointRestartKey struct{}
+
+func (checkpointRestartKey) ExecutionState() {}
+
+type checkpointRestartScope struct {
+	base         context.Context
+	checkpointer Checkpointer
+	sid, ns      string
+}
+
+func withCheckpointRestartScope(ctx, base context.Context, cfg *runOptions) context.Context {
+	return context.WithValue(ctx, checkpointRestartKey{}, checkpointRestartScope{
+		base: base, checkpointer: cfg.checkpointer, sid: cfg.sessionID, ns: cfg.graphNS,
+	})
+}
+
+// restartOwnsCheckpoint 允许低阶空根槽重开时回收原分区的旧子档。候选档必须能在
+// 最终根存储上下文中读回同一份快照，仅有相同的后端句柄和 namespace 并不足够。
+func restartOwnsCheckpoint(ctx context.Context, cp Checkpointer, sid string, slot NSCheckpoint) (bool, error) {
+	root, ok := ctx.Value(checkpointRestartKey{}).(checkpointRestartScope)
+	if !ok || root.sid != sid || GetOwner(root.base) != GetOwner(ctx) ||
+		!reflect.ValueOf(cp).Comparable() || cp != root.checkpointer ||
+		root.ns == slot.NS || !IsNSInSubtree(root.ns, slot.NS) ||
+		slot.Checkpoint.TaskID == "" || slot.Checkpoint.Status == CPStatusAborted {
+		return false, nil
 	}
+	lookupCtx, cancel := context.WithCancel(root.base)
+	defer cancel()
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+	original, err := cp.LoadNS(lookupCtx, sid, slot.NS)
+	return err == nil && sameCheckpointSnapshot(original, slot.Checkpoint), err
+}
+
+// verifyGraphCheckpointScope 核对最终存储上下文。自定义 Checkpointer 可以按私有 ctx 值
+// 路由；共用一个句柄或精确槽为空都不足以证明其后代存档属于当前任务。
+func verifyGraphCheckpointScope(ctx context.Context, cfg *runOptions, rootRun bool, exact *Checkpoint) error {
+	if IsFreshRunCtx(ctx) {
+		return checkFreshTaskCheckpoints(ctx, cfg.checkpointer, cfg.sessionID)
+	}
+	taskID := getRunTaskID(ctx)
+	var authorizedExact *Checkpoint
+	if rootRun && taskID == "" {
+		if cfg.resumeFrom != nil {
+			taskID = cfg.resumeFrom.TaskID
+		} else if exact.HasResumableWork() {
+			taskID = exact.TaskID
+		}
+		if taskID == "" {
+			// 顶层刚校验过的精确槽可按旧任务兼容规则载入，不能据此接管身份不明的后代。
+			authorizedExact = exact
+		}
+	}
+	err := verifyCheckpointSubtree(ctx, cfg.checkpointer, cfg.sessionID, cfg.graphNS, taskID, authorizedExact)
+	if err != nil && !errors.Is(err, ErrGraphIDConflict) && !errors.Is(err, ErrTaskLeaseLost) {
+		// 无法验证所有权时，外层协议同样不能将它视作普通失败并清档。
+		return checkpointTargetRejection(errors.Join(ErrGraphIDConflict, err), exact)
+	}
+	return err
+}
+
+func verifyCheckpointSubtree(ctx context.Context, cp Checkpointer, sid, ns, taskID string, authorizedExact *Checkpoint) error {
 	slots, err := cp.LoadAllInSession(ctx, sid)
 	if leaseErr := CheckCheckpointTaskLease(ctx); leaseErr != nil {
 		return leaseErr
@@ -62,11 +117,31 @@ func checkForeignCheckpointSubtree(ctx context.Context, cp Checkpointer, sid, ns
 		return fmt.Errorf("check checkpoint subtree %q for task %q: %w", ns, sid, err)
 	}
 	for _, slot := range slots {
-		if IsNSInSubtree(ns, slot.NS) && slot.Checkpoint.HasResumableWork() && !slot.Checkpoint.BelongsToTask(taskID) {
-			return RejectCheckpointIdentity(slot.Checkpoint, fmt.Sprintf("checkpoint subtree %q contains another task at %q", ns, slot.NS))
+		if !IsNSInSubtree(ns, slot.NS) || !checkpointRequiresTaskOwnership(slot.Checkpoint) {
+			continue
 		}
+		if taskID != "" && slot.Checkpoint.TaskID == taskID {
+			continue
+		}
+		if slot.NS == ns && authorizedExact != nil && sameCheckpointSnapshot(authorizedExact, slot.Checkpoint) {
+			continue
+		}
+		owned, err := restartOwnsCheckpoint(ctx, cp, sid, slot)
+		if err != nil {
+			return fmt.Errorf("check restart checkpoint %q for task %q: %w", slot.NS, sid, err)
+		}
+		if owned {
+			continue
+		}
+		return RejectCheckpointIdentity(slot.Checkpoint, fmt.Sprintf("checkpoint subtree %q has unverified task ownership at %q", ns, slot.NS))
 	}
 	return nil
+}
+
+// checkpointRequiresTaskOwnership 区分仍有任务意义的存档与普通完成快照。
+// 终局标记虽然不可续，仍负责阻止旧快照重放。
+func checkpointRequiresTaskOwnership(cp *Checkpoint) bool {
+	return cp != nil && (cp.Status == CPStatusAborted || cp.HasResumableWork())
 }
 
 func sameCheckpointPartition(ctx context.Context, cp Checkpointer, sid string) bool {
@@ -75,9 +150,10 @@ func sameCheckpointPartition(ctx context.Context, cp Checkpointer, sid string) b
 		return false
 	}
 	root := GetCheckpointer(base)
-	if reflect.ValueOf(cp).Comparable() && cp == root {
+	if fixed, ok := cp.(*InMemoryCheckpointer); ok && root == fixed {
 		return true
 	}
+	// 共用有效租约的前提是两个客户端确实访问同一存储域，见 TaskLeaseProvider。
 	parent, parentLeased := root.(TaskLeaseProvider)
 	child, childLeased := cp.(TaskLeaseProvider)
 	if !parentLeased || !childLeased {
@@ -269,23 +345,59 @@ func checkpointIdentityRejectionError(conflicts []*checkpointIdentityRejection) 
 	return errors.Join(errs...)
 }
 
-// fanoutCheckpointIdentityError 保留有身份冲突的分支及有效兄弟的中断。
-func fanoutCheckpointIdentityError(errs []error) error {
+// terminalCheckpointConflictError 保留终局与冲突的原错误链，不向调用方投影冲突链上的旧问题。
+type terminalCheckpointConflictError struct{ error }
+
+func (e *terminalCheckpointConflictError) Unwrap() error { return e.error }
+
+// terminalCheckpointConflict 保留终局原链和保护子档所需的身份冲突。
+func terminalCheckpointConflict(terminal, conflict error) error {
+	if errors.Is(terminal, ErrGraphIDConflict) {
+		if _, ok := terminal.(*terminalCheckpointConflictError); ok {
+			return terminal
+		}
+		return &terminalCheckpointConflictError{error: terminal}
+	}
+	if conflict == nil {
+		return terminal
+	}
+	return &terminalCheckpointConflictError{error: errors.Join(terminal, conflict)}
+}
+
+func checkpointConflictForAbort(conflicts []*checkpointIdentityRejection, graphIDConflict bool) error {
+	if conflict := checkpointIdentityRejectionError(conflicts); conflict != nil {
+		return conflict
+	}
+	if graphIDConflict {
+		return ErrGraphIDConflict
+	}
+	return nil
+}
+
+// pickFanoutTerminalOrIdentityError 先确定终局，保留同时发现的身份冲突。
+// 只有这一批仍可续跑时才向外提交有效兄弟的中断。
+func pickFanoutTerminalOrIdentityError(errs []error) error {
 	var kept []error
-	var hasConflict bool
+	var conflicts []*checkpointIdentityRejection
+	var terminal error
+	var graphIDConflict bool
 	for _, err := range errs {
-		conflicts := appendCheckpointIdentityRejections(nil, err)
-		if len(conflicts) != 0 {
-			hasConflict = true
-			if errors.Is(err, ErrRunAborted) {
-				err = checkpointIdentityRejectionError(conflicts)
-			}
+		if terminal == nil && errors.Is(err, ErrRunAborted) {
+			terminal = err
+		}
+		graphIDConflict = graphIDConflict || errors.Is(err, ErrGraphIDConflict)
+		before := len(conflicts)
+		conflicts = appendCheckpointIdentityRejections(conflicts, err)
+		if len(conflicts) > before {
 			kept = append(kept, err)
 		} else if _, pending := pendingInterrupt(err); pending {
 			kept = append(kept, err)
 		}
 	}
-	if !hasConflict {
+	if terminal != nil {
+		return terminalCheckpointConflict(terminal, checkpointConflictForAbort(conflicts, graphIDConflict))
+	}
+	if len(conflicts) == 0 {
 		return nil
 	}
 	return errors.Join(kept...)
@@ -293,10 +405,7 @@ func fanoutCheckpointIdentityError(errs []error) error {
 
 func withInterruptValidationError(original, invalid error) error {
 	conflicts := appendCheckpointIdentityRejections(nil, original)
-	if conflict := checkpointIdentityRejectionError(conflicts); conflict != nil {
-		return fmt.Errorf("%w, invalid sibling interruption: %v", conflict, invalid)
-	}
-	return invalid
+	return terminalCheckpointConflict(invalid, checkpointConflictForAbort(conflicts, errors.Is(original, ErrGraphIDConflict)))
 }
 
 func checkpointTargetUnknown(conflicts []*checkpointIdentityRejection) bool {

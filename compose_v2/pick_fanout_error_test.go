@@ -117,3 +117,22 @@ func TestPickFanoutError_AbortDominatesInterrupt(t *testing.T) {
 		}
 	}
 }
+
+func TestPickFanoutError_AbortProtectsCheckpointAcrossErrorTrees(t *testing.T) {
+	cause := errors.New("工具已经写入")
+	terminal := fmt.Errorf("%w: %w", compose_v2.ErrRunAborted, cause)
+	for name, errs := range map[string][]error{
+		"独立冲突分支":    {terminal, compose_v2.ErrGraphIDConflict, ie("兄弟待答")},
+		"已聚合的终局与冲突": {errors.Join(terminal, compose_v2.RejectCheckpointIdentity(nil, "子档不相容"), ie("原待答"))},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := compose_v2.PickFanoutError(errs)
+			if !errors.Is(got, compose_v2.ErrRunAborted) || !errors.Is(got, cause) || !errors.Is(got, compose_v2.ErrGraphIDConflict) {
+				t.Errorf("应保留终局和冲突原链，实际 %v", got)
+			}
+			if _, waiting := compose_v2.IsInterrupt(got); waiting {
+				t.Errorf("终局批次不应投影待答项，实际 %v", got)
+			}
+		})
+	}
+}

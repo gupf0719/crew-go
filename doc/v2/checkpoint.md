@@ -260,15 +260,15 @@ Parallel + HITL 下 Resume 重跑失败分支时，子图捡不起自己那份�
 
 ### 3.3 何时清
 
-成功与终局失败都经 `purgeExitSlot` 清（出口档没写成时也用它清旧档）——「这个槽里的档不该留」：
+成功与通常的终局失败经 `purgeExitSlot` 清理。出口档没写成且仍拥有存档槽时也用它清旧档。
 
 - **成功**：Run 出口 defer `DeleteSubtree(sid, graphNS)`。避免 Run 1 留下的 cp 污染 Run 2。
-- **`ErrRunAborted`**（终局失败）：Run 出口**主动删子树**。
+- **`ErrRunAborted`**（终局失败）：Run 出口主动删子树。同一超步同时有子档身份冲突和终局失败时，出口保留两条错误链，只在本图的槽写入终局档，并保留冲突子档。终局档没有待执行节点或待答问题，目标槽拒绝续跑。写入失败时，错误链还包含 `ErrCheckpointNotPersisted`，此前的存档可能仍在。
 
 ⚠️ **必须主动删而不是"跳过写"**：cp 是 `(sid, ns)` **单槽覆盖式**，跳过写只是不覆盖，先前那份
 （HITL 档 / durability 中途档）会幸存且 `Status=Pending` → auto-load 捡起 → 重跑已成功的节点 /
 **重问已答过的问题** / 子图 **livelock**（子跳过写但父照存 → 反复 Resume 反复问，永不收敛）。
-子图的终局性会经 `%w` 冒泡自动向上传播，父子树一并清。
+子图的终局性沿错误链逐层传播。遇到子档身份冲突时，各层分别封存自己的档。
 
 **「子树」只沿 `/` 往下**：`DeleteSubtree(sid, P)` 删 P 自身与 `P/…`，不删 `P#k`、`P@v`——
 它们是同一个节点的**其他执行**（fan-out 实例 / 重访 / 同一节点里对同一个名字的另一次调用），
@@ -510,8 +510,9 @@ DetachTask 连会话 ID 与软取消信号一起剥。入口拒绝恒不可重�
 不碍事。approve_always 规则按 RunID 分，换了 RunID 就是新的一套。
 
 内建图 Agent 的顶层 Run 在登记任务和取得后端租约后检查整个 RunID。发现任一 namespace 有可续工作时，
-返回 `agent_v2.ErrRunIDHasResumableCheckpoint`。继续该任务用 Resume。开始新任务用 `RunSession.NextTask`，
-需要放弃旧任务时可以使用 `WithAbandonedTasks`。钩子为新任务选择其他存档后端时，在使用它之前同样检查。
+返回 `agent_v2.ErrRunIDHasResumableCheckpoint`。继续该任务用 Resume。存在用于拒绝旧快照的终局标记时返回
+`ErrGraphIDConflict`。开始新任务用 `RunSession.NextTask`，需要放弃旧任务时可以使用 `WithAbandonedTasks`。
+钩子为新任务选择其他存档后端时，在使用它之前同样检查。
 
 ### 4.3 GraphID 防串台
 
@@ -526,8 +527,11 @@ DetachTask 连会话 ID 与软取消信号一起剥。入口拒绝恒不可重�
 `cm.SnapshotForGraph(g.WithCheckpointContext(ctx))` 在生产侧绑定当时的图与版本。
 
 回复应用前，自动载入和显式恢复都核对图身份。显式恢复还检查目标槽归属，已有可续目标时必须属于同一个任务。
-冲突返回 `ErrGraphIDConflict` 并保护目标档。子图冲突保留原问题和已经提交的兄弟进度。若图启动钩子改变存储分区，
-引擎复核实际目标。读失败保留原错误。低阶 `WithFreshRun` 表达调用方明确从头执行的意图。
+冲突返回 `ErrGraphIDConflict` 并保护目标档。仍可续跑时，子图冲突保留原问题和已经提交的兄弟进度。
+节点或图的启动钩子选用其他存档分区时，引擎在实际分区检查目标子树的可续存档和终局标记。精确槽为空时仍需检查后代，
+身份不明的后代会阻止接管。首跑也在该分区重新检查 RunID。子图由实际执行的图引擎清理所选的分区。
+低阶 Run 从空根槽重开时，只有在该根的实际存储分区读回同一份旧快照，才可在新任务中替换对应子档。终局标记继续保留。
+读失败保留原错误。低阶 `WithFreshRun` 表达调用方明确从头执行的意图。
 
 `SaveNS` 原子比较槽内两份非空的 GraphID。不同身份的写入被拒绝，原档保留。
 Redis 和 SQL 的索引身份列与完整存档一起更新。

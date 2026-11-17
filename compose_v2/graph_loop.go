@@ -507,6 +507,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 正是这轮要拆开的东西。
 	var stayPendingFact bool
 	var frontierIdentityErr error
+	var frontierAbortConflict error
 	var frontierQuestionsRecorded bool
 	var frontierTargetUnknown bool
 	// **本 defer 只收 defer 链自身抛的 panic**（业务 OnGraphEnd hook / 自定义 checkpointer
@@ -692,9 +693,10 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			return fmt.Errorf("graph %q (ns=%q): %w", g.ID(), cfg.graphNS, err)
 		}
 	}
-	if err := checkForeignCheckpointSubtree(ctx, cfg.checkpointer, cfg.sessionID, cfg.graphNS); err != nil {
-		return err
-	}
+	// 待钩子确定实际存储分区之后才允许在未知分区执行存档写删。低阶显式新开自行管理原槽。
+	checkpointScopeManaged := cfg.checkpointer != nil && cfg.sessionID != "" &&
+		(!IsFreshRunCtx(ctx) || hasFreshTaskAdmission(ctx, cfg.sessionID))
+	initialScopeUnverified := checkpointScopeManaged && !rootRun && !sameCheckpointPartition(ctx, cfg.checkpointer, cfg.sessionID)
 	// 一个存档槽 (sid, ns) 同一时刻只归一个执行：一张正在跑的图，或一次在这个槽上跑图的 agent 调用从入口到出口（它的 agent 级钩子期间槽里
 	// 放着它自己的挂起档，见 OccupySlot）。在占着它的执行里发起、落进同一个槽的嵌套 Run 会把那份档当成自己的读进来接着跑
 	// （两张图的 GraphID 相同时——两个 BasicAgent 的图都是——用自己的节点跑别人的 frontier，实测旁路工具多执行一次），成功收尾时
@@ -748,6 +750,15 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		}
 		if boundResumeTarget && (GetOwner(ctx) != target.owner || !sameCheckpointSnapshot(target.checkpoint, rootCp)) {
 			return RejectCheckpointIdentity(target.checkpoint, "agent start changed the checkpoint target")
+		}
+		taskID := getRunTaskID(ctx)
+		if cfg.resumeFrom != nil {
+			taskID = cfg.resumeFrom.TaskID
+		}
+		if (rootCp != nil && rootCp.Status == CPStatusAborted && rootCp.BelongsToTask(taskID)) ||
+			(cfg.resumeFrom != nil && cfg.resumeFrom.Status == CPStatusAborted) {
+			return fmt.Errorf("session %q namespace %q has a terminal checkpoint: %w",
+				cfg.sessionID, cfg.graphNS, ErrNoPendingCheckpoint)
 		}
 		if cfg.resumeFrom != nil && rootCp.HasResumableWork() && !rootCp.BelongsToTask(cfg.resumeFrom.TaskID) {
 			conflict := RejectCheckpointIdentity(rootCp, "explicit resume target belongs to a different task")
@@ -960,7 +971,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 函数里的 defer 不止表面这几道（顶部还有 outer recover 与兑付上冒），每加一道那些
 	// 数字就全错一遍，本文件为此错过一次。要判先后直接看注册位置。
 	// 恢复被拒时还没有接管存档。即使调用方传入已有值的 ChannelManager，出口也不得改写原档。
-	var restoreRejected bool
+	restoreRejected := initialScopeUnverified
 	defer func() {
 		// **F4 修复**（Phase 5.1.a Step 5）：Run 出口自动持久化根 graph cp，
 		// 让根 graph cp 协议与子图 cp 协议对称（之前只有子图 cp 自动 SaveNS，
@@ -968,7 +979,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		//
 		// 规则：
 		//   - cper + sid 存在
-		//   - runErr 命中 ErrRunAborted（终局失败）→ **主动 DeleteSubtree 清子树**（见下）
+		//   - 终局失败通常清子树，同时有身份冲突时只封住本层续跑入口
 		//   - runErr != nil（其余可 Resume 的失败/中断）→ SaveNS(sid, graphNS) 写根 cp（Status=Pending）
 		//   - runErr == nil → DeleteSubtree(sid, graphNS) 清根 cp 子树
 		//     （含本 graph 自身 + 任何残留子图 cp）
@@ -976,8 +987,16 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		if cfg.checkpointer == nil || cfg.sessionID == "" {
 			return
 		}
+		terminalConflict := errors.Is(runErr, ErrRunAborted) && errors.Is(runErr, ErrGraphIDConflict)
+		if terminalConflict {
+			runErr = terminalCheckpointConflict(runErr, nil)
+		}
 		if err := CheckCheckpointTaskLease(ctx); err != nil {
-			runErr = err
+			if terminalConflict {
+				runErr = errors.Join(runErr, err)
+			} else {
+				runErr = err
+			}
 			return
 		}
 		if restoreRejected {
@@ -997,6 +1016,16 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			// NodeFunc，父 Run 出口同样命中 → 终局性逐层向上传播，无需显式协调。
 			// 详见 ErrRunAborted godoc。
 			if errors.Is(runErr, ErrRunAborted) {
+				if terminalConflict {
+					taskID := getRunTaskID(ctx)
+					if cfg.resumeFrom != nil {
+						taskID = cfg.resumeFrom.TaskID
+					} else if autoLoad && CanAutoResumeCheckpoint(ctx, rootCp) {
+						taskID = rootCp.TaskID
+					}
+					runErr = persistTerminalCheckpoint(ctx, cfg, cm, g.CheckpointIdentity(), taskID, runErr)
+					return
+				}
 				// **陈旧执行者不许删别人的子树**：我基于过时状态跑出的终局失败，
 				// 不构成删掉别人成果的理由。保留 ErrRunAborted 不换成 stale——
 				// "终局失败别重试"对 caller 更要紧，陈旧只是附注。
@@ -1260,6 +1289,10 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	var startErr error
 	newCtxNil := false
 	checkpointCtxChanged := false
+	var emptyRootBeforeHook context.Context
+	if commitRoot && autoLoad && rootCp == nil {
+		emptyRootBeforeHook = ctx
+	}
 	ctx, startErr = callHookOnto(ctx, func(c context.Context) (got context.Context, err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1275,7 +1308,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		sc := graphHookScope("OnGraphStart", graphPhaseNS)
 		hookCtx := withHookPhase(c, sc, scopedOf(outerAcc, sc))
 		got, err = cfg.hooks.OnGraphStart(hookCtx, cm.Channels())
-		if readsCheckpoint && got != nil {
+		if cfg.checkpointer != nil && cfg.sessionID != "" && got != nil {
 			checkpointCtxChanged = !reflect.ValueOf(got).Comparable() || got != hookCtx
 		}
 		newCtxNil = got == nil && err == nil
@@ -1294,6 +1327,16 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		return graphCtx
 	})
 	if startErr != nil {
+		// 钩子失败时仍使用其入参分区。终局错误也必须在授权该分区后才可清档。
+		if initialScopeUnverified {
+			if scopeErr := verifyGraphCheckpointScope(ctx, cfg, rootRun, rootCp); scopeErr != nil {
+				if errors.Is(startErr, ErrRunAborted) {
+					return terminalCheckpointConflict(fmt.Errorf("OnGraphStart: %w", startErr), scopeErr)
+				}
+				return scopeErr
+			}
+			restoreRejected = false
+		}
 		// 不手动调 OnGraphEnd — defer 已注册会自动调 (with runErr=startErr after wrap).
 		//
 		// **顶层图的 OnGraphStart 抛中断在这里被拒**（转非中断错误、不 %w——cond 先例：
@@ -1302,6 +1345,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		// 不变量拒绝（pending interrupts but no frontier）。嵌套子图照旧放行——中断冒给
 		// 父节点路径落父档（同 agent_v2.WrapAgentStartErr 的判据与理由，两层互为镜像——
 		// 判据都是**引擎盖的「在节点执行范围内」章**（WithinNodeScope），见 enteredFromNodeBody）。
+		if errors.Is(startErr, ErrRunAborted) {
+			startErr = terminalCheckpointConflict(startErr, nil)
+		}
 		if ie, isInt := IsInterrupt(startErr); isInt && !enteredFromNodeBody {
 			return &errUncatchableGraphStartInterrupt{msg: fmt.Sprintf(
 				"OnGraphStart: 顶层 hook 抛了中断（reason=%q）——图还没开始跑，"+
@@ -1321,7 +1367,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 一直是 Run 入口建的那个，业务按自己推的 span 挂事件时挂到了调用方的 span 上（审计实测）。OnGraphStart 钩子
 	// 自己发的那一刻图的 ctx 还没定下，拿到的是调它之前的。
 	ctx = withEventSink(ctx, graphEventSink(ctx, cfg.hooks, cfg.graphNS))
-	if checkpointCtxChanged {
+	if checkpointCtxChanged && readsCheckpoint {
 		var scopeErr error
 		boundTarget := rootCp.HasResumableWork() || cfg.resumeFrom != nil
 		switch {
@@ -1344,10 +1390,27 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			return scopeErr
 		}
 	}
+	_, fixedCheckpointScope := cfg.checkpointer.(*InMemoryCheckpointer)
+	if checkpointScopeManaged && (initialScopeUnverified || checkpointCtxChanged && !fixedCheckpointScope) {
+		scopeCtx := ctx
+		if emptyRootBeforeHook != nil && rootCp == nil {
+			// 两次都读到空根槽时，用入口分区核对旧子档，兼容仅增加链路值的钩子。
+			scopeCtx = withCheckpointRestartScope(ctx, emptyRootBeforeHook, cfg)
+		}
+		if err := verifyGraphCheckpointScope(scopeCtx, cfg, rootRun, rootCp); err != nil {
+			restoreRejected = true
+			return err
+		}
+		restoreRejected = false
+	}
 
 	// 有冲突时只向祖先交付实际保留的待答项。若本层无法形成合法待答清单，
 	// 保留原档和子树，并用旧档的问题更新祖先。
 	defer func() {
+		if errors.Is(runErr, ErrRunAborted) {
+			runErr = terminalCheckpointConflict(runErr, frontierAbortConflict)
+			return
+		}
 		if frontierIdentityErr == nil {
 			return
 		}
@@ -1356,10 +1419,10 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			runErr = &checkpointIdentityRejection{cause: frontierIdentityErr, unknownTarget: true}
 			return
 		}
-		if !frontierQuestionsRecorded || runErr == nil || errors.Is(runErr, ErrRunAborted) {
+		if !frontierQuestionsRecorded || runErr == nil {
 			restoreRejected = true
 			cause := frontierIdentityErr
-			if runErr != nil && !errors.Is(runErr, ErrRunAborted) {
+			if runErr != nil {
 				if _, interrupted := IsInterrupt(runErr); !interrupted {
 					cause = runErr
 				}
@@ -1518,6 +1581,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		cm.setInputDigest(cfg.inputDigest)
 		// 复用 cm 跑新任务时，上一次运行已提交的上行信号不该在这次成功时再交一次
 		cm.resetSignalsForFreshRun()
+		if commitRoot && autoLoad && rootCp == nil {
+			ctx = withCheckpointRestartScope(ctx, ctx, cfg)
+		}
 	}
 	// push 给嵌套子层（续跑路径 push 的是读回的那枚——顶层 Resume 时子层拿到的代号
 	// 与各自存档里的一致，中断 ID 的 TaskID 维跨 Resume 不漂）。
@@ -1780,8 +1846,13 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		cm.markFrontierStarted()
 		res := executeFrontier(ctx, g, frontier, cm, cfg.hooks)
 		frontierIdentityErr = checkpointIdentityRejectionError(res.IdentityRejections)
+		frontierAbortConflict = checkpointConflictForAbort(res.IdentityRejections, res.HasGraphIDConflict)
 		frontierTargetUnknown = checkpointTargetUnknown(res.IdentityRejections)
 		frontierQuestionsRecorded = false
+		if res.AbortErr != nil && frontierAbortConflict != nil {
+			// 本超步已经确定终局。子档仍需保留，不再提交兄弟的写入或待答项。
+			return terminalCheckpointConflict(res.AbortErr, frontierAbortConflict)
+		}
 
 		// 同一逻辑超步的单写入者冲突在提交前终止。恢复时也要检查此前已提交的成员。
 		if res.SingleWriterConflictErr != nil {
@@ -2172,6 +2243,8 @@ type frontierResult struct {
 
 	// IdentityRejections 记录被拒绝的子档及其原待答项。
 	IdentityRejections []*checkpointIdentityRejection
+	// HasGraphIDConflict 包含后端或自定义分支直接返回的图身份冲突。
+	HasGraphIDConflict bool
 
 	AllInterrupts []*InterruptError
 	// interruptRaws 是各中断分支返出来的**原始 error**，与 AllInterrupts 按下标一一
@@ -2198,10 +2271,10 @@ type frontierResult struct {
 
 // exitErr 定本超步失败时返给调用方的那**一个** error。
 //
-// # 存档身份拒绝 > 终局失败 > 坏存档 > 档没写成 > 中断 > 第一个业务错
+// # 终局失败 > 存档身份拒绝 > 坏存档 > 档没写成 > 中断 > 第一个业务错
 //
-//	有子档身份拒绝 → 返该冲突并保留存档，已结算的兄弟进度仍可提交
 //	有分支终局失败 → 那条分支的原始 error（`ErrRunAborted`，见 AbortErr）
+//	有子档身份拒绝 → 返该冲突并保留存档，已结算的兄弟进度仍可提交
 //	有分支存档坏了 → 那条分支的原始 error（见 NotResumableErr）
 //	有分支档没写成 → 那条分支的原始 error（见 NotPersistedErr）
 //	1 个分支中断   → 那条分支的**原始 error**（不抠不重建，见 interruptRaws）
@@ -2260,14 +2333,11 @@ type frontierResult struct {
 //
 // 被返回值省略的那些分支也不会永久静默：它们都在 FailedBranches 里，Resume 时会重跑。
 func (r frontierResult) exitErr() error {
+	if r.AbortErr != nil {
+		return terminalCheckpointConflict(r.AbortErr, checkpointConflictForAbort(r.IdentityRejections, r.HasGraphIDConflict))
+	}
 	if err := checkpointIdentityRejectionError(r.IdentityRejections); err != nil {
 		return err
-	}
-	// 终局失败严格支配「等回答」——理由见上。这一档是本函数独有的（扇出调用方没有
-	// cp 子树要清），故留在这儿；`AbortErr` 与 `NotResumableErr` 之后的那两档（中断 / 第一个业务错）跟框架里别处的扇出仲裁**共用同一份判据**，
-	// 见 PickFanoutError。
-	if r.AbortErr != nil {
-		return r.AbortErr
 	}
 	// **存档自相矛盾排在中断之前**，判据跟 AbortErr 同一条：「回答这个问题有没有可能有用」。
 	//
@@ -2343,6 +2413,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 				FailedBranches:     []FrontierMember{frontier[0]},
 				FirstErr:           err,
 				IdentityRejections: appendCheckpointIdentityRejections(nil, err),
+				HasGraphIDConflict: errors.Is(err, ErrGraphIDConflict),
 				WriteOwners:        writeOwners,
 			}
 			if errors.Is(err, ErrRunAborted) {
@@ -2486,6 +2557,7 @@ func executeFrontier(ctx context.Context, g *Graph, frontier []FrontierMember, c
 		if r.err != nil {
 			out.FailedBranches = append(out.FailedBranches, r.member)
 			out.IdentityRejections = appendCheckpointIdentityRejections(out.IdentityRejections, r.err)
+			out.HasGraphIDConflict = out.HasGraphIDConflict || errors.Is(r.err, ErrGraphIDConflict)
 			if out.FirstErr == nil {
 				out.FirstErr = r.err
 			}

@@ -9,23 +9,6 @@ import (
 	"crew-go/schema"
 )
 
-// dropStatusCper 模拟**业务自研 backend 漏序列化 `Status`**——读回来那个字段是零值
-// （`Unset`）。这是「按档位判」和「按内容判」行为分叉最锋利的一处：写进去是完整的，
-// 读回来少一个字段，而且读写两侧都不报错。
-type dropStatusCper struct {
-	compose_v2.Checkpointer
-}
-
-func (d *dropStatusCper) LoadNS(ctx context.Context, sid, ns string) (*compose_v2.Checkpoint, error) {
-	cp, err := d.Checkpointer.LoadNS(ctx, sid, ns)
-	if err != nil || cp == nil {
-		return cp, err
-	}
-	clone := *cp
-	clone.Status = compose_v2.CPStatusUnset // ← 漏掉的就是这一个字段
-	return &clone, nil
-}
-
 // TestAutoLoad_ByContentNotByStatus 钉住「捡不捡这份档**按内容判**，不按档位判」。
 //
 // 判据是 [compose_v2.Checkpoint.HasResumableWork]（frontier 或挂起清单非空），三处闸门
@@ -94,7 +77,7 @@ func TestAutoLoad_ByContentNotByStatus(t *testing.T) {
 		}
 	})
 
-	t.Run("backend 漏序列化 Status：照样续得上", func(t *testing.T) {
+	t.Run("存量快照没有 Status：照样续得上", func(t *testing.T) {
 		// 按档位判时：档读回 Unset ⟹ 不捡 ⟹ 一次真 HITL 中断退化成
 		// 「fresh run + 换新 InterruptID + 答案永远配不上」，全程只有一条 warn。
 		asked := 0
@@ -110,8 +93,7 @@ func TestAutoLoad_ByContentNotByStatus(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		inner := compose_v2.NewInMemoryCheckpointer()
-		cper := &dropStatusCper{Checkpointer: inner}
+		cper := compose_v2.NewInMemoryCheckpointer()
 		ctx := context.Background()
 
 		ie, ok := compose_v2.IsInterrupt(compose_v2.Run(ctx, g, compose_v2.NewChannelManager(),
@@ -120,6 +102,16 @@ func TestAutoLoad_ByContentNotByStatus(t *testing.T) {
 			t.Fatal("fixture 没搭对：首跑该中断")
 		}
 		id := ie.AllQueries()[0].InterruptID
+		current, err := cper.LoadNS(ctx, "ds", "")
+		if err != nil || current == nil {
+			t.Fatalf("读取首跑存档：%v", err)
+		}
+		legacy := *current
+		legacy.Status = compose_v2.CPStatusUnset
+		legacy.Epoch = ""
+		if err := cper.SaveNS(ctx, "ds", "", &legacy); err != nil {
+			t.Fatal(err)
+		}
 
 		// **承重**：答案要送达（身份没漂 + 档被捡起），整条链收尾
 		if err := compose_v2.Run(ctx, g, compose_v2.NewChannelManager(),

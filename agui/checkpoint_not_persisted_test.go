@@ -76,11 +76,11 @@ func (c *ctxHonoringCP) SaveNS(ctx context.Context, sid, ns string, cp *compose_
 	return c.InMemoryCheckpointer.SaveNS(ctx, sid, ns, cp)
 }
 
-func (c *ctxHonoringCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *ctxHonoringCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
-	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 // blockUntilCanceled 的模型调用一直等到请求 ctx 被取消。

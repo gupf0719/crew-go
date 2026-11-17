@@ -24,11 +24,11 @@ func (c *failAbortCleanupCP) SaveNS(ctx context.Context, sid, ns string, cp *com
 	return c.InMemoryCheckpointer.SaveNS(ctx, sid, ns, cp)
 }
 
-func (c *failAbortCleanupCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *failAbortCleanupCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if c.fail {
 		return 0, errors.New("temporary delete outage")
 	}
-	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func TestHandler_AbortCleanupRetry(t *testing.T) {

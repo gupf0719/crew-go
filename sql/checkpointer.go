@@ -140,17 +140,11 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 		}
 	}
 
-	ph := c.dialect.Placeholder
-	claim := fmt.Sprintf(
-		`INSERT INTO %s (sid, ns, parent_ns, status, schema_ver, graph_id, created_at, payload)
-		 VALUES (%s, %s, '', 0, 0, '', 0, '{}') %s`,
-		c.table, ph(1), ph(2),
-		c.dialect.UpsertSuffix([]string{"sid", "ns"}, []string{"sid"}),
-	)
-	if _, err := tx.ExecContext(ctx, claim, sessionID, ns); err != nil {
+	if err := c.lockCheckpointRow(ctx, tx, sessionID, ns); err != nil {
 		return fmt.Errorf("sql cp SaveNS claim row: %w", err)
 	}
 
+	ph := c.dialect.Placeholder
 	var stored string
 	if err := tx.QueryRowContext(ctx,
 		fmt.Sprintf(`SELECT graph_id FROM %s WHERE sid = %s AND ns = %s`, c.table, ph(1), ph(2)),
@@ -163,15 +157,7 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 			compose_v2.ErrGraphIDConflict, sessionID, ns, stored, cp.GraphID)
 	}
 
-	write := fmt.Sprintf(
-		`UPDATE %s SET parent_ns = %s, status = %s, schema_ver = %s, graph_id = %s, created_at = %s, payload = %s
-		 WHERE sid = %s AND ns = %s`,
-		c.table, ph(1), ph(2), ph(3), ph(4), ph(5), ph(6), ph(7), ph(8),
-	)
-	if _, err := tx.ExecContext(ctx, write,
-		cp.ParentNS, int(cp.Status), cp.SchemaVer, cp.GraphID, cp.CreatedAt, bindJSON(payload),
-		sessionID, ns,
-	); err != nil {
+	if err := c.writeCheckpointRow(ctx, tx, sessionID, ns, cp, payload); err != nil {
 		return fmt.Errorf("sql cp SaveNS: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -179,6 +165,33 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 	}
 	committed = true
 	return nil
+}
+
+// lockCheckpointRow 对目标槽取得写锁。空槽的占位档须在同个事务里替换或回滚。
+func (c *Checkpointer) lockCheckpointRow(ctx context.Context, tx *dbsql.Tx, sessionID, ns string) error {
+	ph := c.dialect.Placeholder
+	claim := fmt.Sprintf(
+		`INSERT INTO %s (sid, ns, parent_ns, status, schema_ver, graph_id, created_at, payload)
+		 VALUES (%s, %s, '', 0, 0, '', 0, '{}') %s`,
+		c.table, ph(1), ph(2),
+		c.dialect.UpsertSuffix([]string{"sid", "ns"}, []string{"sid"}),
+	)
+	_, err := tx.ExecContext(ctx, claim, sessionID, ns)
+	return err
+}
+
+func (c *Checkpointer) writeCheckpointRow(ctx context.Context, tx *dbsql.Tx, sessionID, ns string, cp *compose_v2.Checkpoint, payload []byte) error {
+	ph := c.dialect.Placeholder
+	write := fmt.Sprintf(
+		`UPDATE %s SET parent_ns = %s, status = %s, schema_ver = %s, graph_id = %s, created_at = %s, payload = %s
+		 WHERE sid = %s AND ns = %s`,
+		c.table, ph(1), ph(2), ph(3), ph(4), ph(5), ph(6), ph(7), ph(8),
+	)
+	_, err := tx.ExecContext(ctx, write,
+		cp.ParentNS, int(cp.Status), cp.SchemaVer, cp.GraphID, cp.CreatedAt, bindJSON(payload),
+		sessionID, ns,
+	)
+	return err
 }
 
 // LoadNS 实现 compose_v2.Checkpointer.LoadNS. 不存在返 (nil, nil).
@@ -272,9 +285,12 @@ func (c *Checkpointer) ExistsNS(ctx context.Context, sessionID, ns string) (bool
 // 的 `DeleteSubtree` 接口 godoc 里（一条不枚举调用点的判据）。
 //
 // PG / MySQL / SQLite 共用本段，方言只差 [Dialect.Placeholder] 渲染出的占位符。
-func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix string) (int32, error) {
+func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
+	if len(condition) > 1 {
+		return 0, fmt.Errorf("expected at most one checkpoint delete condition")
+	}
 	token := compose_v2.CheckpointTaskLeaseToken(ctx, c.CheckpointTaskLeases(), sessionID)
-	if token == "" {
+	if token == "" && len(condition) == 0 {
 		return c.deleteSubtree(ctx, c.db, sessionID, nsPrefix)
 	}
 	tx, err := c.db.BeginTx(ctx, &dbsql.TxOptions{Isolation: dbsql.LevelReadCommitted})
@@ -282,10 +298,17 @@ func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix st
 		return 0, fmt.Errorf("sql cp DeleteSubtree begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // 已提交时无操作，否则回滚。
-	if err := c.checkTaskLease(ctx, tx, sessionID, token); err != nil {
-		return 0, fmt.Errorf("sql cp DeleteSubtree task lease: %w", err)
+	if token != "" {
+		if err := c.checkTaskLease(ctx, tx, sessionID, token); err != nil {
+			return 0, fmt.Errorf("sql cp DeleteSubtree task lease: %w", err)
+		}
 	}
-	deleted, err := c.deleteSubtree(ctx, tx, sessionID, nsPrefix)
+	var deleted int32
+	if len(condition) == 1 {
+		deleted, err = c.deleteSubtreeConditionally(ctx, tx, sessionID, nsPrefix, condition[0])
+	} else {
+		deleted, err = c.deleteSubtree(ctx, tx, sessionID, nsPrefix)
+	}
 	if err != nil {
 		return 0, err // 事务回滚全部删除。
 	}
@@ -293,6 +316,39 @@ func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix st
 		return 0, fmt.Errorf("sql cp DeleteSubtree commit: %w", err)
 	}
 	return deleted, nil
+}
+
+func (c *Checkpointer) deleteSubtreeConditionally(ctx context.Context, tx *dbsql.Tx, sid, prefix string, condition compose_v2.CheckpointDeleteCondition) (int32, error) {
+	ph := c.dialect.Placeholder(1)
+	query := fmt.Sprintf("SELECT ns, payload FROM %s WHERE sid = %s", c.table, ph)
+	// 核对与行锁使用同一批结果。只删核对过的精确键。
+	switch c.dialect.(type) {
+	case SQLite, *SQLite:
+		lock := fmt.Sprintf("UPDATE %s SET status = status WHERE sid = %s", c.table, ph)
+		if _, err := tx.ExecContext(ctx, lock, sid); err != nil {
+			return 0, fmt.Errorf("sql checkpoint delete lock: %w", err)
+		}
+	default:
+		query += " FOR UPDATE"
+	}
+	slots, err := queryNSCheckpoints(ctx, tx, query, sid)
+	if err != nil {
+		return 0, err
+	}
+	current := make([]compose_v2.NSCheckpoint, 0, len(slots))
+	for _, slot := range slots {
+		if compose_v2.IsNSInSubtree(prefix, slot.NS) {
+			current = append(current, slot)
+		}
+	}
+	if err := compose_v2.CheckCheckpointDeleteCondition(current, condition); err != nil {
+		return 0, err
+	}
+	victims := make([]string, len(current))
+	for i, slot := range current {
+		victims[i] = slot.NS
+	}
+	return c.deleteNS(ctx, tx, sid, victims)
 }
 
 type checkpointQueryer interface {
@@ -346,7 +402,11 @@ func (c *Checkpointer) deleteSubtree(ctx context.Context, db checkpointQueryer, 
 	if len(victims) == 0 {
 		return 0, nil
 	}
+	return c.deleteNS(ctx, db, sessionID, victims)
+}
 
+func (c *Checkpointer) deleteNS(ctx context.Context, db checkpointQueryer, sessionID string, victims []string) (int32, error) {
+	ph := c.dialect.Placeholder
 	// 3. 按 ns 精确删。分批是必需的：PG 的参数上限是 65535，MySQL 受
 	//    max_allowed_packet 约束——一个 session 的 ns 数虽小，但没有硬上界。
 	var total int64
@@ -383,8 +443,8 @@ var _ compose_v2.Checkpointer = (*Checkpointer)(nil)
 
 // queryNSCheckpoints 共享 helper — 给 ListPending / LoadAllInSession 用.
 // 跑 SELECT, scan ns + payload, unmarshal cp.
-func (c *Checkpointer) queryNSCheckpoints(ctx context.Context, q string, args ...any) ([]compose_v2.NSCheckpoint, error) {
-	rows, err := c.db.QueryContext(ctx, q, args...)
+func queryNSCheckpoints(ctx context.Context, db checkpointQueryer, q string, args ...any) ([]compose_v2.NSCheckpoint, error) {
+	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("sql cp query: %w", err)
 	}

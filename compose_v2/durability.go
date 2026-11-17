@@ -120,7 +120,7 @@ func resolveDurability(ctx context.Context, optVal Durability) Durability {
 // **调用前置**：caller 保证 cfg.durability != Exit 且 cfg.checkpointer != nil 且
 // cfg.sessionID != ""（见 graph_loop 写点守卫）。
 func saveStepCheckpoint(ctx context.Context, g *Graph, cm *ChannelManager, cfg *runOptions) error {
-	cp, err := snapshotStepCheckpoint(g, cm)
+	cp, err := snapshotStepCheckpoint(g, cm, cfg.resumeInProgress)
 	if err != nil {
 		return err
 	}
@@ -141,12 +141,15 @@ func saveStepCheckpoint(ctx context.Context, g *Graph, cm *ChannelManager, cfg *
 //     完整说明和破坏它的具体动作见 `serialization.go` 里 `Snapshot` 那段注释。
 //
 // **调用前置**：caller 保证 cfg.durability != Exit（见 graph_loop 写点守卫）。
-func snapshotStepCheckpoint(g *Graph, cm *ChannelManager) (*Checkpoint, error) {
+func snapshotStepCheckpoint(g *Graph, cm *ChannelManager, resumeInProgress bool) (*Checkpoint, error) {
 	cp, err := cm.Snapshot()
 	if err != nil {
 		return nil, fmt.Errorf("durability step checkpoint snapshot failed: %w", err)
 	}
 	cp.Status = CPStatusPending
+	if resumeInProgress {
+		cp.Status = CPStatusResuming
+	}
 	cp.GraphID = g.CheckpointIdentity() // 同 Run-defer：防 cp 串台（SaveNS 冲突守卫据此 fail-fast）
 	return cp, nil
 }
@@ -207,19 +210,47 @@ func emitCpCleanupRejected(ctx context.Context, cfg *runOptions, reason string, 
 	})
 }
 
-// deleteCpSubtree 删掉 (sid, graphNS) 子树的全部 cp（只做存储读写，事件与日志由 reportCpPurge 发）。
-//
-// Run 出口清档用（见 purgeExitSlot）：成功收尾（cp 不该留，sid lifetime = 根 Run lifetime）、终局失败
-// （ErrRunAborted——**主动删而非跳过写**：单槽覆盖式 cp 下「跳过写」只是不覆盖，先前 HITL 存的档 /
-// durability 中途 cp 会幸存且 Status=Pending → auto-load 捡起 → 重跑已成功节点 / 重问已答问题 /
-// 子图 livelock，详见 ErrRunAborted godoc）、出口档没写成。三者本质都是「这个槽里的档不该留」，共用一份
-// 逻辑避免行为漂移；删除失败的处置由调用方决定（成功路径只记日志，另外两条写进错误）。
-//
-// **调用前置**：caller 保证 cfg.checkpointer != nil 且 cfg.sessionID != ""。
-func deleteCpSubtree(ctx context.Context, cfg *runOptions) (int32, time.Duration, error) {
+// deleteCpSubtree 先确认子树归属，再交给已绑定的后端原子核对整棵子树。
+func deleteCpSubtree(ctx context.Context, cfg *runOptions, cm *ChannelManager, ownEpoch string) (int32, time.Duration, error) {
 	start := time.Now()
-	deleted, delErr := cfg.checkpointer.DeleteSubtree(ctx, cfg.sessionID, cfg.graphNS)
-	return deleted, time.Since(start), delErr
+	expected, err := loadCheckpointSubtree(ctx, cfg.checkpointer, cfg.sessionID, cfg.graphNS)
+	if err != nil {
+		return 0, time.Since(start), err
+	}
+	taskID := getRunTaskID(ctx)
+	if taskID == "" && cfg.checkpointStart != nil {
+		taskID = cfg.checkpointStart.TaskID
+	}
+	for _, slot := range expected {
+		cp := slot.Checkpoint
+		if old := cfg.checkpointReplaced[slot.NS]; sameStoredCheckpoint(old, cp) {
+			continue
+		}
+		if slot.NS == cfg.graphNS {
+			baseline := cm.CpEpochBaseline()
+			writtenHere := cp.Epoch != "" && (cp.Epoch == ownEpoch || cp.Epoch == baseline &&
+				(cfg.resumeClaimed || taskID != "" && cp.TaskID == taskID && cfg.resumeFrom == nil))
+			if writtenHere || sameStoredCheckpoint(cfg.checkpointStart, cp) {
+				continue
+			}
+		} else {
+			// 旧业务无内容快照沿用会话寿命。祖先不能代为结算子图已获准的续跑。
+			if cp.TaskID == "" && !checkpointRequiresTaskOwnership(cp) ||
+				taskID != "" && cp.TaskID == taskID && cp.Status != CPStatusResuming {
+				continue
+			}
+			owned, err := restartOwnsCheckpoint(ctx, cfg.checkpointer, cfg.sessionID, slot)
+			if err != nil {
+				return 0, time.Since(start), err
+			}
+			if owned {
+				continue
+			}
+		}
+		return 0, time.Since(start), fmt.Errorf("%w: cannot confirm cleanup ownership of checkpoint %q", ErrCheckpointStale, slot.NS)
+	}
+	deleted, err := cfg.checkpointer.DeleteSubtree(ctx, cfg.sessionID, cfg.graphNS, CheckpointDeleteCondition{Expected: expected})
+	return deleted, time.Since(start), err
 }
 
 // reportCpPurge 发一次出口清档的 cp.cleanup 事件（opt-in）并记日志。reason 是 "success" / "abort"。

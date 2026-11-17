@@ -27,9 +27,8 @@
 //
 // # 业务必实现 capability
 //
-// 所有 8 个 Checkpointer 方法都是 mandatory (不像 store.TTLAware 有 opt-in
-// skip 路径). 业务 backend 必实现:
-//   - SaveNS / LoadNS / ExistsNS / DeleteSubtree
+// 所有 Checkpointer 方法均为必实现能力。业务后端必须实现：
+//   - SaveNS / ClaimResume / LoadNS / ExistsNS / DeleteSubtree
 //   - ListPending / LoadAllInSession / SaveBatch
 //   - Cleanup (keepLastN 按 sid 维度排序)
 //
@@ -100,11 +99,13 @@ func RunCheckpointerTests(t *testing.T, factory CheckpointerFactory) {
 	t.Run("Exists", func(t *testing.T) { testExists(t, factory) })
 	t.Run("KeyIdentity", func(t *testing.T) { testKeyIdentity(t, factory) })
 	t.Run("Delete", func(t *testing.T) { testDelete(t, factory) })
+	t.Run("DeleteCondition", func(t *testing.T) { testDeleteCondition(t, factory) })
 	t.Run("ListPending", func(t *testing.T) { testListPending(t, factory) })
 	t.Run("LoadAllInSession", func(t *testing.T) { testLoadAllInSession(t, factory) })
 	t.Run("SaveBatch", func(t *testing.T) { testSaveBatch(t, factory) })
 	t.Run("SaveBatchNodeStates", func(t *testing.T) { testSaveBatchNodeStates(t, factory) })
 	t.Run("GraphIDConflict", func(t *testing.T) { testGraphIDConflict(t, factory) })
+	t.Run("ClaimResume", func(t *testing.T) { testClaimResume(t, factory) })
 	t.Run("Cleanup", func(t *testing.T) { testCleanup(t, factory) })
 	t.Run("CleanupNodeStates", func(t *testing.T) { testCleanupNodeStates(t, factory) })
 	t.Run("Concurrent", func(t *testing.T) { testConcurrent(t, factory) })

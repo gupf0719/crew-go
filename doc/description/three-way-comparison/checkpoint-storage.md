@@ -94,7 +94,7 @@ crew-go 已合并成功成员的值，因此只保留单写入者 channel 到 `F
 - **失败 / InterruptError / ctx 取消** → `SaveNS(sid, ns)` 写 cp（Status=Pending）
 - **成功** → `DeleteSubtree(sid, ns)` 清本 graph cp 子树（成功路径不留 cp）
 
-cp 仅作"异常状态快照"存在——正常完成不留。**所有 `runErr != nil` 都写 cp，但要标清是哪一种**（`graph_loop.go`，判据是 `shouldStayPending`——**比 `IsControlFlowSignal` 宽**，还含 `CondFailRerunFrom` 与坏存档两类「返业务错但框架要它被重跑」的，`compose_v2/retry.go` 函数体为准）：中断 / ctx 取消 / 软取消 / 陈旧写回写 `Status=Pending`（等答案的挂起），其余业务错 / hook 错 / 基础设施错写 `Status=Failed`（失败现场）。三态 `Unset`/`Pending`/`Failed` + `Status.Resumable()` —— ⚠️ **2026-08-13 起 `Status` 只是报告位，不参与控制流**：三处闸门统一按**内容**判（`Checkpoint.HasResumableWork()`，frontier 或挂起非空），**失败档也被捡起、从失败节点续跑**。所以上面那个判据只决定「标什么位」，不决定「能不能续」——后者另有谓词 `LeavesResumableCheckpoint`。见决策记录。
+普通中断和失败分别写 Pending 或 Failed，恢复会使用已记录的剩余分支。当前框架还在恢复执行前持久记录准入，并按实际分区及存档世代做条件清理。状态说明和后端要求见 [Checkpoint 生命周期](../../v2/checkpoint.md#3-生命周期)。
 
 **durability 每超步写与「成功即清」不冲突**（`WithDurability`，`compose_v2/durability.go`）：`sync`/`async` 档让框架在每个超步边界额外写 cp（`exit` 默认不写、保持上面的纯出口-defer 行为）——但写的是**同 `(sid, ns)` key 覆盖**，成功路径的 `DeleteSubtree`（上面那条，**无 durability 条件**、对所有档都跑）照清。所以 sync/async 只在**执行中途**多一份"硬崩可恢复"的 cp，成功完成后一样不留。崩溃恢复价值需配**持久** Checkpointer（`redis/` / `sql/`，InMemory 随进程死救不回）。详见 §不足 #2 + 决策记录「本次」行。
 
@@ -1022,6 +1022,10 @@ Step Functions 的 `name + input` 幂等、Restate 的 idempotency key、LangGra
 
 
 ---
+
+### 续跑准入与清档决策（2026-11-17）
+
+保留单槽存档与任务租约。在派发续跑图节点之前，原子领取已验证的存档世代。续跑未持久结算时保留受保护的现场，避免换请求 ID 或进程后再次领取。原子清档以最后确认的实际分区为范围，核对完整子树并删除确认过的键。调用方可显式放弃任务。公共契约见 [持久续跑准入](../../v2/checkpoint.md#持久续跑准入)及[分区绑定与条件清档](../../v2/checkpoint.md#62-分区绑定与条件清档)。
 
 ## ns 拼串 + 前缀匹配：元字符转义（2026-08-31 调研）
 

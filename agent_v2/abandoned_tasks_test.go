@@ -482,11 +482,11 @@ type failDeleteCheckpointer struct {
 
 var errAbandonDelete = errors.New("backend down")
 
-func (c failDeleteCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c failDeleteCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if sid == c.sid {
 		return 0, errAbandonDelete
 	}
-	return c.Checkpointer.DeleteSubtree(ctx, sid, ns)
+	return c.Checkpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 // 删档失败时不补「被放弃」：任务还能续，补了的话续跑执行之后真结果排在它后面、按先到的配对被当成多余的。入口收尾与 Resume 的

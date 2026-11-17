@@ -382,9 +382,8 @@ func (p *exitPurge) failure() error {
 	return p.delErr
 }
 
-// purgeExitSlot 清掉这一层的存档子树（只做存储调用）：先做陈旧写回检查（staleOp 进 StaleWriteError.Op），槽被
-// 别的执行推进时不删。ownEpoch 是这次出口刚尝试写的那一代（写档结果不明时，槽里可能就是它），没有就传空。
-// 调用前置：cfg.checkpointer != nil 且 cfg.sessionID != ""。
+// purgeExitSlot 核对当前分区及存档世代后条件清档。可选的陈旧探测用尽预算时，
+// 后端仍需在删除前核对完整子树。ownEpoch 指本次出口结果未确认的写档世代。
 func purgeExitSlot(ctx context.Context, cfg *runOptions, cm *ChannelManager, reason, staleOp, ownEpoch string) *exitPurge {
 	p := &exitPurge{reason: reason}
 	staleErr, notDone := exitStaleCheck(ctx, cfg, cm, staleOp, ownEpoch, &p.notes)
@@ -393,18 +392,21 @@ func purgeExitSlot(ctx context.Context, cfg *runOptions, cm *ChannelManager, rea
 		return p
 	}
 	if notDone != nil {
-		// 检查没做成：照常清（见不变量 2），记一条告警
+		// 检查没做成：继续做条件删除，记一条告警
 		p.notes.add(func(c context.Context) {
-			slog.WarnContext(c, "compose_v2: 出口清档前的陈旧写回检查没做成，照常清档",
+			slog.WarnContext(c, "compose_v2: 出口的陈旧探测未完成，继续做条件清档",
 				"sid", cfg.sessionID, "ns", cfg.graphNS, "reason", reason, "err", notDone)
 		})
 	}
 	p.deleted = true
 	p.delErr = exitStorageOp(ctx, exitOpDelete, "checkpoint purge", func(c context.Context) error {
 		var err error
-		p.count, p.duration, err = deleteCpSubtree(c, cfg)
+		p.count, p.duration, err = deleteCpSubtree(c, cfg, cm, ownEpoch)
 		return err
 	})
+	if errors.Is(p.delErr, ErrCheckpointStale) {
+		p.staleErr, p.delErr = p.delErr, nil
+	}
 	return p
 }
 

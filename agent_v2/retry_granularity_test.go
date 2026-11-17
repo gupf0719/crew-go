@@ -167,8 +167,12 @@ func TestRetry_CrossTaskIsolationHolds(t *testing.T) {
 		t.Errorf("任务 B 执行了任务 A 的待办：hold 跑了 %d 次，而 B 的 model 永不产生 tool_call。\n"+
 			"errB=%v\n上一个被放弃任务的挂起档被 B 捡起来了——跨任务隔离破了。", n, errB)
 	}
-	if final := agent_v2.FinalMessage(eventsB); errB != nil || final == nil || final.Content != "B 直接完成" {
-		t.Errorf("任务 B 应完成自己的执行，答复=%v、错误=%v", final, errB)
+	if final := agent_v2.FinalMessage(eventsB); !errors.Is(errB, compose_v2.ErrCheckpointStale) || final == nil || final.Content != "B 直接完成" {
+		t.Errorf("任务 B 应得到自己的答复，且在收尾时保护旧子档，答复=%v、错误=%v", final, errB)
+	}
+	saved, err := cp.LoadNS(ctx, sess.RunID, lateNS)
+	if err != nil || saved == nil || saved.Epoch != lateCheckpoint.Epoch || saved.TaskID != lateCheckpoint.TaskID {
+		t.Fatalf("迟到的任务 A 子档应保持原样，存档=%+v、错误=%v", saved, err)
 	}
 }
 

@@ -33,6 +33,8 @@ type runOptions struct {
 	inputIsIdentity     bool
 	resumeFrom          *Checkpoint
 	checkedResumeTarget bool                       // 低阶子图已在同一租约下读出其目标档
+	resumeClaimed       bool                       // 本图领取了自己的存档槽
+	resumeInProgress    bool                       // 本图或祖先已经领取续跑，过程档暂不可重新准入
 	resumeAnswers       map[string]*schema.Message // by InterruptID — audit R9 B1
 	resumeUserText      string                     // 非寻址型「用户这轮说了什么」，见 ResumeContext.UserText
 	hooks               OrchestrationHooks
@@ -41,9 +43,11 @@ type runOptions struct {
 	// 业务通过 WithCheckpointer + WithSessionID 注入后子图 cp 写到 (sessionID, ns)
 	// 物理分离独立 store——对齐 ISSUE-70 Phase 2 Step Ⅰ。
 	// 不注入时子图嵌套场景下中断会丢失嵌套 cp（业务必须显式注入）。
-	checkpointer Checkpointer
-	sessionID    string
-	graphNS      string // 本 graph 在拓扑中的 ns 位置（嵌入子图时由父注入）
+	checkpointer       Checkpointer
+	checkpointStart    *Checkpoint            // 当前分区准入时确认拥有的精确槽
+	checkpointReplaced map[string]*Checkpoint // 显式重开时看到的旧档
+	sessionID          string
+	graphNS            string // 本 graph 在拓扑中的 ns 位置（嵌入子图时由父注入）
 
 	// Phase 5.1.a Step 5 audit Round 2：caller 显式跳过 auto-load 的 escape hatch
 	// 典型用法：业务用同 sid 跑不同 graph（GraphID 防串台守卫 Phase 5.1.b 落地前
@@ -485,7 +489,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	rootRun := !WithinNodeScope(ctx)
 	commitRoot := rootRun && taskCommitBase(ctx) == nil
 	var alive *atomic.Bool
-	var activity *TaskActivity
+	var activity, scopeActivity *TaskActivity
 	if rootRun {
 		alive = new(atomic.Bool)
 		alive.Store(true)
@@ -494,6 +498,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	defer func() {
 		if alive != nil {
 			alive.Store(false)
+		}
+		if scopeActivity != nil {
+			scopeActivity.Release()
 		}
 		if activity != nil {
 			activity.Release()
@@ -686,6 +693,13 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	if cfg.graphNS == "" {
 		cfg.graphNS = NestedGraphParentNS(ctx)
 	}
+	configuredCheckpoint := cfg.checkpointer
+	partitionCtx := WithGraphNS(withSessionID(ctx, cfg.sessionID), cfg.graphNS)
+	partition, err := ResolveCheckpointPartition(partitionCtx, configuredCheckpoint)
+	if err != nil {
+		return err
+	}
+	cfg.checkpointer = partition
 	if cfg.sessionID != "" {
 		var err error
 		ctx, activity, err = beginTaskActivity(ctx, cfg.checkpointer, cfg.sessionID, nil, false)
@@ -722,7 +736,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 再按实际的存储上下文核对，防止恢复一个分区的档却写入另一个分区。
 	autoLoad := cfg.resumeFrom == nil && !cfg.freshRun && !IsFreshRunCtx(ctx) &&
 		cfg.checkpointer != nil && cfg.sessionID != ""
-	readsCheckpoint := autoLoad || (cfg.resumeFrom != nil && cfg.checkpointer != nil && cfg.sessionID != "")
+	readsCheckpoint := cfg.checkpointer != nil && cfg.sessionID != ""
 	owner := GetOwner(ctx)
 	target, _ := ctx.Value(resumeCheckpointTargetKey{}).(resumeCheckpointTarget)
 	boundResumeTarget := target.checkpoint != nil && target.sid == cfg.sessionID && target.ns == cfg.graphNS
@@ -748,7 +762,11 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		if loadErr != nil {
 			return fmt.Errorf("check resume target checkpoint: %w", loadErr)
 		}
-		if boundResumeTarget && (GetOwner(ctx) != target.owner || !sameCheckpointSnapshot(target.checkpoint, rootCp)) {
+		if rootCp != nil && rootCp.Status == CPStatusResuming || cfg.resumeFrom != nil && cfg.resumeFrom.Status == CPStatusResuming {
+			return ErrCheckpointResumeUnconfirmed
+		}
+		if boundResumeTarget && (GetOwner(ctx) != target.owner || !SameCheckpointPartition(target.partition, cfg.checkpointer) ||
+			!sameStoredCheckpoint(target.checkpoint, rootCp)) {
 			return RejectCheckpointIdentity(target.checkpoint, "agent start changed the checkpoint target")
 		}
 		taskID := getRunTaskID(ctx)
@@ -772,6 +790,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			resumeCandidate = rootCp
 		}
 		if resumeCandidate == nil {
+			if !checkpointRequiresTaskOwnership(rootCp) {
+				cfg.checkpointStart = rootCp
+			}
 			return nil
 		}
 		identityErr := g.CheckCheckpointIdentity(resumeCandidate)
@@ -788,11 +809,37 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			}
 			return fmt.Errorf("session %q namespace %q: %w", cfg.sessionID, cfg.graphNS, identityErr)
 		}
+		if cfg.resumeFrom != nil && rootCp.HasResumableWork() && !sameStoredCheckpoint(cfg.resumeFrom, rootCp) {
+			return fmt.Errorf("explicit resume snapshot differs from the current checkpoint: %w", ErrCheckpointStale)
+		}
+		cfg.checkpointStart = rootCp
 		return nil
 	}
 	if err := checkResumeIdentity(); err != nil {
 		return err
 	}
+	// 重开可回收进入本分区前已有的子档。启动钩子和节点执行期间新出现的档不在许可里。
+	bareFresh := readsCheckpoint && !checkpointScopeManaged && IsFreshRunCtx(ctx) && cfg.resumeFrom == nil
+	restartCandidate := commitRoot && autoLoad && rootCp == nil
+	var restartSlots []NSCheckpoint
+	if bareFresh || restartCandidate {
+		startCtx := WithGraphNS(withSessionID(withCheckpointer(ctx, cfg.checkpointer), cfg.sessionID), cfg.graphNS)
+		slots, err := loadCheckpointSubtree(startCtx, cfg.checkpointer, cfg.sessionID, cfg.graphNS)
+		if err != nil {
+			return err
+		}
+		restartSlots = slots
+		if bareFresh {
+			cfg.checkpointReplaced = make(map[string]*Checkpoint, len(slots))
+			for _, slot := range slots {
+				if slot.Checkpoint.Status == CPStatusResuming {
+					return fmt.Errorf("checkpoint %q: %w", slot.NS, ErrCheckpointResumeUnconfirmed)
+				}
+				cfg.checkpointReplaced[slot.NS] = slot.Checkpoint
+			}
+		}
+	}
+
 	// 图级相位（OnGraphStart / OnGraphEnd / 入口条件边）的名字：这张图的 ns，嵌套时再加「外层这次
 	// 执行里第几次跑这个 ns 的图」。它们记在承载这张图的外层节点执行名下，同一次外层执行在循环里
 	// 对同一个 ns 跑两遍（两份相同的工单各跑一遍）时，只按 ns 分的话第二遍拿回第一遍的记录
@@ -872,8 +919,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 
 	// Phase 5.1.a Step 3: 注入 Checkpointer / sessionID / graphNS 到 ctx
 	// 让 subgraph 节点 + 业务自定义 NodeFunc 可读
-	if cfg.checkpointer != nil {
-		ctx = withCheckpointer(ctx, cfg.checkpointer)
+	if configuredCheckpoint != nil {
+		ctx = withCheckpointer(ctx, configuredCheckpoint)
 	}
 	if cfg.sessionID != "" {
 		ctx = withSessionID(ctx, cfg.sessionID)
@@ -1366,6 +1413,36 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// OnNodeEvent 时带着 OnGraphStart 推的值（比如图的 span），跟节点体发的事件带着 OnNodeStart 推的值一样。曾经
 	// 一直是 Run 入口建的那个，业务按自己推的 span 挂事件时挂到了调用方的 span 上（审计实测）。OnGraphStart 钩子
 	// 自己发的那一刻图的 ctx 还没定下，拿到的是调它之前的。
+	partitionChanged := false
+	if checkpointCtxChanged {
+		if _, routes := configuredCheckpoint.(CheckpointPartitionResolver); routes {
+			partitionCtx := WithGraphNS(withSessionID(ctx, cfg.sessionID), cfg.graphNS)
+			partition, err := ResolveCheckpointPartition(partitionCtx, configuredCheckpoint)
+			if err != nil {
+				restoreRejected = true
+				return err
+			}
+			if !SameCheckpointPartition(cfg.checkpointer, partition) {
+				restoreRejected = true
+				if rootCp.HasResumableWork() || cfg.resumeFrom != nil || boundResumeTarget {
+					return RejectCheckpointIdentity(rootCp, "graph start hook changed the admitted checkpoint partition")
+				}
+				selected, extra, err := beginTaskActivity(ctx, partition, cfg.sessionID, nil, false)
+				if err != nil {
+					return err
+				}
+				scopeActivity = extra
+				ctx = selected
+				cfg.checkpointer, partitionChanged = partition, true
+				cfg.checkpointStart = nil
+				cfg.checkpointReplaced = nil
+			}
+		}
+	}
+
+	if GetOwner(ctx) != owner {
+		cfg.checkpointReplaced = nil
+	}
 	ctx = withEventSink(ctx, graphEventSink(ctx, cfg.hooks, cfg.graphNS))
 	if checkpointCtxChanged && readsCheckpoint {
 		var scopeErr error
@@ -1378,10 +1455,11 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			switch {
 			case err != nil:
 				scopeErr = fmt.Errorf("recheck checkpoint after graph start: %w", err)
-			case boundTarget && !sameCheckpointSnapshot(rootCp, actual):
+			case boundTarget && !sameStoredCheckpoint(rootCp, actual):
 				scopeErr = RejectCheckpointIdentity(rootCp, "graph start hook changed the checkpoint target")
 			default:
 				rootCp, loadErr = actual, nil
+				cfg.checkpointStart = nil
 				scopeErr = checkResumeIdentity()
 			}
 		}
@@ -1391,11 +1469,11 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		}
 	}
 	_, fixedCheckpointScope := cfg.checkpointer.(*InMemoryCheckpointer)
-	if checkpointScopeManaged && (initialScopeUnverified || checkpointCtxChanged && !fixedCheckpointScope) {
+	if partitionChanged || checkpointScopeManaged && (initialScopeUnverified || checkpointCtxChanged && !fixedCheckpointScope) {
 		scopeCtx := ctx
-		if emptyRootBeforeHook != nil && rootCp == nil {
+		if !partitionChanged && emptyRootBeforeHook != nil && rootCp == nil {
 			// 两次都读到空根槽时，用入口分区核对旧子档，兼容仅增加链路值的钩子。
-			scopeCtx = withCheckpointRestartScope(ctx, emptyRootBeforeHook, cfg)
+			scopeCtx = withCheckpointRestartScope(ctx, emptyRootBeforeHook, cfg, restartSlots)
 		}
 		if err := verifyGraphCheckpointScope(scopeCtx, cfg, rootRun, rootCp); err != nil {
 			restoreRejected = true
@@ -1581,13 +1659,14 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		cm.setInputDigest(cfg.inputDigest)
 		// 复用 cm 跑新任务时，上一次运行已提交的上行信号不该在这次成功时再交一次
 		cm.resetSignalsForFreshRun()
-		if commitRoot && autoLoad && rootCp == nil {
-			ctx = withCheckpointRestartScope(ctx, ctx, cfg)
+		if restartCandidate && !partitionChanged && rootCp == nil && GetOwner(ctx) == owner {
+			ctx = withCheckpointRestartScope(ctx, ctx, cfg, restartSlots)
 		}
 	}
 	// push 给嵌套子层（续跑路径 push 的是读回的那枚——顶层 Resume 时子层拿到的代号
 	// 与各自存档里的一致，中断 ID 的 TaskID 维跨 Resume 不漂）。
 	ctx = withRunTaskID(ctx, cm.TaskID())
+	cfg.resumeInProgress = hasResumeAdmission(ctx, cfg.sessionID, cfg.graphNS, cm.TaskID())
 
 	// 计算初始 frontier：Resume 路径从 cp.CurrentFrontier 起；正常路径从 StartNode 起。
 	var frontier []FrontierMember
@@ -1636,6 +1715,18 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		// 幂等：caller 已 Restore 过的话，再调用同 snap 覆盖回相同值（无副作用）。
 		if err := cm.Restore(cfg.resumeFrom); err != nil {
 			return fmt.Errorf("auto-restore: %w", err)
+		}
+		if len(cfg.resumeFrom.CurrentFrontier) != 0 && readsCheckpoint {
+			claimed, err := cfg.checkpointer.ClaimResume(ctx, cfg.sessionID, cfg.graphNS, rootCp, cfg.resumeFrom)
+			if err != nil {
+				return fmt.Errorf("%w: claim checkpoint for resume: %w", ErrCheckpointNotResumable, err)
+			}
+			if claimed == nil || claimed.Status != CPStatusResuming || claimed.Epoch == "" || claimed.Epoch == cfg.resumeFrom.Epoch {
+				return fmt.Errorf("%w: checkpointer did not return a new resume generation", ErrCheckpointNotResumable)
+			}
+			cfg.resumeClaimed, cfg.resumeInProgress = true, true
+			ctx = withResumeAdmission(ctx, cfg.sessionID, cfg.graphNS, cm.TaskID())
+			cm.setCpEpochBaseline(claimed.Epoch)
 		}
 		restoreRejected = false
 		// 从存档续跑：已提交的进度原样拿回、不重新交出流，所在那段执行取代的东西一个都不撤（见 stream_attempt.go）
@@ -2092,7 +2183,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				}
 			case DurabilityAsync:
 				// 同步 snapshot 捕获一致态 → 交后台 worker 写 I/O，不阻塞下一超步。
-				cp, err := snapshotStepCheckpoint(g, cm)
+				cp, err := snapshotStepCheckpoint(g, cm, cfg.resumeInProgress)
 				if err != nil {
 					return err // snapshot 失败 abort（与 sync 一致）
 				}

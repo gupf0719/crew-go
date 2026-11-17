@@ -46,7 +46,7 @@ type Checkpoint struct {
     ID        string           // = sessionID（SaveNS 自动填）
     NS        string           // 本 cp 的 ns 路径（嵌套寻址用）
     ParentNS  string           // 父 ns（O(1) 反查祖先）
-    Status    CheckpointStatus // Unset / Pending / Failed —— **只是报告位**，不参与控制流，见 §3.1
+    Status    CheckpointStatus // Unset / Pending / Failed / Aborted / Resuming，见 §3.1
     SchemaVer int              // 当前 CheckpointSchemaVer = 23
     GraphID   string           // 防 cp 串台（§4.3）
     CreatedAt int64            // UnixNano，Cleanup 按它排序；框架只在 caller 没给时盖
@@ -199,52 +199,17 @@ func TestMyPGCheckpointer(t *testing.T) {
 
 ## 3. 生命周期
 
-### 3.1 Status 三档
+### 3.1 存档状态
 
-```go
-const (
-    CPStatusUnset   CheckpointStatus = iota // 默认值（旧 cp 反序列化兼容）
-    CPStatusPending                         // 中断挂起，等 Resume
-    CPStatusFailed                          // 上次 Run 带着错误退出——失败现场，不是等答案的挂起
-)
+| 状态 | 含义 |
+|---|---|
+| `CPStatusUnset` | 存量快照缺少状态。符合身份和内容要求时仍可续跑。 |
+| `CPStatusPending` | 挂起或正常首跑的过程档。只有这一状态进入 `ListPending`。 |
+| `CPStatusFailed` | 保存了失败现场。续跑从剩余分支开始。 |
+| `CPStatusAborted` | 终局失败与存档身份冲突并存时封存根档。身份冲突的子档保留。 |
+| `CPStatusResuming` | 该世代已获准续跑，后续结果尚未持久确认。保留快照和旧问题供诊断。 |
 
-func (s CheckpointStatus) Resumable() bool { return s == CPStatusPending || s == CPStatusFailed }
-```
-
-⚠️ **`Status` 只是报告位，不参与控制流。** 「捡不捡这份档」的三处闸门（Run 入口 auto-load /
-子图载入 / `agent_v2.Resume`）统一读 **`Checkpoint.HasResumableWork()`**——按**内容**判：
-frontier 或挂起清单非空。`agent_v2/resume_helpers.go` 里那道守卫用的就是它，`Status` 只进
-错误消息的格式化参数。
-
-**为什么按内容而不按档位**：
-
-1. 对业务自研 backend 漏序列化 `Status` 鲁棒——按档位判时，一次真 HITL 中断会退化成 fresh
-   run + 换一批新 `InterruptID`，用户手上那个答案永远配不上
-2. 拒得掉「业务把一份跑完的快照存进这个槽」——按「存在与否」判会静默返 nil、零节点跑完，
-   存档还被当成功清掉
-3. 与引擎出口早退、`SnapshotForGraph` 是同一个谓词，判据只有一份、不会漂
-
-**撤掉的那道档位 gate 挡错了东西**：它曾按「auto-load 只捡 Pending」挡「失败档别被自动捡起」，
-立论是「下次同 sid 跑会静默从失败点恢复、再撞同一个错」。但那个担心在**顶层**已由
-编排入口的新任务判定（`enterRunTask`：新任务恒推「新开」信号）结构性覆盖；而 gate 在**嵌套层**挡掉的是**合法续跑**——
-Parallel + HITL 下 Resume 重跑失败分支时，子图捡不起自己那份失败子档 ⟹ fresh run ⟹
-扣款重放（实测 1→2，撤掉后 →0）。
-
-**所以失败档也续得上**：`Resume` 不带答案 = 重试失败分支（成功兄弟不重放）；带答案 = 答问题；
-两者可叠加（混合档一次调用把两件事都办了）。
-
-**光看字段分不出档位，必须由出口标**：失败存档和 durability 中途存档长得一样（都有 frontier、
-`PendingInterrupts` 为空），区别只有 Run 出口知道。
-
-**出口标什么档位**是另一个判据：`shouldStayPending`，比 `IsControlFlowSignal` **宽**，除控制流
-信号外还含两类**返业务错但框架决定存着等重跑**的——`CondFailRerunFrom` 档的 cond 报错、坏存档的
-`ErrCheckpointNotResumable`。⚠️ **按类目读、别数个数**（这份名单加过项），`compose_v2/retry.go`
-的函数体是真相源。
-
-⚠️ **「标什么位」和「能不能续」从此是两个谓词，别当同义词**：前者 `shouldStayPending`，后者
-导出面的 `LeavesResumableCheckpoint`（判「这次退出**留没留下**之后能续上的档」——**普通业务错也留**）。
-两者曾经是同一个，gate 撤掉后真值表分了叉。跨包消费者（`agent_v2` 的历史落点）读的是后者，
-混用会让「业务错退出、之后 Resume 重试成功」这条链上的用户输入落不进历史。
+恢复会检查 `Checkpoint.HasResumableWork()`、图与任务身份、目标分区和存档世代。普通的 Pending、Failed 和旧 Unset 快照都按 frontier 与待答内容判断。已封存或未结算的续跑会被入口拒绝。详见[持久续跑准入](#持久续跑准入)。
 
 ### 3.2 何时存
 
@@ -353,14 +318,15 @@ Run 出口要写的档没写成（`SaveNS` 或写档前的 `Snapshot` 失败）�
 
 ```go
 type Checkpointer interface {
-    SaveNS(ctx, sessionID, ns string, cp *Checkpoint) error
-    LoadNS(ctx, sessionID, ns string) (*Checkpoint, error)
-    ExistsNS(ctx, sessionID, ns string) (bool, error)
-    DeleteSubtree(ctx, sessionID, nsPrefix string) (int32, error)
-    ListPending(ctx, sessionID string) ([]NSCheckpoint, error)      // 只返 Pending（§3.1）
-    LoadAllInSession(ctx, sessionID string) ([]NSCheckpoint, error)
-    SaveBatch(ctx, sessionID string, batch map[string]*Checkpoint) error
-    Cleanup(ctx, keepLastN int32) (int32, error)                    // 唯一跨 session 的
+    SaveNS(ctx context.Context, sessionID, ns string, cp *Checkpoint) error
+    ClaimResume(ctx context.Context, sessionID, ns string, expected, source *Checkpoint) (*Checkpoint, error)
+    LoadNS(ctx context.Context, sessionID, ns string) (*Checkpoint, error)
+    ExistsNS(ctx context.Context, sessionID, ns string) (bool, error)
+    DeleteSubtree(ctx context.Context, sessionID, nsPrefix string, condition ...CheckpointDeleteCondition) (int32, error)
+    ListPending(ctx context.Context, sessionID string) ([]NSCheckpoint, error)
+    LoadAllInSession(ctx context.Context, sessionID string) ([]NSCheckpoint, error)
+    SaveBatch(ctx context.Context, sessionID string, batch map[string]*Checkpoint) error
+    Cleanup(ctx context.Context, keepLastN int32) (int32, error)
 }
 ```
 
@@ -650,22 +616,13 @@ Redis 和 SQL 内建方言的 Checkpointer 以存储域和任务 ID 为键，在
 - Redis 的应用副本使用同一主库、逻辑库及存档前缀，配置 Redis 保留租约键。
 - 自定义共享 Checkpointer 需要实现 `TaskLeaseProvider` 和 `TaskLeaseStore` 的原子校验，或由调用方协调。租约存储值须可比较，相等的值须指向同一存储域。同一存储域中的所有工作进程需使用同一协议。调用方直接修改存档、调用 `Cleanup` 或手动传入旧快照时，自行管理这些操作的归属。
 
-### 6.2 陈旧写回检测
+### 6.2 分区绑定与条件清档
 
-只使用进程内登记且共用自定义存储时，同一个 sid 仍可能被并发 Run/Resume。双方各自载入同一份 cp、各自执行、各自写回 → 后写者静默覆盖先
-写者，**且两边都 `err == nil`**。`WithStaleWriteGuard()` / `WithStaleWriteGuardCtx(ctx)` 开启后，
-写/删 cp 前比对 `Epoch`，被推进过则返 `ErrCheckpointStale`。
+根据上下文选择存档分区的后端实现 `CheckpointPartitionResolver`，并返回固定在实际分区的 `Checkpointer`。同一分区应返回相等的句柄，或让 `TaskLeaseProvider` 返回相等的租约存储值。续跑预读绑定 owner、实际分区、session ID、namespace 与存档世代。钩子无法把已经绑定的续跑迁到另一分区。尚未绑定续跑时，钩子仍可为新图选定分区，框架会核对该分区的归属。
 
-**它明确不解决的**（别当成并发安全开关）：
+引擎自动清档时先确认子树归属，再提交 `CheckpointDeleteCondition`。后端在一次原子操作内核对范围内的键、状态、身份和世代，仅删除核对过的键。缺少世代的旧档会核对快照内容。发现新增、移除或推进的槽时返回 `ErrCheckpointStale`，本次删除零条。父图会保留未结算的子图续跑档。显式放弃仍经任务租约清理指定子树。
 
-- **不阻止副作用双跑**——检测发生在写回时，那时两边都已经执行完了
-- **非原子**——read-then-write 之间有窗口
-- **每层各判各的**——子层基线是它刚读到那一代，只覆盖本层的读-写窗口
-- **只管 cp**——`store.Store` 的写在图内、早于判定
-- **不管带「新开」信号的 Run**——新开的 Run 没有世代基线（agent_v2 顶层 Run 恒是），守卫要等本次首写之后才生效，而首写本身不校验；于是默认 exit 档下，新开的 Run 全程不受保护——成功清理时还会把槽里别人的挂起档一并删掉；sync / async 档从本次第二次写入起受保护（每次写成功都会把基线推到自己写的那一代）。两个新开 Run 并发撞同一 sid——那本身违反「一枚 RunID 只服务一个任务」的契约（见 `RunSession.RunID` godoc）
-
-**默认关闭。** `agent_v2` 的 9 编排下只能用 ctx 那个（编排内部自己拼 RunOption、不透传业务的），
-嵌套子图靠 ctx 继承。执行入口的互斥由上节的任务租约或调用方的串行化提供。
+`WithStaleWriteGuard()` 和 `WithStaleWriteGuardCtx(ctx)` 默认关闭。它们为常规写档增加写前世代检查，检查和写入是两次调用。续跑准入与条件删除由后端原子执行，始终启用。业务直接写存档时，每次修改都要更新 `Epoch`，同时遵守任务归属与租约约定。
 
 ## 7. Resume 协议
 
@@ -673,15 +630,8 @@ Redis 和 SQL 内建方言的 Checkpointer 以存储域和任务 ID 为键，在
 
 底层 `compose_v2.Run` **没有独立 Resume 入口**：
 
-- **auto-load**：给了 `WithCheckpointer` + 同 sessionID → 入口 `LoadNS` 命中就续、没有就拿
-  `WithInitialWrites` 的种子从头跑。**判据是 `Checkpoint.HasResumableWork()`——按内容判**
-  （`len(CurrentFrontier) > 0 || len(PendingInterrupts) > 0`），**不看档位**。
-- **`WithResumeFrom(cp)`**：调用方自己把 cp 递进来（跨 sid、或想指定某份特定存档时用）。
-
-⚠️ **别再按「只捡 Pending / 续 Failed 档只能走 `WithResumeFrom`」理解**——那是 2026-08-13
-撤掉档位 gate 之前的行为（§3.1 已记）。现在**失败现场在 9 编排上直接续得上**：同 sid 再跑一次
-就是从失败点重试，上游已成功的成员不重放。`ListPending` 仍只返 `Pending`，但那个 API 的语义是
-「谁在等人回答」，不是「哪些档能续」。
+- **自动载入**。配置 Checkpointer 和 session ID 后，`Run` 从目标槽读取符合内容和身份要求的普通快照，失败档也能从失败点续跑。
+- **`WithResumeFrom(cp)`**。调用方可显式指定来源快照。已有挂起档的目标槽必须匹配当前快照，导入也可以从空目标槽开始。手动导出用 `ChannelManager.SnapshotForGraph`。
 
 **答案怎么递进去，两层各有入口**：底层 `compose_v2.WithResumeAnswers(map[string]*schema.Message)`
 是 RunOption，直接给 `Run`；高层 `agent_v2.WithResumeUserInputs(...)` 给 `Agent.Resume`，封装层
@@ -696,6 +646,13 @@ compose_v2.Checkpointer in ctx`，普通 error 非哨兵）。有 checkpointer �
 ⚠️ 入口默认档是「**恢复否则新开**」。种子（`WithInitialWrites`）**只在新开路径 apply**，所以
 「有种子 + 存档命中」是**正常形态**（崩溃恢复就长这样），引擎不会因此报错。想开新任务传
 `WithFreshRun()`。
+
+### 持久续跑准入
+
+入口完成存档身份校验及恢复准备后，`ClaimResume` 在图节点执行前原子提交 `CPStatusResuming` 和新世代。Sync 和 Async 写出的续跑过程档沿用该状态，包括同一续跑范围内新启动的子图。正常退出时提交新挂起档、失败档或封存标记，也可以成功条件清理已完成的存档。
+
+封存或清理失败后，如果当前档仍为 `Resuming`，新的续跑返回 `ErrCheckpointResumeUnconfirmed`，它也匹配 `ErrCheckpointNotResumable`。租约过期后该限制仍有效。调用方可以读取旧快照诊断，确认外部操作状态后显式放弃任务。准备阶段的自定义钩子及外部系统写入应各自使用操作幂等键。
+
 
 ### 7.2 配对答案
 

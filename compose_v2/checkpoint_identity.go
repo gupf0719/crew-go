@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"reflect"
 )
 
 type checkpointRevisionCtxKey struct{}
@@ -31,20 +30,22 @@ func (resumeCheckpointTargetKey) ExecutionState() {}
 
 type resumeCheckpointTarget struct {
 	sid, ns, owner string
+	partition      Checkpointer
 	checkpoint     *Checkpoint
 }
 
-// BindResumeCheckpointTarget 将宿主核对过的目标档绑定到即将恢复的图。
-func BindResumeCheckpointTarget(ctx context.Context, sid, ns string, cp *Checkpoint) context.Context {
+// BindResumeCheckpointTarget 将宿主核对过的存档、owner 和实际分区绑定到图。
+// partition 是解析后固定在目标域的 Checkpointer。
+func BindResumeCheckpointTarget(ctx context.Context, partition Checkpointer, sid, ns string, cp *Checkpoint) context.Context {
 	return context.WithValue(ctx, resumeCheckpointTargetKey{}, resumeCheckpointTarget{
-		sid: sid, ns: ns, owner: GetOwner(ctx), checkpoint: cp,
+		sid: sid, ns: ns, owner: GetOwner(ctx), partition: partition, checkpoint: cp,
 	})
 }
 
 // CanAutoResumeCheckpoint 判断这一层是否应载入已读出的存档。它检查调用意图和任务
 // 所有权。图身份由 Graph.CheckCheckpointIdentity 校验，冲突由调用方返回给上层。
 func CanAutoResumeCheckpoint(ctx context.Context, cp *Checkpoint) bool {
-	return !IsFreshRunCtx(ctx) && cp.HasResumableWork() && cp.BelongsToTask(getRunTaskID(ctx))
+	return !IsFreshRunCtx(ctx) && cp.HasResumableWork() && cp.Status != CPStatusResuming && cp.BelongsToTask(getRunTaskID(ctx))
 }
 
 type checkpointRestartKey struct{}
@@ -55,12 +56,16 @@ type checkpointRestartScope struct {
 	base         context.Context
 	checkpointer Checkpointer
 	sid, ns      string
+	slots        map[string]*Checkpoint
 }
 
-func withCheckpointRestartScope(ctx, base context.Context, cfg *runOptions) context.Context {
-	return context.WithValue(ctx, checkpointRestartKey{}, checkpointRestartScope{
-		base: base, checkpointer: cfg.checkpointer, sid: cfg.sessionID, ns: cfg.graphNS,
-	})
+func withCheckpointRestartScope(ctx, base context.Context, cfg *runOptions, slots []NSCheckpoint) context.Context {
+	scope := checkpointRestartScope{base: base, checkpointer: cfg.checkpointer, sid: cfg.sessionID, ns: cfg.graphNS}
+	scope.slots = make(map[string]*Checkpoint, len(slots))
+	for _, slot := range slots {
+		scope.slots[slot.NS] = slot.Checkpoint
+	}
+	return context.WithValue(ctx, checkpointRestartKey{}, scope)
 }
 
 // restartOwnsCheckpoint 允许低阶空根槽重开时回收原分区的旧子档。候选档必须能在
@@ -68,9 +73,12 @@ func withCheckpointRestartScope(ctx, base context.Context, cfg *runOptions) cont
 func restartOwnsCheckpoint(ctx context.Context, cp Checkpointer, sid string, slot NSCheckpoint) (bool, error) {
 	root, ok := ctx.Value(checkpointRestartKey{}).(checkpointRestartScope)
 	if !ok || root.sid != sid || GetOwner(root.base) != GetOwner(ctx) ||
-		!reflect.ValueOf(cp).Comparable() || cp != root.checkpointer ||
+		!SameCheckpointPartition(cp, root.checkpointer) ||
 		root.ns == slot.NS || !IsNSInSubtree(root.ns, slot.NS) ||
-		slot.Checkpoint.TaskID == "" || slot.Checkpoint.Status == CPStatusAborted {
+		slot.Checkpoint.TaskID == "" || slot.Checkpoint.Status == CPStatusAborted || slot.Checkpoint.Status == CPStatusResuming {
+		return false, nil
+	}
+	if !sameStoredCheckpoint(root.slots[slot.NS], slot.Checkpoint) {
 		return false, nil
 	}
 	lookupCtx, cancel := context.WithCancel(root.base)
@@ -78,7 +86,7 @@ func restartOwnsCheckpoint(ctx context.Context, cp Checkpointer, sid string, slo
 	stop := context.AfterFunc(ctx, cancel)
 	defer stop()
 	original, err := cp.LoadNS(lookupCtx, sid, slot.NS)
-	return err == nil && sameCheckpointSnapshot(original, slot.Checkpoint), err
+	return err == nil && sameStoredCheckpoint(original, slot.Checkpoint), err
 }
 
 // verifyGraphCheckpointScope 核对最终存储上下文。自定义 Checkpointer 可以按私有 ctx 值
@@ -141,7 +149,7 @@ func verifyCheckpointSubtree(ctx context.Context, cp Checkpointer, sid, ns, task
 // checkpointRequiresTaskOwnership 区分仍有任务意义的存档与普通完成快照。
 // 终局标记虽然不可续，仍负责阻止旧快照重放。
 func checkpointRequiresTaskOwnership(cp *Checkpoint) bool {
-	return cp != nil && (cp.Status == CPStatusAborted || cp.HasResumableWork())
+	return cp != nil && (cp.Status == CPStatusAborted || cp.Status == CPStatusResuming || cp.HasResumableWork())
 }
 
 func sameCheckpointPartition(ctx context.Context, cp Checkpointer, sid string) bool {

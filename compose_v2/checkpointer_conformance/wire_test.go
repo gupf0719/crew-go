@@ -73,6 +73,22 @@ func (w *jsonWireCheckpointer) SaveNS(ctx context.Context, sid, ns string, cp *c
 	return w.inner.SaveNS(ctx, sid, ns, out)
 }
 
+func (w *jsonWireCheckpointer) ClaimResume(ctx context.Context, sid, ns string, expected, source *compose_v2.Checkpoint) (*compose_v2.Checkpoint, error) {
+	out, err := roundTrip(expected)
+	if err != nil {
+		return nil, err
+	}
+	input, err := roundTrip(source)
+	if err != nil {
+		return nil, err
+	}
+	claimed, err := w.inner.ClaimResume(ctx, sid, ns, out, input)
+	if err != nil {
+		return nil, err
+	}
+	return roundTrip(claimed)
+}
+
 func (w *jsonWireCheckpointer) LoadNS(ctx context.Context, sid, ns string) (*compose_v2.Checkpoint, error) {
 	cp, err := w.inner.LoadNS(ctx, sid, ns)
 	if err != nil {
@@ -121,8 +137,8 @@ func (w *jsonWireCheckpointer) ExistsNS(ctx context.Context, sid, ns string) (bo
 	return w.inner.ExistsNS(ctx, sid, ns)
 }
 
-func (w *jsonWireCheckpointer) DeleteSubtree(ctx context.Context, sid, nsPrefix string) (int32, error) {
-	return w.inner.DeleteSubtree(ctx, sid, nsPrefix)
+func (w *jsonWireCheckpointer) DeleteSubtree(ctx context.Context, sid, nsPrefix string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
+	return w.inner.DeleteSubtree(ctx, sid, nsPrefix, condition...)
 }
 
 func (w *jsonWireCheckpointer) Cleanup(ctx context.Context, keepLastN int32) (int32, error) {

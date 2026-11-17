@@ -275,14 +275,15 @@ type pauseSharedDeletion struct {
 	entered, release chan struct{}
 }
 
-func (p pauseSharedDeletion) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (p pauseSharedDeletion) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	close(p.entered)
 	select {
 	case <-p.release:
-		return p.Checkpointer.DeleteSubtree(ctx, sid, ns)
+		return p.Checkpointer.DeleteSubtree(ctx, sid, ns, condition...)
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
+
 }
 
 func TestSharedCheckpointer_ResumeDuringAbandon(t *testing.T) {

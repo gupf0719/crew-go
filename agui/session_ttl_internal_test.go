@@ -434,12 +434,12 @@ func (c *remoteBusyCheckpointer) ReleaseTaskLease(_ context.Context, _, token st
 	c.token = ""
 	return nil
 }
-func (c *remoteBusyCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *remoteBusyCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	c.t.Helper()
 	if c.token == "" || c.token != compose_v2.CheckpointTaskLeaseToken(ctx, c, sid) {
 		c.t.Fatal("DeleteSubtree missing lease token")
 	}
-	return c.Checkpointer.DeleteSubtree(ctx, sid, ns)
+	return c.Checkpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func TestSessionTTL_RemoteBusyKeepsEntryUntilReclaim(t *testing.T) {

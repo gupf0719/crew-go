@@ -9,6 +9,7 @@ import (
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/hook"
 	"crew-go/schema"
 )
 
@@ -27,6 +28,10 @@ func (c *routedGraphCheckpointer) partition(ctx context.Context) compose_v2.Chec
 	return c.Checkpointer
 }
 
+func (c *routedGraphCheckpointer) ResolveCheckpointPartition(ctx context.Context) (compose_v2.Checkpointer, error) {
+	return compose_v2.ResolveCheckpointPartition(ctx, c.partition(ctx))
+}
+
 func (c *routedGraphCheckpointer) LoadNS(ctx context.Context, sid, ns string) (*compose_v2.Checkpoint, error) {
 	return c.partition(ctx).LoadNS(ctx, sid, ns)
 }
@@ -39,8 +44,12 @@ func (c *routedGraphCheckpointer) SaveNS(ctx context.Context, sid, ns string, cp
 	return c.partition(ctx).SaveNS(ctx, sid, ns, cp)
 }
 
-func (c *routedGraphCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
-	return c.partition(ctx).DeleteSubtree(ctx, sid, ns)
+func (c *routedGraphCheckpointer) ClaimResume(ctx context.Context, sid, ns string, expected, source *compose_v2.Checkpoint) (*compose_v2.Checkpoint, error) {
+	return c.partition(ctx).ClaimResume(ctx, sid, ns, expected, source)
+}
+
+func (c *routedGraphCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
+	return c.partition(ctx).DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 type chooseGraphCheckpointPartition struct {
@@ -507,5 +516,74 @@ func testGraphCheckpointBareRestartPreservesOtherPartition(t *testing.T, atRoot 
 	if !bytes.Equal(primaryBefore, partitionCheckpointBytes(t, ctx, cp, sid, leaf)) ||
 		!bytes.Equal(foreignBefore, partitionCheckpointBytes(t, otherCtx, cp, sid, leaf)) {
 		t.Fatal("拒绝接管时两份旧档都应保留")
+	}
+}
+
+type chooseAgentCheckpointPartition struct {
+	hook.NoOpHooks
+	selectPartition func(context.Context) context.Context
+}
+
+func (h chooseAgentCheckpointPartition) OnAgentStart(ctx context.Context, _ *hook.AgentInfo, _ *hook.AgentInput) (context.Context, error) {
+	return h.selectPartition(ctx), nil
+}
+
+func TestGraphCheckpointResumeRejectsAnotherPartitionWithIdenticalSnapshot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	primary, other := compose_v2.NewInMemoryCheckpointer(), compose_v2.NewInMemoryCheckpointer()
+	change := func(ctx context.Context) context.Context {
+		return context.WithValue(ctx, checkpointPartitionKey{}, true)
+	}
+	cp := &routedGraphCheckpointer{Checkpointer: primary, other: other, useOther: func(ctx context.Context) bool {
+		selected, _ := ctx.Value(checkpointPartitionKey{}).(bool)
+		return selected
+	}}
+	ctx = compose_v2.WithBoundCheckpointerCtx(ctx, cp)
+	sess := agent_v2.NewRunSession()
+	var writes int
+	g := partitionTestGraph(t, "same-image", func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+		if _, err := partitionAsk(ctx, chs); err != nil {
+			return nil, err
+		}
+		writes++
+		return nil, nil
+	})
+	ga := partitionTestAgent(g)
+	_, err := ga.Run(ctx, sess, schema.UserMessage("等待批准"))
+	question := partitionQuestionID(t, err)
+	before := partitionCheckpointBytes(t, ctx, primary, sess.RunID, "")
+	clone, err := compose_v2.UnmarshalCheckpoint(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.SaveNS(ctx, sess.RunID, "", clone); err != nil {
+		t.Fatal(err)
+	}
+	root := ""
+	graphSwitch := chooseGraphCheckpointPartition{graphAt: &root, selectGraph: change}
+	agentSwitch := agent_v2.NewGraphAgent(g, agent_v2.WithGraphAgentName("partition-workflow"),
+		agent_v2.WithGraphAgentHooks(chooseAgentCheckpointPartition{selectPartition: change}),
+		agent_v2.WithGraphOutputReader(func(compose_v2.Channels) *schema.Message { return schema.AssistantMessage("完成") }))
+	answer := agent_v2.WithResumeUserInputs(map[string]*schema.Message{question: schema.UserMessage("批准")})
+	_, err = ga.Resume(compose_v2.WithOrchHooks(ctx, graphSwitch), sess.RunID, answer)
+	if !errors.Is(err, compose_v2.ErrGraphIDConflict) || writes != 0 {
+		t.Fatalf("OnGraphStart 切分区应拒绝续跑且不执行写入：%v, writes=%d", err, writes)
+	}
+	_, err = agentSwitch.Resume(ctx, sess.RunID, answer)
+	if !errors.Is(err, compose_v2.ErrGraphIDConflict) || writes != 0 {
+		t.Fatalf("OnAgentStart 切分区应拒绝续跑且不执行写入：%v, writes=%d", err, writes)
+	}
+	if !bytes.Equal(before, partitionCheckpointBytes(t, ctx, primary, sess.RunID, "")) ||
+		!bytes.Equal(before, partitionCheckpointBytes(t, ctx, other, sess.RunID, "")) {
+		t.Fatal("两个物理分区的原始存档都须保持不变")
+	}
+	events, err := ga.Resume(ctx, sess.RunID, answer)
+	if err != nil || writes != 1 || agent_v2.FinalMessage(events).GetContent() != "完成" {
+		t.Fatalf("固定在原分区才可续跑一次：%v, writes=%d", err, writes)
+	}
+	if len(partitionCheckpointBytes(t, ctx, primary, sess.RunID, "")) != 0 ||
+		!bytes.Equal(before, partitionCheckpointBytes(t, ctx, other, sess.RunID, "")) {
+		t.Fatal("应只清理实际获准续跑的分区")
 	}
 }

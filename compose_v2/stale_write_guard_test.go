@@ -106,15 +106,8 @@ func TestStaleWriteGuard_SecondWriterOnSameBaselineRejected(t *testing.T) {
 	t.Logf("work 执行了 %d 次——守卫不阻止副作用双跑，只让冲突可见", ranWork.Load())
 }
 
-// TestStaleWriteGuard_DefaultOffUnchanged：不开 option 时行为与引入前完全一致。
-//
-// **用与 T1 相同的确定性 fixture**（同基线两执行者先后写回），只是不开守卫——这样
-// 它是个真正的 positive control：不仅断言"没报 stale"，还断言**后写者的结果真的
-// 落进了槽**（读回比 Epoch）。
-//
-// 原版只有"不返回 stale"这个否定断言，守卫坏成什么样它都绿（变异测试实证：删掉整个
-// 比对块它照样 PASS）；并发版则因 Run 体太短常被 scheduler 串行化而 flaky。
-func TestStaleWriteGuard_DefaultOffUnchanged(t *testing.T) {
+// TestResumeAdmissionRejectsStaleSnapshotWithoutWriteGuard 验证准入始终要求当前世代。
+func TestResumeAdmissionRejectsStaleSnapshotWithoutWriteGuard(t *testing.T) {
 	var ranWork atomic.Int32
 	cper := compose_v2.NewInMemoryCheckpointer()
 	ctx := context.Background()
@@ -139,18 +132,19 @@ func TestStaleWriteGuard_DefaultOffUnchanged(t *testing.T) {
 		// 注意：**不开** WithStaleWriteGuard
 	}
 	if errA := runFrom(baseline); errors.Is(errA, compose_v2.ErrCheckpointStale) {
-		t.Fatalf("守卫默认关闭，不该有 stale 错误: %v", errA)
+		t.Fatalf("当前档必须能继续: %v", errA)
 	}
 	afterA, _ := cper.LoadNS(ctx, "off_sid", "")
+	if afterA == nil || afterA.Epoch == baseline.Epoch || ranWork.Load() != 1 {
+		t.Fatalf("首个续跑应推进存档且执行一次工作: %+v, %d", afterA, ranWork.Load())
+	}
 
-	// 后写者：同一老基线。默认关闭时它必须**成功覆盖**——这正是引入守卫前的行为
-	if errB := runFrom(baseline); errors.Is(errB, compose_v2.ErrCheckpointStale) {
-		t.Fatalf("守卫默认关闭，后写者不该被拒: %v", errB)
+	if errB := runFrom(baseline); !errors.Is(errB, compose_v2.ErrCheckpointStale) {
+		t.Fatalf("显式旧源不能再次准入: %v", errB)
 	}
 	afterB, _ := cper.LoadNS(ctx, "off_sid", "")
-	if afterB == nil || afterB.Epoch == afterA.Epoch {
-		t.Errorf("默认关闭时后写者应静默覆盖先写者（引入前的行为）——槽里 Epoch 该变，"+
-			"A 后=%v B 后=%v", afterA.Epoch, afterB.Epoch)
+	if afterB == nil || afterB.Epoch != afterA.Epoch || ranWork.Load() != 1 {
+		t.Fatalf("拒绝旧源时应保留正在等待的新档，工作没有重跑: %+v, %d", afterB, ranWork.Load())
 	}
 }
 

@@ -51,7 +51,7 @@ local function checkpoint_exists(key)
     return redis.call("TYPE", key).ok ~= "none"
 end
 
-local function delete_subtree(legacy_item_prefix)
+local function delete_subtree(legacy_item_prefix, expected)
 local nsidx_key   = KEYS[1]
 local pending_key = KEYS[2]
 local sids_key    = KEYS[3]
@@ -87,6 +87,18 @@ for i, ns in ipairs(all_ns) do
         local sep = string.sub(ns, ns_prefix_len + 1, ns_prefix_len + 1)
         if sep == subtree_sep and string.sub(ns, 1, ns_prefix_len) == ns_prefix then
             matched[#matched + 1] = ns
+        end
+    end
+end
+
+if expected ~= nil then
+    if #matched ~= expected.count then
+        return -2
+    end
+    for i, ns in ipairs(matched) do
+        local raw = expected.payloads[ns]
+        if raw == nil or redis.call("GET", item_key_prefix .. ns) ~= raw then
+            return -2
         end
     end
 end
@@ -130,13 +142,20 @@ return deleted
 end
 `
 
-// 独立删除额外以 ARGV[7] 传递旧格式 payload 键前缀。
+// 独立删除额外以 ARGV[7] 传递旧格式 payload 键前缀，条件删除再传精确快照。
 var deleteSubtreeScript = redis.NewScript(deleteSubtreeLua + `
 local owner = ARGV[6]
 if owner ~= "" and redis.call("GET", KEYS[4]) ~= owner then
     return -1
 end
-return delete_subtree(ARGV[7])
+local expected = nil
+if ARGV[8] ~= nil then
+    expected = { count = tonumber(ARGV[8]), payloads = {} }
+    for i = 9, #ARGV, 2 do
+        expected.payloads[ARGV[i]] = ARGV[i + 1]
+    end
+end
+return delete_subtree(ARGV[7], expected)
 `)
 
 // DeleteSubtree 实现 compose_v2.Checkpointer.DeleteSubtree.
@@ -149,15 +168,53 @@ return delete_subtree(ARGV[7])
 //   - prefix="" 删整 session
 //
 // **iter-5-K**: 全 Lua 原子, 不依赖 cjson 解析整 payload.
-func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix string) (int32, error) {
+func (c *Checkpointer) DeleteSubtree(ctx context.Context, sessionID, nsPrefix string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
+	if len(condition) > 1 {
+		return 0, fmt.Errorf("expected at most one checkpoint delete condition")
+	}
 	keys, args := c.subtreeDeleteArgs(ctx, sessionID, nsPrefix)
 	args = append(args, cpLegacyItemPrefix(c.prefix, sessionID))
+	if len(condition) == 1 {
+		expected := condition[0].Expected
+		keysToRead := make([]string, len(expected))
+		for i, slot := range expected {
+			if !compose_v2.IsNSInSubtree(nsPrefix, slot.NS) {
+				return 0, compose_v2.ErrCheckpointStale
+			}
+			keysToRead[i] = cpItemKey(c.prefix, sessionID, slot.NS)
+		}
+		values, err := c.mgetChunked(ctx, keysToRead)
+		if err != nil {
+			return 0, fmt.Errorf("redis cp DeleteSubtree load: %w", err)
+		}
+		args = append(args, len(expected))
+		current := make([]compose_v2.NSCheckpoint, 0, len(expected))
+		for i, value := range values {
+			raw, ok := value.(string)
+			if !ok {
+				return 0, compose_v2.ErrCheckpointStale
+			}
+			cp, err := compose_v2.UnmarshalCheckpoint([]byte(raw))
+			if err != nil {
+				return 0, err
+			}
+			ns := expected[i].NS
+			current = append(current, compose_v2.NSCheckpoint{NS: ns, Checkpoint: cp})
+			args = append(args, ns, raw)
+		}
+		if err := compose_v2.CheckCheckpointDeleteCondition(current, condition[0]); err != nil {
+			return 0, err
+		}
+	}
 	n, err := deleteSubtreeScript.Run(ctx, c.rdb, keys, args...).Int64()
 	if err != nil {
 		return 0, fmt.Errorf("redis cp DeleteSubtree eval: %w", err)
 	}
 	if n == -1 {
 		return 0, fmt.Errorf("redis cp DeleteSubtree: %w", compose_v2.ErrTaskLeaseLost)
+	}
+	if n == -2 {
+		return 0, compose_v2.ErrCheckpointStale
 	}
 	return int32(n), nil
 }

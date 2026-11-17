@@ -575,11 +575,11 @@ func (c *joinOrderCp) SaveNS(ctx context.Context, sid, ns string, cp *compose_v2
 	return err
 }
 
-func (c *joinOrderCp) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *joinOrderCp) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	c.mu.Lock()
 	c.events = append(c.events, "delete")
 	c.mu.Unlock()
-	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 // TestDurability_Async_JoinBeforeCleanup：async 成功 Run——所有后台写（save_done）必须在

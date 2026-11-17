@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/agui"
@@ -103,18 +104,48 @@ func TestSQLiteAGUITerminalConflictClosesResume(t *testing.T) {
 			if replay := aguiPost(t, peer, owner, body); !strings.Contains(replay.Body.String(), wantCode) || writes.Load() != 1 {
 				t.Fatalf("相同 runId 应重放终态，实际 %d %s，写入 %d 次", replay.Code, replay.Body, writes.Load())
 			}
-			if !tc.failUnbind {
-				pending = aguiPending(t, peer, owner)
-				body["runId"] = "retry-terminal-conflict"
-				retry := aguiPost(t, peer, owner, body)
-				if len(pending.Interrupts) != 0 || retry.Code != http.StatusNotFound ||
-					!strings.Contains(retry.Body.String(), `"code":"no_session"`) || writes.Load() != 1 {
-					t.Fatalf("原挂起档仍在时也必须禁止换 runId 重放，实际问题 %v，重试 %d %s，写入 %d 次",
-						pending.Interrupts, retry.Code, retry.Body, writes.Load())
-				}
+			pending = aguiPending(t, peer, owner)
+			body["runId"] = "retry-terminal-conflict"
+			retry := aguiPost(t, peer, owner, body)
+			wantStatus, wantRetry := http.StatusNotFound, `"code":"no_session"`
+			if tc.failUnbind {
+				wantStatus, wantRetry = http.StatusConflict, `"code":"checkpoint_not_resumable"`
 			}
-			if !bytes.Equal(root, checkpoint("")) || !bytes.Equal(child, checkpoint("child")) {
-				t.Fatal("解绑会话不应改写根档或冲突子档")
+			if pending.ResumeBlocked != tc.failUnbind || retry.Code != wantStatus ||
+				!strings.Contains(retry.Body.String(), wantRetry) || writes.Load() != 1 {
+				t.Fatalf("原挂起档仍在时也必须禁止换 runId 重放，实际问题 %v，重试 %d %s，写入 %d 次",
+					pending.Interrupts, retry.Code, retry.Body, writes.Load())
+			}
+			claimed, err := compose_v2.UnmarshalCheckpoint(checkpoint(""))
+			if err != nil || claimed.Status != compose_v2.CPStatusResuming || claimed.Epoch == "" {
+				t.Fatalf("终局写失败时必须持久保持已准入，实际 %v，%v", claimed, err)
+			}
+			original, err := compose_v2.UnmarshalCheckpoint(root)
+			if err != nil || claimed.Epoch == original.Epoch {
+				t.Fatalf("准入必须推进存档世代，实际 %v", err)
+			}
+			claimed.Status, claimed.Epoch = original.Status, original.Epoch
+			unchanged, err := compose_v2.MarshalCheckpoint(claimed)
+			if err != nil || !bytes.Equal(root, unchanged) || !bytes.Equal(child, checkpoint("child")) {
+				t.Fatal("准入应保留根档现场和冲突子档")
+			}
+			directCtx, cancel := context.WithTimeout(compose_v2.WithCheckpointerCtx(ctx, f.b), time.Second)
+			defer cancel()
+			_, err = factory(hook.NoOpHooks{}).Resume(directCtx, taskID)
+			if !errors.Is(err, compose_v2.ErrCheckpointResumeUnconfirmed) || writes.Load() != 1 {
+				t.Fatalf("直接 Resume 也须拒绝重复执行，实际 err=%v，外部写入 %d 次", err, writes.Load())
+			}
+			if tc.failUnbind {
+				for i := range answers {
+					answers[i].Status = agui.ResumeStatusCancelled
+				}
+				body["runId"] = "discard-terminal-conflict"
+				if abort := aguiPost(t, peer, owner, body); abort.Code != http.StatusOK || writes.Load() != 1 {
+					t.Fatalf("明确放弃应可回收且不重放，实际 %d %s", abort.Code, abort.Body)
+				}
+				if cp, err := f.b.LoadNS(ctx, taskID, ""); err != nil || cp != nil {
+					t.Fatalf("放弃后仍有根档，实际 %v，%v", cp, err)
+				}
 			}
 		})
 	}

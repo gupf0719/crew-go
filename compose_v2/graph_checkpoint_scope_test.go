@@ -25,17 +25,25 @@ func (s *checkpointScopeStore) SaveNS(ctx context.Context, sid, ns string, cp *c
 	return s.partitions[s.scope(ctx)].SaveNS(ctx, sid, ns, cp)
 }
 
+func (s *checkpointScopeStore) ClaimResume(ctx context.Context, sid, ns string, expected, source *compose_v2.Checkpoint) (*compose_v2.Checkpoint, error) {
+	return s.partitions[s.scope(ctx)].ClaimResume(ctx, sid, ns, expected, source)
+}
+
 func (s *checkpointScopeStore) LoadNS(ctx context.Context, sid, ns string) (*compose_v2.Checkpoint, error) {
 	return s.partitions[s.scope(ctx)].LoadNS(ctx, sid, ns)
+}
+
+func (s *checkpointScopeStore) LoadAllInSession(ctx context.Context, sid string) ([]compose_v2.NSCheckpoint, error) {
+	return s.partitions[s.scope(ctx)].LoadAllInSession(ctx, sid)
 }
 
 func (s *checkpointScopeStore) ExistsNS(ctx context.Context, sid, ns string) (bool, error) {
 	return s.partitions[s.scope(ctx)].ExistsNS(ctx, sid, ns)
 }
 
-func (s *checkpointScopeStore) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (s *checkpointScopeStore) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	s.deletes.Add(1)
-	return s.partitions[s.scope(ctx)].DeleteSubtree(ctx, sid, ns)
+	return s.partitions[s.scope(ctx)].DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 type checkpointScopeHook struct {

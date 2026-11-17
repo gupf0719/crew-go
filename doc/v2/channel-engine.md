@@ -480,7 +480,7 @@ CLAUDE.md "交付纪律" 强制约束。
 | `ctx.Done() / DeadlineExceeded` | 走错误路径 + 整 Run return | ✅ Run defer SaveNS |
 | `panic` | `safeNodeRun` recover 转 `node panic recovered: ...` 普通 error | ✅ 同业务 error（frontier 非空时 SaveNS，档位同上）——业务**应避免用 panic 表达 HITL**（Resume 拿 panic 时不一致 channel 状态，§13.5 #7）|
 | `*compose_v2.InterruptError` | 框架识别 + 收集 PendingInterrupts | ✅ Run defer SaveNS |
-| 业务普通 error | 静默上抛 caller | ✅ Run defer SaveNS，**标 `Status=Failed`**——⚠️ **照样会被 auto-load 捡起**：闸门读 `HasResumableWork() && BelongsToTask()`，**不读 Status**（2026-08-13 起 Status 只是报告位）。实测：a→b、b 报业务错，同 sid 再 Run ⟹ a 一次不跑、b 从失败点重跑。判据见 [checkpoint.md §3.1](checkpoint.md)|
+| 业务普通 error | 静默上抛 caller | ✅ Run defer SaveNS，**标 `Status=Failed`**——⚠️ **照样会被 auto-load 捡起**：恢复入口验证内容、身份与持久准入。实测：a→b、b 报业务错，同 sid 再 Run ⟹ a 一次不跑、b 从失败点重跑。判据见 [checkpoint.md §3.1](checkpoint.md)|
 | 节点正常 return + writes | ApplyAll reduce 进 channel | （超步成功，cp 在下次失败/中断时 save）|
 
 **关键不变量**：

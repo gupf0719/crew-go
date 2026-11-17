@@ -4,6 +4,7 @@
 
 - 根模块与三个子模块要求 Go 1.26.0 或更高版本。仓库工具链与 GitLab CI 使用 Go 1.26.4。
 - 对共用同一 Redis 或 SQL 存档域的进程，先停旧副本，再启动新版。新版用任务租约协调执行、续跑和清档。 [任务租约](../v2/checkpoint.md#61-共享存档的任务租约)
+- 恢复执行前会写入 `CPStatusResuming`。回退前让新版处理或显式放弃这类存档，旧版本可以按遗留 frontier 再次执行。自定义 Checkpointer 需要实现原子 `ClaimResume` 和带条件的 `DeleteSubtree`。 [持久准入](../v2/checkpoint.md#持久续跑准入)
 - 新版恢复要求带版本的图存档身份。切换前让旧版处理仍在途的任务，或显式放弃，再统一切换读写版本。旧档可以读取和导出。回退前由新版处理新版产生的待答档。 [存档身份](../v2/checkpoint.md#43-graphid-防串台)
 - 新建路由升级链时给每个 `WithRouteDecider` 档位使用稳定名称。 [路由决策](../v2/route-decider.md)
 - 使用 `SendDirective.Input` 的部署应统一 Checkpoint 的读写版本。Schema 19 增加 `frontier_inputs` 和 `deferred_sends[].input`，缺少这两个字段的旧存档仍可读取。旧进程读取新存档会忽略这些字段，回退前先处理挂起的私有投递。 [存档结构](../v2/checkpoint.md)

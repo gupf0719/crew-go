@@ -49,11 +49,11 @@ func (c *keyDurCP) SaveNS(ctx context.Context, sid, ns string, cp *compose_v2.Ch
 	return c.InMemoryCheckpointer.SaveNS(ctx, sid, ns, cp)
 }
 
-func (c *keyDurCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *keyDurCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if c.frozen.Load() {
 		return 0, nil
 	}
-	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func (c *keyDurCP) savedNS(ns string) bool {
@@ -273,9 +273,9 @@ func (c *topFailOnceCP) SaveNS(ctx context.Context, sid, ns string, cp *compose_
 	return c.keyDurCP.SaveNS(ctx, sid, ns, cp)
 }
 
-func (c *topFailOnceCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *topFailOnceCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if ns == "" && c.failedDeleteTop.CompareAndSwap(false, true) {
 		return 0, errors.New("后端瞬时错误")
 	}
-	return c.keyDurCP.DeleteSubtree(ctx, sid, ns)
+	return c.keyDurCP.DeleteSubtree(ctx, sid, ns, condition...)
 }

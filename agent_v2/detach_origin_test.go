@@ -277,9 +277,9 @@ func TestDetach_ReusedInterruptObject_NotStampedForLegitTask(t *testing.T) {
 	}
 }
 
-// doPendingNow 数 sid 下此刻挂着的存档份数（查询失败返 -1，让断言暴露出来）。
-func doPendingNow(cper compose_v2.Checkpointer, sid string) int {
-	p, err := cper.ListPending(context.Background(), sid)
+// countTaskCheckpoints 数 sid 下此刻保存的存档份数（查询失败返 -1，让断言暴露出来）。
+func countTaskCheckpoints(cper compose_v2.Checkpointer, sid string) int {
+	p, err := cper.LoadAllInSession(context.Background(), sid)
 	if err != nil {
 		return -1
 	}
@@ -338,9 +338,9 @@ func TestDetach_StoredCtxFromEarlierExecution_DuringResume_Rejected(t *testing.T
 				case 1:
 					stored = ctx
 				case 2:
-					before = doPendingNow(cper, sess.RunID)
+					before = countTaskCheckpoints(cper, sess.RunID)
 					actErr = act(compose_v2.DetachExecution(context.WithoutCancel(stored)), a, x, sess)
-					after = doPendingNow(cper, sess.RunID)
+					after = countTaskCheckpoints(cper, sess.RunID)
 				}
 			}))
 			_, err := a.Run(top, sess, schema.UserMessage("go"))
@@ -453,9 +453,9 @@ func TestDetach_StoredCtxDuringResume_EveryOrchestration_Rejected(t *testing.T) 
 				case 1:
 					stored = ctx
 				case 2:
-					before = doPendingNow(cper, sess.RunID)
+					before = countTaskCheckpoints(cper, sess.RunID)
 					_, xErr = x.Run(compose_v2.DetachExecution(context.WithoutCancel(stored)), sess, schema.UserMessage("y"))
-					after = doPendingNow(cper, sess.RunID)
+					after = countTaskCheckpoints(cper, sess.RunID)
 				}
 			}))
 			ag := wrap(t, ask)
@@ -501,9 +501,9 @@ func TestDetach_TaskResumedWithStoredCtx_NodeDetachesAgain_Rejected(t *testing.T
 		case 1:
 			stored = ctx
 		case 2:
-			before = doPendingNow(cper, sess.RunID)
+			before = countTaskCheckpoints(cper, sess.RunID)
 			_, xErr = x.Run(agent_v2.DetachTask(ctx), sess, schema.UserMessage("y"))
-			after = doPendingNow(cper, sess.RunID)
+			after = countTaskCheckpoints(cper, sess.RunID)
 		}
 	}))
 	_, err := a.Run(top, sess, schema.UserMessage("go"))
@@ -724,7 +724,7 @@ func TestDetach_NilSessionWithSIDPushedBack_Rejected(t *testing.T) {
 		sid := agent_v2.GetSession(ctx).RunID
 		before = doWaitPending(cper, sid)
 		_, xErr = x.Run(compose_v2.WithSessionIDCtx(agent_v2.DetachTask(ctx), sid), nil, schema.UserMessage("y"))
-		after = doPendingNow(cper, sid)
+		after = countTaskCheckpoints(cper, sid)
 		return "bypass done", nil
 	})
 	par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("par")).AddBranch("asker", asker).AddBranch("bypass", bypass)

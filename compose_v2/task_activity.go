@@ -34,13 +34,21 @@ type TaskActivity struct {
 //
 // 给图引擎和 Agent 入口使用：在读写存档或历史之前调用，结束时 Release。放弃操作完成后可先调用 FinishAbandon。
 func BeginTaskActivity(ctx context.Context, sid string, abandoned []string) (context.Context, *TaskActivity, error) {
-	return beginTaskActivity(ctx, GetCheckpointer(ctx), sid, abandoned, false)
+	return beginConfiguredTaskActivity(ctx, sid, abandoned, false)
 }
 
 // BeginFreshTaskActivity 保护新任务对存档的独占使用。沿同一 ctx 派生的执行可借用登记，
 // 其他存档调用在本次任务退出前得到 [ErrTaskBusy]。每个实际使用的后端在持有租约时检查该 sid 下的可续存档。
 func BeginFreshTaskActivity(ctx context.Context, sid string, abandoned []string) (context.Context, *TaskActivity, error) {
-	return beginTaskActivity(ctx, GetCheckpointer(ctx), sid, abandoned, true)
+	return beginConfiguredTaskActivity(ctx, sid, abandoned, true)
+}
+
+func beginConfiguredTaskActivity(ctx context.Context, sid string, abandoned []string, fresh bool) (context.Context, *TaskActivity, error) {
+	partition, err := ResolveCheckpointPartition(ctx, GetCheckpointer(ctx))
+	if err != nil {
+		return ctx, nil, err
+	}
+	return beginTaskActivity(ctx, partition, sid, abandoned, fresh)
 }
 
 type taskActivityKey struct{}

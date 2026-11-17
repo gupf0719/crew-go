@@ -8,66 +8,22 @@ import (
 	"sync"
 )
 
-// Checkpointer 是 ns-aware checkpoint 存储抽象——业务可注入自己的实现
-// （Redis / Postgres / S3 等）。
+// Checkpointer 按 (sessionID, ns) 保存图的进度。同一任务的嵌套图各用一个 namespace。
+// 所有方法须支持并发调用。写档填写 sessionID 和 ns，保留完整的任务、图及存档世代。
 //
-// 由 compose 旧版 Checkpointer（17 方法）精简而来。当前 8 方法：
-// SaveNS / LoadNS / ExistsNS / DeleteSubtree / ListPending / LoadAllInSession /
-// SaveBatch / Cleanup——覆盖 (sid, ns) 物理分离寻址；不保留旧 Save/Load 无 ns
-// 兼容层。跨 Run 的会话历史**不在这一层**（cp 单次 Run 临时态、成功即清）——
-// 走 agent_v2 的会话历史层，见 ISSUE-98。
-//
-// 物理寻址：cp 按 (sessionID, ns) 二元组索引——单一 sid 下多 ns 表达嵌套
-// 子图 cp 物理分离。
-//
-// **实现契约**：
-//   - SaveNS：cp.ID/cp.NS 自动填充为入参 sessionID/ns（覆盖 cp 自带值）
-//   - 所有方法**并发安全**
-//   - DeleteSubtree：删 sessionID 下 nsPrefix 这次执行的子树（nsPrefix 自身 + 经 `/`
-//     往下的后代，判据 [IsNSInSubtree]；同一个节点的 `#`/`@` 兄弟执行不在内）；
-//     prefix="" 删整 session
-//
-// # 残留：清理部分失败时留下的半棵子树，会不会被后面的清理扫掉
-//
-// 非空前缀的删除允许不原子（见 `DeleteSubtree` 给实现者的契约），所以会有残留。
-// **判据只有一条，跟「哪个函数调的」无关**：
-//
-//	DeleteSubtree(sid, P) 留下的残留，会被之后任何 DeleteSubtree(sid, P') 扫掉，
-//	其中 IsNSInSubtree(P', P) 为真（P' 是 P 自身，或经 `/` 在 P 之上的某一层）。
-//
-// 所以要问的不是「哪个调用点」，是「**这次清理之后，还有没有更外层的清理者**」：
-//
-// 先问「这次调用会不会留下残留」，再问「有没有更外层的清理者」：
-//
-//   - **不会留残留**：空前缀在多数 backend 上是单条原子操作（`sql` 是单条 DELETE，
-//     `redis` 整个 `DeleteSubtree` 都是原子 Lua、空非空都不留）。⚠️ 这是**实现性质
-//     不是接口保证**——业务自研 backend 若统一走「枚举 + 分批」，空前缀同样会留残留。
-//   - **会留残留 + 有更外层清理者**（子图之上的父 Run、嵌套 Run 之上的祖先 Run）⟹
-//     会被扫掉，**但只在它成功收尾、或以 [ErrRunAborted] 终局失败时**。两个例外：
-//     祖先带**普通业务错**退出时一次 DeleteSubtree 都不发（实测三档：成功→
-//     DeleteSubtree、业务错→SaveNS、ErrRunAborted→DeleteSubtree）；开了
-//     [WithStaleWriteGuard] 且本次执行被判陈旧时，成功与 abort 两条路都在 purge
-//     **之前**返回，同样不扫。
-//   - **会留残留 + 没有更外层清理者** ⟹ 留着。今天三个形态：嵌套 Abort（业务显式放弃
-//     某个子树）；**业务自己择机调 `DeleteSubtree(sid, 非空ns)` 显式清**（本包别处明确
-//     推荐过这个写法）；以及业务在顶层 push 了非空 ns 的 Run——最后这个**框架代码里零实例**
-//     （但业务可达：`WithGraphNS(ctx, "tenant-a")` + 裸 `Run`，入口会回落到 ctx 里的 ns）
-//     （框架里 `WithRunNS` 要么是 `if ns := GetGraphNS(ctx); ns != ""` 的转发，要么是
-//     子图节点无条件传 childNS，而子图按构造就在父 Run 内）。
-//
-// 留着的残留**对执行是够不着的**（auto-load 走 `LoadNS(sid, 精确 ns)`，够不到后代），
-// 但**对枚举是可见的**——`ListPending` 与 `LoadAllInSession` 都会返回它（实测）。业务按
-// sid 建恢复面板 / 告警时会看到一条永远处理不掉的挂起项，最终由业务自己的 `Cleanup`
-// 回收：**框架没有自动 reaper**。
-//
-// ⚠️ 这段刻意**不列调用点清单**。那种写法在 `sql` 的 godoc 里试过三版，每版都在修上一个
-// 错的同时造出新错——它的输入维（调用点集合、各自运行期的 ns、祖先的退出路径）全在别的
-// 包，散文追不上。上面这条判据不枚举调用点，加第五个调用点时它自动仍然正确；调用点集合
-// 本身由 `delete_subtree_callsite_test.go` 机械对账。
+// 框架自动清档使用条件删除。租约、任务归属和存档世代共同决定可删除的槽。
+// 无条件删除适用于显式放弃和管理操作。若非空前缀的无条件清理中途报错，
+// 调用方可根据返回的条数及错误再次清理。
+// 业务会话历史由 agent_v2 的 HistoryStore 保存。
 type Checkpointer interface {
 	// SaveNS 按 (sessionID, ns) 持久化 cp。
 	// cp.ID/cp.NS 自动填入 sessionID/ns。返 error 时 cp 状态未定义。
 	SaveNS(ctx context.Context, sessionID, ns string, cp *Checkpoint) error
+
+	// ClaimResume 原子核对 expected 并将当前槽推进到 [CPStatusResuming]，返回新世代。
+	// 读、比较和写同属一次原子操作。实现可用 [PrepareResumeCheckpoint] 生成新档，
+	// 并在提交时验证当前上下文的任务租约。失败时调用方不能继续执行。
+	ClaimResume(ctx context.Context, sessionID, ns string, expected, source *Checkpoint) (*Checkpoint, error)
 
 	// LoadNS 按 (sessionID, ns) 精确寻址。不存在返 (nil, nil)（不返 error 让
 	// caller 用 nil cp 判断"无快照"）。
@@ -101,11 +57,11 @@ type Checkpointer interface {
 	//
 	//   - 判据是 [IsNSInSubtree]，**段级匹配**——`sub` 的子树含 `sub/x`，**不含** `subx`
 	//     （别用裸字符前缀，业务 PG backend 的经典坑），也**不含** `sub#0`、`sub@1`。
-	//   - 非空前缀的实现**允许不原子**（`sql` 那个是「枚举 + 分批删」）：失败时返
-	//     「**已删条数** + 那个错」，留下半棵子树是可接受的。**别为此加事务或重试**——
-	//     引擎那侧对残留有自己的处置（见 [Checkpointer] 类型 godoc 的「残留」一节）。
-	//   - 空前缀（删整 session）**应当**是单条操作、天然原子。
-	DeleteSubtree(ctx context.Context, sessionID, nsPrefix string) (int32, error)
+	//   - 无条件删除覆盖指定子树。前缀为空时覆盖整个 session。非空前缀的实现允许
+	//     返部分已删条数及错误。
+	//   - 传入一个 [CheckpointDeleteCondition] 时，按原子核对时可见的子树验证每个存档，
+	//     只删除通过核对的精确槽。条件不成立时返回 [ErrCheckpointStale]，且删除零条。
+	DeleteSubtree(ctx context.Context, sessionID, nsPrefix string, condition ...CheckpointDeleteCondition) (int32, error)
 
 	// ListPending 返 sessionID 下所有 Status=Pending 的 cp。
 	// 用于 Resume 入口枚举有 pending cp 的 ns 子树, 业务 caller / framework
@@ -424,62 +380,26 @@ const (
 	//   - 业务能从 Status 看出「上次是失败不是挂起」
 	//   - `ListPending` 不返它——那个 API 的语义是「谁在等人回答」，失败现场没人在等
 	//
-	// ⚠️ **它不再决定「捡不捡这份档」**。三处闸门（Run 入口 auto-load / 子图载入 /
-	// `agent_v2.Resume`）统一读 [Checkpoint.HasResumableWork]，**按内容判**（frontier 或
-	// 挂起清单非空），不看档位——理由见那个方法的 godoc。
-	//
-	// 所以「从失败现场续跑」在 `agent_v2` 的 9 个编排上是**通的**：同 sid 再跑一次就是
-	// 从失败点重试（不带答案的 Resume 亦然），上游已成功的成员不重放。
-	//
-	// 这段曾经逐字写着相反的话（「auto-load 认不了它，判据是 `Status == CPStatusPending`」
-	// 「对 Failed 档一律返 `ErrNoPendingCheckpoint`」）——那是撤掉档位 gate 之前的行为。
-	//
-	// **不需要区分确定性错和瞬时错**——那个判断框架做不了（它看到的只是一个 error，
-	// 判不了下次会不会好），也不必做：标出「这是失败现场」就够了，要不要再试是业务的事。
+	// 失败状态仍允许恢复。恢复从已有 frontier 起步，已成功并记录的成员会保留。
+	// 入口在验证内容和任务身份后取得持久准入。
 	CPStatusFailed
 	// CPStatusAborted 标记遇到身份冲突的终局退出。只保存本层任务身份，
 	// frontier 和挂起清单留空，供续跑入口拒绝本任务的旧快照。
 	CPStatusAborted
+	// CPStatusResuming 保存已获准续跑的现场。进程退出或租约过期后，
+	// 仍须由显式放弃或已提交的后续状态结束此次准入。
+	CPStatusResuming
 )
 
-// Resumable 报这个**档位**能不能用来恢复执行——[CPStatusPending] 和 [CPStatusFailed]
-// 都能（两者都存着完整的 frontier 和 channel 状态）。
-//
-// ⚠️ **引擎的「捡不捡」判据已经不读档位了**（2026-08-13）：auto-load / 子图载入 /
-// `agent_v2.Resume` 统一读 [Checkpoint.HasResumableWork]（按**内容**判——frontier 或
-// 挂起清单非空）。本谓词保留给观测与报告场景；别再拿它当控制流判据，那会重造
-// 「同一个问题两处各判各的」（`subgraph.go` 曾用本谓词、根 auto-load 用
-// `== CPStatusPending`，同一份失败子档一条路捡一条路不捡，实测嵌套 Resume 时
-// 副作用重放）。
+// Resumable 报告 Pending 和 Failed 两类普通档位。执行前还须校验内容、身份和持久准入。
 func (s CheckpointStatus) Resumable() bool {
 	return s == CPStatusPending || s == CPStatusFailed
 }
 
-// HasResumableWork 报「这份档里还有没跑完的东西」——frontier 非空（有节点等着跑）或
-// 挂起清单非空（有人等着答）。**这是引擎「捡不捡这份档」的唯一判据**：Run 入口的
-// auto-load、子图载入、`agent_v2.Resume` 三处闸门共用本谓词。
-//
-// # 为什么按内容判，不按 Status 档位判
-//
-// 三条，每条都实测过：
-//
-//  1. **对 backend 漏序列化鲁棒**。业务自研 backend 漏存 `Status` 时档读回 [CPStatusUnset]——
-//     按档位判的话，一次真 HITL 中断退化成「fresh run 重放副作用 + 换新 InterruptID +
-//     答案永远配不上」，全程只有一条 warn。按内容判照样续上、答案送达。
-//  2. **拒得掉业务残档**。业务把一份「跑完了」的快照存进槽（frontier 空、无挂起），
-//     按存在判会把它当未完成任务捡起来——实测 Run 静默返 nil、一个节点都没跑、存档
-//     还被当成功清掉。按内容判它不是「可续的活」，照常 fresh run。
-//  3. **与出口同源**。引擎出口的「没 frontier 也没挂起就不写档」早退、
-//     `SnapshotForGraph` 的按内容盖章，用的都是这同一个谓词——判据只有一份，不漂。
-//
-// 内容判据适用于普通快照，终局标记不保存任何可续内容。曾按档位挡「失败档别自动捡」——那道 gate 的立论（隐式 auto-load 会
-// 静默捡起失败档再撞同错）在顶层已被 `agent_v2` 的新任务判定（恒 fresh）结构性覆盖，
-// 而它在嵌套层挡掉的恰恰是**合法的续跑**：Resume 重跑失败分支时子图捡不起自己的
-// 失败子档 ⟹ fresh run ⟹ 已完成超步的副作用重放（实测扣款 1→2；只把档位掰成
-// Pending、数据一字节不改，重放消失）。
-//
-// 矛盾档（挂起非空而 frontier 空）会被本谓词放进来、随后被 `ErrCheckpointNotResumable`
-// 自洽守卫**响亮拒绝**——这是有意的：那种档该被看见，不该被静默跳过。
+// HasResumableWork 报存档是否有待执行节点或待答问题。存量普通快照即使没有
+// Status，仍可按内容判断。恢复还要核对图、任务和目标槽的身份，并通过 [Checkpointer.ClaimResume]
+// 的持久准入。[CPStatusResuming] 保存诊断现场，本谓词仍可能为真。
+// 挂起非空且 frontier 为空的矛盾档由恢复入口拒绝。
 func (cp *Checkpoint) HasResumableWork() bool {
 	return cp != nil && (len(cp.CurrentFrontier) > 0 || len(cp.PendingInterrupts) > 0)
 }
@@ -515,6 +435,8 @@ func (s CheckpointStatus) String() string {
 		return "failed"
 	case CPStatusAborted:
 		return "aborted"
+	case CPStatusResuming:
+		return "resuming"
 	default:
 		return "unset"
 	}
@@ -682,9 +604,23 @@ func (c *InMemoryCheckpointer) ExistsNS(_ context.Context, sessionID, ns string)
 }
 
 // DeleteSubtree 删 sid 下 nsPrefix 这次执行的子树（自身 + 经 `/` 往下的后代，判据 [IsNSInSubtree]）。
-func (c *InMemoryCheckpointer) DeleteSubtree(_ context.Context, sessionID, nsPrefix string) (int32, error) {
+func (c *InMemoryCheckpointer) DeleteSubtree(_ context.Context, sessionID, nsPrefix string, condition ...CheckpointDeleteCondition) (int32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(condition) > 1 {
+		return 0, fmt.Errorf("expected at most one checkpoint delete condition")
+	}
+	if len(condition) == 1 {
+		var current []NSCheckpoint
+		for ns, cp := range c.data[sessionID] {
+			if IsNSInSubtree(nsPrefix, ns) {
+				current = append(current, NSCheckpoint{NS: ns, Checkpoint: cp})
+			}
+		}
+		if err := CheckCheckpointDeleteCondition(current, condition[0]); err != nil {
+			return 0, err
+		}
+	}
 	if c.data[sessionID] == nil {
 		return 0, nil
 	}

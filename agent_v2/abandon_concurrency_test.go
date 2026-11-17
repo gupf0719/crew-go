@@ -29,7 +29,7 @@ func (p *pausedTaskDeletion) LoadNS(ctx context.Context, sid, ns string) (*compo
 	return p.Checkpointer.LoadNS(ctx, sid, ns)
 }
 
-func (p *pausedTaskDeletion) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (p *pausedTaskDeletion) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if sid == p.task {
 		p.once.Do(func() { close(p.entered) })
 		select {
@@ -38,7 +38,7 @@ func (p *pausedTaskDeletion) DeleteSubtree(ctx context.Context, sid, ns string) 
 			return 0, ctx.Err()
 		}
 	}
-	return p.Checkpointer.DeleteSubtree(ctx, sid, ns)
+	return p.Checkpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 type pausedResumeTools struct {

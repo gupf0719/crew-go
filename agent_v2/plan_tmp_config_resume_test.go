@@ -34,6 +34,11 @@ func (c *planStaleRootCP) SaveNS(ctx context.Context, sid, ns string, cp *compos
 	c.saved = append(c.saved, ns)
 	c.mu.Unlock()
 	if c.failRoot.Load() && ns == "" {
+		winner := *cp
+		winner.Epoch = "other-execution-generation"
+		if err := c.InMemoryCheckpointer.SaveNS(ctx, sid, ns, &winner); err != nil {
+			return err
+		}
 		return fmt.Errorf("simulated concurrent advance: %w", compose_v2.ErrCheckpointStale)
 	}
 	return c.InMemoryCheckpointer.SaveNS(ctx, sid, ns, cp)

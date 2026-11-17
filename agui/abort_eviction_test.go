@@ -20,14 +20,14 @@ type evictionAbortCP struct {
 	badCtx  bool
 }
 
-func (c *evictionAbortCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *evictionAbortCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if sid == c.wantSID {
 		deadline, bounded := ctx.Deadline()
 		if ctx.Err() != nil || compose_v2.GetOwner(ctx) != "test-owner" || compose_v2.GetThreadID(ctx) != "old" || !bounded || time.Until(deadline) <= 0 || time.Until(deadline) > 11*time.Second {
 			c.badCtx = true
 		}
 	}
-	return c.failAbortCleanupCP.DeleteSubtree(ctx, sid, ns)
+	return c.failAbortCleanupCP.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func TestHandler_EvictionCompletesCancelledTaskHistory(t *testing.T) {

@@ -77,11 +77,11 @@ type taskCheckpoint struct {
 	id string
 }
 
-func (cp taskCheckpoint) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (cp taskCheckpoint) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if sid == cp.id && ns == "" {
 		return 0, nil
 	}
-	return cp.Store.DeleteSubtree(ctx, sid, ns)
+	return cp.Store.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func (m *Manager) advance(workerCtx context.Context, id string) (err error) {

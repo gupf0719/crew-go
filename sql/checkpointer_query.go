@@ -18,7 +18,7 @@ func (c *Checkpointer) ListPending(ctx context.Context, sessionID string) ([]com
 		`SELECT ns, payload FROM %s WHERE sid = %s AND status = %s ORDER BY ns`,
 		c.table, ph(1), ph(2),
 	)
-	return c.queryNSCheckpoints(ctx, q, sessionID, int(compose_v2.CPStatusPending))
+	return queryNSCheckpoints(ctx, c.db, q, sessionID, int(compose_v2.CPStatusPending))
 }
 
 // LoadAllInSession 实现 compose_v2.Checkpointer.LoadAllInSession.
@@ -28,7 +28,7 @@ func (c *Checkpointer) LoadAllInSession(ctx context.Context, sessionID string) (
 		`SELECT ns, payload FROM %s WHERE sid = %s ORDER BY ns`,
 		c.table, ph(1),
 	)
-	return c.queryNSCheckpoints(ctx, q, sessionID)
+	return queryNSCheckpoints(ctx, c.db, q, sessionID)
 }
 
 // Cleanup 实现 compose_v2.Checkpointer.Cleanup.

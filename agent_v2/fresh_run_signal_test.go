@@ -2,6 +2,7 @@ package agent_v2_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"crew-go/agent_v2"
@@ -332,8 +333,11 @@ func TestFreshRunSignal_ConsumersHonorIt(t *testing.T) {
 		}
 		// 同 session 发第二个任务，令 A 的子档在 B 进入图时迟到。
 		next := restoreCheckpointAfterAdmission(t, ctx, cp, sess.RunID, "g")
-		if _, err := seq.Run(next, sess, schema.UserMessage("任务B")); err != nil {
-			t.Fatalf("任务 B: %v", err)
+		if _, err := seq.Run(next, sess, schema.UserMessage("任务B")); !errors.Is(err, compose_v2.ErrCheckpointStale) {
+			t.Fatalf("任务 B 应执行自身节点，且在清理时保护迟到的旧任务存档：%v", err)
+		}
+		if saved, err := cp.LoadNS(ctx, sess.RunID, "g"); err != nil || !saved.HasResumableWork() {
+			t.Fatalf("任务 A 的旧档应保留，实际存档=%+v、错误=%v", saved, err)
 		}
 
 		// 承重：任务 B 的输入必须真的进图。漏读信号时这里会是 `<nil 输入>` 或者干脆是任务 A。

@@ -117,8 +117,8 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 
 	// 1. cper nil check (跟 9 编排 8330d6e 后 message 格式对齐:
 	//    "<agentTypeName> %q: resume requires compose_v2.Checkpointer in ctx (use compose_v2.WithCheckpointer)")
-	cper := compose_v2.GetCheckpointer(ctx)
-	if cper == nil {
+	configured := compose_v2.GetCheckpointer(ctx)
+	if configured == nil {
 		return nil, ctx, fmt.Errorf("%s %q: resume requires compose_v2.Checkpointer in ctx (use compose_v2.WithCheckpointer)", agentTypeName, agentName)
 	}
 
@@ -163,10 +163,15 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 			abandoned = []string{sessionID}
 		}
 	}
-	ctx, activity, err := compose_v2.BeginTaskActivity(ctx, runID, abandoned)
+	cper, err := compose_v2.ResolveCheckpointPartition(compose_v2.WithSessionIDCtx(ctx, sessionID), configured)
+	if err != nil {
+		return nil, ctx, err
+	}
+	ctx, activity, err := compose_v2.BeginTaskActivity(compose_v2.WithCheckpointerCtx(ctx, cper), runID, abandoned)
 	if err != nil {
 		return nil, ctx, fmt.Errorf("%s %q: %w", agentTypeName, agentName, err)
 	}
+	ctx = compose_v2.WithCheckpointerCtx(ctx, configured)
 	var transferActivity bool
 	defer func() {
 		if !transferActivity {
@@ -287,6 +292,9 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 		return nil, ctx, fmt.Errorf("%s %q: resume sid=%q ns=%q: 没有存档（sid 拼错 / 从未跑过 / 上次正常跑完已清）: %w",
 			agentTypeName, agentName, sessionID, ns, compose_v2.ErrNoPendingCheckpoint)
 	}
+	if savedCp.Status == compose_v2.CPStatusResuming {
+		return nil, ctx, compose_v2.ErrCheckpointResumeUnconfirmed
+	}
 	if !savedCp.HasResumableWork() {
 		// **手上有存档就把它的样子说出来**。哨兵仍是同一个（业务的 errors.Is 不变——
 		// 2026-08-11 定稿过「哨兵不变、消息区分」，别拆），但「档里没有可续的活」和
@@ -304,8 +312,8 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 	}
 
 	// 6. WithSession push
-	newCtx := compose_v2.BindResumeCheckpointTarget(WithSession(ctx, session), sessionID, ns, savedCp)
+	newCtx := compose_v2.BindResumeCheckpointTarget(WithSession(ctx, session), cper, sessionID, ns, savedCp)
 
 	transferActivity = true
-	return &resumePrep{Checkpoint: savedCp, Cper: cper, Rcfg: rcfg, Session: session, activity: activity}, newCtx, nil
+	return &resumePrep{Checkpoint: savedCp, Cper: configured, Rcfg: rcfg, Session: session, activity: activity}, newCtx, nil
 }

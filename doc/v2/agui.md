@@ -182,6 +182,8 @@ sequenceDiagram
 如果某条当前问题的答复已保存且图还停在该处，响应会带 `acceptedInterruptIds`。
 这时可发送同一个 ID、`status:"resolved"` 并省略 `payload`，由服务端重放已采纳的答复。
 线程正被驱动时返回 HTTP 409 `busy`。图已进入下一问时，迟到的旧 ID 返回 `invalid_resume`。
+若此前续跑的结果尚未持久确认，查询返回 `resumeBlocked: true`。仍有旧问题 ID 时可整批取消。过程档没有问题 ID 时，可在同一线程启动新任务来放弃旧任务。
+普通答复返回 HTTP 409 `checkpoint_not_resumable`，换 `runId` 仍受同一存档准入限制。
 
 共享路径重建 `agent_v2.RunSession`。已准入工具依赖图存档中的调用状态，新调用按当前工具审批规则判定。
 挂起上限和 TTL 适用于进程内会话。普通执行写入共享会话终态标记后，后续同线程请求会补偿未完成的清理。

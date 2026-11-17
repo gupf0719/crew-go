@@ -122,7 +122,7 @@ func (c *exitProbeCP) SaveNS(ctx context.Context, sid, ns string, cp *Checkpoint
 	return c.InMemoryCheckpointer.SaveNS(ctx, sid, ns, cp)
 }
 
-func (c *exitProbeCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *exitProbeCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...CheckpointDeleteCondition) (int32, error) {
 	c.deletes.Add(1)
 	if c.hangDelete.Load() {
 		<-ctx.Done()
@@ -134,7 +134,7 @@ func (c *exitProbeCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32,
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
-	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func exitCompile(t *testing.T, b *GraphBuilder) *Graph {
@@ -602,7 +602,7 @@ func (c *nsProbeCP) SaveNS(ctx context.Context, sid, ns string, cp *Checkpoint) 
 	return c.InMemoryCheckpointer.SaveNS(ctx, sid, ns, cp)
 }
 
-func (c *nsProbeCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *nsProbeCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...CheckpointDeleteCondition) (int32, error) {
 	c.mu.Lock()
 	c.delCount[ns]++
 	stall := c.delStall[ns]
@@ -615,7 +615,7 @@ func (c *nsProbeCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, e
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
-	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func blockGraphNamed(t *testing.T, name string, started chan<- struct{}) *Graph {
@@ -766,11 +766,8 @@ func TestExitGrace_LiveCtxCallNotRefused(t *testing.T) {
 	}
 }
 
-// 开着陈旧写回守卫：本执行（调用方已放弃）的嵌套层检查读挂住、把读预算用完；之后读恢复，另一个执行把槽推进成
-// 自己的挂起档；本执行根层终局清档时检查没做成——照常清。这道检查是尽力型的，拿不到结论时跟写档一样放行：代价是
-// 同一个 sid 上并发跑两个任务（违反 RunID 契约）时，另一个执行的挂起档跟着清掉（本用例的场景）；拦下的代价落在
-// 合法调用上——成功收尾时旧的挂起档留着、同样的答案再续跑一次会重放节点（见 SuccessPurgeCheckNotDoneStillCleans）。
-func TestExitCheckpoint_PurgeCheckNotDoneStillCleans(t *testing.T) {
+// 可选的陈旧探测耗尽读预算时，条件删除仍须保护另一执行者已推进的档。
+func TestExitCheckpoint_AtomicPurgeProtectsWinnerAfterProbeTimeout(t *testing.T) {
 	setExitGrace(t, 100*time.Millisecond)
 	cp := newNSProbeCP()
 	started := make(chan struct{}, 1)
@@ -790,6 +787,7 @@ func TestExitCheckpoint_PurgeCheckNotDoneStillCleans(t *testing.T) {
 		}
 		cpy := *other // 另一个执行推进了槽：写成自己的挂起档（换了一代）
 		cpy.Epoch = "epoch-of-other"
+		cpy.Status = CPStatusPending
 		cpy.PendingInterrupts = append([]*AskQuery{{InterruptID: "other-question", Question: "那边的用户正在答的问题"}}, cpy.PendingInterrupts...)
 		if err := cp.InMemoryCheckpointer.SaveNS(context.Background(), sid, "", &cpy); err != nil {
 			return nil, err
@@ -813,11 +811,13 @@ func TestExitCheckpoint_PurgeCheckNotDoneStillCleans(t *testing.T) {
 	}()
 	err := Run(ctx, g, NewChannelManager(), WithCheckpointer(cp), WithSessionID(sid), WithStaleWriteGuard(),
 		WithResumeAnswers(map[string]*schema.Message{ie.AllQueries()[0].InterruptID: schema.UserMessage("开始")}))
-	if left, _ := cp.InMemoryCheckpointer.LoadNS(context.Background(), sid, ""); left != nil {
-		t.Fatalf("清档前的检查没做成时应照常清，槽里还有 epoch=%s 的档：%v", left.Epoch, err)
+	left, readErr := cp.InMemoryCheckpointer.LoadNS(context.Background(), sid, "")
+	if readErr != nil || left == nil || left.Epoch != "epoch-of-other" ||
+		len(left.PendingInterrupts) == 0 || left.PendingInterrupts[0].InterruptID != "other-question" {
+		t.Fatalf("原子清档须保留另一执行者的挂起档，实际 %+v，读取错误 %v", left, readErr)
 	}
-	if !errors.Is(err, ErrRunAborted) || strings.Contains(fmt.Sprint(err), "purge failed") {
-		t.Fatalf("清成了，应只报业务的终局失败：%v", err)
+	if !errors.Is(err, ErrRunAborted) || !errors.Is(err, ErrCheckpointStale) {
+		t.Fatalf("应保留业务终局失败和拒绝清档的错误链：%v", err)
 	}
 }
 

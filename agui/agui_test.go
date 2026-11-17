@@ -776,11 +776,11 @@ type recordingCP struct {
 	deleted []string
 }
 
-func (c *recordingCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *recordingCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	c.mu.Lock()
 	c.deleted = append(c.deleted, sid)
 	c.mu.Unlock()
-	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func (c *recordingCP) deletedCount() int {
@@ -1005,11 +1005,11 @@ type panicOnReplacementDrop struct {
 	fail bool
 }
 
-func (cp *panicOnReplacementDrop) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (cp *panicOnReplacementDrop) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if cp.fail {
 		panic("replacement storage panic")
 	}
-	return cp.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return cp.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 // twoToolsModel 第一轮一次发两个 tool_call，第二轮给终局答复。

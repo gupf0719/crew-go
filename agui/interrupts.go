@@ -16,10 +16,11 @@ var errInvalidPending = errors.New("agui: invalid pending interrupt")
 type answerSchemas map[string]*jsonschema.Schema
 
 type interruptBatch struct {
-	epoch   string
-	events  []RunInterrupt
-	open    map[string]bool
-	schemas answerSchemas
+	epoch         string
+	events        []RunInterrupt
+	open          map[string]bool
+	schemas       answerSchemas
+	resumeBlocked bool
 }
 
 // projectInterrupts 统一 SSE 与重连查询的投影，校验待展示的结构化答复约束。

@@ -790,6 +790,11 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 					rejectSharedSession(ctx, sse, err)
 					return
 				}
+				if batch.resumeBlocked && !allCancelled {
+					_ = sse.Reject(http.StatusConflict, string(runoutcome.CheckpointNotResumable),
+						"the previous resume has no confirmed outcome")
+					return
+				}
 				pendingEpoch = batch.epoch
 				if len(batch.open) > 0 {
 					entry = &sessionEntry{sess: shared.session(), open: batch.open, schemas: batch.schemas, prior: shared.record.Prior}
@@ -1077,6 +1082,10 @@ func (h *handler) handleOutcome(ctx context.Context, sse eventWriter, key sessio
 				kind = runoutcome.CheckpointStale
 				slog.WarnContext(ctx, "agui: 投影挂起时失去任务租约", "err", leaseErr)
 				_ = sse.WriteEvent(NewRunError(kind.Message(), string(kind)))
+				return
+			}
+			if projectErr == nil && batch.resumeBlocked {
+				_ = sse.WriteEvent(NewRunError("the previous resume has no confirmed outcome", string(runoutcome.CheckpointNotResumable)))
 				return
 			}
 			if projectErr == nil && len(batch.open) == 0 {

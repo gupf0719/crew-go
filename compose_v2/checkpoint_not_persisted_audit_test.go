@@ -246,11 +246,11 @@ type panicDeleteCP struct {
 	panicDelete atomic.Bool
 }
 
-func (c *panicDeleteCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *panicDeleteCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if c.panicDelete.Load() {
 		panic("backend delete bug")
 	}
-	return c.notPersistedCP.DeleteSubtree(ctx, sid, ns)
+	return c.notPersistedCP.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 // 终局失败出口清档时后端 panic：清档失败写进错误，兜住的 panic 照样 errors.As 取得到。曾经清档失败只以文本

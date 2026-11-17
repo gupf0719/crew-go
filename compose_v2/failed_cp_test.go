@@ -86,7 +86,11 @@ func TestFailedCp_StatusMarkedAndResumedFromFailurePoint(t *testing.T) {
 		t.Errorf("失败节点跑了 %d 次，期望 2 次（Run1 一次 + 这次续跑一次）", got)
 	}
 
-	// ④ 显式指名那份存档：走的是另一条路（WithResumeFrom 根本不看 Status），同样从失败点续
+	// ④ 显式指名当前世代也能从失败点续跑。
+	cp, err = cper.LoadNS(ctx, sid, "")
+	if err != nil || cp == nil || cp.Status != compose_v2.CPStatusFailed {
+		t.Fatalf("应能载入新一轮失败存档：%v %v", cp, err)
+	}
 	upBefore, nBefore := ranUp.Load(), ranN.Load()
 	_ = compose_v2.Run(ctx, g, compose_v2.NewChannelManager(),
 		compose_v2.WithCheckpointer(cper), compose_v2.WithSessionID(sid),

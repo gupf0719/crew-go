@@ -43,11 +43,11 @@ func (c *notPersistedCP) SaveNS(ctx context.Context, sid, ns string, cp *compose
 	return c.InMemoryCheckpointer.SaveNS(ctx, sid, ns, cp)
 }
 
-func (c *notPersistedCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *notPersistedCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if c.honorCtx && ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
-	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func npCompile(t *testing.T, b *compose_v2.GraphBuilder) *compose_v2.Graph {

@@ -25,9 +25,9 @@ func (s *graphConflictStore) SaveNS(ctx context.Context, sid, ns string, cp *com
 	return s.InMemoryCheckpointer.SaveNS(ctx, sid, ns, cp)
 }
 
-func (s *graphConflictStore) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (s *graphConflictStore) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	s.deletes.Add(1)
-	return s.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return s.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 type graphConflictHooks struct {
@@ -676,8 +676,14 @@ func TestT503GraphCheckpointConflictKeepsAllPendingAcrossAncestors(t *testing.T)
 				answers[q.InterruptID] = schema.UserMessage(q.Question + "允许")
 			}
 			selected = original
-			if err := compose_v2.Run(ctx, root, compose_v2.NewChannelManager(),
-				append(opts, compose_v2.WithResumeAnswers(answers))...); err != nil {
+			err = compose_v2.Run(ctx, root, compose_v2.NewChannelManager(), append(opts, compose_v2.WithResumeAnswers(answers))...)
+			if scenario == "nested_commit_error" {
+				if !errors.Is(err, compose_v2.ErrCheckpointResumeUnconfirmed) || calls.safe != 0 || siblingAnswer != rolledBackAnswer {
+					t.Fatalf("未提交的子图续跑必须保留原档并拒绝重放，实际 err=%v child=%+v answer=%q", err, calls, siblingAnswer)
+				}
+				return
+			}
+			if err != nil {
 				t.Fatalf("恢复原子图后，两条原答案应能完成执行，实际 %v", err)
 			}
 			if calls.safe != 1 || calls.answer != calls.question+"允许" || siblingAnswer != siblingQuestion+"允许" {

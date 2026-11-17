@@ -87,7 +87,20 @@ func TestRedisCheckpointer_DeleteWithoutExistsPermission(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var check compose_v2.CheckpointDeleteCondition
+	slots, err := store.LoadAllInSession(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, slot := range slots {
+		if compose_v2.IsNSInSubtree("branch", slot.NS) {
+			check.Expected = append(check.Expected, slot)
+		}
+	}
 	setACL("-srem")
+	if n, err := store.DeleteSubtree(ctx, sid, "branch", check); err == nil || n != 0 {
+		t.Fatalf("缺少索引写权限时条件删除同样应保留全树，删除 %d 错误 %v", n, err)
+	}
 	if n, err := store.SaveSession(ctx, key, nil, sid); err == nil || n != 0 {
 		t.Fatalf("无索引写权限时应拒绝整次清理，删除 %d 错误 %v", n, err)
 	}
@@ -99,7 +112,7 @@ func TestRedisCheckpointer_DeleteWithoutExistsPermission(t *testing.T) {
 	}
 	setACL("+srem")
 
-	if n, err := store.DeleteSubtree(ctx, sid, "branch"); err != nil || n != 2 {
+	if n, err := store.DeleteSubtree(ctx, sid, "branch", check); err != nil || n != 2 {
 		t.Fatalf("运行角色应能清理自身和后代，删除 %d 错误 %v", n, err)
 	}
 	assertCheckpoint("branch", false)

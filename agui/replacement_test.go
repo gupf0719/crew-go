@@ -33,12 +33,12 @@ func (cp *replacementDeleteFailure) SaveNS(ctx context.Context, sid, ns string, 
 	return nil
 }
 
-func (cp *replacementDeleteFailure) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (cp *replacementDeleteFailure) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if sid == cp.failTask {
 		cp.failures++
 		return 0, errors.New("checkpoint storage unavailable")
 	}
-	return cp.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return cp.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func TestHandler_ReplacementDeleteFailureKeepsPendingTask(t *testing.T) {

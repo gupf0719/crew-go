@@ -216,6 +216,7 @@ func (s *sharedSession) pending(ctx context.Context) (interruptBatch, error) {
 	}
 	batch, err := projectInterrupts(cp.PendingInterrupts, "")
 	batch.epoch = cp.Epoch
+	batch.resumeBlocked = cp.Status == compose_v2.CPStatusResuming
 	return batch, err
 }
 
@@ -500,11 +501,12 @@ func (h *handler) servePending(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	err = json.NewEncoder(w).Encode(struct {
-		ThreadID   string         `json:"threadId"`
-		Interrupts []RunInterrupt `json:"interrupts"`
-		Accepted   []string       `json:"acceptedInterruptIds,omitempty"`
-		Version    string         `json:"workflowVersion,omitempty"`
-	}{threadID, batch.events, accepted, version})
+		ThreadID      string         `json:"threadId"`
+		Interrupts    []RunInterrupt `json:"interrupts"`
+		Accepted      []string       `json:"acceptedInterruptIds,omitempty"`
+		Version       string         `json:"workflowVersion,omitempty"`
+		ResumeBlocked bool           `json:"resumeBlocked,omitempty"`
+	}{threadID, batch.events, accepted, version, batch.resumeBlocked})
 	if err != nil {
 		slog.DebugContext(ctx, "agui: 挂起查询响应未送达", "err", err)
 	}

@@ -32,7 +32,7 @@ type cancelFailCP struct {
 	badContext atomic.Bool
 }
 
-func (c *cancelFailCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *cancelFailCP) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	c.calls.Add(1)
 	deadline, bounded := ctx.Deadline()
 	if ctx.Err() != nil || compose_v2.GetOwner(ctx) != "owner" || compose_v2.GetSessionID(ctx) != sid || !bounded || time.Until(deadline) < 9*time.Second || time.Until(deadline) > 11*time.Second {
@@ -44,7 +44,7 @@ func (c *cancelFailCP) DeleteSubtree(ctx context.Context, sid, ns string) (int32
 	if c.fail.Load() {
 		return 0, errors.New("injected delete failure")
 	}
-	return c.Checkpointer.DeleteSubtree(ctx, sid, ns)
+	return c.Checkpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func TestCancelTask_RetriesFailedCleanupAfterTerminalStatus(t *testing.T) {

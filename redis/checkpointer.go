@@ -107,6 +107,7 @@ func (c *Checkpointer) cpSidsKey() string {
 //	[6] = is_pending ("1" / "0")
 //	[7] = sid
 //	[8] = 任务租约 token（空表示调用方直接操作）
+//	[9] = 续跑准入时要求的原 payload（空串表示目标槽为空，普通写入不传）
 var saveNSScript = redis.NewScript(`
 local item_key   = KEYS[1]
 local meta_key   = KEYS[2]
@@ -125,6 +126,12 @@ local owner        = ARGV[8]
 
 if owner ~= "" and redis.call("GET", KEYS[6]) ~= owner then
     return "TASK_LEASE_LOST"
+end
+if ARGV[9] ~= nil then
+    local current = redis.call("GET", item_key)
+    if (ARGV[9] == "" and current ~= false) or (ARGV[9] ~= "" and current ~= ARGV[9]) then
+        return "CHECKPOINT_STALE"
+    end
 end
 
 -- HGET meta graph_id (单字段, 不需 cjson 解析 — iter-5-K Redis Hash 思路)
@@ -163,6 +170,29 @@ return "OK"
 
 // SaveNS 实现 compose_v2.Checkpointer.SaveNS.
 func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *compose_v2.Checkpoint) error {
+	return c.saveNS(ctx, sessionID, ns, cp, nil)
+}
+
+// ClaimResume 比较原始存档并原子写入续跑状态和索引。
+func (c *Checkpointer) ClaimResume(ctx context.Context, sid, ns string, expected, source *compose_v2.Checkpoint) (*compose_v2.Checkpoint, error) {
+	current, raw, err := c.loadNS(ctx, sid, ns)
+	if err != nil {
+		return nil, err
+	}
+	claimed, err := compose_v2.PrepareResumeCheckpoint(sid, ns, current, expected, source)
+	if err != nil {
+		return nil, err
+	}
+	if raw == nil {
+		raw = []byte{} // 区分要求空槽与无条件写入。
+	}
+	if err := c.saveNS(ctx, sid, ns, claimed, raw); err != nil {
+		return nil, err
+	}
+	return claimed, nil
+}
+
+func (c *Checkpointer) saveNS(ctx context.Context, sessionID, ns string, cp *compose_v2.Checkpoint, expected []byte) error {
 	if cp == nil {
 		return errors.New("checkpoint is nil")
 	}
@@ -202,6 +232,9 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 		fmt.Sprintf("%d", cp.CreatedAt),
 		isPending, sessionID, compose_v2.CheckpointTaskLeaseToken(ctx, c.CheckpointTaskLeases(), sessionID),
 	}
+	if expected != nil {
+		args = append(args, expected)
+	}
 
 	result, err := saveNSScript.Run(ctx, c.rdb, keys, args...).Result()
 	if err != nil {
@@ -209,15 +242,19 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 	}
 
 	switch result {
+	case "OK":
+		return nil
 	case "MIGRATION_REQUIRED":
 		return errors.New("redis checkpoint requires legacy key migration")
 	case "TASK_LEASE_LOST":
 		return fmt.Errorf("redis cp SaveNS: %w", compose_v2.ErrTaskLeaseLost)
+	case "CHECKPOINT_STALE":
+		return compose_v2.ErrCheckpointStale
 	case "GRAPH_ID_CONFLICT":
 		return fmt.Errorf("%w: sid=%q ns=%q new=%q",
 			compose_v2.ErrGraphIDConflict, sessionID, ns, cp.GraphID)
 	}
-	return nil
+	return fmt.Errorf("redis cp SaveNS: unexpected script reply %v", result)
 }
 
 // LoadNS 实现 compose_v2.Checkpointer.LoadNS. 不存在返 (nil, nil).
@@ -225,18 +262,23 @@ func (c *Checkpointer) SaveNS(ctx context.Context, sessionID, ns string, cp *com
 // **不变**: GET payload (完整 cp JSON) → UnmarshalCheckpoint → 返完整 cp. meta
 // hash 是 Lua 内部冗余索引, LoadNS 路径不感知.
 func (c *Checkpointer) LoadNS(ctx context.Context, sessionID, ns string) (*compose_v2.Checkpoint, error) {
+	cp, _, err := c.loadNS(ctx, sessionID, ns)
+	return cp, err
+}
+
+func (c *Checkpointer) loadNS(ctx context.Context, sessionID, ns string) (*compose_v2.Checkpoint, []byte, error) {
 	raw, err := c.rdb.Get(ctx, cpItemKey(c.prefix, sessionID, ns)).Bytes()
 	if errors.Is(err, redis.Nil) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("redis cp LoadNS: %w", err)
+		return nil, nil, fmt.Errorf("redis cp LoadNS: %w", err)
 	}
 	cp, err := compose_v2.UnmarshalCheckpoint(raw)
 	if err != nil {
-		return nil, fmt.Errorf("redis cp LoadNS unmarshal: %w", err)
+		return nil, nil, fmt.Errorf("redis cp LoadNS unmarshal: %w", err)
 	}
-	return cp, nil
+	return cp, raw, nil
 }
 
 // ExistsNS 实现 compose_v2.Checkpointer.ExistsNS.

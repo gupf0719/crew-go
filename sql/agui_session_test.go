@@ -311,9 +311,10 @@ func aguiPost(t *testing.T, h http.Handler, owner string, body any) *httptest.Re
 }
 
 type pendingAGUI struct {
-	Interrupts []agui.RunInterrupt `json:"interrupts"`
-	Accepted   []string            `json:"acceptedInterruptIds"`
-	Version    string              `json:"workflowVersion"`
+	Interrupts    []agui.RunInterrupt `json:"interrupts"`
+	Accepted      []string            `json:"acceptedInterruptIds"`
+	Version       string              `json:"workflowVersion"`
+	ResumeBlocked bool                `json:"resumeBlocked"`
 }
 
 func aguiPending(t *testing.T, h http.Handler, owner string) pendingAGUI {

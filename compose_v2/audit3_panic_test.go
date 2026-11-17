@@ -131,11 +131,11 @@ func (c *auditCheckpointer) SaveNS(ctx context.Context, sid string, ns string, c
 	return c.InMemoryCheckpointer.SaveNS(ctx, sid, ns, cp)
 }
 
-func (c *auditCheckpointer) DeleteSubtree(ctx context.Context, sid string, ns string) (int32, error) {
+func (c *auditCheckpointer) DeleteSubtree(ctx context.Context, sid string, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	c.mu.Lock()
 	c.deleteCalled = true
 	c.mu.Unlock()
-	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns)
+	return c.InMemoryCheckpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func (c *auditCheckpointer) wasDelete() bool {

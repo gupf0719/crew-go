@@ -156,11 +156,11 @@ func (c checkpointOwnerSelector) LoadAllInSession(ctx context.Context, sid strin
 	return c.Checkpointer.LoadAllInSession(ctx, sid)
 }
 
-func (c checkpointOwnerSelector) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c checkpointOwnerSelector) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if compose_v2.GetOwner(ctx) == "other" {
-		return c.other.DeleteSubtree(ctx, sid, ns)
+		return c.other.DeleteSubtree(ctx, sid, ns, condition...)
 	}
-	return c.Checkpointer.DeleteSubtree(ctx, sid, ns)
+	return c.Checkpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func TestFreshRunCheckpoint_RechecksOwnerChangedAtAgentStart(t *testing.T) {

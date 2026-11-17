@@ -85,10 +85,10 @@ func (c *observedSubgraphCheckpointer) LoadNS(ctx context.Context, sid, ns strin
 	return c.Checkpointer.LoadNS(ctx, sid, ns)
 }
 
-func (c *observedSubgraphCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (c *observedSubgraphCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	c.drops++
 	c.requireLease(ctx, sid)
-	return c.Checkpointer.DeleteSubtree(ctx, sid, ns)
+	return c.Checkpointer.DeleteSubtree(ctx, sid, ns, condition...)
 }
 
 func (c *observedSubgraphCheckpointer) requireLease(ctx context.Context, sid string) {

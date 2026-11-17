@@ -15,12 +15,13 @@ type hangingAbandonCheckpointer struct {
 	sid string
 }
 
-func (h hangingAbandonCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string) (int32, error) {
+func (h hangingAbandonCheckpointer) DeleteSubtree(ctx context.Context, sid, ns string, condition ...compose_v2.CheckpointDeleteCondition) (int32, error) {
 	if sid != h.sid {
-		return h.Checkpointer.DeleteSubtree(ctx, sid, ns)
+		return h.Checkpointer.DeleteSubtree(ctx, sid, ns, condition...)
 	}
 	<-ctx.Done()
 	return 0, ctx.Err()
+
 }
 
 // 入口收尾被放弃任务的存储调用有上限（abandonEntryTimeout）：后端挂住时到点告警、这次 Run 照常跑完。审计实测：曾经直接用这次

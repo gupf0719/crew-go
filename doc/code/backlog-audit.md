@@ -1,14 +1,26 @@
 # 历史待办与 Issue 核验台账
 
-基线为 2026-11-16 的本地和远端 `test`（`e185749`）。独立 worktree 的 `fb1f22e` 只有本次之前的三项 P1 修复，是基线的旁支。两者从 `552685b` 分开。2026-11-16 完成 A01 的合并态验证，下表记录关闭证据。GitHub Issue 查询返回 0 条，仓内 Issue 编号以 [Issue 索引](../issue/issues.md) 和专题 Markdown 为准。
+逐条核验基线为 2026-11-16 的本地和远端 `test`（`e185749`）。独立 worktree 的 `fb1f22e` 含当时的三项 P1 修复，两者从 `552685b` 分开。A01 合并后已完成验证。[2026-11-17 合入 test 后的核验](#2026-11-17-合入-test-后的核验) 记录了之后的变更。GitHub 当前无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
 
 [现行优先级清单](todo.md)是选择下一批的入口。这里保留 ISSUE-01 至 ISSUE-99、同编号专题、最近复审及历史 TODO 的逐项证据。历史 TODO 的 490 条含主表 327 行、优先级快照 48 项，以及发布、测试、文档和其他章节 115 项。同一事项在不同快照里的记录仍可回查。行号对应 [TODO 快照](todo-history.md)或 `e185749` 的文件。
 
 **证据口径**。以可达提交、当前生产路径和现存回归确认现行契约。只有历史结论或旧符号的记录保留为档案。导入文档中的部分短 SHA 在本地现有历史中无法解析，不能单独证明关闭。源码推导与本次实跑分别注明。本轮在基线复跑 `make test`，根模块、Redis、SQL 和 ZooKeeper 四组全部通过，另实测 ISSUE-24 的双槽存档问题。已有发布和凭据依赖用例的通过记录另列，目标 CI、真实 provider 和业务数据验收见 A02–A07。
 
+## 2026-11-17 合入 test 后的核验
+
+核对 `test` 从 `4d7aeec` 到 `0588906` 的改动及已有回归。`0f72f6b` 和 `0588906` 已推至 `origin/test`。合并态四个模块的 `make test` 以及 `make cover` 均通过，总覆盖率 88.2%。 A12 在 `b3f6b93` 已从待办表移除。逐行重算后，开放项为 66 项。
+
+| 事项 | 状态与证据 |
+| --- | --- |
+| 扇出身份冲突与终局失败并存 | 已关闭。父档封存，冲突子档保留，原错误链可查。跨层回归覆盖切回原图后外部写入仍为一次。 [扇出回归](../../agent_v2/terminal_checkpoint_conflict_test.go) |
+| 根档封存和 AG-UI 解绑同时失败 | 已关闭。确认两个收尾失败后，SQLite 另一实例换请求 ID 或直接 Resume 都被拒绝。子图 Sync 和 Async 过程档沿用已准入状态。 [AG-UI 回归](../../sql/agui_terminal_conflict_test.go) · [过程档回归](../../compose_v2/checkpoint_resume_test.go) |
+| 跨分区误删与清档竞态 | 已关闭。钩子把 Resume 路由到另一分区时，即使两份档完全相同也会拒绝。SQLite 独立连接在清档取样后插入新后代，条件删除保留两份档。 [分区回归](../../agent_v2/graph_checkpoint_late_backend_test.go) · [条件清档回归](../../sql/checkpointer_atomic_graph_test.go) |
+| D06、D10 的存档 API 问题 | 仍开放。`SaveNS` 仍会保存原输入指针，`SaveBatch` 仍同时写有原子和 best-effort 两种承诺。两者可在本机复测。 [内存实现与接口](../../compose_v2/checkpointer.go) |
+| A02、A09 的部署验收 | 共用存档部分暂缓。目标发布 CI、实际使用的后端升级和 Plan Web 单实例生产入口仍待验收。 [升级说明](../release/next.md) · [ISSUE-90](../issue/issue-90-plan-chat-web-lifecycle-prod.md) |
+
 ## 最近复审、发布与设计入口
 
-当前 test 相比 `552685b` 的提交只动了后台子 Agent、路由评测及相关文档和测试。下面原合并复审结论涉及的源码路径在 `e185749` 未改。静态保留复现能够依赖的代码位置，结合既有真实 Redis、SQLite、BasicAgent 与旧存档的红绿对照。本轮另复跑了 `test` 四模块默认套件。
+在 2026-11-16 的核验基线，`552685b` 到 `e185749` 的改动集中在后台子 Agent、路由评测及配套文档和测试。这里保留该轮的真实 Redis、SQLite、BasicAgent 和旧存档验证。
 
 | 来源 | 状态与归并 | 核对依据 |
 | --- | --- | --- |
@@ -67,7 +79,7 @@ A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合�
 | ISSUE-20 · doc/issue/issues.md:1829 | 决策，关闭提案 | compose_v2/graph.go:347、subgraph.go:138 继续用 AddNode / AddSubgraphNode 注册，NodeFunc 为公开执行入口。TestGraph_SimpleLinear、TestSubgraph_ImportFromParent。 |
 | ISSUE-21 · doc/issue/issues.md:1812 | 关闭 | compose_v2/checkpointer.go:664–670 的 SaveNS 仅要求非空 sid 和 cp，Checkpointer conformance 用无 owner 的上下文，TestCheckpointer_SaveLoad_BasicRoundTrip。 |
 | ISSUE-22 · doc/issue/issues.md:1798 | 关闭 | agent_v2/session.go:159–168 的 NewRunSession 生成 RunID，NextTask 换任务 ID。agent_v2/cross_task_isolation_test.go 核对新任务输入。 |
-| ISSUE-23 · doc/issue/issues.md:1747 | 关闭 | compose_v2/checkpointer.go:881 的 WithCheckpointerCtx，与 compose_v2/checkpointer_integration_test.go 的 TestCheckpointer_InjectionViaCtx / BusinessUseFromNode / BoundCheckpointerControlsGraphAndDetaches。 |
+| ISSUE-23 · doc/issue/issues.md:1747 | 关闭 | 现行 [WithCheckpointerCtx](../../compose_v2/checkpointer.go#L778)，与 compose_v2/checkpointer_integration_test.go 的 TestCheckpointer_InjectionViaCtx / BusinessUseFromNode / BoundCheckpointerControlsGraphAndDetaches。 |
 | ISSUE-24 · doc/issue/issues.md:1722 | H 项关闭或转入后续，L4 开放缺陷见 24-L4 | agent_v2/session.go:534 的 lane 提交、run_subagent.go 的嵌套身份、history_slot.go 的历史归属、compose_v2/graph_loop.go 的分支恢复分别有 member_history_scope、nested_call_identity、history_e2e 和 partial_failure_successor 回归。旧 H3 的事件托管见 ISSUE-40，M3 压缩见 ISSUE-45。 |
 | ISSUE-25 · doc/issue/issues.md:1701 | 关闭 | compose_v2/retry.go:145 的 ExponentialBackoff，TestRetry_BackoffDelayBasics 与 agent_v2/retry_integration_test.go 的 TestRetry_UsesExponentialBackoff。 |
 | ISSUE-26 · doc/issue/issues.md:1685 | 关闭 | compose_v2/exit_checkpoint.go 的退出存档与有界 grace。TestNodeTimeout_SiblingKeptAndCheckpointFailed、TestExitGrace_InnerTimeoutDoesNotConsumeCallerGrace / SlowBackendStillCompletes。 |

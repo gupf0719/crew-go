@@ -1,23 +1,25 @@
 # 项目待办
 
-2026-11-16 逐项核验以 `test` 的 `e185749` 为基线。A01 已完成 `fb1f22e` 与该基线的集成验证。GitHub 仓库当前没有独立 Issue 记录，仓内编号见 [Issue 索引](../issue/issues.md)。
+2026-11-17 对照 `test` 的 `0588906` 更新。本轮合入的终局扇出、持久续跑准入和跨分区清档已登记关闭。[GitHub](https://github.com/gupf0719/crew-go/issues) 当前没有开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **67 项**。P1 **0**、P2 **5**、P3 **62**。缺陷 **6**、能力缺口 **18**、待决 **26**、验收 **17**。
+共 **66 项**。P1 **0**、P2 **5**、P3 **61**。缺陷 **6**、能力缺口 **18**、待决 **26**、验收 **16**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
 - **待决**需要选择业务边界、回放语义或设计选项。
 - **验收**需要集成、凭据、目标环境，或先复核旧探针在当前版本上的结果。
 
+当前部署使用独立存档。A02 和 A09 中共用存档的升级、故障切换和跨副本续跑验收暂缓。发版 CI、实际使用的后端及单实例入口验收仍有各自的完成条件。
+
 ## P2 · 业务回归与发布验收
 
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
 | C06 | 能力缺口 | 提供 Anthropic 服务端 context editing | 当前已有签名回放和服务端 compaction。分别验证工具结果与 thinking 的编辑参数、beta 请求头、与既有缓存和前缀绑定的交互。历史 TODO 328。 [Anthropic](../../model/anthropic/client.go) |
-| A02 | 验收 | 发版候选的目标 CI 和存档升级验收 | `test-postgres` 和 `test-mysql` 已定义，`e185749` 提交记录含本机真库结果。收集目标 GitLab job 结果，准备回放 Redis 旧键迁移、SQL 身份列和 AG-UI 轮询表迁移，验证挂起恢复及回退。 [CI](../../.gitlab-ci.yml) · [升级说明](../release/next.md) |
-| A03 | 验收 | 路由模型接管门槛 | e185749 实现按输入和配置指纹做缓存回放、阈值扫描，已有 89 条构造会话验证工具链。需要脱敏业务样本、人审标签和模型调用结果来定错路由率、承接率和 P95 门槛。 [接入和评测](https://github.com/gupf0719/crew-go/blob/e18574950566e8b5a52f1f9ebff0f3da50028bca/doc/v2/route-decider.md) · [回放测试](https://github.com/gupf0719/crew-go/blob/e18574950566e8b5a52f1f9ebff0f3da50028bca/example/decision/routing_eval/replay_test.go) |
+| A02 | 验收 | 发版候选 CI 与存档升级 | 收集发布 SHA 对应的 PostgreSQL/MySQL CI 结果。在实际启用的后端验证旧挂起档、迁移与回退。共用存档的互斥和跨副本恢复验收暂缓。 [CI](../../.gitlab-ci.yml) · [升级说明](../release/next.md) |
+| A03 | 验收 | 路由模型接管门槛 | 仓内已有真服务报告与按输入、配置指纹做的离线回放。用当前业务的脱敏样本、人工标签及候选模型结果确定错路由率、承接率和端到端 P95 门槛。 [历史实测](../../example/decision/routing_eval/REPORT.md) · [接入和评测](../v2/route-decider.md) · [回放测试](../../example/decision/routing_eval/replay_test.go) |
 | A04 | 验收 | OpenAI 真模型流式和工具调用 | Chat Completions 和 Responses 各有流式与工具调用冒烟，共四个独立用例。有 `OPENAI_API_KEY` 时收集四项结果。 [冒烟测试](../../example/model/openai_smoke/openai_smoke_test.go) |
 | A05 | 验收 | Qwen 真模型链路和 A2A | 用现有 `llm_smoke` 验流式 artifact、服务端 HITL 和 Resume。按发布范围覆盖编排矩阵、Skill Action、工具审批与存档 durability。依赖 `QWEN_API_KEY`。 [冒烟命令](../description/smoke-test-recipes.md) |
 
@@ -25,8 +27,8 @@
 
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
-| D05 | 缺陷 | 修复合法慢后端的后台取消持续超时 | 守约的 6 秒逐页返回后端在现行 5 秒扫描预算下从不派发。在租约接管仍可推进的同时，恢复单页调用的有效预算。 [取消扫描](../../agui/cancellation_recovery.go#L150) |
-| D06 | 缺陷 | 修复内存 Checkpointer 复用输入指针导致的存档身份覆盖 | 同一 `Checkpoint` 顺序保存到两个任务后，第一槽读出的 ID/NS 被改写。独立输入对象作为控制组，核对身份及旧存档。 [内存实现](../../compose_v2/checkpointer.go#L687) · [ISSUE-24](../issue/issues.md#-issue-24--数据流转-bug-专项审查2026-04-15) |
+| D05 | 缺陷 | 修复慢后端的 AG-UI 后台取消补偿超时 | 启用 `WithSessionStore` 时，守约的 6 秒逐页返回后端在现行 5 秒扫描预算下从不派发。恢复列表调用的有效预算，并保证轮询租约到期后其他副本仍可接手。 [取消扫描](../../agui/cancellation_recovery.go) |
+| D06 | 缺陷 | 修复内存 Checkpointer 复用输入指针导致的存档身份覆盖 | `SaveNS` 原地填写 ID、NS 后保存同一指针，重复使用输入对象会改动上一槽的存档。用独立输入做对照，核对两个槽的身份与内容。 [内存实现](../../compose_v2/checkpointer.go#L547) · [ISSUE-24](../issue/issues.md#-issue-24--数据流转-bug-专项审查2026-04-15) |
 | D07 | 缺陷 | Redis 迁移兼容旧 GraphID 的 JSON 字节归一化 | 旧 writer 允许含非 UTF-8 字节的 GraphID，元数据使用原字节。真实 Redis 对照中迁移对普通 Unicode 成功，对该存档报错中止。验证迁移保留原元数据和结果可继续枚举。 [迁移校验](../../redis/checkpointer_migration.go#L55) |
 | D08 | 缺陷 | 限制 Handoff 历史模式的继承范围 | 源码及 ISSUE-93 记录显示 Handoff 模式随 ctx 进入内层非 Handoff 成员。复测成员选择的 prompt、事件和历史去重，再为拥有该配置的调用限定边界。 [ISSUE-93](../issue/issue-93-handoff-modelb-audit-low.md) · [成员派发](../../agent_v2/member_dispatch.go) |
 | D10 | 缺陷 | 统一 Checkpointer.SaveBatch 的文档承诺与行为 | 接口同时写了原子批量和逐条报错，三个后端实际逐条执行。当前内部没有生产调用者。用中间项失败的 conformance 固定选定的契约。 [接口](../../compose_v2/checkpointer.go) · [持久化决策](../description/three-way-comparison/checkpoint-storage.md) |
@@ -51,17 +53,17 @@
 | A06 | 验收 | Anthropic 真流和错误分类 | 核对空闲流处理、SSE 间隔、真实计费拒绝及 prompt-too-long 原文的可识别性。依赖 `ANTHROPIC_API_KEY` 与实际返回条件。 [冒烟命令](../description/smoke-test-recipes.md) |
 | A07 | 验收 | 跑齐 thinking 多轮回放、关停和 provider 变体 | 使用现有模型集成入口补 3 轮以上及中途关闭的对照。Anthropic 的空闲/计费另见 A06。历史 TODO 570。 |
 | A08 | 验收 | 复核有具体目标的弱测试与历史探针 | 核对 Reflect/Plan 失败重试代数、Toolkit.StreamCall 的流式分派与退化，以及观测扇出实例和真实 fallback 指标。ISSUE-99 的现有嵌套测试已断言各成员输出，补慢历史后端下共享输入只写一次的断言。provider 候选归 A18。历史 TODO 207、291、569、639–640、659 及 ISSUE-16、99。 |
-| A09 | 验收 | Plan Web 目标环境双副本和生产入口 | 已实现共享 Redis、生命周期和 mock 恢复。验真实用户鉴权、Cookie/反向代理、状态 TTL、部署迁移、双副本切换及故障窗口。 [ISSUE-90](../issue/issue-90-plan-chat-web-lifecycle-prod.md) |
+| A09 | 验收 | Plan Web 生产入口与生命周期 | mock 已覆盖挂起、续跑及完成态。目标环境仍需验鉴权、Cookie、反向代理、状态 TTL 和故障恢复。共享 Redis 迁移、双副本切换和跨副本续跑暂缓。 [ISSUE-90](../issue/issue-90-plan-chat-web-lifecycle-prod.md) |
 | A10 | 验收 | 明确 MySQL Store 的有限数值写入域与范围过滤 | 现有后端方言和 conformance 已覆盖默认类型；验证边界、越界和下推过滤的真实 MySQL 行为，再固定告警、返回或约束。历史 TODO 502。 [SQL 方言](../../sql/dialect.go) |
-| A11 | 验收 | GraphAgent 多层脱离与嵌套调用的任务边界 | 已验证有名和匿名图拓扑冲突、显式快照、GraphAgent 包装名和跨后端的子树归属。复核图外钩子、外来 ctx、裸调及闭包逻辑版本的剩余变体。旧档部署验收归 A02。 [任务隔离](../../agent_v2/detach_task.go) · [图存档身份](../v2/checkpoint.md#43-graphid-防串台) |
-| A13 | 验收 | 解决禁止重做的入口否决在重试中反复沿用原输入 | AddSubgraphNode、成员主图、RunWithRetry 有不同所有权边界。核对上游调用次数、可否合法推进重做代际和取消时存档保留，按条件避免原地耗尽重试。历史 TODO 562、563。 [条件边](../../compose_v2/out_edges.go) |
+| A11 | 验收 | GraphAgent 多层脱离与嵌套调用的任务边界 | 图身份、显式源档、钩子换分区及条件清档已有回归。余下核对图外钩子、外来 ctx、裸调和闭包逻辑改版，以及直接完成子图后再恢复父图时的完成记录归属。旧档部署验收归 A02。 [脱离入口](../../agent_v2/detach_origin_test.go) · [直接恢复子图](../../agent_v2/handoff_commit_test.go) · [分区回归](../../agent_v2/graph_checkpoint_late_backend_test.go) |
+| A13 | 验收 | 复核禁止重做的入口否决与重试 | 现有回归已覆盖有权重做的上游及若干钩子相位。余下用 AddSubgraphNode、成员主图和 RunWithRetry 对照不可重做的输入，检查上游调用次数、重试之间的代际与取消时的存档。 [条件边](../../compose_v2/out_edges.go) · [入口否决回归](../../compose_v2/entry_reject_paths_test.go) |
 | A14 | 验收 | 低阶 BasicAgentBuilder 的工具 tracing 使用自身类型查表 | 嵌套节点运行同名工具时，验证观测分类来自自身的位置与工具绑定，而不是调用方的表。历史 TODO 532。 [构建器](../../agent_v2/basic_builder.go) |
 | A15 | 验收 | 把 Anthropic 回放的隐藏 thinking 纳入预算核对 | `ReasoningContent` 文本已计入，签名块可能仅存在标注。优先用真实回放的服务端 input usage 对照触发点。历史 TODO 329。 [估算](../../compose_v2/token_estimate.go) · [Anthropic](../../model/anthropic/client.go) |
 | A16 | 验收 | 复测同一消息对象跨两个调用槽的历史归属 | 旧探针中第二份回复被判成透传。用当前真实 GraphAgent/HistoryStore 复测，同 ID 独立来源与真正透传作对照。历史 TODO 428。 [历史归属](../../agent_v2/history_slot.go) |
 | A17 | 验收 | 复测自定义模型的非 UTF-8 工具调用 ID | provider JSON 下不会产生这类 ID。通过自定义模型和持久存档复核中断寻址，确认入口应规范化还是拒绝。历史 TODO 341。Redis 旧 GraphID 另见 D07。 |
 | A18 | 验收 | 核对仍有独立使用意义的历史审查条目 | 对只有档案结论的事项按台账定位。先核对现行的长 HistoryKey 可移植边界、旧候选可用性及低阶/自定义入口，再决定是否补测试。 [历史 TODO 逐条表](backlog-audit.md#历史-todo-逐条核验) |
 | Q01 | 待决 | 可插拔 Sandbox 的一致性边界 | 现有 `Sandbox` 和工具适配器只提供约定及单测。确定哪些文件、网络、进程及取消语义由每个应用实现保证，是否要落可共享 conformance。 [现行契约](../v2/sandbox.md) · [接口](../../sandbox/sandbox.go) |
-| Q02 | 待决 | 多分支停机时对外报告与挂起记录的关系 | 确定一支存档失败时另一支已生成问题该如何报告和恢复，以及终局清除兄弟挂起时需否记录数量。保持现行错误优先级和错误链。 [超步退出](../../compose_v2/graph_loop.go) · [历史记录](todo-history.md) |
+| Q02 | 待决 | 多分支停机时对外报告与挂起记录的关系 | 终局错误与身份冲突并存时保留两条错误链，受保护的子档保留。余下决定某支存档失败时，哪些兄弟问题需要对外展示及如何继续处理，以及成功清理兄弟挂起档时是否报告数量。 [超步退出](../../compose_v2/graph_loop.go) · [历史记录](todo-history.md) |
 | Q03 | 待决 | MicroCompact 转存生命周期与取回契约 | 确定 offload 键回收 / TTL 的责任方及引用有效期。与按真实消息位置保留近期结果、存档引用仍可读取的现有回归一起验。 [压缩](../../agent_v2/microcompact.go) · [ISSUE-98](../issue/issue-98-conversation-history.md) |
 | Q05 | 待决 | 引入 AgenticMessage 或继续使用现行消息契约 | 对照现行 `schema.Message`、历史与流式适配器，决定是否需要双格式。依赖明确的跨 provider/消息生命周期诉求。 [演进状态](../description/three-way-comparison/eino-langgraph-upgrades.md) |
 | Q06 | 待决 | 故障分析 RCA 立项 | 已有设计提案。确认业务场景、知识来源和可信验收样本，再选择最小实现范围。 [设计](../v2/fault-analysis-system.md) |
@@ -89,6 +91,8 @@
 
 ## 已关闭及归并去向
 
+- **终局扇出与跨分区清档已修。** `0f72f6b` 保留终局失败和图身份冲突两条错误链，封存本层存档并保留冲突子档。`0588906` 把续跑绑定到实际分区，由后端原子核对清档范围。取得清档清单后出现新后代时，整次删除被拒绝。 [扇出回归](../../agent_v2/terminal_checkpoint_conflict_test.go) · [分区回归](../../agent_v2/graph_checkpoint_late_backend_test.go) · [条件清档回归](../../sql/checkpointer_atomic_graph_test.go)
+- **持久 Resume 准入已完成。** `0588906` 在派发节点之前领取存档世代。根档封存与 AG-UI 会话解绑都失败时，新请求或直接 Resume 都不能重复执行旧写入。Sync 和 Async 的子图过程档也有回归。合并态 `make test` 四个模块通过，`make cover` 的 10 个核心包达标，总覆盖率 88.2%。 [双失败回归](../../sql/agui_terminal_conflict_test.go) · [过程档回归](../../compose_v2/checkpoint_resume_test.go) · [本轮核验](backlog-audit.md#2026-11-17-合入-test-后的核验)
 - **A12 已修。** 错误树中的中断按分支顺序公开及落档，合法问题可全部续跑，非法叶子终止本批。聚合结果有独立的问题副本。 [回归](../../compose_v2/interrupt_fanout_regression_test.go)
 - **新任务准入和流式 fallback 已修。** 同 RunID 的可续档受任务登记保护。流预读有限，选中流的长限流影响后续请求，旧流的结束不会解除本次熔断。 [新任务回归](../../agent_v2/fresh_run_checkpoint_test.go) · [流式回归](../../fallback/stream_regression_test.go)
 - **D01、D02、D21 已修。** AG-UI 阻止迟到的新 Run 重复执行，撤回后丢弃同一模型调用的迟到工具事件，跨历史分区的替换在原历史库收尾且可补偿。 [复核台账](backlog-audit.md#最近复审发布与设计入口)

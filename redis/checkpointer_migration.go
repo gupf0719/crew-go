@@ -1,10 +1,13 @@
 package redis
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	goredis "github.com/redis/go-redis/v9"
 )
@@ -93,11 +96,11 @@ func (c *Checkpointer) migrateLegacyKey(ctx context.Context, sid, ns string) (bo
 		return false, err
 	}
 	var identity struct {
-		ID        string `json:"id"`
-		NS        string `json:"ns"`
-		GraphID   string `json:"graph_id"`
-		Status    int    `json:"status"`
-		CreatedAt int64  `json:"created_at"`
+		ID        string          `json:"id"`
+		NS        string          `json:"ns"`
+		GraphID   json.RawMessage `json:"graph_id"`
+		Status    int             `json:"status"`
+		CreatedAt int64           `json:"created_at"`
 	}
 	if err := json.Unmarshal(raw, &identity); err != nil {
 		return false, fmt.Errorf("decode legacy checkpoint identity: %w", err)
@@ -105,8 +108,37 @@ func (c *Checkpointer) migrateLegacyKey(ctx context.Context, sid, ns string) (bo
 	if identity.ID != checkpointJSONIdentity(sid) || identity.NS != checkpointJSONIdentity(ns) {
 		return false, errors.New("legacy checkpoint identity does not match the index")
 	}
+	var graphID string
+	if identity.GraphID != nil {
+		if err := json.Unmarshal(identity.GraphID, &graphID); err != nil {
+			return false, fmt.Errorf("decode legacy checkpoint graph identity: %w", err)
+		}
+	}
+	if strings.ContainsRune(graphID, utf8.RuneError) {
+		// 旧 writer 的 json.Marshal 把非法 UTF-8 字节写成 \ufffd，字面的替换字符按 UTF-8 写入。
+		// 用旧 hash 重现 JSON 拼写以区分两者，再由脚本按读到的原字节复核并迁移。
+		fields, err := c.rdb.HMGet(ctx, oldMeta, "graph_id").Result()
+		if err != nil {
+			return false, fmt.Errorf("read legacy checkpoint graph identity: %w", err)
+		}
+		if len(fields) != 1 {
+			return false, errors.New("legacy metadata is missing or invalid")
+		}
+		storedGraphID, ok := fields[0].(string)
+		if !ok {
+			return false, errors.New("legacy metadata does not match the checkpoint")
+		}
+		wireGraphID, err := json.Marshal(storedGraphID)
+		if err != nil {
+			return false, fmt.Errorf("encode legacy checkpoint graph identity: %w", err)
+		}
+		if !bytes.Equal(wireGraphID, identity.GraphID) {
+			return false, errors.New("legacy metadata does not match the checkpoint")
+		}
+		graphID = storedGraphID
+	}
 	result, err := migrateLegacyCheckpoint.Run(ctx, c.rdb, []string{oldItem, oldMeta, newItem, newMeta},
-		raw, identity.GraphID, identity.Status, identity.CreatedAt).Text()
+		raw, graphID, identity.Status, identity.CreatedAt).Text()
 	if err != nil {
 		return false, err
 	}
@@ -116,7 +148,7 @@ func (c *Checkpointer) migrateLegacyKey(ctx context.Context, sid, ns string) (bo
 	return true, nil
 }
 
-// 旧 payload 的 JSON 将每个非法 UTF-8 字节替换为 U+FFFD，Redis 索引保留原字节。
+// 旧 payload 的 JSON 将每个非法 UTF-8 字节替换为 U+FFFD，Redis 索引和元数据保留原字节。
 func checkpointJSONIdentity(value string) string {
 	return string([]rune(value))
 }

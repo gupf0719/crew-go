@@ -61,6 +61,7 @@ func WithCancellationHistory(resolve func(ctx context.Context, key agent_v2.Hist
 
 const (
 	cancellationPollInterval = 5 * time.Second
+	cancellationListTimeout  = 10 * time.Second
 	cancellationPageSize     = 64
 	cancellationConcurrency  = 4
 )
@@ -146,7 +147,7 @@ func (r *cancellationRecovery) complete(result cancellationResult) {
 
 func (h *handler) scanCancellations(ctx context.Context, store CancellationPollStore, r *cancellationRecovery) (token string, err error) {
 	defer catchCancellationPollPanic(ctx, "agui: scan cancellations", &err)
-	// 从申请前计时并且不续约。即使读取索引卡住，其他实例仍可在租约到期后扫描。
+	// 新页准入从申请前计时。轮询租约有固定期限，期间无续约。
 	scanCtx, cancel := context.WithTimeout(ctx, cancellationPollInterval)
 	defer cancel()
 	if store != nil {
@@ -179,7 +180,7 @@ func catchCancellationPollPanic(ctx context.Context, operation string, err *erro
 func (h *handler) discoverCancellations(ctx, scanCtx context.Context, r *cancellationRecovery) error {
 	for scanCtx.Err() == nil {
 		if len(r.pending) == 0 {
-			keys, next, err := h.listCancellations(scanCtx, r.cursor)
+			keys, next, err := h.listCancellations(ctx, r.cursor)
 			if err != nil {
 				return err
 			}
@@ -188,8 +189,9 @@ func (h *handler) discoverCancellations(ctx, scanCtx context.Context, r *cancell
 			}
 			r.pending, r.cursor = keys, next
 		}
-		// 最多保留一页待派发候选。任务一旦开始便使用自己的时限，不受轮询租约替换影响。
-		for len(r.pending) > 0 && scanCtx.Err() == nil {
+		// 迟于轮询窗口返回的页仍可用空闲名额。候选在补偿时会在会话租约下重读。
+		// 满载等待与开始新页受轮询窗口约束，未派发项保留到下一轮。
+		for len(r.pending) > 0 && ctx.Err() == nil {
 			key := r.pending[0]
 			if _, busy := r.active[key]; busy {
 				r.pending = r.pending[1:]
@@ -243,7 +245,13 @@ func (h *handler) listCancellations(ctx context.Context, cursor string) (keys []
 			err = panicerr.WrapOpaque("agui: list cancellations", p)
 		}
 	}()
-	return h.sessionStore.ListCancellations(ctx, cursor, cancellationPageSize)
+	listCtx, cancel := context.WithTimeout(ctx, cancellationListTimeout)
+	defer cancel()
+	keys, next, err = h.sessionStore.ListCancellations(listCtx, cursor, cancellationPageSize)
+	if err == nil {
+		err = listCtx.Err()
+	}
+	return keys, next, err
 }
 
 func (h *handler) recoverCancellation(ctx context.Context, key string) (err error) {

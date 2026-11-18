@@ -1,10 +1,10 @@
 # 项目待办
 
-2026-11-17 在 `test` 的 `0588906` 基础上核对。终局扇出、持久续跑准入和跨分区清档已合入 `test`。D06、D11、D08、D10 已在修复分支关闭。基线核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
+2026-11-18 在 `test` 的 `0588906` 基础上核对。终局扇出、持久续跑准入和跨分区清档已合入 `test`。D06、D11、D08、D10、D05、D07 已在修复分支关闭。基线核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **62 项**。P1 **0**、P2 **5**、P3 **57**。缺陷 **2**、能力缺口 **18**、待决 **26**、验收 **16**。
+共 **60 项**。P1 **0**、P2 **5**、P3 **55**。缺陷 **0**、能力缺口 **18**、待决 **26**、验收 **16**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -27,8 +27,6 @@
 
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
-| D05 | 缺陷 | 修复慢后端的 AG-UI 后台取消补偿超时 | 启用 `WithSessionStore` 时，守约的 6 秒逐页返回后端在现行 5 秒扫描预算下从不派发。恢复列表调用的有效预算，并保证轮询租约到期后其他副本仍可接手。 [取消扫描](../../agui/cancellation_recovery.go) |
-| D07 | 缺陷 | Redis 迁移兼容旧 GraphID 的 JSON 字节归一化 | 旧 writer 允许含非 UTF-8 字节的 GraphID，元数据使用原字节。真实 Redis 对照中迁移对普通 Unicode 成功，对该存档报错中止。验证迁移保留原元数据和结果可继续枚举。 [迁移校验](../../redis/checkpointer_migration.go#L55) |
 | C01 | 能力缺口 | MCP Streamable HTTP 的独立 GET 推送和 SSE 断线续订 | POST 响应 SSE、会话协商、过期重建和 DELETE 已覆盖。余下 GET/事件续订按同一会话和游标对账。 [MCP 已知缺口](../v2/mcp.md#9-已知缺口) · [现有会话回归](../../mcp/http_session_test.go) |
 | C02 | 能力缺口 | MCP 工具的图片、音频结果透传 | 现行适配器生成文字说明。各支持媒体的模型适配器需要保留工具结果的内容块和调用配对。 [适配器](../../mcp/tool_adapter.go) · [MCP 已知缺口](../v2/mcp.md#9-已知缺口) |
 | C03 | 能力缺口 | 从协议层报告细粒度断点信息 | 核心已有断点。按协议分别定义 AG-UI 和 A2A 的调试暂停事件、节点身份、续跑地址和状态映射。 [中断契约](../v2/hitl-resume.md) |
@@ -56,7 +54,7 @@
 | A14 | 验收 | 低阶 BasicAgentBuilder 的工具 tracing 使用自身类型查表 | 嵌套节点运行同名工具时，验证观测分类来自自身的位置与工具绑定，而不是调用方的表。历史 TODO 532。 [构建器](../../agent_v2/basic_builder.go) |
 | A15 | 验收 | 把 Anthropic 回放的隐藏 thinking 纳入预算核对 | `ReasoningContent` 文本已计入，签名块可能仅存在标注。优先用真实回放的服务端 input usage 对照触发点。历史 TODO 329。 [估算](../../compose_v2/token_estimate.go) · [Anthropic](../../model/anthropic/client.go) |
 | A16 | 验收 | 复测同一消息对象跨两个调用槽的历史归属 | 旧探针中第二份回复被判成透传。用当前真实 GraphAgent/HistoryStore 复测，同 ID 独立来源与真正透传作对照。历史 TODO 428。 [历史归属](../../agent_v2/history_slot.go) |
-| A17 | 验收 | 复测自定义模型的非 UTF-8 工具调用 ID | provider JSON 下不会产生这类 ID。通过自定义模型和持久存档复核中断寻址，确认入口应规范化还是拒绝。历史 TODO 341。Redis 旧 GraphID 另见 D07。 |
+| A17 | 验收 | 复测自定义模型的非 UTF-8 工具调用 ID | provider JSON 下不会产生这类 ID。通过自定义模型和持久存档复核中断寻址，确认入口应规范化还是拒绝。历史 TODO 341。Redis 旧 GraphID 的迁移修复见 [D07](backlog-audit.md#2026-11-18-剩余缺陷修复)。 |
 | A18 | 验收 | 核对仍有独立使用意义的历史审查条目 | 对只有档案结论的事项按台账定位。先核对现行的长 HistoryKey 可移植边界、旧候选可用性及低阶/自定义入口，再决定是否补测试。 [历史 TODO 逐条表](backlog-audit.md#历史-todo-逐条核验) |
 | Q01 | 待决 | 可插拔 Sandbox 的一致性边界 | 现有 `Sandbox` 和工具适配器只提供约定及单测。确定哪些文件、网络、进程及取消语义由每个应用实现保证，是否要落可共享 conformance。 [现行契约](../v2/sandbox.md) · [接口](../../sandbox/sandbox.go) |
 | Q02 | 待决 | 多分支停机时对外报告与挂起记录的关系 | 终局错误与身份冲突并存时保留两条错误链，受保护的子档保留。余下决定某支存档失败时，哪些兄弟问题需要对外展示及如何继续处理，以及成功清理兄弟挂起档时是否报告数量。 [超步退出](../../compose_v2/graph_loop.go) · [历史记录](todo-history.md) |
@@ -86,6 +84,8 @@
 | Q27 | 待决 | 持久化业务状态演进与按执行 namespace 查历史 | ISSUE-70 Phase 4 的通用状态迁移需要版本化调用方。SelfHistoryByNS 希望按执行 namespace 查写入记录，先核对执行位置能否成为历史身份。 [ISSUE-70](../issue/issue-70-checkpoint-evolution.md) |
 
 ## 已关闭及归并去向
+
+- **D05、D07 已修。** AG-UI 的慢页能跨轮询窗口继续读取和派发。Redis 旧档迁移识别 JSON 对非法 UTF-8 的替换，保留原始元数据和索引。 [回归与关闭记录](backlog-audit.md#2026-11-18-剩余缺陷修复)
 
 - **D06、D11、D08、D10 已修。** 写档保留调用方输入，确认整任务收尾后回收审批规则，Handoff 共享历史只在直接候选调用生效，批量写档按 namespace 字节序停止在首个错误。 [回归与关闭记录](backlog-audit.md#2026-11-17-四项缺陷修复)
 

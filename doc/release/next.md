@@ -72,7 +72,9 @@ CREATE TABLE IF NOT EXISTS crew_checkpoint_task_lease (
 Redis Checkpointer 将任务 ID 编为独立的 base64url 键段，namespace 及三个枚举索引沿用原值。
 已有存档的部署先停止同一 Redis 前缀下的所有存档读写者并备份，再对每个使用中的前缀构造
 `redis.NewCheckpointer` 并调用 `(*Checkpointer).MigrateLegacyKeys(ctx)`。迁移成功后启动新版，
-查询已有挂起项并验证续跑。迁移中断后可重试，已迁移的记录会跳过。旧数据的记录归属或元数据不一致时，
+查询已有挂起项并验证续跑。迁移中断后可重试，已迁移的记录会跳过。
+如果 Redis 元数据里的旧 GraphID 含非法 UTF-8 字节，迁移按旧写入器的 JSON 编码核对 payload，原样移动元数据。字面 U+FFFD 与非法字节产生的 JSON 转义各有不同编码。
+旧数据的记录归属或元数据不一致时，
 按错误中的任务与 namespace 核对备份后再继续。旧格式已经覆盖的内容只能从备份或应用数据恢复。
 需要回退时使用迁移前的备份。
 会话记录、任务租约及 Store 数据沿用原键。 [Redis Checkpointer](../../redis/checkpointer_migration.go)

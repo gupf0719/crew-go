@@ -27,6 +27,13 @@
 | D08 | Raw 和 Rewrite 绑定到直接候选。内层成员用各自历史，三跳送模视图按原始消息 ID 合并同一用户输入，各归属的审计记录保留。回归也覆盖使用新 session 续跑时恢复本轮输入。 [跨层回归](../../agent_v2/handoff_modelb_test.go) |
 | D10 | 批量按 namespace 字节序调用 `SaveNS`。中项冲突时保留成功前缀，冲突槽和尾部槽保持旧值。 [共用回归](../../compose_v2/checkpointer_conformance/save_batch.go) |
 
+## 2026-11-18 剩余缺陷修复
+
+| ID | 关闭依据 |
+| --- | --- |
+| D05 | AG-UI 每页读取有独立时限。回归让两个页面各用六秒，验证其他副本在五秒租约到期后能取锁，后台完整清档并沿原游标推进。 [跨层回归](../../agui/cancellation_recovery_internal_test.go) |
+| D07 | Redis 按旧写入器的 JSON 编码确认 GraphID，在移动前按原字节复核。回归核对非法 UTF-8、字面 U+FFFD 和普通 Unicode 的迁移、原字节、读档和挂起项枚举，也验证不同 JSON 编码的冲突保留源键。 [迁移回归](../../redis/checkpointer_migration_test.go) |
+
 ## 最近复审、发布与设计入口
 
 在 2026-11-16 的核验基线，`552685b` 到 `e185749` 的改动集中在后台子 Agent、路由评测及配套文档和测试。这里保留该轮的真实 Redis、SQLite、BasicAgent 和旧存档验证。
@@ -40,8 +47,8 @@
 | 合并后复审 P2 · AG-UI 撤回后仍发工具结果 | D02 已修 | HTTP/SSE 实测撤回后的增量不会产生孤儿结果，新的模型调用复用 provider ID 时仍正常配对，模型历史仍收到两次真实工具结果。 [回归](../../agui/tool_result_withdrawal_test.go) |
 | 合并后复审 P2 · 旧摘要在提前失败后丢失相位 | 随 A01 完成升级验收 | 原版 `b7c2241` fixture 依赖旧相位。合并态覆盖首次可重试失败、原档仍可执行、新摘要问题独立审批、原业务答复仍有效和最终完成。 [归属与重试](../../agent_v2/autocompact_approval_resume_test.go) |
 | 合并后复审 P2 · Redis 清档权限 | D04 已修 | Redis 7.4.2 验证无 EXISTS 的运行角色可清档，仅索引允许 TYPE 的角色也可走原有权限。权限不足时存档和会话保留。 [回归](../../redis/checkpointer_delete_acl_test.go) |
-| 合并后复审 P3 · 慢后端取消补偿 | 开放 D05 | `agui/cancellation_recovery.go:150`。逐页第 6 秒返回的守约 backend 在 5 秒预算下持续超时，旧版能推进。 |
-| 合并后复审 P3 · Redis 旧 GraphID | 开放 D07 | `redis/checkpointer_migration.go:55`。真实 Redis 对照，普通 Unicode 成功，旧 writer 存入带非 UTF-8 字节的 GraphID 后迁移失败。 |
+| 合并后复审 P3 · 慢后端取消补偿 | D05 已修 | 旧扫描在五秒时限取消六秒返回的页面。修复和回归见[剩余缺陷修复](#2026-11-18-剩余缺陷修复)。 |
+| 合并后复审 P3 · Redis 旧 GraphID | D07 已修 | 旧迁移比较原字节和 JSON 替换后的值，误拒绝含非 UTF-8 字节的 GraphID。修复和回归见[剩余缺陷修复](#2026-11-18-剩余缺陷修复)。 |
 | ISSUE-24 · 内存存档引用 | D06 已修 | 基线把同一输入写入 `alpha/left`、`beta/right` 后，第一槽读出第二槽身份。现在各槽保存自己的顶层值，按 [D06 回归](#2026-11-17-四项缺陷修复)复核。 |
 | 后台子 Agent · 原 defer | 关闭 | `e185749` 实现显式派单、独立任务及跨进程恢复。提交与 [SQL 后台恢复回归](https://github.com/gupf0719/crew-go/blob/e18574950566e8b5a52f1f9ebff0f3da50028bca/sql/background_recovery_test.go) 有写入重试、崩溃恢复、父任务唤醒证据。不同于普通嵌套工具自动转后台。 |
 | 离线路由评测 · 原线上回放缺口 | 回放框架已关闭，验收 A03 | `e185749` 的 `TestReplayScansThresholdsWithoutCredentials` 验缓存回放。真实标签流量与上线门槛仍待。 |

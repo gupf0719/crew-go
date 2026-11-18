@@ -1,9 +1,14 @@
 package redis_test
 
 import (
+	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
+	"maps"
+	"strings"
 	"testing"
+	"time"
 
 	"crew-go/compose_v2"
 	crewredis "crew-go/redis"
@@ -73,6 +78,90 @@ func TestRedisCheckpointer_MigrateLegacyKeys(t *testing.T) {
 	}
 	if n, err := cp.DeleteSubtree(ctx, sid, ""); err != nil || n != 3 {
 		t.Fatalf("expected remaining three checkpoints to be deleted, got %d: %v", n, err)
+	}
+}
+
+func TestRedisCheckpointer_MigrateLegacyKeysGraphID(t *testing.T) {
+	const invalidGraphID = "报表-\xff\xc0\xaf"
+	const replacementGraphID = "报表-\uFFFD\uFFFD\uFFFD"
+	for _, tt := range []struct {
+		name, graphID, metadataGraphID, decodedGraphID string
+		reject                                         bool
+	}{
+		{name: "unicode", graphID: "报表-一", metadataGraphID: "报表-一", decodedGraphID: "报表-一"},
+		{name: "invalid_utf8", graphID: invalidGraphID, metadataGraphID: invalidGraphID, decodedGraphID: replacementGraphID},
+		{name: "literal_replacement_runes", graphID: replacementGraphID, metadataGraphID: replacementGraphID, decodedGraphID: replacementGraphID},
+		{name: "different_metadata", graphID: invalidGraphID, metadataGraphID: "工单-\xff\xc0\xaf", reject: true},
+		{name: "invalid_utf8_payload_literal_metadata", graphID: invalidGraphID, metadataGraphID: replacementGraphID, reject: true},
+		{name: "literal_payload_invalid_utf8_metadata", graphID: replacementGraphID, metadataGraphID: invalidGraphID, reject: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			client := goredis.NewClient(&goredis.Options{Addr: aguiRedisAddress(t)})
+			t.Cleanup(func() { _ = client.Close() })
+			const sid, ns = "team:reports", "planner/main"
+			prefix := "checkpoint-migration-graph-id-" + rand.Text()
+			cp := crewredis.NewCheckpointer(client, crewredis.WithCheckpointerPrefix(prefix))
+			oldItem, oldMeta := prefix+":cp:item:"+sid+":"+ns, prefix+":cp:meta:"+sid+":"+ns
+			encodedSID := base64.RawURLEncoding.EncodeToString([]byte(sid))
+			newItem, newMeta := prefix+":cp:item-v2:"+encodedSID+":"+ns, prefix+":cp:meta-v2:"+encodedSID+":"+ns
+			sids, namespaces, pending := prefix+":cp:sids", prefix+":cp:nsidx:"+sid, prefix+":cp:pending:"+sid
+			t.Cleanup(func() {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				if err := client.Del(cleanupCtx, oldItem, oldMeta, newItem, newMeta, sids, namespaces, pending).Err(); err != nil {
+					t.Error(err)
+				}
+			})
+			record := &compose_v2.Checkpoint{ID: sid, NS: ns, GraphID: tt.graphID, Status: compose_v2.CPStatusPending, CreatedAt: 12345}
+			raw, err := compose_v2.MarshalCheckpoint(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata := map[string]string{"graph_id": tt.metadataGraphID, "status": "1", "created_at": "12345"}
+			if _, err := client.Pipelined(ctx, func(pipe goredis.Pipeliner) error {
+				pipe.Set(ctx, oldItem, raw, 0)
+				pipe.HSet(ctx, oldMeta, metadata)
+				pipe.SAdd(ctx, sids, sid)
+				pipe.SAdd(ctx, namespaces, ns)
+				pipe.SAdd(ctx, pending, ns)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			n, err := cp.MigrateLegacyKeys(ctx)
+			keptItem, keptMeta, absentItem, absentMeta := newItem, newMeta, oldItem, oldMeta
+			if tt.reject {
+				if n != 0 || err == nil || !strings.Contains(err.Error(), "legacy metadata does not match the checkpoint") {
+					t.Fatalf("应拒绝元数据中的真实身份冲突，迁移 %d 条，错误 %v", n, err)
+				}
+				keptItem, keptMeta, absentItem, absentMeta = oldItem, oldMeta, newItem, newMeta
+			} else if n != 1 || err != nil {
+				t.Fatalf("应迁移一条 GraphID 匹配的存档，实际 %d 条，错误 %v", n, err)
+			}
+			if got, err := client.Get(ctx, keptItem).Result(); err != nil || got != string(raw) {
+				t.Fatalf("存档 payload 应逐字节保留，实际 %q，错误 %v", got, err)
+			}
+			if got, err := client.HGetAll(ctx, keptMeta).Result(); err != nil || !maps.Equal(got, metadata) {
+				t.Fatalf("存档元数据应逐字节保留，实际 %q，错误 %v", got, err)
+			}
+			if existing, err := client.Exists(ctx, absentItem, absentMeta).Result(); err != nil || existing != 0 {
+				t.Fatalf("另一套键应为空，实际 %d 条，错误 %v", existing, err)
+			}
+			if tt.reject {
+				return
+			}
+			loaded, err := cp.LoadNS(ctx, sid, ns)
+			if err != nil || loaded == nil || loaded.ID != sid || loaded.NS != ns ||
+				loaded.GraphID != tt.decodedGraphID || loaded.Status != compose_v2.CPStatusPending {
+				t.Fatalf("应能读到迁移后的 JSON 存档，实际 %+v，错误 %v", loaded, err)
+			}
+			found, err := cp.ListPending(ctx, sid)
+			if err != nil || len(found) != 1 || found[0].NS != ns || found[0].Checkpoint == nil || found[0].Checkpoint.GraphID != tt.decodedGraphID {
+				t.Fatalf("应按旧索引枚举迁移后的待答存档，实际 %+v，错误 %v", found, err)
+			}
+		})
 	}
 }
 

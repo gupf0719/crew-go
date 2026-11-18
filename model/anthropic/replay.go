@@ -31,6 +31,8 @@ const (
 	// {"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"}——这些不在
 	// 消息的 Usage 里（Usage 只算模型答的那一轮，也就是压缩之后的上下文）；没有压缩时不打。用 [Compactions] 读。
 	CompactionAnnotation = "anthropic.compaction"
+	// ContextEditsAnnotation 记服务端实际应用的上下文清理，可用 [AppliedContextEdits] 读取。
+	ContextEditsAnnotation = "anthropic.context_edits"
 )
 
 // replayVersion 是 [AssistantContentAnnotation] 的格式版本：读到别的版本时按「没有快照」处理。
@@ -175,6 +177,28 @@ func Compactions(msg *schema.Message) []CompactionUsage {
 			OutputTokens:             intOf(item["output_tokens"]),
 			CacheReadInputTokens:     intOf(item["cache_read_input_tokens"]),
 			CacheCreationInputTokens: intOf(item["cache_creation_input_tokens"]),
+		})
+	}
+	return out
+}
+
+// AppliedContextEdit 是 API 返回的一次上下文清理统计。Type 对应服务端策略名。
+type AppliedContextEdit struct {
+	Type                 string
+	ClearedInputTokens   int
+	ClearedToolUses      int
+	ClearedThinkingTurns int
+}
+
+// AppliedContextEdits 读取 [ContextEditsAnnotation] 里的清理记录。没有记录时返回 nil。
+func AppliedContextEdits(msg *schema.Message) []AppliedContextEdit {
+	var out []AppliedContextEdit
+	for _, item := range annotationItems(msg, ContextEditsAnnotation) {
+		out = append(out, AppliedContextEdit{
+			Type:                 stringOf(item["type"]),
+			ClearedInputTokens:   intOf(item["cleared_input_tokens"]),
+			ClearedToolUses:      intOf(item["cleared_tool_uses"]),
+			ClearedThinkingTurns: intOf(item["cleared_thinking_turns"]),
 		})
 	}
 	return out

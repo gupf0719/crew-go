@@ -4,7 +4,7 @@
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **60 项**。P1 **0**、P2 **5**、P3 **55**。缺陷 **0**、能力缺口 **18**、待决 **26**、验收 **16**。
+共 **59 项**。P1 **0**、P2 **4**、P3 **55**。缺陷 **0**、能力缺口 **17**、待决 **26**、验收 **16**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -17,7 +17,6 @@
 
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
-| C06 | 能力缺口 | 提供 Anthropic 服务端 context editing | 当前已有签名回放和服务端 compaction。分别验证工具结果与 thinking 的编辑参数、beta 请求头、与既有缓存和前缀绑定的交互。历史 TODO 328。 [Anthropic](../../model/anthropic/client.go) |
 | A02 | 验收 | 发版候选 CI 与存档升级 | 收集发布 SHA 对应的 PostgreSQL/MySQL CI 结果。在实际启用的后端验证旧挂起档、迁移与回退。共用存档的互斥和跨副本恢复验收暂缓。 [CI](../../.gitlab-ci.yml) · [升级说明](../release/next.md) |
 | A03 | 验收 | 路由模型接管门槛 | 仓内已有真服务报告与按输入、配置指纹做的离线回放。用当前业务的脱敏样本、人工标签及候选模型结果确定错路由率、承接率和端到端 P95 门槛。 [历史实测](../../example/decision/routing_eval/REPORT.md) · [接入和评测](../v2/route-decider.md) · [回放测试](../../example/decision/routing_eval/replay_test.go) |
 | A04 | 验收 | OpenAI 真模型流式和工具调用 | Chat Completions 和 Responses 各有流式与工具调用冒烟，共四个独立用例。有 `OPENAI_API_KEY` 时收集四项结果。 [冒烟测试](../../example/model/openai_smoke/openai_smoke_test.go) |
@@ -44,7 +43,7 @@
 | C16 | 能力缺口 | 手写 Graph 的 AND-join 与收尾屏障 | 当不同深度前驱汇入同一节点时提供全到齐的策略。普通 any-of 保留现行契约。历史 TODO 571。 |
 | C17 | 能力缺口 | 给内部决策和结构化输出补可观测区分 | 明确独立的路由/评估模型统计维度，补结构化输出类型。fallback 已 emit 指标，端到端断言归 A08。历史 TODO 350、382。 [可观测性](../v2/observability.md) |
 | C18 | 能力缺口 | 按 Handoff 来源收窄候选与按次暂停转交 | 源自 ISSUE-99 的 #7 和 #8。分别验证候选权限和同一次执行中 tool/程序化转交都受控制。 [控制信号](../issue/issue-99-handoff-control-signal.md) |
-| A06 | 验收 | Anthropic 真流和错误分类 | 核对空闲流处理、SSE 间隔、真实计费拒绝及 prompt-too-long 原文的可识别性。依赖 `ANTHROPIC_API_KEY` 与实际返回条件。 [冒烟命令](../description/smoke-test-recipes.md) |
+| A06 | 验收 | Anthropic 真流、错误分类与服务端上下文清理 | 核对空闲流处理、SSE 间隔、真实计费拒绝及 prompt-too-long 原文的可识别性。跑 `TestSmoke_ContextEditing` 确认两种清理的实际统计、与 compaction 组合的请求以及严格前缀回放。另核对实际触发压缩后的交互和编辑前后的缓存用量。依赖 `ANTHROPIC_API_KEY` 与实际返回条件。 [流式冒烟命令](../description/smoke-test-recipes.md) · [清理冒烟](../../example/model/anthropic_smoke/context_editing_test.go) |
 | A07 | 验收 | 跑齐 thinking 多轮回放、关停和 provider 变体 | 使用现有模型集成入口补 3 轮以上及中途关闭的对照。Anthropic 的空闲/计费另见 A06。历史 TODO 570。 |
 | A08 | 验收 | 复核有具体目标的弱测试与历史探针 | 核对 Reflect/Plan 失败重试代数、Toolkit.StreamCall 的流式分派与退化，以及观测扇出实例和真实 fallback 指标。ISSUE-99 的现有嵌套测试已断言各成员输出，补慢历史后端下共享输入只写一次的断言。provider 候选归 A18。历史 TODO 207、291、569、639–640、659 及 ISSUE-16、99。 |
 | A09 | 验收 | Plan Web 生产入口与生命周期 | mock 已覆盖挂起、续跑及完成态。目标环境仍需验鉴权、Cookie、反向代理、状态 TTL 和故障恢复。共享 Redis 迁移、双副本切换和跨副本续跑暂缓。 [ISSUE-90](../issue/issue-90-plan-chat-web-lifecycle-prod.md) |
@@ -84,6 +83,8 @@
 | Q27 | 待决 | 持久化业务状态演进与按执行 namespace 查历史 | ISSUE-70 Phase 4 的通用状态迁移需要版本化调用方。SelfHistoryByNS 希望按执行 namespace 查写入记录，先核对执行位置能否成为历史身份。 [ISSUE-70](../issue/issue-70-checkpoint-evolution.md) |
 
 ## 已关闭及归并去向
+
+- **C06 已实现。** Anthropic 客户端可按需清理旧工具结果和 thinking。HTTP/SSE 回归覆盖请求合成、清理统计解析和签名回放，并核对了缓存请求选项。真实服务验收归 A06。 [用法](../v2/model-adaptation.md#51-默认请求与选项) · [回归](../../model/anthropic/context_editing_test.go)
 
 - **D05、D07 已修。** AG-UI 的慢页能跨轮询窗口继续读取和派发。Redis 旧档迁移识别 JSON 对非法 UTF-8 的替换，保留原始元数据和索引。 [回归与关闭记录](backlog-audit.md#2026-11-18-剩余缺陷修复)
 

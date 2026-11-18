@@ -100,6 +100,9 @@ func (c *Client) interpret(ctx context.Context, resp *anthropic.BetaMessage, raw
 	if cs := compactionValues(resp); len(cs) > 0 {
 		t.annotations[CompactionAnnotation] = cs
 	}
+	if edits := resp.ContextManagement.AppliedEdits; len(edits) > 0 {
+		t.annotations[ContextEditsAnnotation] = contextEditValues(edits)
+	}
 	t.metadata = &schema.MessageMetadata{
 		FinishReason: finishReason(resp.StopReason),
 		Model:        string(resp.Model),
@@ -354,6 +357,25 @@ func compactionValues(resp *anthropic.BetaMessage) []any {
 			"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
 	}
 	return out
+}
+
+// contextEditValues 保存服务端报告的清理次数与 token 数，随消息标注往返。
+func contextEditValues(edits []anthropic.BetaContextManagementResponseAppliedEditUnion) []any {
+	values := make([]any, 0, len(edits))
+	for _, edit := range edits {
+		item := map[string]any{
+			"type":                 edit.Type,
+			"cleared_input_tokens": int(edit.ClearedInputTokens),
+		}
+		if edit.JSON.ClearedToolUses.Valid() {
+			item["cleared_tool_uses"] = int(edit.ClearedToolUses)
+		}
+		if edit.JSON.ClearedThinkingTurns.Valid() {
+			item["cleared_thinking_turns"] = int(edit.ClearedThinkingTurns)
+		}
+		values = append(values, item)
+	}
+	return values
 }
 
 // fallbackValues 是 [FallbackAnnotation] 的值：每个 fallback 块一项 {"from": 模型, "to": 模型}。

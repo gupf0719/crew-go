@@ -113,7 +113,10 @@ thinking 模型（DeepSeek deepseek-reasoner / Qwen3 thinking 等）的 wire 协
 | 顶层 `cache_control: {type: "ephemeral"}`（自动 prompt cache）| `WithPromptCaching(false)`、`WithCacheTTL(CacheTTL1h)` |
 | `fallbacks: "default"`（beta `server-side-fallback-2026-07-01`，被安全分类器拒绝时由 Anthropic 指定的回退模型接着答）| `WithFallbacks(false)`（Bedrock / Vertex / Foundry 等不支持的端点要关）|
 | effort、thinking display 用 API 默认 | `WithEffort` / 按次 `WithEffortOption`；`WithThinkingDisplay(DisplaySummarized / DisplayUpdates)` |
+| 工具结果按需清理，thinking 沿用模型默认 | `WithContextEditing` 接收 `ContextEditing` 配置，可分别启用工具结果清理和 thinking 清理。任一策略启用时自动带上 `context-management-2025-06-27`。 |
 | 不开服务端压缩 | `WithCompaction(Compaction{TriggerTokens, Instructions})`：每次请求带 `context_management.edits: [{type: "compact_20260112", trigger, instructions}]`（beta `compact-2026-01-12`），输入达到阈值（不填用 API 默认 15 万）时 API 先把更早的内容摘要成一个 compaction 块再接着答。不支持 `pause_after_compaction` |
+
+工具结果清理可通过 `TriggerTokens` 或 `TriggerToolUses` 指定触发阈值。`KeepToolUses` 可显式指定保留零次调用，nil 采用 API 默认的三次。`ExcludeTools` 保留指定工具，`ClearToolInputs` 或 `ClearToolInputsFor` 可同时清理相应的调用参数。thinking 清理用 `KeepTurns` 或 `KeepAll`，启用后省略保留范围时默认保留一轮，含当前轮。客户端先发送 thinking 清理，再发送工具结果清理。与 `WithCompaction` 同时配置时，请求会在同一 `context_management.edits` 列表末尾附加压缩策略，并带上两个 beta 标志。 [Anthropic context editing](https://platform.claude.com/docs/en/build-with-claude/context-editing)
 
 `WithExtraBody`（构造期）与 `model.WithExtraBody`（按次）按 **JSON merge patch（RFC 7386）** 并进请求体：对象逐键递归合并、null 删除键——跟 `model/openai` 的顶层整键覆盖不同，`{"output_config": {"effort": "high"}}` 不会冲掉 `output_config.format`。
 
@@ -128,6 +131,7 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 - 服务端回退在中途切换模型时，切换点之前被拒模型的 thinking 与工具调用作废：不回放、工具调用不交出（所以流式把工具调用压到最后一片才交），文本照常保留；切换经过记在标注 `anthropic.fallback`（`anthropic.Fallbacks(msg)` 读）。
 - 服务端压缩返回的 compaction 块跟别的块一样进快照、原样回放（排在服务端回退切换点之前的也保留：压缩的是这次请求的输入，跟哪个模型接着答无关），API 据它把块之前的历史换成摘要；调用方的历史照常只追加、全量发送，本包不删。
 - API 对输入的改动（丢掉的 thinking 块等）按（种类, 原因）归并计数，记在标注 `anthropic.input_transformations`（`anthropic.InputTransformations(msg)` 读），每条响应打一条告警。不逐块记：历史改过之后，后面每次请求都会把同一批块再丢一遍，逐块记会让会话标注按轮数的平方增长。
+- 服务端实际应用的上下文清理记在 `anthropic.context_edits`。`anthropic.AppliedContextEdits(msg)` 可从完整答复或流式聚合消息读取清理策略、释放的输入 token 数及被清理的工具调用或 thinking 轮数。消息用量沿用服务端计费字段。
 
 ### 5.3 映射规则
 
@@ -150,6 +154,8 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 
 上下文管理换成服务端压缩（`WithCompaction`）就不冲突：客户端历史不改，前缀校验从最近的 compaction 块算起，压缩之后产生的 thinking 照常回放（见 5.5 实测）；代价是压缩让 prompt cache 从头开始，压缩之前的 thinking 不带到之后。已知局限：客户端仍发全量历史，ReactiveCompact 按本地全量估 token、从最旧的组删起，而最新 compaction 块之前的内容服务端本来就不看——它的头几次重试在服务端眼里输入没变；另外 SDK 累积流式响应时 `compaction_delta` 是赋值不是追加，真 API 若把摘要拆成多段 delta 只剩最后一段（SDK 行为，未见实例）。
 
+`WithContextEditing` 同样发送原会话。对支持 preserved thinking 的模型，Anthropic 在服务端清理时维护 thinking 签名有效性。清理会使编辑位置起的 prompt cache 失效，后续请求可复用新的缓存前缀。工具结果清理可用 `ClearAtLeastTokens` 设每次清理的最低收益。 [Anthropic 缓存与清理约定](https://platform.claude.com/docs/en/build-with-claude/context-editing#context-editing-and-prompt-caching)
+
 `agent_v2.NewLLMPlanner` 读取 `StructuredCapability`。Claude 由提示词引导自动选择本轮绑定的 `plan` 或 `respond`，模型没有返回工具调用时可用 `errors.Is` 判断 `ErrPlannerNoToolCall`。
 
 另外，`EstimateMessageTokens` 看不到回放快照里的 thinking，而 preserved thinking 计入输入 token——按估算触发的压缩会偏晚。
@@ -157,6 +163,8 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 ### 5.5 测试
 
 单测（`model/anthropic/*_test.go`）用 httptest 桩断言请求体；真 API 冒烟 `example/model/anthropic_smoke`（`//go:build integration`，需 `ANTHROPIC_API_KEY`），全部用例都在 `prefix_mismatch_behavior: "error"` 下跑：BasicAgent 跨两次 Run 的多轮工具调用、中途 system 消息、prompt cache 命中、并行工具结果合并、服务端压缩。压缩用例 2026-10-23 实跑（`claude-haiku-5-5`、阈值 5 万、自定义 instructions）：第一轮约 7.5 万 token 的输入触发压缩，响应带 compaction 块、`Compactions` 记下一项；第二轮原样回放它（连同第一轮的 thinking），没有 400，计费输入只剩一两千 token（两次实跑 655 / 1221），模型凭摘要答出开头埋的暗号。
+
+`TestSmoke_ContextEditing` 覆盖两种清理的实际统计、配上 compaction 的请求和严格前缀校验下的流式回放。真 API 验收记录在待办 A06。 [冒烟测试](../../example/model/anthropic_smoke/context_editing_test.go) · [A06](../code/todo.md#p3--窄路径扩展与设计决策)
 
 ## 六、OpenAI Responses 原生客户端
 

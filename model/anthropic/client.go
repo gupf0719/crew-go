@@ -123,6 +123,7 @@ type Client struct {
 	caching        bool
 	cacheTTL       CacheTTL
 	compaction     *Compaction // nil = 不开服务端压缩
+	contextEditing ContextEditing
 	betas          []anthropic.AnthropicBeta
 	extraBody      map[string]any
 	requestTimeout time.Duration

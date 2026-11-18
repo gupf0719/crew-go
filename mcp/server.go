@@ -375,7 +375,7 @@ func (s *server) callFailed(ctx, callCtx context.Context, name string, gen uint6
 			fmt.Sprintf("%s 返回的结果解析不了（%v），这次调用可能已执行", s.name, bad.err)), nil
 	}
 	var st *httpStatusError
-	if errors.As(err, &st) {
+	if errors.As(err, &st) && !st.afterSend {
 		switch st.code {
 		case 400, 413, 422, 429: // 执行之前就拒了这一个请求，server 活着
 			return tool.Failure(tool.ErrCodeInternal,
@@ -413,22 +413,11 @@ func (s *server) markOffline(gen uint64, cause error) bool {
 	if s.factory == nil || s.hub == nil {
 		return false
 	}
-	s.mu.Lock()
-	if s.closed || !s.online || s.gen != gen {
-		s.mu.Unlock()
+	stale, ok := s.retireClient(gen, cause)
+	if !ok {
 		return false
 	}
-	stale := s.client
-	s.client = nil
-	s.online = false
-	s.since = time.Now()
-	s.lastErr = cause
-	s.hub.events.push(s.statusLocked())
-	// 在 s.mu 里 Add：Close 先在 s.mu 里置 closed 再 Wait，这里要么看到 closed 不起，要么 Add 先于 Wait。
-	// 在线时不会有重连循环在跑（循环只在离线时存在、上线即退出），所以每次掉线起一个。
-	s.hub.bg.Add(1)
-	s.mu.Unlock()
-	// **起 goroutine 紧跟在 Add 之后**（中间只隔一个 Unlock，它不会 panic）：这两者之间夹任何可能 panic 的
+	// **起 goroutine 紧跟在 Add 之后**（retireClient 在 Add 后只释放锁）：这两者之间夹任何可能 panic 的
 	// 代码，panic 就留下一个「Add 了却没有对应 Done」的 WaitGroup ⟹ Hub.Close 的 bg.Wait() 永久挂住。
 	// 实测过：日志原先排在这中间，而它调的是**业务 error 的 Error()**（见下），Close 挂死、3 秒看门狗全程
 	// 不返回。**这里不要插代码。**
@@ -445,6 +434,34 @@ func (s *server) markOffline(gen uint64, cause error) bool {
 	slog.Warn("mcp: server 掉线，后台重连；期间它的工具返回「该能力暂时不可用」",
 		logKeyServer, s.name, logKeyErr, cause)
 	return true
+}
+
+func (s *server) retireClient(gen uint64, cause error) (Client, bool) {
+	var httpFailure *httpGenerationError
+	errors.As(cause, &httpFailure)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || !s.online || s.gen != gen {
+		return nil, false
+	}
+	if httpFailure != nil {
+		// HTTP 客户端可能已在原 Hub 连接上重建会话。判定和摘除期间禁止发布下一代。
+		client := httpFailure.client
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		if client.generation != httpFailure.generation {
+			return nil, false
+		}
+	}
+	stale := s.client
+	s.client = nil
+	s.online = false
+	s.since = time.Now()
+	s.lastErr = cause
+	s.hub.events.push(s.statusLocked())
+	// 在 s.mu 里 Add：Close 先在 s.mu 里置 closed 再 Wait。
+	s.hub.bg.Add(1)
+	return stale, true
 }
 
 // reconnectLoop 按退避反复连，连上或 Hub 关闭为止。stale 是掉线的那个连接（factory 型），在这里关：

@@ -49,8 +49,9 @@ func (e *badResponseError) Unwrap() error { return e.err }
 
 // httpStatusError 是 HTTP 非 2xx 且响应体不是 JSON-RPC 错误。body 已截短、抹掉了自己发出的请求头的值。
 type httpStatusError struct {
-	code int
-	body string
+	code      int
+	body      string
+	afterSend bool // 状态码属于已发出 RPC 的流处理，不能用它判定原 POST 是否执行。
 }
 
 func (e *httpStatusError) Error() string {
@@ -242,8 +243,8 @@ func decodeBlock(raw json.RawMessage) (Block, error) {
 		URI      string `json:"uri"`
 		Name     string `json:"name"`
 		Resource *struct {
-			URI      string `json:"uri"`
-			MimeType string `json:"mimeType"`
+			URI      string  `json:"uri"`
+			MimeType string  `json:"mimeType"`
 			Text     *string `json:"text"` // 有这个键就是文本资源（空文件的 text 是空串）
 			Blob     string  `json:"blob"` // base64
 		} `json:"resource"`

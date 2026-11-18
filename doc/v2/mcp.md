@@ -9,7 +9,7 @@
 
 | 类型 | 作用 |
 |---|---|
-| `Client` | 一个 MCP server 的连接：`Initialize` → `ListTools` / `CallTool`（可并发）→ `Close`。`Close` 之后不能再用。内置 `StdioClient`（`NewStdioClient`，子进程，按行 JSON-RPC）与 `StreamableHTTPClient`（`NewStreamableHTTPClient`，每次调用一个 POST） |
+| `Client` | 一个 MCP server 的连接：`Initialize` → `ListTools` / `CallTool`（可并发）→ `Close`。`Close` 之后不能再用。内置 `StdioClient`（子进程，按行 JSON-RPC）与 `StreamableHTTPClient`（POST 发请求，可用 GET 接收推送或续接 SSE） |
 | `Hub` | 管多个 server：`Start` 连接并拉清单、把工具注册进一个 `*tool.Toolkit`；`Toolkit()` 交给 agent；`Status()` 查在线状态；`Close()` |
 | `RemoteTool` | 一个远端工具适配成 `tool.Tool`；`Call` 经所属 server 的当前连接调 `CallTool` |
 
@@ -81,10 +81,11 @@ agent := agent_v2.NewBasicAgent(agent_v2.WithToolkit(hub.Toolkit()), ...)
 | 超过 `WithCallTimeout`、请求已发出 | `timeout` | 工具调用超时（超过 d 未返回），已放弃等待；X 那边可能仍在执行 | 不变；`WithSerialCalls` 的掉线、断开重连，说明改为「已断开 X 重连（它那边的执行可能被打断）」 |
 | 请求没发出（`Client` 包上 `ErrNotSent`：连不上、没写出去、连接早已关闭、握手没过；含被时限打断的） | `server_unavailable` | 该能力暂时不可用（X 连不上），这次调用没有发出 | 掉线 |
 | server 答了 JSON-RPC 错误（`*RPCError`，在 2xx 或非 2xx 响应体里） | `internal_error` | `mcp rpc error <code>: <message>` | 不变 |
-| HTTP 400 / 413 / 422 / 429（不是 JSON-RPC 错误体） | `internal_error` | X 拒绝了这次调用（HTTP n），没有执行 | 不变 |
-| HTTP 409 | `internal_error` | X 拒绝了这次调用（HTTP 409）（不断言没执行） | 不变 |
-| HTTP 408（代理的空闲超时也回它，请求可能已转给 server） | `timeout` | X 那边超时（HTTP 408），不确定是否已执行 | 不变 |
-| HTTP 401 / 403 / 404（哪怕响应体是 JSON-RPC 错误） | `server_unavailable` | 该能力暂时不可用（X 拒绝了请求：HTTP n），这次调用没有执行 | 掉线（重连会新建会话） |
+| 工具 POST 返回 HTTP 400 / 413 / 422 / 429（无 JSON-RPC 错误体） | `internal_error` | X 拒绝了这次调用（HTTP n），没有执行 | 不变 |
+| 工具 POST 返回 HTTP 409 | `internal_error` | X 拒绝了这次调用（HTTP 409），执行结果未知 | 不变 |
+| 工具 POST 返回 HTTP 408（代理空闲超时也会返回，请求可能已转给 server） | `timeout` | X 那边超时（HTTP 408），不确定是否已执行 | 不变 |
+| 工具 POST 返回 HTTP 401 / 403 / 404（含 JSON-RPC 错误体） | `server_unavailable` | 该能力暂时不可用（X 拒绝了请求：HTTP n），这次调用没有执行 | 掉线（重连会新建会话） |
+| 工具 POST 已发出，续订 GET 返回 HTTP 错误 | `server_unavailable` | 该能力暂时不可用（X 连接出错），这次调用没拿到结果，不确定是否已执行 | 当前会话的连接可标掉线。带服务端会话 ID 的当前会话收到 GET 404 时撤下，旧会话的迟到失败只归原调用 |
 | server 答了但结果解析不了（不是 JSON、坏的 base64、超过 10MB） | `internal_error` | X 返回的结果解析不了（原因），这次调用可能已执行 | 不变 |
 | 其余连接错误（写出之后断开、HTTP 5xx、stdio 子进程中途退出……） | `server_unavailable` | 该能力暂时不可用（X 连接出错），这次调用没拿到结果，不确定是否已执行 | 掉线 |
 | server 返回 `isError` | `internal_error` | 第一个非空文本块（没有则 "mcp tool call failed"） | 不变 |
@@ -159,12 +160,25 @@ query 值与长路径段），响应体再截到 512 字节（不切断多字节
 | `WithToolNamer(fn)` | 框架内的工具名，默认 `CanonicalName`（`mcp_<server>_<tool>`）；结果要符合 provider 的要求（Anthropic / OpenAI：`^[a-zA-Z0-9_-]{1,64}$`） |
 | `WithHTTPAllowTools` / `WithStdioAllowTools`（Client 级） | 按原始名过滤 server 报的清单；快照存的是过滤后的 |
 
-## 9. 已知缺口
+## 9. SSE 推送与续订
 
-见 [`doc/code/todo.md`](../code/todo.md)：
+`StreamableHTTPClient` 支持 POST 的 JSON 或 SSE 响应，按 JSON-RPC ID 取结果。初始化完成后发送 `notifications/initialized`。此后的 HTTP 请求带协商版本和服务端分配的会话 ID。会话过期后下一次调用重新握手，关闭时尽力发送 DELETE。跨 origin 或改写请求方法的重定向作为 HTTP 错误处理。 [MCP Streamable HTTP 规范](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
 
-- `StreamableHTTPClient` 支持 POST 的 JSON 或 SSE 响应，按 JSON-RPC ID 取结果。初始化完成后发送 `notifications/initialized`，后续请求携带协商版本与服务端分配的会话 ID。会话过期时下一次调用重建会话，关闭时尽力发送 DELETE。跨 origin 或改写请求方法的重定向会作为 HTTP 错误处理。[MCP Streamable HTTP 规范](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
-- 客户端消费本次 POST 的响应流，后台 GET 推送和 SSE 断线续订尚未实现。
-- 图片、音频不交给模型（只有一行说明）：要原样交，得让 tool_result 带图片块（Anthropic 支持），牵涉 schema 与各家适配器，没做。
+`Subscribe` 完成握手后打开独立 GET 流，按到达顺序调用通知回调。方法与参数分别在 `Notification.Method` 和 `Notification.Params`，参数保留 JSON 原文。订阅阻塞到调用方取消、会话关闭、流无法重连或回调返回错误。服务端用 HTTP 405 表示独立 GET 不可用，调用方仍可使用 POST。传输层应答服务端的 `ping`，对需要其他客户端能力的请求返回 JSON-RPC `-32601`。Hub 向模型绑定 `Start` 时形成的工具清单。
+
+```go
+err := client.Subscribe(ctx, func(_ context.Context, notice mcp.Notification) error {
+    slog.Info("收到 MCP 通知", "method", notice.Method)
+    return nil
+})
+```
+
+工具响应流与独立推送流各维护自己的游标。SSE 空 `data` 引导事件也可提交游标，断线时用 `Last-Event-ID` 在原会话上续接 GET。握手流可先用响应头分配的会话 ID 续接，取得初始化结果后才发布协商版本。独立推送无游标时重开 GET，断线期间的推送可能遗漏。工具响应无游标时返回错误并保留执行不确定性。 [MCP 续订与重投规范](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery)
+
+续订按 SSE `retry` 等待，默认 250ms，最短 25ms。重连时的暂时传输错误或 HTTP 5xx 最多尝试三次。RPC 的 POST 与续订共用原调用时限，包括配置在 `http.Client` 上的 `Timeout`。独立 GET 的寿命由订阅 ctx 与会话决定。`Close` 取消进行中的握手和已经建立的会话请求，由调用方结束正在执行的订阅回调。
+
+## 10. 已知缺口
+
+MCP 工具结果中的图片和音频目前以文字说明呈现，透传工作登记在 C02。 [现行待办](../code/todo.md#p3--窄路径扩展与设计决策)
 
 stdio 子进程默认继承父进程环境。`WithStdioEnvAllowlist` 选择允许继承的变量名，传空名单可清空继承项。`WithStdioEnv` 设置的值照常传入，同名值覆盖继承值。Windows 上 `os/exec` 会补入 `SYSTEMROOT`。

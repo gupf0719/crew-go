@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -25,7 +24,7 @@ const maxResponseBytes = 10 * 1024 * 1024
 const maxErrorBodyBytes = 512
 
 // StreamableHTTPClient 通过 streamable HTTP JSON-RPC 对接 MCP Server。
-// 支持 JSON 和 SSE 响应。服务端分配会话时，后续请求携带会话标识。
+// 支持 JSON、SSE 响应及通过 [StreamableHTTPClient.Subscribe] 接收独立推送。
 type StreamableHTTPClient struct {
 	name            string
 	endpoint        string
@@ -38,18 +37,47 @@ type StreamableHTTPClient struct {
 
 	nextID atomic.Int64
 
-	mu          sync.Mutex
-	session     *httpSession
-	cachedTools []ToolSpec
+	mu           sync.Mutex
+	session      *httpSession
+	initializing *httpInitialization
+	generation   uint64
+}
+
+type httpInitialization struct {
+	done       chan struct{}
+	cancel     context.CancelFunc
+	generation uint64
+	session    *httpSession // 与 err、retry 在关闭 done 前写入。
+	err        error
+	retry      bool
 }
 
 type httpSession struct {
-	id      string
-	version string
+	id         string
+	version    string
+	generation uint64
+	lifetime   context.Context // 独立的会话寿命，仅用于在过期或 Close 时取消这个会话的网络请求
+	cancel     context.CancelFunc
+
+	toolsMu     sync.Mutex
+	cachedTools []ToolSpec
 }
 
 const mcpSessionHeader = "Mcp-Session-Id"
 const mcpProtocolHeader = "MCP-Protocol-Version"
+const lastEventIDHeader = "Last-Event-ID"
+
+func (s *httpSession) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.lifetime, cancel)
+	if s.lifetime.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
 
 // HTTPOption 配置 StreamableHTTPClient。
 type HTTPOption func(*StreamableHTTPClient)
@@ -142,25 +170,71 @@ func (c *StreamableHTTPClient) Initialize(ctx context.Context) error {
 }
 
 func (c *StreamableHTTPClient) activeSession(ctx context.Context) (*httpSession, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.initializeLocked(ctx)
-}
-
-func (c *StreamableHTTPClient) initializeLocked(ctx context.Context) (*httpSession, error) {
-	if c.session != nil {
-		return c.session, nil
-	}
-	raw, sessionID, err := c.rpc(ctx, nil, "initialize", buildInitializeParams(c.protocolVersion, c.clientName, c.clientVersion))
-	for _, b := range []byte(sessionID) {
-		if b < 0x21 || b > 0x7e {
-			return nil, fmt.Errorf("mcp initialize: invalid session id")
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		if session := c.session; session != nil {
+			c.mu.Unlock()
+			return session, nil
+		}
+		pending := c.initializing
+		if pending == nil {
+			requestCtx, cancel := context.WithCancel(ctx)
+			c.generation++
+			pending = &httpInitialization{done: make(chan struct{}), cancel: cancel, generation: c.generation}
+			c.initializing = pending
+			c.mu.Unlock()
+			return c.finishInitialization(requestCtx, pending)
+		}
+		c.mu.Unlock()
+		select {
+		case <-pending.done:
+			if !pending.retry {
+				return pending.session, pending.err
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
-	session := &httpSession{id: sessionID, version: c.protocolVersion}
+}
+
+func (c *StreamableHTTPClient) finishInitialization(ctx context.Context, pending *httpInitialization) (session *httpSession, err error) {
+	// 即使自定义传输 panic，也要解开同一握手的等待者，由调用方按自己的边界处理 panic。
 	defer func() {
-		if c.session != session {
-			_ = c.terminateSession(session) // 尽力释放握手未完成的远端会话，返回原始初始化错误。
+		pending.cancel()
+		c.mu.Lock()
+		publish := c.initializing == pending
+		if publish {
+			c.initializing = nil
+			if session != nil {
+				session.generation = pending.generation
+			}
+			c.session = session
+			pending.session = session
+			pending.retry = session == nil // 不继承握手发起方的取消，等待者可重新准入。
+			if err != nil {
+				pending.err = &httpGenerationError{err, c, pending.generation}
+			}
+			close(pending.done)
+		}
+		c.mu.Unlock()
+		if !publish && session != nil {
+			session.cancel()
+			_ = c.terminateSession(session) // Close 时握手刚完成，由完成方清理得到的远端会话。
+		}
+		session, err = pending.session, pending.err
+	}()
+	return c.initialize(ctx)
+}
+
+func (c *StreamableHTTPClient) initialize(ctx context.Context) (session *httpSession, err error) {
+	raw, sessionID, err := c.rpc(ctx, nil, "initialize", buildInitializeParams(c.protocolVersion, c.clientName, c.clientVersion))
+	candidate := &httpSession{id: sessionID, version: c.protocolVersion}
+	defer func() {
+		if session == nil {
+			_ = c.terminateSession(candidate) // 尽力释放握手未完成的远端会话，返回原始初始化错误。
 		}
 	}()
 	if err != nil {
@@ -180,34 +254,37 @@ func (c *StreamableHTTPClient) initializeLocked(ctx context.Context) (*httpSessi
 	default:
 		return nil, fmt.Errorf("mcp initialize: unsupported negotiated protocol version %q", c.redact([]byte(result.ProtocolVersion), sessionID))
 	}
-	session.version = result.ProtocolVersion
-	if err := c.initializedNotification(ctx, session); err != nil {
+	candidate.version = result.ProtocolVersion
+	if err := c.initializedNotification(ctx, candidate); err != nil {
 		return nil, fmt.Errorf("mcp notifications/initialized: %w", err)
 	}
-	c.session = session
-	return session, nil
+	candidate.lifetime, candidate.cancel = context.WithCancel(context.Background())
+	return candidate, nil
 }
 
 func (c *StreamableHTTPClient) ListTools(ctx context.Context) ([]ToolSpec, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	session, err := c.initializeLocked(ctx)
+	session, err := c.activeSession(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if c.cachedTools != nil {
-		return append([]ToolSpec{}, c.cachedTools...), nil
+	session.toolsMu.Lock()
+	defer session.toolsMu.Unlock()
+	if err := session.lifetime.Err(); err != nil {
+		return nil, err
+	}
+	if session.cachedTools != nil {
+		return append([]ToolSpec{}, session.cachedTools...), nil
 	}
 	tools, err := listAllTools(ctx, func(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
 		result, _, err := c.rpc(ctx, session, method, params)
 		return result, err
 	}, c.allowTools)
 	if err != nil {
-		c.expireSessionLocked(session, err)
+		c.expireSession(session, err)
 		return nil, err
 	}
-	c.cachedTools = append([]ToolSpec{}, tools...)
-	return append([]ToolSpec{}, c.cachedTools...), nil
+	session.cachedTools = append([]ToolSpec{}, tools...)
+	return append([]ToolSpec{}, session.cachedTools...), nil
 }
 
 func (c *StreamableHTTPClient) CallTool(ctx context.Context, name string, args map[string]any) (*CallResult, error) {
@@ -224,10 +301,9 @@ func (c *StreamableHTTPClient) CallTool(ctx context.Context, name string, args m
 	}
 	raw, _, err := c.rpc(ctx, session, "tools/call", params)
 	if err != nil {
-		c.mu.Lock()
-		c.expireSessionLocked(session, err)
-		c.mu.Unlock()
-		return nil, fmt.Errorf("mcp tools/call %s: %w", name, err)
+		c.expireSession(session, err)
+		cause := fmt.Errorf("mcp tools/call %s: %w", name, err)
+		return nil, &httpGenerationError{cause, c, session.generation}
 	}
 	res, err := parseCallResult(raw)
 	if err != nil {
@@ -240,7 +316,15 @@ func (c *StreamableHTTPClient) Close() error {
 	c.mu.Lock()
 	session := c.session
 	c.session = nil
-	c.cachedTools = nil
+	if session != nil {
+		session.cancel()
+	}
+	if pending := c.initializing; pending != nil {
+		c.initializing = nil
+		pending.err = &httpGenerationError{context.Canceled, c, pending.generation}
+		close(pending.done)
+		pending.cancel()
+	}
 	c.mu.Unlock()
 	return c.terminateSession(session)
 }
@@ -267,11 +351,16 @@ func (c *StreamableHTTPClient) terminateSession(session *httpSession) error {
 	return &httpStatusError{code: resp.StatusCode}
 }
 
-func (c *StreamableHTTPClient) expireSessionLocked(session *httpSession, err error) {
+func (c *StreamableHTTPClient) expireSession(session *httpSession, err error) {
 	var status *httpStatusError
-	if session == c.session && session.id != "" && errors.As(err, &status) && status.code == http.StatusNotFound {
+	if session.cancel == nil || session.id == "" || !errors.As(err, &status) || status.code != http.StatusNotFound {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if session == c.session {
 		c.session = nil
-		c.cachedTools = nil
+		session.cancel()
 	}
 }
 
@@ -279,25 +368,28 @@ func (c *StreamableHTTPClient) setRequestHeaders(req *http.Request, session *htt
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
+	req.Header.Del(lastEventIDHeader) // 游标只属于一条正在续订的 SSE 流。
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	if req.Method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if session != nil {
+	req.Header.Del(mcpSessionHeader)
+	req.Header.Del(mcpProtocolHeader)
+	if session != nil && session.id != "" {
+		req.Header.Set(mcpSessionHeader, session.id)
+	}
+	if session != nil && session.version != "" {
 		req.Header.Set(mcpProtocolHeader, session.version)
-		req.Header.Del(mcpSessionHeader)
-		if session.id != "" {
-			req.Header.Set(mcpSessionHeader, session.id)
-		}
-	} else {
-		req.Header.Del(mcpSessionHeader)
-		req.Header.Del(mcpProtocolHeader)
 	}
 }
 
 func (c *StreamableHTTPClient) initializedNotification(ctx context.Context, session *httpSession) error {
 	const notification = `{"jsonrpc":"2.0","method":"notifications/initialized"}`
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, strings.NewReader(notification))
+	return c.postSessionMessage(ctx, session, []byte(notification))
+}
+
+func (c *StreamableHTTPClient) postSessionMessage(ctx context.Context, session *httpSession, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return c.redactTransportError(err, session.id)
 	}
@@ -320,6 +412,19 @@ func (c *StreamableHTTPClient) initializedNotification(ctx context.Context, sess
 // （2xx 或非 2xx 响应体里都可能）→ *RPCError；其余非 2xx → httpStatusError；2xx 但响应解析不了 → badResponseError；
 // 写出之后连接出错 → 原样（不确定是否已执行）。
 func (c *StreamableHTTPClient) rpc(ctx context.Context, session *httpSession, method string, params map[string]any) (json.RawMessage, string, error) {
+	if session != nil {
+		var release context.CancelFunc
+		ctx, release = session.requestContext(ctx)
+		defer release()
+	}
+	if timeout := c.httpClient.Timeout; timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout) // POST 和所有续订共享原有 RPC 时限。
+		defer cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, "", fmt.Errorf("%w: %w", ErrNotSent, err)
+	}
 	req := rpcRequest{
 		JSONRPC: "2.0",
 		ID:      c.nextID.Add(1),
@@ -362,13 +467,13 @@ func (c *StreamableHTTPClient) rpc(ctx context.Context, session *httpSession, me
 		}
 		return nil, "", err
 	}
-	defer resp.Body.Close()
 	responseSessionID := resp.Header.Get(mcpSessionHeader)
 	secrets := []string{responseSessionID}
 	if session != nil {
 		secrets = append(secrets, session.id)
 	}
 	if resp.StatusCode/100 != 2 {
+		defer resp.Body.Close()
 		// review-v6 M-26 fix: 读 error body 让业务定位错误原因（ReadAll 同样排空 body，连接可复用）。
 		// JSON-RPC 错误放在非 2xx 响应体里的 server 也有：解得出来就按 server 的错误交出（它活着）——鉴权 / 地址 / 会话
 		// 不对的（401 / 403 / 404）除外，那几种按状态码分档（标掉线），原文只进日志与 Status。
@@ -383,9 +488,26 @@ func (c *StreamableHTTPClient) rpc(ctx context.Context, session *httpSession, me
 		}
 		return nil, "", &httpStatusError{code: resp.StatusCode, body: c.redact(respBody, secrets...)}
 	}
-	contentType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")) // 缺省时按 JSON 读取。
-	env, err := readHTTPResponse(resp.Body, contentType, idKey(req.ID))
+	if session == nil && !validSessionID(responseSessionID) {
+		_ = resp.Body.Close() // 返回握手错误，不使用非法 ID 发送后续请求。
+		return nil, "", errors.New("invalid session id")
+	}
+	var env rpcResponse
+	if isEventStream(resp) {
+		streamSession := session
+		if streamSession == nil {
+			// 初始化响应也是 SSE。续订可使用服务端已分配的 ID，版本要等响应到齐再协商。
+			streamSession = &httpSession{id: responseSessionID}
+		}
+		env, err = c.readSSEReply(ctx, streamSession, resp.Body, idKey(req.ID))
+	} else {
+		defer resp.Body.Close()
+		env, err = readJSONReply(resp.Body, idKey(req.ID))
+	}
 	if err != nil {
+		if errors.Is(err, ErrNotSent) {
+			err = &responseReadError{err} // GET 或应答服务端请求的失败不能证明原 POST 未发送。
+		}
 		return nil, responseSessionID, err
 	}
 	if env.Error != nil {
@@ -393,6 +515,33 @@ func (c *StreamableHTTPClient) rpc(ctx context.Context, session *httpSession, me
 	}
 	return env.Result, responseSessionID, nil
 }
+
+func validSessionID(id string) bool {
+	for i := 0; i < len(id); i++ {
+		if id[i] < 0x21 || id[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// httpGenerationError 携带这次调用所在 HTTP 会话的代数，供 Hub 丢弃旧会话的迟到失败。
+type httpGenerationError struct {
+	error
+	client     *StreamableHTTPClient
+	generation uint64
+}
+
+func (e *httpGenerationError) Unwrap() error { return e.error }
+
+// responseReadError 保留响应读取错误的类型，但隔离属于后续请求的 ErrNotSent。
+type responseReadError struct{ error }
+
+func (e *responseReadError) Is(target error) bool {
+	return target != ErrNotSent && errors.Is(e.error, target)
+}
+
+func (e *responseReadError) As(target any) bool { return errors.As(e.error, target) }
 
 type redactedTransportError struct {
 	message string

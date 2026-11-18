@@ -2,6 +2,7 @@ package agent_v2
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"crew-go/schema"
@@ -16,6 +17,7 @@ const toolResultSizePendingAnnotation = "crew_tool_result_size_pending"
 // renderedToolContent 是一条工具结果交给模型的正文，连同处理时记下的东西。
 type renderedToolContent struct {
 	content string
+	parts   []schema.ToolResultPart
 	// origBytes 记「截断之前正文有多少字节」——0 表示没截过。它要一路带到消息的 annotation 上，因为
 	// **下一刀（紧急压缩兜底）手上的 len 是这一刀之后的残长**。
 	origBytes int
@@ -63,6 +65,18 @@ func renderToolContent(ctx context.Context, cfg *Config, minted bool, toolName s
 		return r
 	}
 	r.content = sized.body
+	if res.Success && len(res.Parts) > 0 && r.content == body && schema.ToolResultPartsText(res.Parts) == body {
+		if budget := cfg.ToolResultMaxBytes; budget > 0 && !minted && !isReturnDirectResult(res) {
+			used := len(body)
+			for _, part := range res.Parts {
+				used += len(part.Data)
+			}
+			if used > budget {
+				return r // 超预算时保留经过大小处理的文本说明。
+			}
+		}
+		r.parts = slices.Clone(res.Parts)
+	}
 	return r
 }
 
@@ -144,6 +158,7 @@ func finishPendingToolResult(ctx context.Context, cfg *Config, toolName string, 
 	msg.Content = content
 	if len(msg.ContentBlocks) > 0 && msg.ContentBlocks[0].Toolresult != nil {
 		msg.ContentBlocks[0].Toolresult.Content = content
+		msg.ContentBlocks[0].Toolresult.Parts = nil
 	}
 	annotateSizedToolResult(msg, sized)
 }

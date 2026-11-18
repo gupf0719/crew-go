@@ -916,6 +916,7 @@ func WithSkillBodyMaxChars(n int) Option {
 
 // WithToolResultMaxBytes 给**单条业务工具结果**设字节上限，超了从中间挖空
 // （保留头尾 + 一条说明被删了多少字节的标记，见 [Config.ToolResultMaxBytes]）。
+// 有附件时按正文和 Base64 数据的总字节数检查，超预算走相同的文本结果路径。
 //
 // n <= 0 关闭。**默认关闭**——它会改变模型看到的内容，该由业务按自己的工具产出规模决定。
 //

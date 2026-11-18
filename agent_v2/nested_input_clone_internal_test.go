@@ -28,6 +28,7 @@ func TestCloneCalleeInput_FieldCoverage(t *testing.T) {
 		"FileContentBlock.File":             "clonePtr",
 		"ContentBlock.Toolcall":             "clonePtr",
 		"ContentBlock.Toolresult":           "clonePtr",
+		"ToolresultContentBlock.Parts":      "slices.Clone",
 		"ContentBlock.Data":                 "结构体拷",
 		"DataContentBlock.Data":             "cloneAny",
 	}
@@ -77,7 +78,8 @@ func TestCloneCalleeInput_EditsDoNotReachOriginal(t *testing.T) {
 		{Type: "file", File: &schema.FileContentBlock{File: &schema.FileData{FileData: "AAAA", Filename: "f"}}},
 		{Type: "input_audio", InputAudio: &schema.InputAudioContentBlock{InputAudio: &schema.InputAudio{Data: "au"}}},
 		{Type: "toolcall", Toolcall: &schema.ToolcallContentBlock{Id: "c1", Name: "n", Arguments: "{}"}},
-		{Type: "toolresult", Toolresult: &schema.ToolresultContentBlock{ToolCallId: "c1", Content: "r"}},
+		{Type: "toolresult", Toolresult: &schema.ToolresultContentBlock{ToolCallId: "c1", Content: "r",
+			Parts: []schema.ToolResultPart{{Text: "r", MediaType: "image/png", Data: "QUJD"}}}},
 		{Type: "data", Data: &schema.DataContentBlock{Type: schema.ContentBlockTypeData,
 			Data: map[string]any{"list": []any{"x"}}}},
 	}
@@ -98,6 +100,7 @@ func TestCloneCalleeInput_EditsDoNotReachOriginal(t *testing.T) {
 	c.ContentBlocks[3].InputAudio.InputAudio.Data = "改了"
 	c.ContentBlocks[4].Toolcall.Arguments = `{"x":1}`
 	c.ContentBlocks[5].Toolresult.Content = "改了"
+	c.ContentBlocks[5].Toolresult.Parts[0].Data = "REVG"
 	c.ContentBlocks[6].Data.Data.(map[string]any)["list"].([]any)[0] = "y"
 	c.ContentBlocks = append(c.ContentBlocks, &schema.ContentBlock{Type: "text"})
 	c.Metadata.Model = "改了"

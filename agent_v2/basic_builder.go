@@ -565,6 +565,7 @@ func markToolFailure(m *schema.Message, code, message string) *schema.Message {
 	for _, cb := range m.ContentBlocks {
 		if cb != nil && cb.Toolresult != nil {
 			cb.Toolresult.IsError = true
+			cb.Toolresult.Parts = nil
 		}
 	}
 	return m
@@ -1529,9 +1530,13 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				content, failed, errMsg := renderHookedToolResult(before, to.Result)
 				r.Content = content
 				if len(r.ContentBlocks) > 0 && r.ContentBlocks[0].Toolresult != nil {
-					r.ContentBlocks[0].Toolresult.Content = content
+					result := r.ContentBlocks[0].Toolresult
+					result.Content = content
+					if failed || content != before.Output || res != to.Result {
+						result.Parts = nil // 旧附件和被替换的正文一起退出送模路径。
+					}
 					// 失败标记跟着模型看到的结论走（钩子可能把失败改成成功，反之亦然）
-					r.ContentBlocks[0].Toolresult.IsError = failed
+					result.IsError = failed
 				}
 				// 失败标注跟着钩子之后的结论走：它们随消息进存档与会话历史，留着钩子之前那份的话，钩子做的脱敏对它们
 				// 不生效——钩子把带秘密的大失败脱敏成一句话、或改成成功之后，标注里还是原文（审计实测）。

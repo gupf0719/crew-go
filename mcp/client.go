@@ -94,8 +94,8 @@ func (a *ToolAnnotations) clone() *ToolAnnotations {
 // CallResult 是一次 MCP 工具调用的结果。
 // 对齐 MCP 协议 tools/call 响应的结构：
 //   - IsError=true 表示业务级失败（LLM 可见）
-//   - Structured 对应 structuredContent 字段，优先于 Content 暴露
-//   - Content 为内容块列表（文本/图像/资源引用），IsError=false 且无 Structured 时使用
+//   - Structured 对应 structuredContent，优先作为正文
+//   - Content 为有序内容块，成功时可携带正文和图片、音频附件
 type CallResult struct {
 	IsError    bool
 	Structured any
@@ -114,6 +114,8 @@ type Block struct {
 	Mime string `json:"mimeType,omitempty"`
 	URI  string `json:"uri,omitempty"`
 	Name string `json:"name,omitempty"`
+	// Audience 来自内容块的 annotations.audience。nil 表示未指定。
+	Audience []string `json:"audience,omitzero"`
 
 	// textResource：这是文本资源（resource.text 有这个键，可能是空串——空文件），不是二进制。
 	textResource bool

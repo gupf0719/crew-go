@@ -90,7 +90,7 @@ agent := agent_v2.NewBasicAgent(agent_v2.WithToolkit(hub.Toolkit()), ...)
 | 其余连接错误（写出之后断开、HTTP 5xx、stdio 子进程中途退出……） | `server_unavailable` | 该能力暂时不可用（X 连接出错），这次调用没拿到结果，不确定是否已执行 | 掉线 |
 | server 返回 `isError` | `internal_error` | 第一个非空文本块（没有则 "mcp tool call failed"） | 不变 |
 | `CallTool` 返回 `(nil, nil)` | `internal_error` | X 返回了空结果 | 不变 |
-| 成功 | — | 有 `structuredContent` 时 `Output` 是解出来的值（数字是 `json.Number`，大整数不失真；BasicAgent 用 `tool.OutputText` 编成 JSON 交给模型），否则各内容块按原顺序整理成文本、块间空一行：text 原样；嵌入资源（resource）取出正文、前面标 `[资源 URI]`；资源链接写成 `[资源链接 名字 URI]`；图片、音频、二进制资源只写一行说明（类型、MIME、字节数、URI），字节不交给模型；base64 不规范也不让调用失败（URL-safe、缺 padding 照认，解不了就在说明里写「base64 解不了」）；空的文本资源写「（空）」 | — |
+| 成功 | — | `structuredContent` 优先作为正文，数字以 `json.Number` 保留精度。其余结果按原顺序整理文本、资源正文与链接。可用的图片和音频另带有序媒体部分，由模型适配器决定怎样发送。 [图片和音频](#10-工具结果的图片和音频) | — |
 
 「没有发出」只认 `ErrNotSent`，不从错误形状推断：推断错了，模型会把一个已执行的写操作当成没执行、再做一遍。
 `StreamableHTTPClient` 用 `httptrace` 判：trace 生效了（`GetConn` 到过）而请求头、请求体都没写出才算没发出（请求 ctx
@@ -177,8 +177,23 @@ err := client.Subscribe(ctx, func(_ context.Context, notice mcp.Notification) er
 
 续订按 SSE `retry` 等待，默认 250ms，最短 25ms。重连时的暂时传输错误或 HTTP 5xx 最多尝试三次。RPC 的 POST 与续订共用原调用时限，包括配置在 `http.Client` 上的 `Timeout`。独立 GET 的寿命由订阅 ctx 与会话决定。`Close` 取消进行中的握手和已经建立的会话请求，由调用方结束正在执行的订阅回调。
 
-## 10. 已知缺口
+## 10. 工具结果的图片和音频
 
-MCP 工具结果中的图片和音频目前以文字说明呈现，透传工作登记在 C02。 [现行待办](../code/todo.md#p3--窄路径扩展与设计决策)
+MCP 的 `image` 和 `audio` 块解码后按原顺序进入 `tool.Result.Parts`。媒体块声明 `annotations.audience` 时，只有包含 `assistant` 的附件能送模。明显错标或 base64 解码失败的块用文字说明，同批可用内容继续交付。URL-safe 或省去 padding 的 base64 会归一化。嵌入资源和资源链接生成文本。`structuredContent` 与媒体并存时，JSON 作为正文，附件保留原有的相对顺序。 [MCP 工具结果规范](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) · [内容受众](https://modelcontextprotocol.io/specification/2025-11-25/server/resources#annotations)
+
+| 模型接口 | 图片 | 音频 |
+| --- | --- | --- |
+| Anthropic Messages | 在原 `tool_result` 内发送，与 `tool_use_id` 配对 | 文本投影 |
+| OpenAI Responses 原生接口 | 在 `function_call_output.output` 内发送，与 `call_id` 配对 | 文本投影 |
+| OpenAI 兼容 Chat Completions | `WithChatToolResultMedia` 的 `Images` 启用 | `WithChatToolResultMedia` 的 `Audio` 启用 |
+
+图片支持 JPEG、PNG、GIF 和 WebP，Chat Completions 音频支持 WAV 和 MP3。Chat Completions 默认发送文本。开启媒体类型后，客户端先按调用 ID 交齐本批工具的文本结果，再发一条带来源 ID 的 `user` 附件消息。应为实际支持所选媒体的模型配置该选项。 [Anthropic Messages](https://platform.claude.com/docs/en/api/http/beta/messages) · [OpenAI Responses](https://developers.openai.com/api/reference/resources/responses/methods/create) · [Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+
+```go
+llm := qwen.NewClient(apiKey, modelName,
+    openai.WithChatToolResultMedia(openai.ChatToolResultMedia{Images: true, Audio: true}))
+```
+
+启用存档或会话历史时，附件随对应工具结果一起保存。`WithToolResultMaxBytes` 用文本正文和 Base64 数据的总字节数检查附件，超预算时发送文本。`OnToolEnd` 可改写正文，替换结果或将结果改成失败时也会清除原附件。MicroCompact 和 ReactiveCompact 清理旧结果时同步清理送模副本中的附件。后台完成通知、AG-UI 工具结果与 OTel 内容采样使用文本投影，`background_task` 查到已完成结果时可带回附件。 [工具链路回归](../../mcp/tool_media_resume_test.go)
 
 stdio 子进程默认继承父进程环境。`WithStdioEnvAllowlist` 选择允许继承的变量名，传空名单可清空继承项。`WithStdioEnv` 设置的值照常传入，同名值覆盖继承值。Windows 上 `os/exec` 会补入 `SYSTEMROOT`。

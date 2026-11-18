@@ -3310,7 +3310,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			}
 		}
 
-		runOne := func(callCtx context.Context, tc schema.ToolCall, idx int, record *toolCallRecord, save func()) (oc outcome) {
+		runOne := func(callCtx context.Context, tc schema.ToolCall, idx int, record *toolCallRecord, save func() bool) (oc outcome) {
 			if hit := record.Result; hit != nil && hit.ToolMsg != nil {
 				compose_v2.EmitSignals(callCtx, hit.Signals)
 				return outcome{toolMsg: hit.ToolMsg, bodyMsg: hit.BodyMsg, replayed: true}
@@ -3422,7 +3422,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			// 第一次执行时定下、续跑不变（见 saveToolCallContent），这一层让「新工具不读旧工具的记录」
 			// 不依赖那份记录，跟工具账（toolMemoContext 带名字）同一个理由。改写曾经在续跑时生效，那时新工具
 			// 读到旧工具记的「做过了」，事没做（实测）。现在同样是冗余的第二道，没有测试覆盖。
-			callCtx = compose_v2.WithNodeStateSealed(callCtx, "tool\x00"+tc.Function.Name)
+			callCtx = toolExecutionState(callCtx, tc.Function.Name)
 			// invoke 跑这次调用：中间件链 + 工具。中间件链在这儿——memo / 渐进披露 / 审批**之内**，工具**之外**（理由见
 			// ToolMiddleware godoc「顺序」）。框架自带工具不过链：它们的真产出不在 tool_result 里，短路掉是静默失败
 			// （同 memo 的判定，别改回去）。
@@ -3470,7 +3470,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				// 后台任务结束时没有 OnToolEnd 这一步，当场按大小处理（deferSize=false）
 				render := func(c context.Context, r *tool.Result) bgRendered {
 					rc := renderToolContent(c, &cfg, false, tc.Function.Name, r, false)
-					return bgRendered{content: rc.content, spillID: rc.spillID, spillInfo: rc.spillInfo}
+					return bgRendered{content: rc.content, spillID: rc.spillID, spillInfo: rc.spillInfo, parts: rc.parts}
 				}
 				bo, started := sc.cfg.Manager.call(callCtx, sc, tc, cfg.ToolTimeout, invokeWith(false), render)
 				if started {
@@ -3567,6 +3567,7 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			}
 
 			toolMsg := schema.ToolResultMessage(tc.ID, content)
+			toolMsg.ContentBlocks[0].Toolresult.Parts = rendered.parts
 			annotateSizedToolResult(toolMsg, sizedToolContent{origBytes: rendered.origBytes, spillID: rendered.spillID, spillInfo: rendered.spillInfo})
 			if rendered.pending {
 				if toolMsg.Annotations == nil {
@@ -3632,12 +3633,13 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 				record = &toolCallRecord{}
 			}
 			memoCtx := toolMemoContext(ctx, tc, idx)
-			save := func() {
+			save := func() bool {
 				if err := compose_v2.SaveNodeState(memoCtx, record); err != nil {
 					slog.WarnContext(ctx, "agent_v2: 存工具调用账项失败", "tool_call_id", tc.ID, "err", err)
-					return
+					return false
 				}
 				records[idx] = record
+				return true
 			}
 			var oc outcome
 			sigs, _ := compose_v2.CaptureSignals(callCtx, func(c context.Context) error {
@@ -3647,10 +3649,16 @@ func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Tool
 			oc.signals = sigs
 			// 参考文档的读取标记随结果重放，供续跑时的去重读取使用。
 			_, referenceRead := dispatchToolkit.Get(tc.Function.Name).(*skillReferenceTool)
+			minted := isFrameworkMintedIn(dispatchToolkit, tc.Function.Name)
 			if oc.err == nil && oc.toolMsg != nil && !oc.replayed &&
-				(referenceRead || shouldMemoize(isFrameworkMintedIn(dispatchToolkit, tc.Function.Name), oc.signals)) {
+				(referenceRead || shouldMemoize(minted, oc.signals)) {
 				record.Result = &toolMemoEntry{ToolMsg: oc.toolMsg, BodyMsg: oc.bodyMsg, Signals: oc.signals}
-				save()
+				if save() && !minted && len(cfg.ToolMiddlewares) > 0 {
+					// 工具账已接管重放。清除中间件端点的原值，免得被裁剪的附件随存档保留第二份。
+					if err := compose_v2.SaveStepResult(toolExecutionState(callCtx, tc.Function.Name), endpointRecordStep, nil); err != nil {
+						slog.WarnContext(ctx, "agent_v2: 清理工具端点临时记录失败", "tool_call_id", tc.ID, "err", err)
+					}
+				}
 			}
 			return oc
 		}

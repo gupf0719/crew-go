@@ -2,6 +2,7 @@ package compose_v2
 
 import (
 	"encoding/json"
+	"strings"
 
 	"crew-go/schema"
 )
@@ -43,7 +44,7 @@ const (
 //   - 顶层 Content / ReasoningContent 字段: 各 len/4（reasoning 多轮回传上 wire，故计入）
 //   - text block:  len/4
 //   - tool_use:    len(name + json(args))/4
-//   - tool_result: 字符串 len/4；image/file/audio block 固定 2000
+//   - tool_result: 字符串 len/4，加独立附件的媒体估算；image/file/audio block 固定 2000
 //   - 兜底:        len(json(block))/4
 //
 // 同一份正文只算一次：Content 非空时，第一个内容与它相同的 text / tool_result 块不再计入
@@ -79,6 +80,7 @@ func EstimateMessageTokens(messages []*schema.Message) int {
 			}
 			if dupPending && blockRepeatsContent(cb, msg.Content) {
 				dupPending = false
+				total += estimateToolResultMediaTokens(cb.Toolresult)
 				continue
 			}
 			total += estimateContentBlockTokens(cb)
@@ -113,8 +115,7 @@ func estimateContentBlockTokens(cb *schema.ContentBlock) int {
 		size := len(cb.Toolcall.Name) + len(cb.Toolcall.Arguments)
 		return size / charsPerToken
 	case cb.Toolresult != nil:
-		// tool_result: 内容字符数。Toolresult.Content 是 string
-		return len(cb.Toolresult.Content) / charsPerToken
+		return len(cb.Toolresult.Content)/charsPerToken + estimateToolResultMediaTokens(cb.Toolresult)
 	case cb.ImageUrl != nil:
 		return imageTokenEstimate
 	case cb.File != nil:
@@ -128,6 +129,25 @@ func estimateContentBlockTokens(cb *schema.ContentBlock) int {
 		}
 		return 0
 	}
+}
+
+func estimateToolResultMediaTokens(result *schema.ToolresultContentBlock) int {
+	if result == nil || result.IsError {
+		return 0
+	}
+	tokens := 0
+	for _, part := range result.Parts {
+		if part.Data == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(part.MediaType, "image/"):
+			tokens += imageTokenEstimate
+		case strings.HasPrefix(part.MediaType, "audio/"):
+			tokens += audioTokenEstimate
+		}
+	}
+	return tokens
 }
 
 // estimateTokensFromAPIUsage 优先返回最近一轮 LLM 调用的 Usage.InputTokens

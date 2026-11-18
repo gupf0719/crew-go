@@ -140,10 +140,12 @@ func IsStreamable(t Tool) bool {
 //     fork 模式信号——makeToolsFn 检到此 flag 跳过 P2.D inline body wrapping
 //     （fork final answer 不是 skill body，不能当 body 包装）
 type Result struct {
-	Success  bool           `json:"success"`
-	Output   any            `json:"output,omitempty"`
-	Error    *Error         `json:"error,omitempty"`
-	Metadata map[string]any `json:"-"` // 不序列化（运行时信号给框架，非 LLM input）
+	Success bool `json:"success"`
+	Output  any  `json:"output,omitempty"`
+	// Parts 是成功结果带附件时的有序内容，文本投影应与 [OutputText] 渲染的 Output 一致。
+	Parts    []schema.ToolResultPart `json:"parts,omitempty"`
+	Error    *Error                  `json:"error,omitempty"`
+	Metadata map[string]any          `json:"-"` // 不序列化（运行时信号给框架，非 LLM input）
 }
 
 // ReturnDirectMetaKey 是 Result.Metadata 的约定 key（值 bool）——工具声明"调用后立即

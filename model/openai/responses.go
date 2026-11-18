@@ -200,11 +200,25 @@ func responsesInput(messages []*schema.Message, provider, source string) ([]any,
 					"name": call.Function.Name, "arguments": call.Function.Arguments})
 			}
 		case schema.RoleTool:
-			id := schema.GetToolResultID(m)
-			if id == "" {
+			first := true
+			for _, block := range m.ContentBlocks {
+				if block == nil || block.Toolresult == nil {
+					continue
+				}
+				result := block.Toolresult
+				if result.ToolCallId == "" {
+					return nil, errors.New("openai responses: tool result requires a call id")
+				}
+				text := result.Content
+				if first {
+					text, first = schema.ToolResultTextForMessage(result, m.Content), false
+				}
+				input = append(input, map[string]any{"type": "function_call_output", "call_id": result.ToolCallId,
+					"output": responsesToolContent(result, text, provider)})
+			}
+			if first {
 				return nil, errors.New("openai responses: tool result requires a call id")
 			}
-			input = append(input, map[string]any{"type": "function_call_output", "call_id": id, "output": m.Content})
 		case schema.RoleUser:
 			content, err := responsesUserContent(m, provider)
 			if err != nil {

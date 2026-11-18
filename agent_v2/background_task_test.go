@@ -320,6 +320,37 @@ func TestBackgroundTask_WaitDeliversResultNoLaterNotification(t *testing.T) {
 	}
 }
 
+func TestBackgroundTask_ToolMediaAfterCancellationRequest(t *testing.T) {
+	mgr := agent_v2.NewBackgroundTaskManager(nil)
+	closeMgr(t, mgr)
+	tk := tool.NewToolkit()
+	var calls atomic.Int32
+	tk.Register(tool.NewFuncTool("build", "生成截图", map[string]any{"type": "object"},
+		func(ctx context.Context, _ map[string]any) (*tool.Result, error) {
+			calls.Add(1)
+			<-ctx.Done()
+			return &tool.Result{Success: true, Output: "截图已经生成", Parts: []schema.ToolResultPart{
+				{Text: "截图已经生成", MediaType: "image/png", Data: "QUJD"},
+			}}, nil
+		}))
+	m := &bgScriptModel{steps: []func([]*schema.Message) (*schema.Message, error){
+		callStep("build", `{}`), bgActionStep("cancel", ""), sayStep("构建完成"),
+	}}
+	ctx := compose_v2.WithThreadIDCtx(t.Context(), "conv-media-cancel")
+	if _, err := bgAgent("coder", m, tk, bgConfig(mgr)).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("生成截图")); err != nil {
+		t.Fatal(err)
+	}
+	in := m.input(2)
+	if len(in) == 0 || len(in[len(in)-1].ContentBlocks) == 0 {
+		t.Fatal("模型没收到后台任务的工具结果")
+	}
+	result := in[len(in)-1].ContentBlocks[0].Toolresult
+	if result == nil || !strings.Contains(result.Content, "取消请求之后它仍然跑完了") || len(result.Parts) != 3 ||
+		result.Parts[2].Data != "QUJD" || schema.ToolResultPartsText(result.Parts) != result.Content || calls.Load() != 1 {
+		t.Fatalf("取消后的终局返回应保留附件和取消说明，实际 %+v，调用 %d 次", result, calls.Load())
+	}
+}
+
 // TestBackgroundTask_CancelStopsTool：cancel 让工具的 ctx 被取消、任务记为已取消，模型看到的是「已取消」。
 func TestBackgroundTask_CancelStopsTool(t *testing.T) {
 	mgr := agent_v2.NewBackgroundTaskManager(nil)

@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"slices"
 
 	"crew-go/compose_v2"
+	"crew-go/schema"
 	"crew-go/tool"
 )
 
@@ -18,9 +20,9 @@ import (
 // tool_call 完成时记，覆盖不到「工具已经执行、中间件还没收尾就挂起」这一段——那里曾经每次续跑都把工具再执行一遍
 // （实测扣款两次）。中间件在一次执行里只能调一次 next（第二次被 guardControlFlow 拒），所以一个 tool_call 一条记录。
 //
-// 拿回的 Output：类型用 compose_v2.RegisterValueType 注册过的按原类型拿回；字符串原样；别的按交给模型的那段文本
-// （`%v`）记、拿回时是那个字符串——停没停过，模型看到的都是同一段文本（曾按 JSON 形状存，int64 的订单号续跑后变成
-// 1.8345678901234568e+18、结构体变成 map[...]，实测）。Metadata 按 JSON 形状往返（框架只读里面的 bool 标记）；编不成
+// 拿回的 Output：类型用 compose_v2.RegisterValueType 注册过的按原类型拿回，字符串原样。其余按文本保存，
+// 带内容块的结果沿用块对应的文本投影，其余用 %v。这样无需把任意 Output 解码成 interface{}，避免 int64 精度丢失。
+// Metadata 按 JSON 形状往返（框架只读里面的 bool 标记）；编不成
 // JSON 时不记（告警，续跑会再执行一次工具）。工具返回 Go error 的那次不记（它没有产出，续跑照常再试）。
 //
 // 超过框架给这次调用设的期限（WithToolTimeout）之后才返回的成功也记下（工具已经执行了），连同「已超时」的标记：拿回时
@@ -29,16 +31,22 @@ import (
 // endpointRecordStep 是端点记录在 tool_call 私有态里的键。
 const endpointRecordStep = "agent_v2.tool_endpoint"
 
+// toolExecutionState 为工具体和中间件隔离节点私有态。工具账接管后用同一分域清除端点记录。
+func toolExecutionState(ctx context.Context, name string) context.Context {
+	return compose_v2.WithNodeStateSealed(ctx, "tool\x00"+name)
+}
+
 // endpointResult 是 tool.Result 的可入档形状：Metadata 在 tool.Result 上不进 JSON（json:"-"），而 return-direct 等运行时
 // 标记就在里面，要一起记下。
 type endpointResult struct {
 	Success bool `json:"success"`
 	// Output 的类型注册过时存在 OutputTagged（带类型名，拿回原类型），否则存在 Output（字符串，见文件头）。nil 表示
 	// 没有产出，跟空串区分开：空串渲染出来是空，nil 渲染出来是 "<nil>"
-	Output       *string         `json:"output,omitempty"`
-	OutputTagged json.RawMessage `json:"output_tagged,omitempty"`
-	Error        *tool.Error     `json:"error,omitempty"`
-	Metadata     map[string]any  `json:"metadata,omitempty"`
+	Output       *string                 `json:"output,omitempty"`
+	OutputTagged json.RawMessage         `json:"output_tagged,omitempty"`
+	Parts        []schema.ToolResultPart `json:"parts,omitempty"`
+	Error        *tool.Error             `json:"error,omitempty"`
+	Metadata     map[string]any          `json:"metadata,omitempty"`
 }
 
 // endpointRecord 是一次工具执行的记录：结果，连同执行时做出的上行信号（转交 / 路由决定，拿回时交出，同工具账）。
@@ -84,7 +92,7 @@ func recordedEndpoint(next ToolEndpoint, timedOut func() bool, onRecalledTimeout
 		}
 		compose_v2.EmitSignals(ctx, rec.Signals)
 		return &tool.Result{Success: rec.Result.Success, Output: out, Error: rec.Result.Error,
-			Metadata: rec.Result.Metadata}, nil
+			Parts: slices.Clone(rec.Result.Parts), Metadata: rec.Result.Metadata}, nil
 	}
 }
 
@@ -99,13 +107,18 @@ func runAndRecord(ctx context.Context, next ToolEndpoint, timedOut func() bool, 
 	if err != nil || res == nil {
 		return res, err
 	}
-	er := &endpointResult{Success: res.Success, Error: res.Error, Metadata: res.Metadata}
+	er := &endpointResult{Success: res.Success, Error: res.Error, Parts: slices.Clone(res.Parts), Metadata: res.Metadata}
 	switch out := res.Output.(type) {
 	case nil:
 	case string:
 		er.Output = &out
 	default:
-		text := fmt.Sprintf("%v", out) // 同 renderToolContent 交给模型的那段；String() panic 由 fmt 兜住、渲染成 %!v(PANIC=…)
+		var text string
+		if len(res.Parts) == 0 {
+			text = fmt.Sprintf("%v", out)
+		} else {
+			text = tool.OutputText(out) // 有序内容绑定的文本投影必须在存档往返后保持一致。
+		}
 		er.Output = &text
 		if _, registered := compose_v2.LookupKey(reflect.TypeOf(out)); registered {
 			if b, merr := compose_v2.MarshalTagged(out); merr == nil {

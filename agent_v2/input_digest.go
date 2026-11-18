@@ -169,6 +169,14 @@ func (w digestWriter) block(b *schema.ContentBlock) {
 		if b.Toolresult.IsError {
 			w.str("toolresult.is_error", "true")
 		}
+		if parts := b.Toolresult.Parts; len(parts) > 0 {
+			w.count("toolresult.parts", len(parts))
+			for _, part := range parts {
+				w.str("toolresult.part.text", part.Text)
+				w.str("toolresult.part.media_type", part.MediaType)
+				w.str("toolresult.part.data", part.Data)
+			}
+		}
 	}
 	w.present("data", b.Data != nil)
 	if b.Data != nil {

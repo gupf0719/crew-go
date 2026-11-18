@@ -396,13 +396,14 @@ func TestInputDigest_CoversEveryField(t *testing.T) {
 		"FileContentBlock":       {"Type", "File"},
 		"FileData":               {"FileData", "Filename", "URL", "ID", "Provider"},
 		"ToolcallContentBlock":   {"Type", "Id", "Arguments", "Name"},
-		"ToolresultContentBlock": {"Type", "ToolCallId", "Content", "IsError"},
+		"ToolresultContentBlock": {"Type", "ToolCallId", "Content", "IsError", "Parts"},
+		"ToolResultPart":         {"Text", "MediaType", "Data"},
 		"DataContentBlock":       {"Type", "Data"},
 	}
 	types := []any{
 		schema.Message{}, schema.ContentBlock{}, schema.TextContentBlock{}, schema.ImageUrlContentBlock{},
 		schema.ImageUrl{}, schema.InputAudioContentBlock{}, schema.InputAudio{}, schema.FileContentBlock{},
-		schema.FileData{}, schema.ToolcallContentBlock{}, schema.ToolresultContentBlock{}, schema.DataContentBlock{},
+		schema.FileData{}, schema.ToolcallContentBlock{}, schema.ToolresultContentBlock{}, schema.ToolResultPart{}, schema.DataContentBlock{},
 	}
 	for _, v := range types {
 		rt := reflect.TypeOf(v)
@@ -417,6 +418,29 @@ func TestInputDigest_CoversEveryField(t *testing.T) {
 			t.Errorf("%s 的字段变了：现在 %v，摘要覆盖表 %v——决定新字段算不算输入，改 inputDigest 与本表",
 				rt.Name(), fields, want)
 		}
+	}
+}
+
+func TestInputDigest_ToolResultMediaChangesIdentity(t *testing.T) {
+	message := func(base64 string) *schema.Message {
+		m := schema.ToolResultMessage("recording", "相同字节长度的录音")
+		m.ContentBlocks[0].Toolresult.Parts = []schema.ToolResultPart{{Text: m.Content, MediaType: "audio/wav", Data: base64}}
+		return m
+	}
+	first, other := message("QUJD"), message("REVG")
+	if inputDigest(first) == inputDigest(other) {
+		t.Fatal("不同媒体负载共用了子调用身份")
+	}
+	raw, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored schema.Message
+	if err := json.Unmarshal(raw, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if inputDigest(&restored) != inputDigest(first) {
+		t.Fatal("相同媒体经过 JSON 往返应保持调用身份")
 	}
 }
 

@@ -270,10 +270,7 @@ func (s *server) call(ctx context.Context, name, source string, args map[string]
 		}
 		return tool.Failure(tool.ErrCodeInternal, msg), nil
 	}
-	if res.Structured != nil {
-		return tool.Success(res.Structured), nil
-	}
-	return tool.Success(flattenContent(res.Content)), nil
+	return adaptToolResult(res), nil
 }
 
 // callClient 调业务 Client 的 CallTool，兜住它的 panic。

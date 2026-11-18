@@ -301,7 +301,7 @@ func userContentBlock(cb *schema.ContentBlock) (anthropic.BetaContentBlockParamU
 		}
 		return textBlock(string(raw)), true, nil
 	case cb.Toolresult != nil:
-		return toolResultBlock(cb.Toolresult), true, nil
+		return toolResultBlock(cb.Toolresult, cb.Toolresult.Content), true, nil
 	case cb.InputAudio != nil:
 		return zero, false, errors.New("input_audio blocks are not supported by the Messages API")
 	default:
@@ -321,12 +321,7 @@ func imageBlock(url, mediaType string) (anthropic.BetaContentBlockParamUnion, er
 		if mt == "" {
 			mt = mediaType
 		}
-		return anthropic.BetaContentBlockParamUnion{OfImage: &anthropic.BetaImageBlockParam{
-			Source: anthropic.BetaImageBlockParamSourceUnion{OfBase64: &anthropic.BetaBase64ImageSourceParam{
-				Data:      data,
-				MediaType: anthropic.BetaBase64ImageSourceMediaType(mt),
-			}},
-		}}, nil
+		return anthropic.BetaContentBlockParamUnion{OfImage: base64Image(mt, data)}, nil
 	}
 	if strings.HasPrefix(url, "https://") || strings.HasPrefix(url, "http://") {
 		return anthropic.BetaContentBlockParamUnion{OfImage: &anthropic.BetaImageBlockParam{
@@ -334,6 +329,12 @@ func imageBlock(url, mediaType string) (anthropic.BetaContentBlockParamUnion, er
 		}}, nil
 	}
 	return zero, fmt.Errorf("unsupported image URL scheme in %q", clip(url))
+}
+
+func base64Image(mediaType, data string) *anthropic.BetaImageBlockParam {
+	return &anthropic.BetaImageBlockParam{Source: anthropic.BetaImageBlockParamSourceUnion{
+		OfBase64: &anthropic.BetaBase64ImageSourceParam{Data: data, MediaType: anthropic.BetaBase64ImageSourceMediaType(mediaType)},
+	}}
 }
 
 // fileBlock 转文件：PDF → document（base64 或 url 源），纯文本 → document（文本源），图片 → image。
@@ -384,7 +385,11 @@ func toolResultBlocks(m *schema.Message) ([]anthropic.BetaContentBlockParamUnion
 	var blocks []anthropic.BetaContentBlockParamUnion
 	for _, cb := range m.ContentBlocks {
 		if cb != nil && cb.Toolresult != nil {
-			blocks = append(blocks, toolResultBlock(cb.Toolresult))
+			text := cb.Toolresult.Content
+			if len(blocks) == 0 && len(cb.Toolresult.Parts) > 0 {
+				text = schema.ToolResultTextForMessage(cb.Toolresult, m.Content)
+			}
+			blocks = append(blocks, toolResultBlock(cb.Toolresult, text))
 		}
 	}
 	if len(blocks) == 0 {
@@ -394,10 +399,23 @@ func toolResultBlocks(m *schema.Message) ([]anthropic.BetaContentBlockParamUnion
 }
 
 // toolResultBlock 转一个工具结果。空白内容不发 content（API 不接受空文本块）。
-func toolResultBlock(tr *schema.ToolresultContentBlock) anthropic.BetaContentBlockParamUnion {
+func toolResultBlock(tr *schema.ToolresultContentBlock, text string) anthropic.BetaContentBlockParamUnion {
 	p := &anthropic.BetaToolResultBlockParam{ToolUseID: tr.ToolCallId}
-	if strings.TrimSpace(tr.Content) != "" {
-		p.Content = []anthropic.BetaToolResultBlockParamContentUnion{{OfText: &anthropic.BetaTextBlockParam{Text: tr.Content}}}
+	hasImage := false
+	for _, part := range schema.ToolResultPartsForText(tr, text) {
+		switch {
+		case part.Data != "" && model.SupportsToolResultImage(part.MediaType):
+			p.Content = append(p.Content, anthropic.BetaToolResultBlockParamContentUnion{OfImage: base64Image(part.MediaType, part.Data)})
+			hasImage = true
+		case strings.TrimSpace(part.Text) != "":
+			p.Content = append(p.Content, anthropic.BetaToolResultBlockParamContentUnion{OfText: &anthropic.BetaTextBlockParam{Text: part.Text}})
+		}
+	}
+	if !hasImage {
+		p.Content = nil
+		if strings.TrimSpace(text) != "" {
+			p.Content = []anthropic.BetaToolResultBlockParamContentUnion{{OfText: &anthropic.BetaTextBlockParam{Text: text}}}
+		}
 	}
 	if tr.IsError {
 		p.IsError = param.NewOpt(true)

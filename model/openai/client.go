@@ -39,6 +39,7 @@ type Client struct {
 	streamUnsupported bool
 	// streamIdleTimeout 是流式响应的空闲超时，<= 0 不设；见 WithStreamIdleTimeout。
 	streamIdleTimeout time.Duration
+	toolResultMedia   ChatToolResultMedia
 }
 
 // NewClient 创建 OpenAI ChatModel。
@@ -255,7 +256,7 @@ func (c *Client) buildRequest(messages []*schema.Message, o *model.Options, stre
 		modelName = *o.Model
 	}
 
-	wireMessages, err := convertMessages(messages, c.providerName())
+	wireMessages, err := convertMessages(messages, c.providerName(), c.toolResultMedia)
 	if err != nil {
 		return nil, err
 	}
@@ -782,11 +783,21 @@ func clip(s string) string {
 	return s[:n] + "…"
 }
 
-func convertMessages(msgs []*schema.Message, provider string) ([]openaiMessage, error) {
+func convertMessages(msgs []*schema.Message, provider string, toolMedia ChatToolResultMedia) ([]openaiMessage, error) {
 	out := make([]openaiMessage, 0, len(msgs))
+	var attachments []openaiContentPart
+	flushAttachments := func() {
+		if len(attachments) > 0 {
+			out = append(out, openaiMessage{Role: string(schema.RoleUser), contentParts: attachments})
+			attachments = nil
+		}
+	}
 	for i, m := range msgs {
 		if m == nil {
 			continue
+		}
+		if m.Role != schema.RoleTool {
+			flushAttachments()
 		}
 		om := openaiMessage{
 			Role:    string(m.Role),
@@ -821,19 +832,26 @@ func convertMessages(msgs []*schema.Message, provider string) ([]openaiMessage, 
 					},
 				})
 			}
-			if cb.Toolresult != nil {
+			if result := cb.Toolresult; result != nil {
+				text := result.Content
+				if om.ToolCallID == "" && (m.Content != "" || len(result.Parts) > 0) {
+					text = schema.ToolResultTextForMessage(result, m.Content)
+				}
+				if m.Role == schema.RoleTool {
+					var media []openaiContentPart
+					text, media = chatToolMedia(result, text, provider, toolMedia)
+					attachments = append(attachments, media...)
+				}
 				if om.ToolCallID == "" {
 					// 第一个 tool result：填入主消息
-					om.ToolCallID = cb.Toolresult.ToolCallId
-					if om.Content == "" {
-						om.Content = cb.Toolresult.Content
-					}
+					om.ToolCallID = result.ToolCallId
+					om.Content = text
 				} else {
 					// 后续 tool result：拆为独立消息
 					extraToolResults = append(extraToolResults, openaiMessage{
 						Role:       string(m.Role),
-						ToolCallID: cb.Toolresult.ToolCallId,
-						Content:    cb.Toolresult.Content,
+						ToolCallID: result.ToolCallId,
+						Content:    text,
 					})
 				}
 			}
@@ -841,6 +859,7 @@ func convertMessages(msgs []*schema.Message, provider string) ([]openaiMessage, 
 		out = append(out, om)
 		out = append(out, extraToolResults...)
 	}
+	flushAttachments()
 	return out, nil
 }
 

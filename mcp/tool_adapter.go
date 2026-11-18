@@ -2,9 +2,14 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"mime"
+	"net/http"
+	"slices"
 	"strings"
 
+	"crew-go/schema"
 	"crew-go/tool"
 )
 
@@ -111,23 +116,75 @@ func (t *RemoteTool) Call(ctx context.Context, args map[string]any) (*tool.Resul
 	return t.srv.call(ctx, t.canonical, t.sourceName, args)
 }
 
-// flattenContent 把 MCP content blocks 按原顺序整理成交给模型的文本，块与块之间空一行（见 blockText）。
-//
-// 二进制内容（图片、音频、二进制资源）不交给模型，只写一行说明：塞进文本的话，几 KB 的图片就是几千个 token 的
-// base64（以前打包成 map 再按 %v 打印，模型看到的是一长串数字）。原样交图片要等 tool_result 支持图片块。
-func flattenContent(blocks []Block) string {
-	parts := make([]string, 0, len(blocks))
-	for _, b := range blocks {
-		if s := blockText(b); s != "" {
-			parts = append(parts, s)
+// adaptToolResult 保留原有文本投影，另带上可透传的内嵌媒体。结构化正文优先，媒体仍按相对顺序保留。
+func adaptToolResult(result *CallResult) *tool.Result {
+	parts := make([]schema.ToolResultPart, 0, len(result.Content))
+	structured := result.Structured != nil
+	hasMedia := false
+	for _, b := range result.Content {
+		part := toolResultPart(b)
+		hasMedia = hasMedia || part.Data != ""
+		if structured && part.Data == "" {
+			continue
+		}
+		if !structured {
+			part.Text = blockText(b, part.Data != "")
+		}
+		if part.Text != "" || part.Data != "" {
+			parts = append(parts, part)
 		}
 	}
-	return strings.Join(parts, "\n\n")
+	if structured {
+		out := tool.Success(result.Structured)
+		if hasMedia {
+			out.Parts = append([]schema.ToolResultPart{{Text: tool.OutputText(result.Structured)}}, parts...)
+		}
+		return out
+	}
+	out := tool.Success(schema.ToolResultPartsText(parts))
+	if hasMedia {
+		out.Parts = parts
+	}
+	return out
+}
+
+func toolResultPart(block Block) schema.ToolResultPart {
+	if (block.Type != "image" && block.Type != "audio") || len(block.Data) == 0 || block.undecodable {
+		return schema.ToolResultPart{}
+	}
+	if block.Audience != nil && !slices.Contains(block.Audience, "assistant") {
+		return schema.ToolResultPart{}
+	}
+	mediaType, _, err := mime.ParseMediaType(block.Mime)
+	if err != nil || !strings.HasPrefix(mediaType, block.Type+"/") {
+		return schema.ToolResultPart{}
+	}
+	if mediaType == "image/jpg" {
+		mediaType = "image/jpeg"
+	}
+	if !matchesMediaHeader(mediaType, block.Data) {
+		return schema.ToolResultPart{}
+	}
+	return schema.ToolResultPart{MediaType: mediaType, Data: base64.StdEncoding.EncodeToString(block.Data)}
+}
+
+// matchesMediaHeader 在常用送模格式上挡住明显错标的负载。未知格式仍可供业务读取。
+func matchesMediaHeader(mediaType string, data []byte) bool {
+	switch mediaType {
+	case "image/png", "image/jpeg", "image/gif", "image/webp":
+		return http.DetectContentType(data) == mediaType
+	case "audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave":
+		return http.DetectContentType(data) == "audio/wave"
+	case "audio/mpeg", "audio/mp3":
+		return len(data) >= 10 && http.DetectContentType(data) == "audio/mpeg" ||
+			len(data) >= 4 && data[0] == 0xff && data[1]&0xe0 == 0xe0 && data[1]&0x06 != 0
+	}
+	return true
 }
 
 // blockText 是一个内容块交给模型的文本：text 原样；带文本的嵌入资源在正文前标出 URI；资源链接写成一行；
 // 其余（图片、音频、二进制资源、不认识的类型）写一行说明：类型、MIME、大小、URI。
-func blockText(b Block) string {
+func blockText(b Block, attachment bool) string {
 	switch {
 	case b.Type == "text":
 		return b.Text
@@ -151,6 +208,9 @@ func blockText(b Block) string {
 			desc = append(desc, fmt.Sprintf("%d 字节", len(b.Data)))
 		}
 		desc = append(desc, nonEmpty(b.URI)...)
+		if attachment {
+			return "[" + strings.Join(desc, "，") + "：附件]"
+		}
 		return "[" + strings.Join(desc, "，") + "：二进制内容，没有交给模型]"
 	}
 }

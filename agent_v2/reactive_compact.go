@@ -501,8 +501,16 @@ func shrinkOversizedInPlace(messages []*schema.Message, gap int) []*schema.Messa
 		if m == nil || m.Role != schema.RoleTool {
 			continue
 		}
-		if len(m.Content) > emergencyShrinkKeepBytes {
-			cands = append(cands, cand{i, len(m.Content)})
+		mediaBytes := 0
+		for _, block := range m.ContentBlocks {
+			if block != nil && block.Toolresult != nil {
+				for _, part := range block.Toolresult.Parts {
+					mediaBytes += len(part.Data)
+				}
+			}
+		}
+		if len(m.Content) > emergencyShrinkKeepBytes || mediaBytes > 0 {
+			cands = append(cands, cand{i, len(m.Content) + mediaBytes})
 		}
 	}
 	if len(cands) == 0 {
@@ -545,7 +553,9 @@ func shrinkOneToolResult(m *schema.Message) *schema.Message {
 		annot[k] = v
 	}
 	// 把真原始继续往下传——万一还有第三刀，它读到的仍是真原始而不是这一刀之后的残长。
-	annot[TruncatedOriginalBytesAnnotation] = orig
+	if c.Content != m.Content {
+		annot[TruncatedOriginalBytesAnnotation] = orig
+	}
 	c.Annotations = annot
 	if len(m.ContentBlocks) > 0 {
 		blocks := make([]*schema.ContentBlock, len(m.ContentBlocks))
@@ -555,7 +565,12 @@ func shrinkOneToolResult(m *schema.Message) *schema.Message {
 				continue
 			}
 			tr := *b.Toolresult
-			tr.Content = c.Content
+			if tr.Content == m.Content {
+				tr.Content = c.Content
+			} else if len(tr.Content) > emergencyShrinkKeepBytes {
+				tr.Content = truncateMiddle(tr.Content, emergencyShrinkKeepBytes)
+			}
+			tr.Parts = nil
 			nb := *b
 			nb.Toolresult = &tr
 			blocks[i] = &nb

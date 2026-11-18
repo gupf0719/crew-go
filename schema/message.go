@@ -23,6 +23,7 @@ type (
 	DataContentBlock       = common.DataContentBlock
 	ToolcallContentBlock   = common.ToolcallContentBlock
 	ToolresultContentBlock = common.ToolresultContentBlock
+	ToolResultPart         = common.ToolResultPart
 	MessageMetadata        = common.MessageMetadata
 	MessageUsage           = common.MessageUsage
 	LogProbContent         = common.LogProbContent

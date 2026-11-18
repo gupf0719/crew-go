@@ -236,13 +236,14 @@ func parseCallResult(raw json.RawMessage) (*CallResult, error) {
 // resource_link / 未知类型（只留 type 与认得的字段）。
 func decodeBlock(raw json.RawMessage) (Block, error) {
 	var b struct {
-		Type     string `json:"type"`
-		Text     string `json:"text"`
-		Data     string `json:"data"` // base64
-		MimeType string `json:"mimeType"`
-		URI      string `json:"uri"`
-		Name     string `json:"name"`
-		Resource *struct {
+		Type        string          `json:"type"`
+		Text        string          `json:"text"`
+		Data        string          `json:"data"` // base64
+		MimeType    string          `json:"mimeType"`
+		URI         string          `json:"uri"`
+		Name        string          `json:"name"`
+		Annotations json.RawMessage `json:"annotations"`
+		Resource    *struct {
 			URI      string  `json:"uri"`
 			MimeType string  `json:"mimeType"`
 			Text     *string `json:"text"` // 有这个键就是文本资源（空文件的 text 是空串）
@@ -263,9 +264,18 @@ func decodeBlock(raw json.RawMessage) (Block, error) {
 		}
 	}
 	block := Block{Type: b.Type, Text: b.Text, Mime: b.MimeType, URI: b.URI, Name: b.Name, textResource: textResource}
+	if len(b.Annotations) > 0 && (b.Type == "image" || b.Type == "audio") {
+		var annotations struct {
+			Audience []string `json:"audience"`
+		}
+		if err := json.Unmarshal(b.Annotations, &annotations); err != nil {
+			block.Audience = []string{} // 误写的受众标注只保留文本说明。
+		} else {
+			block.Audience = annotations.Audience
+		}
+	}
 	if b.Data != "" {
-		// 解不了不让整次调用失败：二进制内容本来就不交给模型，解码只为说明里的大小；为它报错的话，同一次结果里的
-		// 文本也丢了，还会被报成「可能已执行」引着模型重试有副作用的工具。不规范的 base64（URL-safe、缺 padding）也认。
+		// 解不了时保留文本说明，同一次调用的其他块仍然可用。URL-safe 和缺 padding 的 base64 也支持。
 		block.Data, block.undecodable = decodeBase64(b.Data)
 	}
 	return block, nil

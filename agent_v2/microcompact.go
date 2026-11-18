@@ -222,7 +222,7 @@ func microCompactToClear(messages []*schema.Message, cfg *MicroCompactConfig) ma
 // 不变量：
 //   - tool_use 块永不修改（保 LLM 看到的 call_id 列表完整）
 //   - tool_result 块的元数据（tool_use_id / role）永不修改
-//   - 仅 tool_result.Content + Toolresult.Content 被替换为占位符
+//   - 结果正文替换为占位符，送模副本中的附件一并清理
 //   - 不在 CompactableTools 白名单的 tool 完全跳过
 //
 // 算法：
@@ -348,6 +348,7 @@ func cloneToolResultWithPlaceholder(m *schema.Message, placeholder string) *sche
 				cbCopy := *cb
 				trCopy := *cb.Toolresult
 				trCopy.Content = placeholder
+				trCopy.Parts = nil
 				cbCopy.Toolresult = &trCopy
 				cloned.ContentBlocks[i] = &cbCopy
 				continue
@@ -400,6 +401,7 @@ func cloneToolResultWithOffloadRef(m *schema.Message, key string, previewBytes i
 				cbCopy := *cb
 				trCopy := *cb.Toolresult
 				trCopy.Content = offloadPlaceholder(key, clampPrefixToUTF8(cb.Toolresult.Content, previewBytes), readToolName, truncated)
+				trCopy.Parts = nil
 				cbCopy.Toolresult = &trCopy
 				cloned.ContentBlocks[i] = &cbCopy
 				continue

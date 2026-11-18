@@ -296,6 +296,7 @@ type bgTask struct {
 	cancelRequested bool
 	status          BackgroundTaskStatus
 	text            string // 结局的正文（交给模型的那段）
+	parts           []schema.ToolResultPart
 	spillID         string // 结果被转存时的取回 id 与说明（盖到通知上，见 ToolResultSpillAnnotation）
 	spillInfo       string
 	endedAt         time.Time
@@ -425,7 +426,10 @@ type bgOutcome struct {
 // bgRender 返回交给模型的正文，连同转存后的取回 id 与说明（没转存为空）。
 type bgRender func(ctx context.Context, res *tool.Result) bgRendered
 
-type bgRendered struct{ content, spillID, spillInfo string }
+type bgRendered struct {
+	content, spillID, spillInfo string
+	parts                       []schema.ToolResultPart
+}
 
 func (m *BackgroundTaskManager) call(callCtx context.Context, sc *backgroundScope, tc schema.ToolCall, toolTimeout time.Duration,
 	invoke func(c, guard context.Context) (*tool.Result, error), render bgRender) (out bgOutcome, started bool) {
@@ -592,9 +596,14 @@ func (m *BackgroundTaskManager) finish(renderCtx context.Context, t *bgTask, res
 	status, text, sp := m.conclude(renderCtx, t.toolName, res, err, cause, render)
 	m.mu.Lock()
 	if status == BackgroundTaskCompleted && t.cancelRequested {
-		text = "（取消请求之后它仍然跑完了，下面是它的结果）\n" + text
+		const note = "（取消请求之后它仍然跑完了，下面是它的结果）"
+		text = note + "\n" + text
+		if len(sp.parts) > 0 {
+			sp.parts = append([]schema.ToolResultPart{{Text: note}}, sp.parts...)
+		}
 	}
 	t.status, t.text, t.spillID, t.spillInfo, t.endedAt = status, text, sp.spillID, sp.spillInfo, time.Now()
+	t.parts = sp.parts
 	m.total--
 	if m.running[t.conv]--; m.running[t.conv] <= 0 {
 		delete(m.running, t.conv)
@@ -792,15 +801,19 @@ func notedTaskIDs(msgs []*schema.Message) map[string]bool {
 
 // terminalTextLocked 是结局的说明：哪次调用、用时多久、结果是什么。通知与 background_task 用的都是它。
 func (t *bgTask) terminalTextLocked() string {
+	return t.terminalPrefixLocked() + t.text
+}
+
+func (t *bgTask) terminalPrefixLocked() string {
 	head := fmt.Sprintf("任务 id=%q（%s，参数 %s）", t.id, t.toolName, truncateWithEllipsis(t.args, backgroundArgsPreview))
 	took := t.endedAt.Sub(t.startedAt).Round(time.Second)
 	switch t.status {
 	case BackgroundTaskCompleted:
-		return fmt.Sprintf("%s已完成，用时 %s。结果：\n%s", head, took, t.text)
+		return fmt.Sprintf("%s已完成，用时 %s。结果：\n", head, took)
 	case BackgroundTaskFailed:
-		return fmt.Sprintf("%s失败了，用时 %s：%s", head, took, t.text)
+		return fmt.Sprintf("%s失败了，用时 %s：", head, took)
 	default:
-		return fmt.Sprintf("%s已取消，用时 %s：%s", head, took, t.text)
+		return fmt.Sprintf("%s已取消，用时 %s：", head, took)
 	}
 }
 
@@ -883,7 +896,7 @@ func backgroundTaskAction(ctx context.Context, args map[string]any) (*tool.Resul
 			return nil, err
 		}
 	}
-	return &tool.Result{Success: true, Output: m.describe(t, action == "cancel")}, nil
+	return m.describe(t, action == "cancel"), nil
 }
 
 // lookup 按 id 找当前会话作用域里的任务；别的会话的当作没有（不透露它存在）。
@@ -935,19 +948,23 @@ func waitBackgroundTask(ctx context.Context, t *bgTask, d time.Duration) error {
 }
 
 // describe 是 status / wait / cancel 交给模型的说明。结局已定时一并交出结果，记为已送达（不再通知）。
-func (m *BackgroundTaskManager) describe(t *bgTask, cancelling bool) string {
+func (m *BackgroundTaskManager) describe(t *bgTask, cancelling bool) *tool.Result {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if t.terminal() {
 		t.delivered = true
-		return t.terminalTextLocked()
+		if len(t.parts) > 0 {
+			parts := append([]schema.ToolResultPart{{Text: strings.TrimSuffix(t.terminalPrefixLocked(), "\n")}}, t.parts...)
+			return &tool.Result{Success: true, Output: schema.ToolResultPartsText(parts), Parts: parts}
+		}
+		return tool.Success(t.terminalTextLocked())
 	}
 	elapsed := time.Since(t.startedAt).Round(time.Second)
 	if cancelling {
-		return fmt.Sprintf("已请求取消任务 id=%q（%s，已运行 %s），它还没停下（工具可能不响应取消）；结束后结果会通知你。", t.id, t.toolName, elapsed)
+		return tool.Success(fmt.Sprintf("已请求取消任务 id=%q（%s，已运行 %s），它还没停下（工具可能不响应取消）；结束后结果会通知你。", t.id, t.toolName, elapsed))
 	}
-	return fmt.Sprintf("任务 id=%q（%s）仍在运行，已运行 %s。它结束后结果会自动通知你；确实需要结果才能往下做时用 action=\"wait\"。",
-		t.id, t.toolName, elapsed)
+	return tool.Success(fmt.Sprintf("任务 id=%q（%s）仍在运行，已运行 %s。它结束后结果会自动通知你；确实需要结果才能往下做时用 action=\"wait\"。",
+		t.id, t.toolName, elapsed))
 }
 
 // listText 列出当前会话作用域里的任务，最近的在前。

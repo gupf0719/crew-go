@@ -109,13 +109,8 @@ func openaiFilePart(file *schema.FileData, mediaType, provider string) (openaiCo
 	case strings.HasPrefix(mediaType, "image/") && source != "":
 		return openaiContentPart{Type: "image_url", ImageURL: &openaiMediaURL{URL: source}}, nil
 	case strings.HasPrefix(mediaType, "audio/"):
-		var format string
-		switch mediaType {
-		case "audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave":
-			format = "wav"
-		case "audio/mpeg", "audio/mp3":
-			format = "mp3"
-		default:
+		format := openaiAudioFormat(mediaType)
+		if format == "" {
 			return openaiContentPart{}, fmt.Errorf("unsupported audio media type %q", mediaType)
 		}
 		data := file.FileData
@@ -134,6 +129,16 @@ func openaiFilePart(file *schema.FileData, mediaType, provider string) (openaiCo
 	default:
 		return openaiContentPart{}, fmt.Errorf("unsupported file source for media type %q", mediaType)
 	}
+}
+
+func openaiAudioFormat(mediaType string) string {
+	switch mediaType {
+	case "audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave":
+		return "wav"
+	case "audio/mpeg", "audio/mp3":
+		return "mp3"
+	}
+	return ""
 }
 
 func openaiAudioPart(format, data, provider string) (openaiContentPart, error) {

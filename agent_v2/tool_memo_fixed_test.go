@@ -126,6 +126,60 @@ func TestToolMemo_FixedAfterProcessing_NotReprocessed(t *testing.T) {
 	}
 }
 
+func TestToolMemo_FixedAfterProcessing_ClearsRedactedMediaFromEndpoint(t *testing.T) {
+	const encoded = "cHJpdmF0ZS1tZWRpYS1hdHRhY2htZW50"
+	var execs atomic.Int64
+	tk := tool.NewToolkit()
+	tk.Register(tool.NewFuncTool("capture", "采集图片", map[string]any{"type": "object"}, func(context.Context, map[string]any) (*tool.Result, error) {
+		execs.Add(1)
+		return &tool.Result{
+			Success: true,
+			Output:  "原始说明",
+			Parts: []schema.ToolResultPart{
+				{Text: "原始说明"},
+				{MediaType: "image/png", Data: encoded},
+			},
+		}, nil
+	}))
+	var seen []*schema.Message
+	m := newStubModelCapturing([]*schema.Message{
+		schema.AssistantToolCallMessage([]schema.ToolCall{evSegCall("c1", "capture")}),
+		schema.AssistantMessage("done")}, &seen)
+	h := &toolEndFunc{fn: func(_ context.Context, out *schema.ToolOutput) {
+		out.Result.Output = "redacted"
+	}}
+	passthrough := func(next agent_v2.ToolEndpoint) agent_v2.ToolEndpoint { return next }
+	ag := agent_v2.NewBasicAgent(agent_v2.WithName("media_memo"), agent_v2.WithModel(m), agent_v2.WithToolkit(tk),
+		agent_v2.WithHooks(h), agent_v2.WithToolMiddleware(passthrough))
+	cp := compose_v2.NewInMemoryCheckpointer()
+	ctx := agent_v2.WithCtxOrchHooks(compose_v2.WithCheckpointerCtx(context.Background(), cp), &goexitAfterNodeOnce{node: "tools"})
+	sess := agent_v2.NewRunSession()
+	runExpectingGoexit(t, func() { _, _ = ag.Run(ctx, sess, schema.UserMessage("go")) })
+	saved, err := cp.LoadNS(ctx, sess.RunID, "")
+	if err != nil || saved == nil {
+		t.Fatalf("工具节点提交前退出应留下存档，实际 err=%v", err)
+	}
+	blob, err := compose_v2.MarshalCheckpoint(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(blob), "redacted") || strings.Contains(string(blob), encoded) {
+		t.Error("存档应保留定稿工具结果并清除端点的原始附件")
+	}
+	if _, err := ag.Resume(ctx, sess.RunID, agent_v2.WithResumeSession(sess)); err != nil {
+		t.Fatalf("续跑失败：%v", err)
+	}
+	got := lastResultFor(t, seen, "c1")
+	if got.Content != "redacted" || execs.Load() != 1 {
+		t.Errorf("续跑应重放脱敏结果，实际文本 %q，工具执行 %d 次", got.Content, execs.Load())
+	}
+	for _, block := range got.ContentBlocks {
+		if block != nil && block.Toolresult != nil && len(block.Toolresult.Parts) != 0 {
+			t.Error("续跑的脱敏结果仍有原始内容块")
+		}
+	}
+}
+
 // TestToolMemo_FixedAfterProcessing_HookDecisionReplayed：钩子在 OnToolEnd 里做决定，第一次定 alpha、之后定 beta（看到的
 // 东西变了、或钩子本身不确定）。首跑处理完时这次调用的决定是 alpha；续跑交出的应是定下的 alpha，钩子不再触发。
 func TestToolMemo_FixedAfterProcessing_HookDecisionReplayed(t *testing.T) {

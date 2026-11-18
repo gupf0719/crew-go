@@ -155,6 +155,9 @@ func cloneContentBlock(b *schema.ContentBlock) *schema.ContentBlock {
 	}
 	c.Toolcall = clonePtr(b.Toolcall)
 	c.Toolresult = clonePtr(b.Toolresult)
+	if c.Toolresult != nil {
+		c.Toolresult.Parts = slices.Clone(b.Toolresult.Parts)
+	}
 	if b.Data != nil {
 		v := *b.Data
 		v.Data = cloneAny(b.Data.Data)

@@ -141,3 +141,4 @@ crew-go 在创建 goroutine 前等空位，BSP 超步统一提交。预算归单
 | 2026-10-20 | 节点超时协作式 + 失效可见 + 迟到成功丢弃；`NodeTimeoutError` 不露 `DeadlineExceeded`；重试套 `RunWithRetry` | `e6ccb2c9`、`c5cf9106` |
 | 2026-10-20 | 只读放行：实例自声明 fail-closed；MCP 注解显式信任才认；approve_always 照常；审批方式进前言 | `7de57454` |
 | 2026-10-20 | 插话 `Inbox` + 回合结束闸门一起做，返回 `feedback string` | `c7afccc7` |
+| 2026-11-18 | 用协议已有的挂起态承载断点坐标，继续动作绑定任务当前的断点 ID。超步恢复会放行整批断点，因此需明确覆盖该批断点。 | [AG-UI](../../v2/agui.md#声明式断点) · [A2A](../../v2/a2a.md#声明式断点) |

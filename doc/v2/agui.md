@@ -113,8 +113,9 @@ Run → 中断 → RunFinished(outcome=interrupt, interrupts=[{id, reason, messa
   由 AG-UI 投影到 `responseSchema`。Handler 在续跑前校验 `resolved` 的 payload。
   字段缺失或类型不符时返回 `invalid_resume_payload`，保留原挂起项。
   允许文档内引用，外部引用报配置错误。工具审批沿用其固定答复格式。
+
 - 全部 `cancelled` 时走 `agent_v2.ResumeActionAbort`，清档后发 `RunFinished(outcome=cancelled)`。
-  混合答复中，取消项以 `[用户取消了此项]` 传给节点。
+  混合答复中，非断点中断的取消项以 `[用户取消了此项]` 传给节点。
 - 默认进程内会话配 `agui.WithCheckpointer` 后支持多轮续跑。同一 `(owner, threadId)`
   在途时第二个请求收到 `busy`。新 Run 替换旧挂起会话时，确认旧档删除后才运行。
   开流前放弃许可存储故障时返回 HTTP 503。开流后清档失败时发 `RUN_ERROR`，两种情况都保留旧会话的续跑入口。
@@ -129,6 +130,22 @@ Run → 中断 → RunFinished(outcome=interrupt, interrupts=[{id, reason, messa
   那种份额恒为 1 的请求也挤不动。代价是**上限变软**——实测约 `max(maxSessions, 有挂起
   会话的租户数) + 在途请求数`，而增量挂在**身份数**上（一个身份恰好多占一格，跟它发多少
   请求无关）。详见 `WithMaxSessions` 的 godoc。
+
+### 声明式断点
+
+图在断点处暂停时，`RUN_FINISHED.outcome.type` 为 `interrupt`。该项的
+`reason` 为 `crew-go:breakpoint`，`metadata.breakpoint` 带匹配的 `before`、
+`after` 节点列表和图的 `ns`。没有命中的方向省略，顶层图省略 `ns`。
+同名节点可来自不同子图，同一超步边界的 before 与 after 命中可出现在同一项。
+启用共享会话时，`GET /agui?threadId=<id>` 从根存档返回相同的断点与 ID。
+远端 A2A 断点转述到宿主时另带 `delegated: true`，节点和 `ns` 是远端图的坐标。
+前端继续使用宿主事件的 `interrupt.id`。
+
+继续时沿用 `threadId`、分配新的 `runId`，对每个当前断点提交
+`{"interruptId":"<id>","status":"resolved"}`。断点无需 `payload`，继续地址取自
+`interrupt.id`。如同批还有其他提问，仍需覆盖全部中断。放弃宿主任务时将全部挂起项设为
+`cancelled`。一边取消断点一边继续其他项的请求返回 `invalid_resume`。终止远端 A2A 任务使用其 `CancelTask`。
+[引擎边界](execution-control.md#14-停下时拿到什么) · [AG-UI 中断规范](https://docs.ag-ui.com/concepts/interrupts)
 
 ### 共享会话
 

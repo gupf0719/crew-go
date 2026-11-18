@@ -195,6 +195,13 @@ func questionChanged(question gatePending, task *a2atypes.Task) bool {
 }
 
 func samePendingQuestion(a, b PendingQuestion) bool {
+	if (a.Breakpoint == nil) != (b.Breakpoint == nil) {
+		return false
+	}
+	if a.Breakpoint != nil && (a.Breakpoint.NS != b.Breakpoint.NS || a.Breakpoint.Delegated != b.Breakpoint.Delegated ||
+		!slices.Equal(a.Breakpoint.Before, b.Breakpoint.Before) || !slices.Equal(a.Breakpoint.After, b.Breakpoint.After)) {
+		return false
+	}
 	return a.InterruptID == b.InterruptID && a.Question == b.Question && a.Approval == b.Approval &&
 		a.ToolCallID == b.ToolCallID && slices.Equal(a.Options, b.Options)
 }

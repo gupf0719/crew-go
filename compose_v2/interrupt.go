@@ -77,9 +77,7 @@ type AskQuery struct {
 	// ToolCallInstanceID 供适配器关联工具事件和审批。旧档及自研调用可留空，答复仍使用 InterruptID。
 	ToolCallInstanceID string `json:"tool_call_instance_id,omitempty"`
 
-	// Breakpoint 非 nil 表示这一问是声明式断点停下的（[GraphBuilder.WithInterruptBefore] /
-	// [WithInterruptBefore] 等），不是节点在提问：没有要回答的问题，续跑（带不带答案都行）就继续。
-	// 由框架填；业务经 [Ask] 提问时填了也会被清掉。
+	// Breakpoint 由引擎或远端适配器填写，标出声明式断点的位置。经 [Ask] 提问时会清除该字段。
 	Breakpoint *Breakpoint `json:"breakpoint,omitempty"`
 }
 
@@ -769,21 +767,7 @@ func NextAnswerSlot(ctx context.Context) (id string, ans *schema.Message, ok boo
 // （业务照样能 `GetResumeContext(ctx).UserInputs[k]`）。要真关得先收窄 ResumeContext
 // （动 observability 两处读点 + 59 个测试文件），那是另一笔账。
 func GetResumeAnswer(ctx context.Context, interruptID string) (*schema.Message, bool) {
-	rc, ok := GetResumeContext(ctx)
-	if !ok || rc.UserInputs == nil {
-		return nil, false
-	}
-	// **兑付记账对这条路同样生效**（见 answer_consumption.go）。
-	//
-	// 这条路正是「拿任意 key 去 pull」，也就是身份最容易撞的地方——业务两处写同一个常量
-	// ID 时，第二个提问会被第一个的答案静默满足。哨兵实测过那个形态：用户只批准了
-	// 「确认转账」，「删除全部历史」跟着执行、`err == nil`。
-	//
-	// 记账放在这里而不是只放在 `NextAnswerSlot`：那样这条路会成为整道兜底的绕过口。
-	if answerAlreadyConsumed(ctx, interruptID) {
-		return nil, false
-	}
-	ans, ok := rc.UserInputs[interruptID]
+	ans, ok := lookupResumeAnswer(ctx, interruptID)
 	// 同 NextAnswerSlot：判据是「真的交出了能用的答案」，不是「key 在不在」——
 	// `map{"id": nil}` 是支持的形态（当没答案、照常再问），按 `ok` 记会把它变成
 	// 终局失败 + 清存档。
@@ -791,6 +775,22 @@ func GetResumeAnswer(ctx context.Context, interruptID string) (*schema.Message, 
 		getAnswerLedger(ctx).record(interruptID)
 	}
 	return ans, ok
+}
+
+// HasResumeAnswer 检查已知的中断 ID 是否有可用答复。适配器可用它在读取答复前确认一批必答项都已就绪。
+// 检查不会消费答复，实际读取仍用 [GetResumeAnswer]。
+func HasResumeAnswer(ctx context.Context, interruptID string) bool {
+	answer, ok := lookupResumeAnswer(ctx, interruptID)
+	return ok && answer != nil
+}
+
+func lookupResumeAnswer(ctx context.Context, interruptID string) (*schema.Message, bool) {
+	rc, ok := GetResumeContext(ctx)
+	if !ok || rc.UserInputs == nil || answerAlreadyConsumed(ctx, interruptID) {
+		return nil, false
+	}
+	answer, ok := rc.UserInputs[interruptID]
+	return answer, ok
 }
 
 // ── 中断寻址坐标 + 每节点 interrupt counter（`Ask` / 业务自填 ID 都从这里取维度） ──

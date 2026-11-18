@@ -58,9 +58,8 @@ type ContextItem struct {
 type ResumeEntry struct {
 	// InterruptID 对应上次 RunFinished(interrupt) 里 interrupt.id。
 	InterruptID string `json:"interruptId"`
-	// Status 是解决状态："resolved"（已答，payload 是答案）/ "cancelled"（用户放弃）。
-	// 全 cancelled → 终止 run（ResumeActionAbort）；混合 resolved/cancelled → resolved
-	// 续跑、cancelled 注入取消标记。
+	// Status 是解决状态。"resolved" 回答提问或放行断点，"cancelled" 表示用户放弃。
+	// 全 cancelled 时终止任务。续跑时普通提问可注入取消标记，断点须全部放行。
 	Status string `json:"status"`
 	// Payload 是用户答复（resolved 时的答案，可能是字符串或结构化对象）。
 	Payload    any `json:"payload,omitempty"`
@@ -359,10 +358,8 @@ type sessionEntry struct {
 	replacementHistoryPending bool
 	history                   agent_v2.TaskHistoryDestination
 	touchedAt                 int64 // 最后活动 Unix nano，LRU 淘汰用
-	// open 是挂起的那个 run 交给前端的全部中断（InterruptID → 是不是工具审批）。续跑的 resume 列表必须恰好覆盖它们
-	// （AG-UI：不支持只答一部分，也不能答不在其中的）；审批的答复先校验再开跑，认不出的整批拒绝、这些问题保持
-	// 挂起（交给审批层的话认不出就按拒绝处理，`{"approved":true}`、`Yes.` 曾都被当成拒绝）。
-	open    map[string]bool
+	// open 按 InterruptID 记录挂起项类型。续跑的 resume 列表必须恰好覆盖它们。
+	open    map[string]interruptKind
 	schemas answerSchemas
 	// prior 是 Run 时交给 agent 的调用方前文（agent_v2.WithCallerHistoryCtx），续跑时原样再推。
 	prior []*schema.Message
@@ -765,9 +762,9 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 	if shared != nil {
 		if shared.record != nil {
 			if saved := shared.record.Cancellation; saved != nil {
-				open := make(map[string]bool, len(saved.InterruptIDs))
+				open := make(map[string]interruptKind, len(saved.InterruptIDs))
 				for _, id := range saved.InterruptIDs {
-					open[id] = true
+					open[id] = openQuestion
 				}
 				if !allCancelled || coverageProblem(in.Resume, open) != "" {
 					_ = sse.Reject(http.StatusConflict, "cleanup_pending", "the cancelled task still needs cleanup")
@@ -838,6 +835,15 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 	approvalAnswers := make(map[string]string, len(open))
 	reused := make(map[string]*schema.Message)
 	for _, e := range in.Resume {
+		kind := open[e.InterruptID]
+		if kind == openBreakpoint || kind == openDelegatedBreakpoint {
+			if !allCancelled && e.Status == ResumeStatusCancelled {
+				_ = sse.Reject(http.StatusBadRequest, "invalid_resume", fmt.Sprintf(
+					"interrupt %q is a breakpoint; resolve every breakpoint to continue or cancel every interrupt to abandon the run", e.InterruptID))
+				return
+			}
+			continue
+		}
 		if e.Status != ResumeStatusResolved {
 			continue
 		}
@@ -857,7 +863,7 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 				return
 			}
 		}
-		if !open[e.InterruptID] {
+		if kind != openApproval {
 			continue
 		}
 		option, ok := approvalAnswerFromPayload(e.Payload)
@@ -910,6 +916,13 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 	// 分类 resume entry：resolved 收集答案（按 InterruptID 配对），cancelled 记账。
 	answers := make(map[string]*schema.Message, len(in.Resume))
 	for _, e := range in.Resume {
+		switch open[e.InterruptID] {
+		case openBreakpoint:
+			continue // 放行断点由 Resume 本身完成。
+		case openDelegatedBreakpoint:
+			answers[e.InterruptID] = schema.UserMessage("") // 远端断点要在宿主 ID 上收到继续确认。
+			continue
+		}
 		if e.Status == ResumeStatusCancelled {
 			answers[e.InterruptID] = schema.UserMessage("[用户取消了此项]")
 			continue
@@ -1240,7 +1253,7 @@ func (h *handler) releaseBusy(key sessionKey, claimed *sessionEntry) {
 	}
 }
 
-// storeInterrupt 中断挂起时把 sess、这次交给前端的中断（InterruptID → 是不是工具审批）与 Run 时的前文存入 entry，换掉
+// storeInterrupt 中断挂起时把 sess、按 ID 索引的中断类型与 Run 时的前文存入 entry，换掉
 // 之前记下的中断；累积的答复留着（busy 保持——releaseBusy defer 会清）。
 func (h *handler) storeInterrupt(key sessionKey, sess *agent_v2.RunSession, batch interruptBatch, prior []*schema.Message) {
 	h.mu.Lock()
@@ -1272,7 +1285,7 @@ func (h *handler) keepSuspended(key sessionKey, sess *agent_v2.RunSession) {
 
 // coverageProblem 检查 resume 列表是否恰好覆盖挂起的中断：每一条都是挂起的中断、没有重复、每个挂起的中断都有一条。
 // 不满足时返回给前端的说明。
-func coverageProblem(entries []ResumeEntry, open map[string]bool) string {
+func coverageProblem(entries []ResumeEntry, open map[string]interruptKind) string {
 	seen := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		if _, ok := open[e.InterruptID]; !ok {

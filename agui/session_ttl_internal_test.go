@@ -107,7 +107,7 @@ func TestServeRun_RetainsPendingTaskWhenCheckpointCleanupIsBusy(t *testing.T) {
 	sid := seedPending(t, h, cp, key, 0)
 	previous := h.sessions[key]
 	touchedAt := previous.touchedAt
-	previous.open = map[string]bool{"q1": true}
+	previous.open = map[string]interruptKind{"q1": openApproval}
 	_, activity, err := compose_v2.BeginTaskActivity(t.Context(), sid, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -124,7 +124,7 @@ func TestServeRun_RetainsPendingTaskWhenCheckpointCleanupIsBusy(t *testing.T) {
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"code":"busy"`) {
 		t.Fatalf("应拒绝覆盖正在执行的任务，实际 HTTP %d %s", w.Code, w.Body.String())
 	}
-	if !hasCP(sid) || h.sessions[key] != previous || previous.busy || !previous.open["q1"] || previous.touchedAt != touchedAt {
+	if !hasCP(sid) || h.sessions[key] != previous || previous.busy || previous.open["q1"] != openApproval || previous.touchedAt != touchedAt {
 		t.Fatal("应保留旧任务的存档、挂起问题、续跑入口和闲置时间")
 	}
 	activity.Release()

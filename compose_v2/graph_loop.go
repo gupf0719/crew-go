@@ -3269,7 +3269,7 @@ func warnUnmatchedAnswerIDs(ctx context.Context, resumeFrom *Checkpoint, answers
 	for _, q := range resumeFrom.PendingInterrupts {
 		if q != nil {
 			pendingIDs[q.InterruptID] = true
-			if q.Breakpoint != nil {
+			if q.atBreakpoint() {
 				breakpointIDs[q.InterruptID] = true
 			}
 		}

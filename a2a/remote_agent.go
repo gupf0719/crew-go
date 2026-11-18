@@ -36,7 +36,7 @@ import (
 // host BasicAgent 的 toolkit（设计说明见包 godoc remote_tool.go）。
 //
 // HITL：RemoteAgent 无自己的 cp，嵌入运行时**骑 host（编排 / BasicAgent toolsNode）的
-// cp**——远端要人时（审批请求与 AUTH_REQUIRED 一律如此，普通追问要开 WithHumanGate）抛 InterruptError 从
+// cp**——远端审批、授权、声明式断点和启用 WithHumanGate 的普通追问均抛 InterruptError 从
 // host 节点冒泡、host cp 存挂起态；等人答复的那一问（远端 taskID、会话线程、第几问、问题）按调用位置记进
 // host 节点的私有态、随 host cp 走（见 gatePending）。Resume 时 host 重跑节点 → RemoteAgent.Run 再调 → 读回
 // 那条记录，按身份（gateQuestionID）取回人的答复续那个远端任务；AUTH_REQUIRED 的凭证走带外通道，人答「已经
@@ -251,8 +251,8 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 	//     同一个 session 带上人的答复再 Run 一次就续刚才那个任务。只按位置
 	//     记的话顶层再 Run 一次会新开任务、把人的答复当成请求（复审实测）。
 	//
-	// 远端的审批请求（挂起清单里标了审批的问题、任务状态 AUTH_REQUIRED）不管开没开 WithHumanGate 都交给真人，所以节点
-	// 里的提问位置一律要取。WithHumanGate 只决定普通追问交给谁。宿主模型用续接句柄选择要补答的任务。
+	// 远端审批、授权和声明式断点经宿主中断等待确认，所以节点里的提问位置一律要取。
+	// WithHumanGate 控制普通追问，宿主模型用续接句柄选择要补答的任务。
 	pos := ""
 	if inNode {
 		pos = compose_v2.CurrentInterruptSite(ctx).InterruptID()
@@ -446,6 +446,8 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 			switch how {
 			case reconcileSend:
 				switch items := question.Items; {
+				case len(items) == 1 && items[0].Breakpoint != nil:
+					msg.Parts = a2atypes.ContentParts{AnswerPart(items[0].InterruptID, nil, "")}
 				case len(items) == 1 && items[0].Approval:
 					parts, err := addressApprovalAnswer(msg.Parts, items[0].InterruptID)
 					if err != nil {
@@ -619,9 +621,8 @@ stream:
 		// 授权请求问的是「去带外完成授权、然后接着办」，不是远端挂着的哪几问
 		items = nil
 	}
-	// 这一问交给真人：审批请求（AUTH_REQUIRED，或挂起清单里标了审批的问题）一律如此——宿主模型不能替人批准远端的
-	// 操作；普通追问看 WithHumanGate
-	toHuman := waitsForInput(lastState) && (a.humanGate || auth || anyApproval(items))
+	// 审批、授权和声明式断点交给调用方确认。普通追问按 WithHumanGate 配置路由。
+	toHuman := waitsForInput(lastState) && (a.humanGate || auth || needsHuman(items))
 	q := firstNonEmpty(statusMsg, "the remote agent needs more information to proceed")
 	if auth {
 		q = firstNonEmpty(statusMsg, "the remote agent needs authorization to proceed") + "\n(" + authAnswerHint + ")"
@@ -902,10 +903,10 @@ func waitsForInput(st a2atypes.TaskState) bool {
 	return st == a2atypes.TaskStateInputRequired || st == a2atypes.TaskStateAuthRequired
 }
 
-// anyApproval 判断挂起清单里有没有工具审批。
-func anyApproval(items []PendingQuestion) bool {
+// needsHuman 判断挂起清单里有没有需要调用方确认的工具审批或断点。
+func needsHuman(items []PendingQuestion) bool {
 	for _, it := range items {
-		if it.Approval {
+		if it.Approval || it.Breakpoint != nil {
 			return true
 		}
 	}
@@ -1170,10 +1171,22 @@ func gateInterrupt(id, question string, items []PendingQuestion) *compose_v2.Int
 	}
 }
 
-// gateQuery 构造宿主这边的一问：远端那一问是工具审批时标成审批（不带远端的 toolCallId——那不是宿主的工具调用）。
+// gateQuery 用宿主 ID 寻址远端中断，保留断点位置与审批类型。
 func gateQuery(id, question string, item *PendingQuestion) *compose_v2.AskQuery {
 	q := &compose_v2.AskQuery{Question: question, InterruptID: id, Reason: "a2a_input_required"}
-	if item != nil && item.Approval {
+	if item == nil {
+		return q
+	}
+	if bp := item.Breakpoint; bp != nil {
+		details := *bp
+		details.Before, details.After = slices.Clone(bp.Before), slices.Clone(bp.After)
+		details.Delegated = true
+		q.Breakpoint = &details
+		q.Reason = compose_v2.BreakpointInterruptReason
+		if item.Question != "" {
+			q.Question = item.Question // 使用断点描述，外层协议按宿主 ID 生成继续说明。
+		}
+	} else if item.Approval {
 		q.Reason = agent_v2.ApprovalInterruptReason
 		q.Options = item.Options
 	}
@@ -1189,15 +1202,24 @@ func gateItemsInterrupt(pos, taskID string, round int, items []PendingQuestion) 
 	return &compose_v2.InterruptError{Reason: "a2a_input_required", Queries: qs}
 }
 
-// gateItemAnswers 取宿主这边对远端每一问的答复，转成按 interruptId 的 DataPart；没答到的跳过。
+// gateItemAnswers 先确认全部断点的答复就绪，再读取并封装本次可发送的答复。
 func gateItemAnswers(ctx context.Context, pos string, p gatePending) a2atypes.ContentParts {
+	for _, it := range p.Items {
+		if it.Breakpoint != nil && !compose_v2.HasResumeAnswer(ctx, gateItemID(pos, p.TaskID, p.Round, it.InterruptID)) {
+			return nil
+		}
+	}
 	var parts a2atypes.ContentParts
 	for _, it := range p.Items {
 		ans, ok := compose_v2.GetResumeAnswer(ctx, gateItemID(pos, p.TaskID, p.Round, it.InterruptID))
 		if !ok || ans == nil {
 			continue
 		}
-		parts = append(parts, AnswerPart(it.InterruptID, nil, ans.Content))
+		text := ans.Content
+		if it.Breakpoint != nil {
+			text = "" // 断点继续只传确认，正文留在宿主。
+		}
+		parts = append(parts, AnswerPart(it.InterruptID, nil, text))
 	}
 	return parts
 }

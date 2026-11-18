@@ -140,7 +140,7 @@ type RunInterrupt struct {
 	ToolCallID string `json:"toolCallId,omitempty"`
 	// ResponseSchema 是这一问期望的答复形状（JSON Schema），前端据此生成表单。
 	ResponseSchema map[string]any `json:"responseSchema,omitempty"`
-	// Metadata 是附加信息（工具审批时放四个选项与工具名，给自家前端用）。
+	// Metadata 是附加信息，例如工具审批选项及声明式断点的位置。
 	Metadata map[string]any `json:"metadata,omitempty"`
 }
 

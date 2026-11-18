@@ -15,8 +15,7 @@ const AllNodes NodeID = "*"
 // BreakpointInterruptReason 是声明式断点停下时 [InterruptError] 与它的 [AskQuery] 上的 Reason。
 const BreakpointInterruptReason = "breakpoint"
 
-// Breakpoint 说明一次声明式断点停在了哪儿——[AskQuery.Breakpoint] 非 nil 即这一问是断点停下的，
-// 不是节点在提问：没有问题要回答，续跑（带不带答案都行）就从这里继续。
+// Breakpoint 记录声明式断点的位置。本图断点在下次从该边界续跑时放行。
 //
 // 一个超步边界上 after 与 before 同时命中时只停一次，两个字段都填。
 type Breakpoint struct {
@@ -26,6 +25,8 @@ type Breakpoint struct {
 	After []NodeID `json:"after,omitempty"`
 	// NS 是停下的那张图的 ns（顶层图为空）。
 	NS string `json:"ns,omitempty"`
+	// Delegated 表示适配层转述远端任务的断点。宿主须按中断 ID 传入继续确认。
+	Delegated bool `json:"delegated,omitempty"`
 }
 
 func (b *Breakpoint) clone() *Breakpoint {
@@ -249,14 +250,19 @@ func breakpointQuestion(before, after []NodeID) string {
 	return "已在断点处暂停（" + strings.Join(parts, "；") + "），续跑即继续。"
 }
 
-// hasBreakpointStop 报挂起清单里有没有断点停下的那一条（续跑就是放行它）。
+// hasBreakpointStop 报挂起清单是否记录了本图的断点边界。
 func hasBreakpointStop(qs []*AskQuery) bool {
 	for _, q := range qs {
-		if q != nil && q.Breakpoint != nil {
+		if q.atBreakpoint() {
 			return true
 		}
 	}
 	return false
+}
+
+// atBreakpoint 判断本图恢复时是否要越过断点边界。
+func (q *AskQuery) atBreakpoint() bool {
+	return q != nil && q.Breakpoint != nil && !q.Breakpoint.Delegated
 }
 
 func joinNodeIDs(ids []NodeID, sep string) string {

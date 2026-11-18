@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
@@ -15,10 +16,19 @@ var errInvalidPending = errors.New("agui: invalid pending interrupt")
 
 type answerSchemas map[string]*jsonschema.Schema
 
+type interruptKind uint8
+
+const (
+	openQuestion interruptKind = iota
+	openApproval
+	openBreakpoint
+	openDelegatedBreakpoint
+)
+
 type interruptBatch struct {
 	epoch         string
 	events        []RunInterrupt
-	open          map[string]bool
+	open          map[string]interruptKind
 	schemas       answerSchemas
 	resumeBlocked bool
 }
@@ -27,7 +37,7 @@ type interruptBatch struct {
 func projectInterrupts(queries []*compose_v2.AskQuery, fallbackReason string) (interruptBatch, error) {
 	batch := interruptBatch{
 		events: make([]RunInterrupt, 0, len(queries)),
-		open:   make(map[string]bool, len(queries)),
+		open:   make(map[string]interruptKind, len(queries)),
 	}
 	for _, q := range queries {
 		if q == nil || q.InterruptID == "" {
@@ -36,13 +46,25 @@ func projectInterrupts(queries []*compose_v2.AskQuery, fallbackReason string) (i
 		if _, exists := batch.open[q.InterruptID]; exists {
 			return interruptBatch{}, fmt.Errorf("%w: duplicate id %q", errInvalidPending, q.InterruptID)
 		}
+		if bp := q.Breakpoint; bp != nil {
+			details := *bp
+			details.Before, details.After = slices.Clone(bp.Before), slices.Clone(bp.After)
+			batch.open[q.InterruptID] = openBreakpoint
+			if bp.Delegated {
+				batch.open[q.InterruptID] = openDelegatedBreakpoint
+			}
+			batch.events = append(batch.events, RunInterrupt{
+				ID: q.InterruptID, Reason: "crew-go:" + compose_v2.BreakpointInterruptReason, Message: q.Question,
+				Metadata: map[string]any{"breakpoint": &details},
+			})
+			continue
+		}
 		reason := q.Reason
 		if reason == "" {
 			reason = fallbackReason
 		}
-		isApproval := reason == agent_v2.ApprovalInterruptReason
-		batch.open[q.InterruptID] = isApproval
-		if isApproval {
+		if reason == agent_v2.ApprovalInterruptReason {
+			batch.open[q.InterruptID] = openApproval
 			batch.events = append(batch.events, approvalInterrupt(q))
 			continue
 		}
@@ -67,6 +89,7 @@ func projectInterrupts(queries []*compose_v2.AskQuery, fallbackReason string) (i
 			}
 			batch.schemas[q.InterruptID] = compiled
 		}
+		batch.open[q.InterruptID] = openQuestion
 		batch.events = append(batch.events, out)
 	}
 	return batch, nil

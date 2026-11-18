@@ -22,7 +22,7 @@ const approvalAnswerHint = `reply "approve", "approve_always", "approve_always_t
 
 // isApproval 判断这一问是不是工具审批。
 func isApproval(q *compose_v2.AskQuery) bool {
-	return q != nil && q.Reason == agent_v2.ApprovalInterruptReason
+	return q != nil && q.Breakpoint == nil && q.Reason == agent_v2.ApprovalInterruptReason
 }
 
 // pendingQuestions 把挂起提问转成发给对端的清单。
@@ -38,6 +38,7 @@ func pendingQuestions(qs []*compose_v2.AskQuery) []a2a.PendingQuestion {
 			Options:     q.Options,
 			Approval:    isApproval(q),
 			ToolCallID:  q.ToolCallID,
+			Breakpoint:  q.Breakpoint,
 		})
 	}
 	return out
@@ -58,6 +59,9 @@ func pendingMessage(qs []*compose_v2.AskQuery, note string) *a2atypes.Message {
 // 挂多问时编号列出，每一问带上它的 interruptId，末尾说明怎么按 interruptId 作答。
 func joinQuestions(qs []*compose_v2.AskQuery) string {
 	if len(qs) == 1 {
+		if qs[0].Breakpoint != nil {
+			return qs[0].Question + "\n" + breakpointReplyHint(qs[0].InterruptID)
+		}
 		if isApproval(qs[0]) {
 			return qs[0].Question + "\n(" + approvalAnswerHint + ")"
 		}
@@ -69,7 +73,16 @@ func joinQuestions(qs []*compose_v2.AskQuery) string {
 	}
 	sb.WriteString(`Answer each question with its own DataPart {"interruptId": "<id>", "answer": "<text>"}; ` +
 		`tool approvals take {"interruptId": "<id>", "approved": true|false} or one of "approve", "approve_always", "approve_always_tool", "deny" as the answer.`)
+	for _, q := range qs {
+		if q.Breakpoint != nil {
+			sb.WriteString("\n" + breakpointReplyHint(q.InterruptID))
+		}
+	}
 	return sb.String()
+}
+
+func breakpointReplyHint(id string) string {
+	return fmt.Sprintf(`Continue breakpoint %q with DataPart {"interruptId": %q, "answer": ""}.`, id, id)
 }
 
 // resumeInputs 按挂起提问解析续发消息里的答复，返回这条消息答了哪几问（interruptId → 答复）；executor 把它并进
@@ -90,7 +103,8 @@ func resumeInputs(qs []*compose_v2.AskQuery, answered map[string]*schema.Message
 			pending[q.InterruptID] = q
 		}
 	}
-	if ids, exists := metadata[a2a.ReplyToInterruptIDsKey]; exists && !samePendingQuestions(ids, pending) {
+	ids, bound := metadata[a2a.ReplyToInterruptIDsKey]
+	if bound && !samePendingQuestions(ids, pending) {
 		return nil, "The reply refers to a different set of questions; answer the questions currently waiting."
 	}
 	inputs := make(map[string]*schema.Message, len(qs))
@@ -122,6 +136,18 @@ func resumeInputs(qs []*compose_v2.AskQuery, answered map[string]*schema.Message
 				return nil, fmt.Sprintf("The text %q and the DataPart give different answers; send one answer.", clip(text))
 			}
 		}
+		// Resume 放行整个边界。逐一核对断点的继续动作，避免普通提问的部分答复放行同批断点。
+		for _, q := range qs {
+			if q.Breakpoint == nil {
+				continue
+			}
+			if inputs[q.InterruptID] == nil {
+				return nil, breakpointReplyHint(q.InterruptID)
+			}
+			if !q.Breakpoint.Delegated {
+				delete(inputs, q.InterruptID)
+			}
+		}
 		return inputs, ""
 	}
 	if len(qs) > 1 {
@@ -133,6 +159,15 @@ func resumeInputs(qs []*compose_v2.AskQuery, answered map[string]*schema.Message
 	q := qs[0]
 	if len(bare) > 1 {
 		return nil, "Several answers were given for one question; send one."
+	}
+	if q.Breakpoint != nil {
+		if !bound || (len(bare) == 1 && bare[0].Approved != nil) {
+			return nil, breakpointReplyHint(q.InterruptID)
+		}
+		if q.Breakpoint.Delegated {
+			inputs[q.InterruptID] = schema.UserMessage("")
+		}
+		return inputs, ""
 	}
 	if len(bare) == 1 {
 		// 一个不带 interruptId 的答复 DataPart 答这唯一的一问；同时还有文本时，文本得是同一个答复。
@@ -178,6 +213,12 @@ func samePendingQuestions(raw any, pending map[string]*compose_v2.AskQuery) bool
 // answerFor 把一个答复 DataPart 转成交给 Resume 的消息；不可用时返回 nil 和原因。审批的 approved 与 answer 都给了
 // 时两者得是同一个选项。
 func answerFor(q *compose_v2.AskQuery, a a2a.Answer) (*schema.Message, string) {
+	if q.Breakpoint != nil {
+		if a.Approved != nil || !a.HasText {
+			return nil, breakpointReplyHint(q.InterruptID)
+		}
+		return schema.UserMessage(""), ""
+	}
 	if !isApproval(q) {
 		if a.Approved != nil || !a.HasText {
 			return nil, fmt.Sprintf("Question %q takes a text answer: {\"interruptId\": %q, \"answer\": \"<text>\"}.", q.InterruptID, q.InterruptID)
@@ -203,6 +244,9 @@ func answerFor(q *compose_v2.AskQuery, a a2a.Answer) (*schema.Message, string) {
 // sameAnswer 判断跟 DataPart 一起给的文本跟 DataPart 解析出的答复是不是同一个。审批：文本是固定词之一时按选项比；
 // 不是固定词的文本不是答复（给人看的附注，A2A 客户端常这么带），不算冲突。其余提问：任何文本都可能是答复，按原文比。
 func sameAnswer(q *compose_v2.AskQuery, text string, ans *schema.Message) bool {
+	if q.Breakpoint != nil {
+		return true // 只校验继续的身份，文本不参与断点放行。
+	}
 	if !isApproval(q) {
 		return text == strings.TrimSpace(ans.Content)
 	}

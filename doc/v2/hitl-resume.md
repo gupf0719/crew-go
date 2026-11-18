@@ -235,7 +235,7 @@ type AskQuery struct {
     ToolCallID  string   `json:"tool_call_id,omitempty"` // 可选：工具调用的模型协议 ID
     ToolCallInstanceID string `json:"tool_call_instance_id,omitempty"` // 可选：适配器关联工具事件的实例 ID
     ToolName    string   `json:"tool_name,omitempty"`    // （空 = 纯问答，不指向任何待执行动作）
-    Breakpoint  *Breakpoint `json:"breakpoint,omitempty"` // 非 nil = 声明式断点停下的（框架填，Ask 会清掉业务填的）
+    Breakpoint  *Breakpoint `json:"breakpoint,omitempty"` // 引擎或适配器记录的声明式断点位置
 }
 ```
 

@@ -228,7 +228,7 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 				// 那种续跑照常放行）；调用方也从存档里分不出「这是断点、续跑即放行」与「节点在等答案」。
 				{InterruptID: "q3", Question: "已在断点处暂停", Reason: compose_v2.BreakpointInterruptReason,
 					Breakpoint: &compose_v2.Breakpoint{Before: []compose_v2.NodeID{"nb"},
-						After: []compose_v2.NodeID{"na1", "na2"}, NS: "outer/sub"}},
+						After: []compose_v2.NodeID{"na1", "na2"}, NS: "outer/sub", Delegated: true}},
 			},
 			// PA-H1: 部分失败超步成功成员 + 其 SendDirectives wire 形态——漏序列化
 			// 任一字段时发散 fan-out HITL Resume 后成功分支后继静默丢失 graph 假成功
@@ -485,10 +485,10 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 		if len(loaded.PendingInterrupts) != 3 {
 			t.Fatalf("PendingInterrupts len: expected 3, got %d", len(loaded.PendingInterrupts))
 		}
-		// q3：断点信息三个字段都要回来，问答型的 q1 / q2 上必须仍是 nil
+		// q3：断点位置与继续确认标记都要回来，问答型的 q1 / q2 上必须仍是 nil。
 		if bp := loaded.PendingInterrupts[2].Breakpoint; bp == nil ||
 			!slices.Equal(bp.Before, []compose_v2.NodeID{"nb"}) ||
-			!slices.Equal(bp.After, []compose_v2.NodeID{"na1", "na2"}) || bp.NS != "outer/sub" {
+			!slices.Equal(bp.After, []compose_v2.NodeID{"na1", "na2"}) || bp.NS != "outer/sub" || !bp.Delegated {
 			t.Errorf("PendingInterrupts[2].Breakpoint 没有原样回来（业务 backend 漏 breakpoint 字段），got %+v", bp)
 		}
 		if loaded.PendingInterrupts[0].Breakpoint != nil || loaded.PendingInterrupts[1].Breakpoint != nil {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"crew-go/compose_v2"
 	"crew-go/schema"
 
 	a2atypes "github.com/a2aproject/a2a-go/v2/a2a"
@@ -24,6 +25,9 @@ import (
 // 一个不带 interruptId 的答复 DataPart（{"answer": "..."} 或 {"approved": bool}）。挂着多问时只接受按 interruptId
 // 的答复：一条文本当成全部提问的答案的话，一句 approve 就批准了全部工具。
 //
+// 断点用 { "interruptId": "...", "answer": "" } 放行。挂起清单仅含一个断点项时，也可通过 ReplyToInterruptIDsKey 绑定续发。
+// 续发须覆盖所有当前断点，同一批的普通提问仍可分次答复。
+//
 // 一问的答复同时用了两种写法时两者必须是同一个答复，否则请重答（审批不能在两个说法里挑一个执行）：DataPart 里
 // approved 与 answer 都给时 answer 必须是同一个选项；只挂一问时文本与答复 DataPart（带不带 interruptId 都算）一起给，
 // 审批的文本是固定词之一时必须是同一个选项、不是固定词的文本当附注，其余提问的文本必须与 answer 相同。挂多问时文本
@@ -39,7 +43,7 @@ const PendingQuestionsKey = "crew.pending"
 // 服务端用它校验答复仍属于同一轮提问，答复正文和附件保留在原 parts。
 const ReplyToInterruptIDsKey = "crew.replyToInterruptIds"
 
-// PendingQuestion 是远端挂起的一问。
+// PendingQuestion 是远端挂起的一问或一个声明式断点。
 type PendingQuestion struct {
 	InterruptID string   `json:"interruptId"`
 	Question    string   `json:"question"`
@@ -47,6 +51,8 @@ type PendingQuestion struct {
 	// Approval 为 true 表示这一问是工具审批：答复给 {"approved": bool}，或四个选项之一。
 	Approval   bool   `json:"approval,omitempty"`
 	ToolCallID string `json:"toolCallId,omitempty"`
+	// Breakpoint 记录命中的节点与图的 namespace，InterruptID 寻址这次暂停。
+	Breakpoint *compose_v2.Breakpoint `json:"breakpoint,omitempty"`
 }
 
 // 答复 DataPart 的键。
@@ -62,11 +68,7 @@ func PendingQuestionsPart(qs []PendingQuestion) *a2atypes.Part {
 	for _, q := range qs {
 		m := map[string]any{"interruptId": q.InterruptID, "question": q.Question}
 		if len(q.Options) > 0 {
-			opts := make([]any, 0, len(q.Options))
-			for _, o := range q.Options {
-				opts = append(opts, o)
-			}
-			m["options"] = opts
+			m["options"] = dataStrings(q.Options)
 		}
 		if q.Approval {
 			m["approval"] = true
@@ -74,11 +76,36 @@ func PendingQuestionsPart(qs []PendingQuestion) *a2atypes.Part {
 		if q.ToolCallID != "" {
 			m["toolCallId"] = q.ToolCallID
 		}
+		if bp := q.Breakpoint; bp != nil {
+			details := make(map[string]any, 3)
+			if bp.NS != "" {
+				details["ns"] = bp.NS
+			}
+			if len(bp.Before) > 0 {
+				details["before"] = dataStrings(bp.Before)
+			}
+			if len(bp.After) > 0 {
+				details["after"] = dataStrings(bp.After)
+			}
+			if bp.Delegated {
+				details["delegated"] = true
+			}
+			m["breakpoint"] = details
+		}
 		items = append(items, m)
 	}
 	p := a2atypes.NewDataPart(map[string]any{PendingQuestionsKey: items})
 	p.MediaType = "application/json"
 	return p
+}
+
+// dataStrings 转成 JSON-RPC、REST 和 protobuf 均可序列化的 DataPart 数组。
+func dataStrings[T ~string](items []T) []any {
+	data := make([]any, len(items))
+	for i, item := range items {
+		data[i] = string(item)
+	}
+	return data
 }
 
 // PendingQuestionsFromParts 从一条消息的 parts 里取出挂起清单；没有这个 DataPart 时返回 nil。

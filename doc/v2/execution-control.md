@@ -80,19 +80,20 @@ after 断点只在超步刚整体提交的那一刻判，恢复出来的边界�
 
 ### 1.4 停下时拿到什么
 
-Run 返回 `*compose_v2.InterruptError`，Reason 是 `compose_v2.BreakpointInterruptReason`（`"breakpoint"`）；它的
-`AskQuery.Breakpoint` 写着 `Before` / `After`（命中的节点，去重排序）与 `NS`（哪一层图）。这个字段由框架填（`Ask`
-会清掉业务填的）：非 nil 就是断点、不是节点在提问。直接构造 `InterruptError` 时别填它——框架会把那条挂起当成断点
-对待（续跑时不提醒它没答）。
+Run 返回 `*compose_v2.InterruptError`。断点项的 Reason 是 `compose_v2.BreakpointInterruptReason`（`"breakpoint"`），
+`AskQuery.Breakpoint` 写着 `Before` / `After`（命中的节点，去重排序）与 `NS`（哪一层图）。
+字段由框架填，`Ask` 会清除该字段。本图断点在续跑时直接放行，适配器转述的远端断点带 `Delegated`，
+由宿主将继续确认交给适配器。
 
 它随挂起清单进存档。自研 checkpointer 漏了这个字段时，引擎认不出上次停在断点上：停在 before 断点上的档每次续跑都
 被重判、在同一个边界再停（第一次续跑的 ID 与原来的不同，之后固定），图永远过不去；停在 after 断点上的档续跑照常
 放行（恢复出来的边界不判 after）。conformance 已断言往返。
 
-InterruptID 由任务代号、ns、边界上的成员（实例身份与访问次数）、命中的节点派生：同一个任务里不同边界算不出同一个
-ID；停下时算一次、随挂起清单进存档，续跑不重算。agent_v2 的 Resume、AG-UI / A2A 适配层按普通挂起处理它：AG-UI 把
-Reason 透给前端；A2A 映射成 input-required，对端回一条文本或空消息即放行，回结构化的审批答复（`approved`）会被当成
-形状不对、请对端重答（断点按普通提问处理）。
+InterruptID 由任务代号、ns、边界上的成员（实例身份与访问次数）、命中的节点派生。同一个任务里不同边界有各自的 ID，
+停下时算一次，随挂起清单进存档，续跑不重算。
+[AG-UI](agui.md#声明式断点) 在 `RUN_FINISHED` 的中断项 metadata 中提供位置，
+[A2A](a2a.md#声明式断点) 在 `input-required` 的 `crew.pending` 项中提供位置。
+两个协议都用任务当前的 InterruptID 绑定继续动作，图从该边界放行。
 
 ### 1.5 嵌套
 

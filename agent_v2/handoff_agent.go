@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
+	"sync/atomic"
 
 	"crew-go/compose_v2"
 	"crew-go/hook"
@@ -16,7 +18,8 @@ import (
 //
 // 拓扑：每轮调 active agent.Run；它这次调用做出的转交决定（上行信号：transfer 工具或 HandoffTo）
 // 决定下一轮 active——stepFn 取发给本跳的那条、写进 HandoffSignalKey 给条件边（成员产出上带来的
-// 这个字段会被清掉，不是转交通道）；没有决定 = done；超 maxHops = exhausted。
+// 这个字段会被清掉，不是转交通道）。没有决定时由 [WithDeterministicReturnTo] 选择是否退回，
+// 没有下一跳则正常结束，达到 maxHops 上限则耗尽。
 //
 // 共享 session：每轮 sub-agent 写 events 到父 session。
 //
@@ -39,6 +42,9 @@ type HandoffAgent struct {
 	historyMode HandoffHistoryMode // 转交后后接看到的历史视图（默认 Rewrite=看前接改写第三人称；§9）
 	hooks       hook.Hooks
 	retryCfg    compose_v2.RetryConfig // 每步 active sub-agent.Run 的重试策略
+	returnTo    string
+	// expectedTransfer 按候选注册名记录配置及本实例是否已报告漏配。
+	expectedTransfer map[string]*atomic.Bool
 
 	// defaultStore 是持久 active 的兜底载体——模型 B 跨 Run 记住 active agent（业务
 	// 未在 ctx push store 时用）。storeOnce 保 lazy init race-free。
@@ -109,6 +115,28 @@ func WithHandoffDescription(desc string) HandoffOption {
 // WithHandoffInitial 设首轮执行 agent name（必填）。
 func WithHandoffInitial(name string) HandoffOption {
 	return func(h *HandoffAgent) { h.initial = name }
+}
+
+// WithDeterministicReturnTo 在其他候选正常完成且未主动转交时，退回指定候选。
+// 显式转交优先，退回沿用通常的跳数限制、历史视图、存档及 active 提交规则。
+// name 是通过 [HandoffAgent.AddAgent] 注册的候选名，空字符串关闭此策略。
+func WithDeterministicReturnTo(name string) HandoffOption {
+	return func(h *HandoffAgent) { h.returnTo = name }
+}
+
+// WithExpectedHandoffTransfer 声明哪些注册候选应通过内置工具自主转交。
+// 直接承接授予的 BasicAgent 未配置 [WithHandoffTransfer] 时，每个编排实例按候选名警告一次。
+// 诊断支持按身份规则透明承接授予的包装，业务显式转授给子成员时不继承诊断。
+func WithExpectedHandoffTransfer(names ...string) HandoffOption {
+	names = slices.Clone(names)
+	return func(h *HandoffAgent) {
+		if h.expectedTransfer == nil {
+			h.expectedTransfer = make(map[string]*atomic.Bool, len(names))
+		}
+		for _, name := range names {
+			h.expectedTransfer[name] = new(atomic.Bool)
+		}
+	}
 }
 
 // WithHandoffMaxHops 设最大转交次数（默认 10）。
@@ -259,6 +287,9 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 	if _, ok := h.agents[h.initial]; !ok {
 		return nil, fmt.Errorf("handoff agent %q: initial %q not registered via AddAgent", h.Name(), h.initial)
 	}
+	if err := h.validateTransferOptions(); err != nil {
+		return nil, err
+	}
 	cfg := applyRunOptions(opts)
 	if err := resolveRunSession(ctx, &session, h.Name()); err != nil {
 		return nil, err
@@ -357,6 +388,9 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 		return nil, nil
 	}
 	defer func() { prep.finish(ctx) }()
+	if err := h.validateTransferOptions(); err != nil {
+		return nil, err
+	}
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	// MED-1 fail-fast：composite Resume 同样不透传 per-call 覆盖给 inner step。
 	if err := rejectCompositeOverride(rcfg.overrides()); err != nil {
@@ -600,12 +634,22 @@ func (h *HandoffAgent) buildComposeGraph(
 			// 注册名与 ag.Name() 互相独立，而名字业务还能自己取重）。经 RunOption 进
 			// ag 的签名，不进 ctx——进了 ctx 就是环境，孙辈照样读得到（见 handoffGrant）。
 			// 每次尝试铸一份新的。
+			grant := &handoffGrant{grantee: ag, candidates: candSet}
+			if warned := h.expectedTransfer[activeName]; warned != nil {
+				grant.onMissingTransfer = func(ctx context.Context) {
+					logger := slog.Default()
+					if logger.Enabled(ctx, slog.LevelWarn) && warned.CompareAndSwap(false, true) {
+						logger.WarnContext(ctx, "handoff: enable WithHandoffTransfer to provide the expected transfer tool",
+							"agent", h.Name(), "candidate", activeName, "tool", HandoffTransferToolName)
+					}
+				}
+			}
 			var events []*AgentEvent
 			sigs, err := compose_v2.CaptureSignals(ctx, func(c context.Context) error {
 				return lanes.run(c, func(lc context.Context, s *RunSession) error {
 					var runErr error
 					events, runErr = ag.Run(lc, s, cloneCalleeInput(input),
-						withHandoffGrant(&handoffGrant{grantee: ag, candidates: candSet}),
+						withHandoffGrant(grant),
 						withRouteGrant(route.regrant(ag)))
 					return runErr
 				})
@@ -643,7 +687,7 @@ func (h *HandoffAgent) buildComposeGraph(
 		toolTarget, rest := takeHandoffTarget(attempt.signals, dest)
 		compose_v2.EmitSignals(ctx, rest)
 
-		// **模型 B 转交信号只有上行信号一条来路**（transfer 工具与 HandoffTo 做出的是同一类）。
+		// **成员的显式转交只有上行信号一条来路**（transfer 工具与 HandoffTo 做出的是同一类）。
 		//
 		// 曾经还有第二条：读 out.Annotations[HandoffSignalKey]。它已删——那条路**绕过
 		// 全部三道校验**（有没有被授予 / 目标合不合法 / 这一层有没有人接）：实测一个
@@ -655,6 +699,9 @@ func (h *HandoffAgent) buildComposeGraph(
 		// 程序化成员（业务自己实现的 Agent）现在走 [HandoffTo]：同一套校验，且只有被
 		// 授予方本人调得动。哨兵 TestHandoffAnnotation_NoLongerATransferChannel。
 		nextTarget := toolTarget
+		if nextTarget == "" && h.returnTo != "" && activeName != h.returnTo {
+			nextTarget = h.returnTo
+		}
 
 		// **入站的这个字段一律不作数——必须在这里清掉。**
 		//
@@ -711,7 +758,23 @@ func (h *HandoffAgent) buildComposeGraph(
 		return out, nil
 	}
 	bld = bld.WithStepFn(stepFn)
-	return bld.Compile()
+	graph, err := bld.Compile()
+	if err != nil || h.returnTo == "" {
+		return graph, err
+	}
+	return graph.WithCheckpointRevision("handoff-return:" + h.returnTo), nil
+}
+
+func (h *HandoffAgent) validateTransferOptions() error {
+	if h.returnTo != "" && h.agents[h.returnTo] == nil {
+		return fmt.Errorf("handoff agent %q: return target %q not registered via AddAgent", h.Name(), h.returnTo)
+	}
+	for name := range h.expectedTransfer {
+		if h.agents[name] == nil {
+			return fmt.Errorf("handoff agent %q: expected transfer candidate %q not registered via AddAgent", h.Name(), name)
+		}
+	}
+	return nil
 }
 
 const handoffActiveKey = "active"

@@ -521,6 +521,8 @@ type HandoffStateSnapshot struct {
 | `.AddAgent(name, agent)` 链式 | 添加候选 agent |
 | `WithHandoffInitial(name)` | 入口 agent（无持久 active 时的起跑点）|
 | `WithHandoffMaxHops(n)` | 单 Run 内转交次数硬上限（防死循环；**per-Run 重置**）|
+| `WithDeterministicReturnTo(name)` | 其他候选成功且未主动转交时退回指定候选。参见[确定性退回](./handoff.md#81-确定性退回) |
+| `WithExpectedHandoffTransfer(names...)` | 声明应具备内置转交工具的候选，直接承接授予的 `BasicAgent` 漏配时警告一次。参见[工具漏配诊断](./handoff.md#工具漏配诊断) |
 | `agent_v2.WithHandoffTransfer()` | **sub-agent 侧 opt-in**：装备 `transfer_to_agent` return-direct 工具（不配则该 agent 无法被 LLM 自主转交）|
 | `WithHandoffHistoryMode(mode)` | 后接看前接历史可见性：`HandoffHistoryRewrite`(默认,第三人称改写,保转交文本痕迹) / `Raw`(保 role;悬空 transfer 由框架剥离、换成一条中性记账文本) / `SelfOnly`(隔离) |
 | `(*HandoffAgent).EndConversation(ctx, threadID)` | 显式结束会话、清持久 active（长跑服务主动清理）|
@@ -528,7 +530,7 @@ type HandoffStateSnapshot struct {
 
 ### 7.5 关键不变量
 
-- 转交后**不重新跑 initial agent**——直接接力到 target
+- 后续 hop 从裁定的候选继续，包括配置为退回目标的 initial
 - maxHops 跑满返 final（不报错）+ snap.Exhausted=true
 - **持久 active 跨 Run**：转交后的控制权走 `store.Store`（按 ThreadID）持久化，**不走 cp**
   （cleanupOnSuccess 清 cp）——同 ThreadID 下次 Run 自动从持久 active 起跑、不回 initial。

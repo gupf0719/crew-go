@@ -2288,6 +2288,9 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	// 愿不愿意」——后者让业务能把某个候选做成终点，也让框架**自己合成**的执行体（TmpSubAgent
 	// 等）天然不在名单里。
 	if !a.config.HandoffTransferOptIn {
+		if grant := grants.handoff; grant != nil && grant.onMissingTransfer != nil {
+			grant.onMissingTransfer(ctx)
+		}
 		grants.handoff = nil
 	}
 	if !a.config.RouteToolOptIn {

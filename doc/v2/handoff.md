@@ -3,8 +3,8 @@
 > **文档状态**：本文是 `HandoffAgent` 的**权威设计 + 实现文档**，描述「模型 B：对话控制权转移」。
 > **模型 B 已全量实现，模型 A（单 Run 接力 annotation-only）已删**——grep `agent_v2/handoff_tool.go` + `handoff_agent.go` + `side_signal.go`：
 > `WithHandoffTransfer` / `newHandoffTransferTool` / `readPersistedActive` / `takeHandoffTarget` / `EndConversation`
-> 全部存在，`handoff_modelb_test.go` 覆盖。下文 §4 决策表保留「设计依据」溯源；唯 supervisor
-> `WithDeterministicReturnTo`（§14 阶段 3）仍是未实现的可选设计。
+> 全部存在，`handoff_modelb_test.go` 覆盖。下文 §4 决策表保留「设计依据」溯源。
+> 可选的 [确定性退回](#81-确定性退回) 和[工具漏配诊断](#工具漏配诊断) 分别提供 supervisor 拓扑和装配检查。
 >
 > 设计依据：四方框架（eino / AgentScope / OpenAI Swarm / LangGraph swarm）深挖对照，关键决策与对照见 §3 + §15。
 
@@ -28,7 +28,7 @@
 | 交互 | 用户**一次**输入 → 内部 A→B→C 接力处理 → 返回 final | 用户和 active agent **多轮对话**，转交后继续和新 agent 对话 |
 | 一次 Run 的 input | 首跳=原始 input；后续跳=**上一跳的 output**（接力传递）| 首跳=用户**新一句话**；单 Run 内转交链的后续跳=**共享历史**（新 active 从 session 历史读上下文，**无新用户输入**）|
 | 跨用户输入持久 active | ❌ 每次新 Run 从 `initial` 重新开始 | ✅ 记住上次转交到谁，下次输入直接进 active |
-| 目标 agent 类型 | 不限（内部接力，可处理型）| 链上能接管对话的必须**对话型**（见 §13）|
+| 目标 agent 类型 | 不限（内部接力，可处理型）| 自主转交的对话 agent、程序化成员或纯处理终点（见 §13）|
 | 像什么 | 动态 pipeline / 分诊流水线 | 客服转接：前台→账单→技术，各自跟你多轮对话 |
 
 > **关键澄清（input 语义）**：模型 B 一次 Run 内可能有多跳转交（A 转 B、B 再转 C），但**用户只在 Run 开始给一句话**。只有 Run 的**首个 active**拿到这句新输入；转交链中后续 active **不拿新用户输入**，而是从共享 session 历史读上下文接管（§8）。这是「单 Run 内转交链」与「跨 Run 持久 active」两层的交界。
@@ -41,12 +41,12 @@
 
 | 编排 | 控制权 | 决策方 | 典型场景 |
 |---|---|---|---|
-| **HandoffAgent** | 单向转移、可持久跨轮 | 当前 active agent 自主（LLM）| 客服转接、专家接力对话 |
+| **HandoffAgent** | 转移控制权、可持久跨轮 | 当前 active 主动转交，编排可按配置退回 | 客服转接、专家接力对话 |
 | `RoutingAgent` | 一次性路由到 1 个分支跑完 | 中心 router/classifier | 按 query 类型派发专家 |
 | `AgentAsTool` | 委派后**收回**（结果返调用者）| 调用方 LLM | 主 agent 调子能力并汇总 |
 | `PlanAgent` | 中心 planner 规划多步 | 中心 planner | 复杂任务分解执行 |
 
-一句话区分：**Routing 选一次就跑完、AsTool 委派后收回、Plan 中心调度、Handoff 控制权单向交出去且持久**。
+**Routing 选一次就跑完，AsTool 委派后收回，Plan 中心调度，Handoff 持久化每轮转交后的 active**。
 
 ---
 
@@ -183,7 +183,11 @@ func WithHandoffTransfer() Option                                  // 只翻一�
 
 > 控制反转：不是编排层注入工具，而是 sub-agent 实现协议——对齐 CLAUDE.md「接口定义在使用方」。
 
-**失败模式（必须文档化）**：opt-in 模型下，业务给 `initial` agent 忘配 `WithHandoffTransfer()` 时，initial 的 LLM 没有 transfer 工具 → 永远无法转交 → HandoffAgent 静默退化成单 agent。eino/SDK 自动注入不会有此坑，crew-go opt-in 独有。**对策**：`HandoffAgent` 构造期/首 Run 无法直接探测黑盒 sub-agent 的 toolkit，故采**文档化**。运行期软提示（一个 Run 内 active agent 从未发出转交信号、业务又声明了多候选时 `log` 一句「active %q 未配 transfer 工具？」，不 fail——合法场景是该 agent 就是终点）设想过、**未实现**，见 `doc/code/todo.md`。
+#### 工具漏配诊断
+
+用 `WithExpectedHandoffTransfer("frontdesk")` 声明应提供内置 `transfer_to_agent` 的候选。Run 和续跑会校验这些名字已通过 `AddAgent` 注册。候选实际收到授予时，由 `BasicAgent` 核对自身的 `WithHandoffTransfer()`。漏配且 WARN 已启用时，按编排实例和候选注册名给出一次 `slog` WARN，包含 `agent`、`candidate` 和 `tool`，当前调用照常执行。
+
+合法终点和使用 `HandoffTo` 的纯程序化候选可以省略工具声明。带工具的候选可以直接回答。按身份规则透明转发的包装与内层 `BasicAgent` 共享这次检查。显式转授只传能力，诊断仍归原挂载。诊断覆盖 `WithHandoffTransfer()` 的装配，具体轮次送模工具仍按 `BasicAgent` 的常规规则生成。
 
 ### 6.3 转交信号机制（拍板，不留 either/or）
 
@@ -210,10 +214,10 @@ transfer 工具 fn 执行（LLM 调用时）：
 
 **职责边界（解决 audit H3）**：
 - **transfer 工具**：只表达「我要转给谁」→ 交给它所在的那段执行
-- **stepFn**：sub-agent.Run **成功**返回后 `takeHandoffTarget` 取走发给本跳的 → 登记跨 Run 的 active 更新并走图回边；剩下的（发给更上方的）交给 stepFn 这次节点执行，跟着它的提交继续往上走
+- **stepFn**：sub-agent.Run **成功**返回后 `takeHandoffTarget` 取走发给本跳的，必要时按 §8.1 补上确定性退回，再登记跨 Run 的 active 更新并走图回边。剩下的（发给更上方的）交给 stepFn 这次节点执行，跟着它的提交继续往上走
 
 工具交出决定，stepFn 同时驱动本图路由和登记任务提交信号。stepFn 靠「这次调用交上来的决定里有没有发给本跳的」
-判断「本次调用是否发生转交」，**不靠读 store active**（store active 可能本来就是当前 agent，无法区分新转交）。
+判断本次候选调用是否主动转交。确定性退回由编排根据配置选择，和显式转交共用路由与 active 提交路径。
 
 #### 一个收件人上是一个单值格子
 
@@ -436,7 +440,7 @@ startActive 为 `initial` 的情形（= swarm `default_active_agent` 语义）�
 ```
 首个 active 处理(input=用户新输入) → 调 transfer → return-direct 终止该 sub-agent
 → stepFn 取发给本跳的转交、登记 active 更新并走图回边 → 新 active 接管(input=共享历史)
-→ ... → 某 active 不转交(回复用户) → Run 返回
+→ ... → 某 active 回复用户 → 按配置退回 supervisor 或结束 Run
 ```
 图内 active 与待提交的更新随宿主存档保存。
 
@@ -461,6 +465,23 @@ startActive 为 `initial` 的情形（= swarm `default_active_agent` 语义）�
 4. stepFn 统一 `store.Put` 持久 active（§6.3 职责）
 
 **防环 maxHops（per-Run，audit M4 cross-verify）**：`maxHops`（`WithHandoffMaxHops`）是**单 Run 内转交链上限**——防的是「单 Run 内 A→B→A→B 自动 ping-pong 死循环」（无用户介入的失控转交）。**跨 Run 的转交是用户驱动的**（每个 Run 一次用户输入），不是死循环，**不需 maxHops 防**，故 maxHops **per-Run 重置不持久**（不存 store）。
+
+### 8.1 确定性退回
+
+把 supervisor 同时注册为初始成员和退回目标，即可配置星形拓扑。`supervisor` 和 `worker` 是已构建的成员，supervisor 配 `WithHandoffTransfer()` 时可以把任务交给 worker。
+
+```go
+h := agent_v2.NewHandoffAgent(
+    agent_v2.WithHandoffName("support"),
+    agent_v2.WithHandoffInitial("supervisor"),
+    agent_v2.WithDeterministicReturnTo("supervisor"),
+    agent_v2.WithExpectedHandoffTransfer("supervisor"),
+).AddAgent("supervisor", supervisor).AddAgent("worker", worker)
+```
+
+- 每个非 supervisor 候选成功完成且这次未主动转交时，编排选择 supervisor 为下一跳。显式 `transfer_to_agent` 或 `HandoffTo` 优先。supervisor 直接作答时本次结束。
+- 退回复用本轮的历史视图、跳数和存档。用尽跳数时返回当前成员的产出并报告 `Exhausted`。最外层任务成功且写入 active 后，相同 owner 和 ThreadID 的下次 Run 从退回目标开始。
+- 退回目标必须是 `AddAgent` 的注册名，默认空字符串关闭。启用、取消或更改退回目标会改变图的存档身份，同一挂起任务应使用原配置续跑。
 
 ---
 
@@ -583,9 +604,7 @@ _ = h.EndConversation(ctx, "conv-T1")
 
 ## 13. 目标 agent 类型约束
 
-**链上能「接管对话并可能再转交」的 agent 必须是对话型**（`BasicAgent`/能注入 transfer 工具的 agent）——因为只有它能跑 LLM 回复用户 + 调 transfer 工具发起下一次转交。**只有转交链末端的纯处理终点**（接管后处理完即结束、不再对话也不再转交）可以是非对话型。
-
-**「必须」如何落地（解决 audit M7：硬约束 vs opt-in 衔接）**：框架**无法**从黑盒 `Agent` 接口探测它是否对话型 / 是否配了 transfer 工具，故此约束是**业务自负的约定**，框架不强制校验。运行期兜底：若 active 路由到一个非对话型 agent（它既不回复也不转交），表现为该 agent 跑完即 done、Run 正常返回——不会死锁，只是「转交到此为止」。§6.2 设想过的运行期软提示（靠**行为推断**：Run 内零转交信号 + 业务声明了多候选；**非探测** sub-agent 的 toolkit，故只能 `log`、不能 fail-fast）**未实现**——「忘配 transfer 工具」这种退化目前只能靠文档与业务自查发现。
+候选可以是通过工具自主转交的 `BasicAgent`、使用 `HandoffTo` 的程序化成员或直接给出结果的终点。终点正常完成后，编排按 §8.1 决定是否退回。需要自主转交的成员可用[工具漏配诊断](#工具漏配诊断)核对装配。
 
 ---
 
@@ -598,7 +617,7 @@ _ = h.EndConversation(ctx, "conv-T1")
 | **0 前置** ✅ | BasicAgent **return-direct 能力**（`tools→model` 边改条件短路 §6.5）——通用能力，handoff/exit 共用 | 工具可声明一调即出 |
 | **1 核心** ✅ | transfer 工具(opt-in,return-direct) + 上行信号(§6.3) + store 持久 active(stepFn 统一写) + 入口条件路由 + 单 Run 转交链改造(§8 四点) + 非法目标三来源处理 + EndConversation + 删模型 A「上轮 output」接力语义 | 纯 LLM 自主转交可用 + 跨轮持久 active |
 | **2 增强** ✅ | `WithHandoffHistoryMode`（3 档，默认 Rewrite 看前接——真实 LLM 修正 Raw→400；后经悬空剥离 fix 解除 400，默认不变，见 §9）+ `HandoffPromptPrefix`/`HandoffPrompt` | 追平 swarm + 真实 LLM 验证 |
-| **3 supervisor**（可选）| `WithDeterministicReturnTo`（worker 跑完回 supervisor，编排层直控下一跳，比 eino 伪造消息更简单）| 星形拓扑 |
+| **3 supervisor** ✅（可选） | `WithDeterministicReturnTo` 选择确定性退回，`WithExpectedHandoffTransfer` 声明模型工具装配要求 | 星形拓扑与候选工具诊断 |
 
 ---
 

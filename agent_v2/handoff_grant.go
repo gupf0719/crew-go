@@ -74,6 +74,9 @@ type handoffGrant struct {
 	// 一起走而不是走 ctx：候选名单是**授予内容的一部分**（授权你转给这几个人），
 	// 跟「能不能转」同生共死才对。
 	candidates map[string]bool
+	// onMissingTransfer 由登记了工具期望的直接挂载定义，在 BasicAgent 的 opt-in 闸口报告漏配。
+	// regrant 只转授能力，诊断仍归原挂载。
+	onMissingTransfer func(context.Context)
 }
 
 // withHandoffGrant 把 grant 交给**这一次** sub-agent 调用（RunOption）。

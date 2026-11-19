@@ -1,10 +1,10 @@
 # 项目待办
 
-2026-11-19 以 `origin/test` 的 `67ac5b8` 为基线。终局扇出、持久续跑准入、跨分区清档、剩余六项缺陷及 C01–C08 已合入。2026-11-18 核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
+2026-11-19 以 `origin/test` 的 `c791c66` 为基线。终局扇出、持久续跑准入、跨分区清档、剩余六项缺陷及 C01–C09 已合入。2026-11-18 核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **51 项**。P1 **0**、P2 **4**、P3 **47**。缺陷 **0**、能力缺口 **9**、待决 **26**、验收 **16**。
+共 **50 项**。P1 **0**、P2 **4**、P3 **46**。缺陷 **0**、能力缺口 **8**、待决 **26**、验收 **16**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -26,7 +26,6 @@
 
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
-| C10 | 能力缺口 | Handoff 确定性退回和缺 transfer 的诊断 | 阶段 3 是可选拓扑，忘装 transfer 的软提示需能区分合法终点。两条分别验收。历史 TODO 359、518。 [Handoff](../v2/handoff.md) |
 | C11 | 能力缺口 | Skill 递归发现、热更新与产品化选项 | 结合实际场景选递归发现、重载、按需工具激活上限、技能编排和可选分发方式。既有资源分层、解析、Go Action 与调用预算已经实现。 [Skill](../v2/skill.md) · [历史备选项](../description/three-way-comparison/skill-system.md) |
 | C12 | 能力缺口 | 用户授权后的历史查询与摘要后 notes | 明确键空间、可读用户和检索结果来源，保留现有存储或消息投影的访问约束。历史 TODO 406、415。 |
 | C13 | 能力缺口 | 普通嵌套慢工具的后台执行与持久性边界 | e185749 关闭显式持久后台子 Agent 方案。独立记录普通 `WithBackgroundTasks` 在嵌套运行的支持范围和异步工具结果恢复。历史 TODO 422、423。 [慢任务](../v2/background-tasks.md) |
@@ -75,6 +74,8 @@
 | Q27 | 待决 | 持久化业务状态演进与按执行 namespace 查历史 | ISSUE-70 Phase 4 的通用状态迁移需要版本化调用方。SelfHistoryByNS 希望按执行 namespace 查写入记录，先核对执行位置能否成为历史身份。 [ISSUE-70](../issue/issue-70-checkpoint-evolution.md) |
 
 ## 已关闭及归并去向
+
+- **C10 已实现。** 已完成的候选可按配置退回 supervisor。跨层回归覆盖历史接力、挂起续跑和只写一次。诊断按注册名报告有工具要求的候选漏配。 [用法](../v2/handoff.md#81-确定性退回) · [退回回归](../../agent_v2/handoff_return_test.go) · [诊断回归](../../agent_v2/handoff_diagnostic_test.go)
 
 - **C09 已实现。** SQL Store 可按表启用 TTL，旧行保持永久。Get、Search、ListNamespaces 和 Batch 使用数据库时钟检查可见性，显式清扫只清当前 Store 表。 [用法](../v2/store.md#342-sql-store-ttl) · [跨层回归](../../sql/store_ttl_test.go)
 

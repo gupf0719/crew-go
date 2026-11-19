@@ -441,9 +441,11 @@ memo 命中 → 渐进披露 gate → 审批 → [ 中间件链 ] → 工具
 ```go
 ag := agent_v2.NewBasicAgent(
     agent_v2.WithToolkit(tk), // 含大量 MCP 工具
-    agent_v2.WithToolSearch(&agent_v2.ToolSearchConfig{Enabled: true, Deferred: mcp.IsRemoteTool}),
+    agent_v2.WithToolSearch(&agent_v2.ToolSearchConfig{Enabled: true, Deferred: mcp.IsRemoteTool, MaxRevealed: 12}),
 )
 ```
+
+`MaxRevealed` 按任务限制累计解锁的不同延迟工具数，随续跑保留。
 
 ### 会话历史（BasicAgent，可选）
 

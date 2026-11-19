@@ -34,11 +34,16 @@ type ToolSearchConfig struct {
 	// 重复的名字框架会丢掉（包装共享索引、在全量工具上检索时常会返回这些）；已经揭示过的照常回给
 	// 模型，但不算新解锁。nil = 默认关键词检索（skill.KeywordScore over name+description）。业务可插
 	// 语义检索（如包装 store.Store.Search）。
+	// 配置 MaxRevealed 时，检索回调负责返回匹配名。回调发出的编排控制信号会使这次检索失败。
 	Retriever func(ctx context.Context, query string, candidates []tool.Tool) []string
 
 	// MaxResults 默认关键词检索单次最多揭示几个工具（默认 5）。自定义 Retriever 时忽略——返回几个由检索器自己
 	// 决定（同 MinScore）。
 	MaxResults int
+
+	// MaxRevealed 限制当前 Agent 在一个任务内累计解锁的不同延迟工具数，包含续跑。非正值表示不限。
+	// 同批按模型声明顺序分配，已解锁工具再次命中时不占额度。对默认和自定义检索器都生效。
+	MaxRevealed int
 
 	// MinScore 默认关键词检索的最低分阈值 [0,1]（默认 0=只要命中即算）。自定义 Retriever 时忽略。
 	MinScore float64
@@ -138,6 +143,26 @@ func (t *revealTurn) accepted(results []*schema.Message) []string {
 		}
 	}
 	return names
+}
+
+// limit 在并行检索汇合后，按当前调用还能占用的额度裁剪候选。
+func (t *revealTurn) limit(index int, have revealedNames, maximum int) ([]string, int) {
+	matched := t.byCall[index]
+	remaining := max(0, maximum-len(have))
+	if remaining >= len(matched) {
+		return matched, 0
+	}
+	allowed := make([]string, 0, len(matched))
+	for _, name := range matched {
+		if have[name] {
+			allowed = append(allowed, name)
+		} else if remaining > 0 {
+			allowed = append(allowed, name)
+			remaining--
+		}
+	}
+	t.byCall[index] = allowed
+	return allowed, len(matched) - len(allowed)
 }
 
 // revealTurnKey 把 [revealTurn] 交给这一批的工具体。它是执行状态：钩子返回别处存下的 ctx 时，采纳取框架这次的。
@@ -298,9 +323,9 @@ func defaultToolRetriever(minScore float64, maxResults int) func(context.Context
 // 这一批的解锁记录（[revealTurn]，自带锁，并发 fanout 安全；tools 节点成功后写进 basicRevealedCh，下一轮 modelFn
 // 过滤时这些工具进 bind list）→ 返回解锁了哪些工具给 LLM。
 type toolSearchTool struct {
-	cfg       *ToolSearchConfig
-	deferred  []tool.Tool // 候选（被延迟的工具）
-	retriever func(context.Context, string, []tool.Tool) []string
+	maxRevealed int
+	deferred    []tool.Tool // 候选（被延迟的工具）
+	retriever   func(context.Context, string, []tool.Tool) []string
 }
 
 func newToolSearchTool(cfg *ToolSearchConfig, deferred []tool.Tool) *toolSearchTool {
@@ -312,7 +337,7 @@ func newToolSearchTool(cfg *ToolSearchConfig, deferred []tool.Tool) *toolSearchT
 		}
 		retriever = defaultToolRetriever(cfg.MinScore, maxR)
 	}
-	return &toolSearchTool{cfg: cfg, deferred: deferred, retriever: retriever}
+	return &toolSearchTool{maxRevealed: cfg.MaxRevealed, deferred: deferred, retriever: retriever}
 }
 
 func (t *toolSearchTool) Name() string { return toolSearchToolName }
@@ -344,7 +369,20 @@ func (t *toolSearchTool) Call(ctx context.Context, args map[string]any) (*tool.R
 	if turn == nil {
 		return tool.Failure(tool.ErrCodeInternal, "tool_search: 不在 BasicAgent 的 tools 节点里（框架内部错误）"), nil
 	}
-	matched, others := splitCandidates(t.retriever(ctx, query, t.deferred), t.deferred)
+	var names []string
+	if t.maxRevealed > 0 {
+		// 额度结算依赖检索结果随这次工具批次一起提交，禁止让它附带可独立重放的信号。
+		signals, _ := compose_v2.CaptureSignals(ctx, func(ctx context.Context) error {
+			names = t.retriever(ctx, query, t.deferred)
+			return nil // 检索接口只有候选列表。
+		})
+		if !signals.IsZero() {
+			return tool.Failure(tool.ErrCodeInternal, "tool_search: 启用累计上限时 Retriever 只能返回候选，不能发出编排控制信号"), nil
+		}
+	} else {
+		names = t.retriever(ctx, query, t.deferred)
+	}
+	matched, others := splitCandidates(names, t.deferred)
 	if len(matched) == 0 {
 		if len(others) > 0 {
 			// 检索器返回的都不是要解锁的工具（共享索引、在全量工具上检索时常见）：多半本来就能直接调。说「可能不存在」
@@ -357,19 +395,28 @@ func (t *toolSearchTool) Call(ctx context.Context, args map[string]any) (*tool.R
 	// 记进这一批的解锁记录，tools 节点成功后写进 basicRevealedCh（工具体拿不到 channel 写入口）。这一批里的
 	// 执行闸不认它：闸只认这一批开始前已提交的解锁集（见 revealedNames）。
 	turn.add(compose_v2.GetCurrentToolCallIndex(ctx), matched...)
-	// 把解锁的工具名 + 描述回给 LLM，让它知道从下一轮起能调哪些。
+	return tool.Success(t.revealReceipt(matched, 0)), nil
+}
+
+// revealReceipt 同时用于检索结果和按批次额度裁剪后的实际回执。
+func (t *toolSearchTool) revealReceipt(matched []string, dropped int) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "已解锁 %d 个工具，现在可直接调用：\n", len(matched))
-	byName := make(map[string]tool.Tool, len(t.deferred))
-	for _, dt := range t.deferred {
-		byName[dt.Name()] = dt
-	}
-	for _, name := range matched {
-		if dt, ok := byName[name]; ok {
-			fmt.Fprintf(&b, "- %s：%s\n", name, dt.Description())
-		} else {
-			fmt.Fprintf(&b, "- %s\n", name)
+	if len(matched) > 0 {
+		fmt.Fprintf(&b, "已解锁 %d 个工具，现在可直接调用：\n", len(matched))
+		byName := make(map[string]tool.Tool, len(t.deferred))
+		for _, dt := range t.deferred {
+			byName[dt.Name()] = dt
+		}
+		for _, name := range matched {
+			if dt, ok := byName[name]; ok {
+				fmt.Fprintf(&b, "- %s：%s\n", name, dt.Description())
+			} else {
+				fmt.Fprintf(&b, "- %s\n", name)
+			}
 		}
 	}
-	return tool.Success(b.String()), nil
+	if dropped > 0 {
+		fmt.Fprintf(&b, "当前任务最多解锁 %d 个延迟工具，本次有 %d 个匹配工具未解锁。", t.maxRevealed, dropped)
+	}
+	return b.String()
 }

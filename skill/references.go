@@ -47,8 +47,8 @@ func MatchReferences(query string, resources []SkillResource) []ReferenceMatch {
 	return matches
 }
 
-func loadReferenceMetadata(dir string, ref *SkillResource) {
-	raw, _, err := readReferenceFile(dir, ref.Path, referenceMetadataLimit)
+func loadReferenceMetadata(root *os.Root, ref *SkillResource) {
+	raw, _, err := readReferenceFile(root, ref.Path, referenceMetadataLimit)
 	if err != nil {
 		return // 文件可能在扫描之后已移走，后续读取会返回错误。
 	}
@@ -75,7 +75,7 @@ func (b *DefaultSkillBox) ReadSkillReference(name, path string, maxBytes int) (b
 	if maxBytes <= 0 {
 		return "", false, fmt.Errorf("reference size limit must be positive")
 	}
-	for _, s := range b.skills {
+	for _, s := range b.loadedSkills() {
 		if s.descriptor.Name != name {
 			continue
 		}
@@ -86,7 +86,12 @@ func (b *DefaultSkillBox) ReadSkillReference(name, path string, maxBytes int) (b
 		}
 		// 元数据和正文分开计数。上限避免在读取层为大文件分配整份缓冲。
 		limit := min(maxBytes, 1<<20)
-		raw, complete, err := readReferenceFile(s.dir, path, limit+referenceMetadataLimit)
+		root, err := s.openResourceRoot()
+		if err != nil {
+			return "", false, err
+		}
+		defer root.Close() // 只读目录句柄。
+		raw, complete, err := readReferenceFile(root, path, limit+referenceMetadataLimit)
 		if err != nil {
 			return "", false, err
 		}
@@ -103,12 +108,7 @@ func (b *DefaultSkillBox) ReadSkillReference(name, path string, maxBytes int) (b
 	return "", false, os.ErrNotExist
 }
 
-func readReferenceFile(dir, path string, limit int) (string, bool, error) {
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return "", false, err
-	}
-	defer root.Close() // 只读目录句柄。
+func readReferenceFile(root *os.Root, path string, limit int) (string, bool, error) {
 	file, err := root.Open(path)
 	if err != nil {
 		return "", false, err

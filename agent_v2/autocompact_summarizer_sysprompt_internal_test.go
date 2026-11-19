@@ -68,7 +68,7 @@ func TestAutoCompact_SummarizerSysPromptIsNotInjectedMemory(t *testing.T) {
 	sess := NewRunSession()
 	ctx := WithSession(store.WithContext(context.Background(), st), sess)
 	// query 与记忆需有词面重叠，否则框架侧打分为 0 根本不注入。
-	_, msgs, err := a.buildInitialMessages(ctx, sess, schema.UserMessage("我的信用卡尾号是多少"))
+	_, msgs, err := a.buildInitialMessages(ctx, sess, schema.UserMessage("我的信用卡尾号是多少"), a.config.Skill)
 	if err != nil {
 		t.Fatalf("buildInitialMessages: %v", err)
 	}

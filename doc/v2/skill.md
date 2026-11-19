@@ -73,7 +73,7 @@ whenToUse: 用户要求翻译 / 跨语言转换时
 | `ListSkillActions(name)` | 列 skill 的 action 清单（**已实现**；`WithSkillActionFunc` 程序化注册的 go-func action）|
 | `RunSkillAction` | go-func action 执行（**已实现**：进程内 Go 函数，见 §11；找不到 action 返 `ErrSkillActionNotFound`。自定义 SkillBox 不提供 action 时 `ListSkillActions` 返空、本方法同样返它——框架只在有可调 action 时才挂 `run_skill_action`，见 §11.3）|
 
-> `NewDefaultSkillBox` 和 `NewInMemorySkillBox` 装配后可并发读取。列举、匹配和激活返回独立的元数据，
+> `NewDefaultSkillBox` 和 `NewInMemorySkillBox` 可并发读取。列举、匹配和激活返回独立的元数据，
 > 包括标签、示例、资源主题和嵌套 action schema。业务自实现 backend 须自负并发安全。
 
 ### BasicAgent 集成点
@@ -85,7 +85,33 @@ BasicAgent 是 preamble + model + tools + postamble 四节点 channel-based Grap
 
 ### 加载 / 发现（`skill/discover.go` + `skillbox.go`）
 
-`DefaultSkillBox.scan()` 扫 rootDir **一级子目录**（不递归），每个目录拼 `SKILL.md` 读取解析。容错：读不到 / `Name==""` 会先 `slog.Warn` 再跳过（`skillbox.go`），只有「文件不存在」和不在 allowList 是静默跳过。
+默认扫描 rootDir 的一级子目录。`WithRecursiveDiscovery(true)` 可穿过分类目录，例如 `ops/inventory/SKILL.md`。含有 `SKILL.md` 的目录是 skill 包，包下子目录按资源扫描。目录软链接不参与发现，清单和资源的打开限制在 skill 包内。首次加载的坏包会告警并跳过。递归和热重载模式下，首次加载按路径顺序保留第一个同名包，重载时重名会报错。
+
+#### 文件目录与热重载
+
+```go
+box, err := skill.NewDefaultSkillBox("./skills",
+    skill.WithRecursiveDiscovery(true),
+    skill.WithHotReload(true),
+)
+if err != nil { /* 处理加载失败 */ }
+// 把 box 传给 agent_v2.WithSkills。文件更新完毕后触发。
+if err := box.Reload(); err != nil { /* 记录错误并继续使用已发布目录 */ }
+```
+
+`Reload` 在全部扫描成功后原子发布目录。根目录丢失、清单无效或重名时，当前快照继续可用。清空已有根目录再重载可发布空目录。调用方决定触发时机，可接入自己的配置发布流程。
+
+直接使用该 `DefaultSkillBox` 的 BasicAgent 在图装配时固定一份目录，预匹配、送模工具和派发共用它。快照固定 Skill 元数据、playbook、资源目录和 Go action 声明。资源正文在读取时取得，原资源目录被替换时旧快照拒读。`Snapshot()` 可用于业务代码显式固定目录。
+
+启用热重载时，目录内容版本参与存档身份。用相同路径、目录内容和 Go action 声明重建可以继续挂起任务。版本变更时续跑返回 `compose_v2.ErrGraphIDConflict`，可恢复原目录和配置再续跑。首次启用前留下的挂起任务继续使用未开启热重载的配置。自定义 `SkillBox` 实现管理自己的目录一致性。
+
+同一个已支持字段只用一种 YAML 拼法。例如同时写 `when-to-use` 和 `when_to_use` 会报重复声明，避免同一文件在重载时选到不同元数据。
+
+#### 编排与分发
+
+确定性的多阶段流程用 `SequentialAgent`、`GraphAgent` 等现有编排，让各阶段的 BasicAgent 挂载需要的 Skill 或 `WithAllowList`。模型自主选择时使用 `WithSkills` 的现有激活模式。
+
+配置服务或其他来源可先对约定的 `SKILL.md` 内容调用 `ParseSkillMD`，再用 `NewInMemorySkillBox` 装配 `SkillContent`，沿同一 `WithSkills` 交给 Agent。`Dir` 记录来源位置。文件型目录与内存来源各自管理更新，Go action 都由应用注册。
 
 frontmatter 用 **`gopkg.in/yaml.v3` 真解析器**（`ParseSkillMD` → `parseFrontmatter`）解到 `map[string]any`，再经一个映射 switch 落进 `SkillDescriptor`。曾经是手写 YAML 子集解析器，一轮审计在它身上抓出 **7 条同源静默缺陷**（嵌套 `metadata:` 被拍平 / 多行 `|` 正文全丢 / 行尾注释吞值 / 引号里的逗号被切碎 / 非列表键收到列表的闸只挂在两条产列表分支之一 / 别名表两份必须同步的拷贝 / BOM 让整份 frontmatter 失踪），已全部换掉，哨兵见 `skill/parser_defects_internal_test.go`。**BOM 那条换解析器不解决**——切分在解析之前、是我们自己做的，单独剥。bool 走 `parseBoolOptional` 三态（`true/yes/y/1/on` → true，`false/no/n/0/off` → false，**其余 typo/中文/空 → 保留字段默认**，R12/R13）。key 别名走**通用归一化**（小写 + 去掉 `-` `_`，见 `normalizeKey`）而不是逐键列清单——`whenToUse` / `when_to_use` / `when-to-use` / `WHEN-TO-USE` 全部落到同一个 case，加新字段不需要同步任何第二份清单。**非列表键收到列表值报错**（两种写法一视同仁：YAML 里 `[a]` 和 `- a` 是同一种节点）；列表键收到裸标量则留空不报错（`allowed_tools: a, b` 这种逗号裸串不是 YAML 列表，不猜）。**裸控制符在解析期被拒**（yaml.v3 的行为），转义形式仍走 `sanitizeDescriptor` 清洗。
 
@@ -312,11 +338,10 @@ ag := agent_v2.NewBasicAgent(agent_v2.WithSkills(skill.SkillSource{SkillBox: box
 
 ## 12. 已实现 vs 未实现
 
-**已实现**：3 激活模式（toolCall/adaptive/pre_match）/ P2.A 二维控制 / P2.B per-skill model / P2.C fork / P2.D inline body / CJK 匹配 / 路径穿越防护 / 资源类型化 / 元数据注入清洗 + listing 信任框定（§14）/ **skill action 执行**（§11：Go-func 进程内 + run_skill_action 工具）。
+**已实现**：3 激活模式（toolCall/adaptive/pre_match）、二维可见性、per-skill model、fork、inline body、CJK 匹配、资源类型化和路径约束、元数据清洗、Go action，以及[可选递归发现和热重载](#文件目录与热重载)。延迟工具的累计解锁额度见 [`ToolSearchConfig`](toolsearch.md#累计解锁上限)。
 
 **未实现 / 限制**（细节见 [skill-system.md §不足](../description/three-way-comparison/skill-system.md) + [issue-88](../issue/issue-88-skill-schema-dead-code.md)）：
 - **skill action 仅 go-func**：经 `WithSkillActionFunc` 程序化注册（SKILL.md frontmatter 声明不了 go 函数）。声明式脚本 action 路径（python/bash/node + `ScriptExecutor` 沙箱 seam + frontmatter `actions:` 解析）已删（2026-06-30，spec 占位无 consumer），脚本执行交 tool 层 open-bash（见 §11.1 删除依据）
-- **嵌套 skill 发现**（`a/b/SKILL.md` 子目录 skill；发现仅扫 rootDir 一级——但注意 skill **内部**资源文件扫描是递归的 `WalkDir`，reference 子目录文件能读到）/ 热重载（构造时一次性加载）
 - ~~`fork_with_context`~~ 已删除（2026-08-26）：不在 agentskills.io 标准里，兼容对象只有 eino 一家；写它现在在解析期报错
 - ~~frontmatter `inputSchema` / `outputSchema`~~ 已删（`bd1ed59e`，零 consumer）；`allowed-tools` 解析但**决定不强制**（解析期对非空值出声，理由见 `AllowedTools` 字段 godoc；按轮裁工具用 `WithToolFilter`）
 - **skill 多激活（同时激活 N skill）：暂缓（2026-06 决策）**——spec 残留字段 `SkillPreMatchOptions`（TopK / 阈值 / `MaxActiveSkills` / UseEmbedding）**已删除**（commit `c0f187d` 从 spec sync 进来后 runtime 零消费）。理由：**默认 toolCall 模式** LLM 可跨轮反复调 `activate_skill`，**早已支持 N 激活**（无 cap）；adaptive/pre_match 维持单 skill（`SkillSelection.Skill` 单指针）。行业 7 框架 skill 层**无一**做框架 TopK 预选（全"全量列出 + LLM 自选"），故不在 adaptive 预选路径加复杂度。未来有业务驱动 → toolCall 加可选 cap+dedup，不改 adaptive 单指针
@@ -357,8 +382,7 @@ always_load: false
 
 `parseFrontmatter` 收尾对 9 个文本元数据字段（`Name` / `Description` / `WhenToUse` / `Context` / `Agent` / `Model` / `Tags` / `Examples` / `AllowedTools`）做 `sanitizeMetadata`：**折叠换行 / 控制符为单空格 + 截断超长**（标识符类 128 / 文本类 1024 rune）。trust-boundary 一处净化 → listing / 选择 / 错误消息所有下游自动安全。合法元数据无换行 / 控制符，清洗对其零影响（无需 opt-in）。body 不在此列（见 §14.3）。
 
-- **挡**：单行内控制符（ANSI `\x1b` / null / 回车）→ listing 在终端 / UI 渲染时的注入与显示伪造；未来非逐行 load 路径（JSON manifest / marketplace API，值可含真实换行）伪造独立 list item 的结构注入。
-- **现状诚实提示**：当前 SKILL.md frontmatter 解析器**严格逐行**（`strings.Split(fm, "\n")`，每行 `key: 单行值`）——真实换行注入不进单个 value，故"换行伪造 list item"经 SKILL.md **当前不可达**。清洗对 SKILL.md 的现实价值是**控制符加固**；换行折叠是给未来非逐行 load 路径（JSON / API）**前瞻兜底**。**新增任何 SkillDescriptor 入库路径必须复用此清洗**（`discover.go` 注释已标）。
+- YAML 多行标量、转义后的值和内存来源都经过相同清洗。换行和控制符会被折叠，降低元数据在列表和终端中伪造边界的风险。新增 `SkillDescriptor` 入库路径也需调用此清洗。
 
 ### 14.2 listing 信任框定（`skillListingTrustNote` / router prompt）
 

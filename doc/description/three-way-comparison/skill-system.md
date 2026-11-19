@@ -171,7 +171,7 @@ default:                          // inline：body 作 tool_result 返
 | 2 执行模式（inline / fork / remote-canonical / coordinator-summary）| 4 种 | ✅ 抄 inline + fork 两种 |
 | 3 跨边界持久化（`invokedSkills` 全局态 + per-agentId 隔离 + POST_COMPACT 保鲜）| 自我修复协议 | ⚠️ crew-go 用 4 层压缩 marker 保护替代（治标，见 §不足 #10）|
 | 4 学习反馈（`skillImprovement.ts` 后台评估 self-improvement loop）| 有 | ❌ 未抄（P3 慎做）|
-| 5 文件系统响应（`skillChangeDetector.ts` chokidar 热重载）| 有 | ❌ 未抄（启动扫描即可）|
+| 5 文件系统响应（`skillChangeDetector.ts` chokidar 热重载）| 有 | C11 支持由调用方触发的显式 `Reload` |
 
 ## LangGraph（无原生 skill 概念）
 
@@ -221,12 +221,12 @@ LangGraph 没有「skill」这个抽象——它的能力扩展机制是：
 |---|---|---|---|
 | 来源抽象 | `SkillBox`（10 方法）| `Backend`（2 方法）| `Command (type='prompt')` 统一抽象 + 6 类来源（bundled/disk/plugin/builtinPlugin/mcp/legacy commands）|
 | 默认实现 | `DefaultSkillBox` 扫 rootDir | `filesystemBackend` 扫 baseDir | filesystem 自动 + bundled 编译进 binary + plugin 注入 |
-| 子目录递归 | ❌ 仅一级子目录 | ❌ 仅一级 | ✅ `discoverSkillDirsForPaths` 文件操作时按需上行查找 `.claude/skills/` |
-| YAML 解析 | 自研 parser（避免依赖）| `gopkg.in/yaml.v3` | 内部 frontmatterParser |
+| 子目录递归 | 默认一级，可通过 `WithRecursiveDiscovery` 启用 | ❌ 仅一级 | ✅ `discoverSkillDirsForPaths` 文件操作时按需上行查找 `.claude/skills/` |
+| YAML 解析 | `gopkg.in/yaml.v3`，检查已支持字段的重复别名 | `gopkg.in/yaml.v3` | 内部 frontmatterParser |
 | 资源类型推断 | ✅ 按扩展名（reference/script/template/asset）| ❌ 不分类 | ❌ 不分类（用通用工具） |
 | 资源访问方式 | `box.ReadSkillResource(name, path)` 框架受控 | LLM 用 `BaseDirectory` 自己拼路径 + 通用工具读 | LLM 用通用 Read / Bash / Glob 按需读 + bundled `files` lazy extract 到 disk |
-| 路径穿越防护 | ✅ `strings.HasPrefix(full, skillDir+sep)` 校验 | ❌ 由通用工具方负责 | ✅ bundled extract 用 `O_NOFOLLOW|O_EXCL + 0o700 + per-process nonce` 防 symlink 攻击；运行时由通用 FileReadTool 的权限模型保护 |
-| 热重载 | ❌ 启动一次性扫 | ❌ | ✅ chokidar + 三段式 debounce/polling/hook-block |
+| 路径穿越防护 | 使用 `os.Root` 限制读取，资源读取核对扫描时的目录身份 | ❌ 由通用工具方负责 | ✅ bundled extract 用 `O_NOFOLLOW|O_EXCL + 0o700 + per-process nonce` 防 symlink 攻击；运行时由通用 FileReadTool 的权限模型保护 |
+| 热重载 | `WithHotReload` 启用后由调用方显式 `Reload` | ❌ | ✅ chokidar + 三段式 debounce/polling/hook-block |
 
 ### 3. 激活协议对比
 
@@ -407,7 +407,7 @@ crew-go 没有「重建对话」这个动作。
 1. ~~**只实现 toolCall 模式**~~（**V2 P1.B 已实现 adaptive / pre_match**）—— `agent_v2/adaptive_skill.go` + `WithSkillSelector(SkillSelectorConfig{Model, MinScore, MaxCandidates, SystemPrompt})`；`SkillSource.Options.ActivationMode` 现在 runtime 真消费。**spec `SkillRuntimeOptions.PreMatch`（`SkillPreMatchOptions`：TopK / 阈值 / MaxActiveSkills / UseEmbedding）已删除**（2026-06）—— 从 spec sync 进来后 runtime 零消费，按"无人调=未完成""不留兼容路径"删；crew-go 用更简 `SkillSelectorConfig` 替代。**skill 多激活暂缓决策**：默认 toolCall 已支持 N 激活（LLM 跨轮反复 activate_skill），行业 7 框架 skill 层无一做框架 TopK 预选，故不在 adaptive 加 MaxActiveSkills 复杂度（详见 skill.md §12）
 2. ~~**无 fork / fork_with_context 模式**~~（**V2 P2.C 实现 fork**；`fork_with_context` **已删（2026-08-26）**——不在 agentskills.io 标准里，写它现在在解析期报错）—— `SkillDescriptor.Context = "fork"` 触发 sub-agent spawn；`WithSkillSubAgentResolver(name→Agent)` 业务注入预配置 sub-agent，或框架默认 BasicAgent（SystemPrompt = skill body + parent model 兜底）。`activate_skill({skill, query})` LLM 必传 query。隔离 RunSession 跑 sub-agent，final answer 作 tool_result 返父 agent
 3. ~~**无 per-skill model 切换**~~（**V2 P2.B 实现**）—— `SkillDescriptor.Model` frontmatter 字段 + `WithSkillModelResolver(name→ChatModel)` 业务注入解析器；仅 fork 默认 BasicAgent 路径用（业务自定义 sub-agent 自带 model）。SQL skill 走 GPT-4 / 翻译 skill 走轻量 model 等场景能做了
-4. **无子目录递归**——`scan` 只读一级子目录，组织层级深的 skill 仓库（按业务线分子目录）需要扁平化
+4. ~~**无子目录递归**~~（**C11 已实现**）——默认一级发现，`WithRecursiveDiscovery(true)` 可穿过分类目录并保留 skill 包边界。
 5. ~~**system prompt 提示是固定中文 hardcode**~~（**V2 P1 Task 2 修复**）——`WithSkillSystemPrompt(string)` 允许业务自定义 hint 文案，仅 toolCall 模式生效（adaptive / pre_match 用 skill body 直接拼）
 6. ~~**无 RunSkillAction 实现**~~（**go-func 已实现**：`DefaultSkillBox.RunSkillAction` 进程内调 go 函数；`WithSkillActionFunc` 程序化注册 + `ListSkillActions` 返注册的 action + LLM 经 `run_skill_action` 工具触发；详见 [`skill.md` §11](../../v2/skill.md)）——**声明式脚本 action 路径已删**（2026-06-30）：`RunSkillScript` / `WithSkillScriptAction` / python·bash·node runtime / `ScriptExecutor` 沙箱 seam / SKILL.md frontmatter `actions:` 解析（`parseActions`）当初是对齐 `skill.tsp` 占位建的，零生产 consumer；三方调研实锤无框架在 skill 层做声明式脚本执行（eino `Shell`/`execute` tool、Claude Code Bash 都走 tool 层 open-bash），故删 script 路径、脚本执行收敛到 tool 层
 7. ~~**`MatchSkills` 实现但未被 `activate_skill` 流程调用**~~（**V2 P1.B 修复**）—— adaptive / pre_match 模式用 `MatchSkills` 做预筛（`selectSkillAdaptive`）。`toolCall` 模式仍不走预筛（LLM 直接按 name 激活）
@@ -417,7 +417,7 @@ crew-go 没有「重建对话」这个动作。
 8. ~~**无预算裁剪**~~（**V2 P1.A 修复**）—— `agent_v2/skill_tool.go::formatSkillListing` 三档降级 + UTF-8 安全截断；`WithSkillListingBudget(totalChars, perEntryChars int)` 业务可调整阈值。仅 toolCall 模式生效
 9. **无增量 listing 下发** —— 曾实现（P2.E）后**已删除**：listing 塞进会话历史流会跨 session 累积且被压缩层保护删不掉。现统一走 `activate_skill` 工具 description 全量列 skill——走 API tools 参数、被 prompt caching 缓存、不进历史流。理由见 [conversation-history.md §六](conversation-history.md)
 10. ~~**无跨 compaction body 保鲜**~~（**V2 P1.C 已实现 toolCall 模式**）—— `SkillBodyAnnotation` marker + AutoCompact `splitProtectedGroups` 按 group 保留（保 tool_call/tool_result pair 完整避免 OpenAI 422）+ ReactiveCompact `isProtectedGroup` 加 SkillBody 检查跨层一致。**已知限制**：仅 toolCall 模式（adaptive / pre_match 已通过 sysPrompt 注入 skill body 不经 tool_result，AutoCompact 本身不动 system，天然保鲜）；不像 Claude `POST_COMPACT_MAX_TOKENS_PER_SKILL=5_000` 做单 skill 预算裁剪——crew-go 整组保留更简单，trade-off 是 token 上多花一些。**📋 但此"压缩时保护"是治标：L0 源头分层方案（见 §skill 源头分层方案设计）落地后移除此专门保护——reference 改按需读取走通用压缩、body 层不再常驻（但 reference 多轮重复读仍需 per-Run 去重兜底，见该节风险 #4）**
-11. **无文件热重载**——业务改 SKILL.md 必须重启 agent 才能生效，DX 差。Claude 的 chokidar + 300ms debounce + 2s polling + ConfigChange-hook-block 三段式可直接抄
+11. ~~**无文件热重载**~~（**C11 已实现显式重载**）——`WithHotReload(true)` 配合 `Reload` 发布目录快照，由调用方接入配置更新时机。
 12. **无权限模型 + safe properties allowlist**——Claude 的"白名单优于黑名单"安全设计（28 字段 SAFE_SKILL_PROPERTIES，新加未知字段默认 ask user）值得借鉴，未来 V2 加权限时直接抄
 13. ~~**无 disableModelInvocation / userInvocable 二维**~~（**V2 P2.A 修复**）—— `SkillDescriptor.DisableModelInvocation` + `SkillDescriptor.UserInvocable` 两字段 frontmatter 解析 + 3 处独立防御（`activate_skill.Description()` listing 过滤 + `Call()` 防御 + `selectSkillAdaptive` 候选过滤）。`UserInvocable` 默认 true 框架不强制（v2 无 slash command），仅作为 metadata 供业务上层 UI / CLI 自行过滤 user-facing 列表。**关键设计**：未识别 frontmatter 值（typo / "maybe"）保留默认而非静默翻转——bool 字段统一走 `parseBoolOptional` 3 态识别（R12 audit MED-1 + R13 audit LOW-1 收敛）
 
@@ -520,10 +520,10 @@ V2 实施时三类 reference 来源的角色定位 + 抄/不抄边界：
 
 | 项 | 工作量 | 来源 | 备注 |
 |---|---|---|---|
-| 文件热重载（chokidar 等价 + 三段式 debounce）| 中（fsnotify + 50 行 Go）| R4 H2 | DX 提升明显，但要业务有"频繁改 SKILL.md"诉求 |
+| 显式文件热重载 | ✅ **C11 已实现** | R4 H2 | 调用方触发原子重载，单次 BasicAgent 执行固定一个目录，挂起任务用相同目录版本恢复。 |
 | paths 条件激活（gitignore 风格 + 文件 tool hook）| 大（要在所有文件操作 tool 埋激活点）| R3 Layer 6 | 仅当 crew-go 走 IDE/编辑器集成路线时做 |
 | safe properties allowlist 权限模型 | 大（要先有完整权限模型基础设施）| R4 安全设计 | V2 加权限时直接抄 |
-| 子目录递归扫描 | 小（`filepath.WalkDir` 替 `os.ReadDir`）| R1 不足 #4 | skill 数量大时再做 |
+| 子目录递归扫描 | ✅ **C11 已实现** | R1 不足 #4 | `WithRecursiveDiscovery` 启用分类目录扫描。 |
 | ~~skill 层脚本 action 执行~~（已删，2026-06-30）| — | R1 不足 #6 | go-func action（`RunSkillAction`）已实现（进程内，无安全模型负担）；声明式脚本 action 路径（`RunSkillScript` + sandbox seam）已删——三方调研实锤脚本执行收敛到 **tool 层 open-bash**（eino `Shell`/Claude Bash），skill 层不再做（删除依据见 R1 不足 #6）|
 | **Skill 命名强校验**（snake_case 目录名 + 目录名 == frontmatter.name + SKILL.md 一级标题 == name）| 小（30 行 discover.go）| spec runtime 提示 | 避免大规模 skill 包命名混乱；做成 opt-in option `WithStrictNaming(true)` 不破坏现有 skill |
 | Markdown 内嵌 ``!`...` `` shell 执行 | 大（安全模型不清前不能做）| R3 模板替换 | 恶意 skill 可执行任意 shell |
@@ -534,6 +534,10 @@ V2 实施时三类 reference 来源的角色定位 + 抄/不抄边界：
 |---|---|---|
 | 支持 MCP 协议作为 skill 来源（消费 MCP server 的 prompts/tools）| 中（crew-go 已有 mcp 包，加 SkillBox 适配器）| 接入整个 MCP 生态（Cursor / Zed / Claude Desktop 都在推），跨生态价值巨大 |
 | Skill self-improvement loop（5 turn LLM 评估 + 改写 SKILL.md）| 大（涉及后台 LLM 评估 + 改写文件 + UI）| 业内独家差异化但 ROI 不确定，**建议不做**——业务通过 hook 自定义 |
+
+### C11 落地决策
+
+同源 agentDock 的 `763e72dd` 已验证目录递归和原子发布的组合。crew-go 采用显式重载，由调用方决定何时发布，并在 BasicAgent 装配时固化这次执行的目录版本。嵌套流程沿用现有 Agent 编排，外部分发沿用 `ParseSkillMD` 和 `NewInMemorySkillBox`。不同延迟工具的累计解锁数使用现有 `tool_search` 的任务状态限制。[目录契约](../../v2/skill.md#文件目录与热重载) · [累计额度](../../v2/toolsearch.md#累计解锁上限)
 
 ---
 

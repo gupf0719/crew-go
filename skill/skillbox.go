@@ -2,13 +2,18 @@ package skill
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // SkillBox 定义 skill 容器契约，负责发现、匹配和资源读取。
@@ -17,10 +22,9 @@ import (
 //
 //  1. **并发安全**：业务自定义 SkillBox 实现的 ListSkills / MatchSkills /
 //     ActivateSkill 等所有方法**必须线程安全**——典型场景 ParallelAgent 多 branch
-//     并发调 ListSkills + lazy-load 实现会 race；DefaultSkillBox 一次性 scan +
-//     运行时只读天然安全。
+//     并发调 ListSkills + lazy-load 实现会 race；DefaultSkillBox 发布不可变的目录快照。
 //
-//  2. **MatchSkills 幂等性**：同一 query 重复调用应返一致结果（顺序+score）——
+//  2. **MatchSkills 幂等性**：同一目录版本内，同一 query 重复调用应返一致结果（顺序+score）——
 //     Resume 路径 toolsNode 重跑会再次调 box.MatchSkills，非确定性实现（如基于
 //     时间戳排序 / 随机 tie-break）会让 selectSkillAdaptive fallback_top1 选不同
 //     skill → Resume 行为漂移业务感知失忆。
@@ -66,21 +70,31 @@ type SkillBox interface {
 var ErrSkillActionNotFound = errors.New("skill: action not found")
 
 // DefaultSkillBox 从文件系统或预解析的内存内容加载 skill。
-// 加载后可并发读取。列表、匹配和激活各自返回独立的元数据快照。
+// 可并发读取。列表、匹配和激活各自返回独立的元数据快照。
+// 文件型目录可用 [WithHotReload] 启用原子重载。
 type DefaultSkillBox struct {
 	name      string
 	rootDir   string
-	skills    []loadedSkill
 	allowList map[string]bool // nil = 允许所有
+	recursive bool
+	hotReload bool
+	reloadMu  sync.Mutex
+	catalog   atomic.Pointer[skillCatalog]
 
 	actionFuncs    map[string]ActionFunc              // key = actionKey(skill, action)，go runtime 进程内实现
 	pendingActions map[string][]SkillActionDescriptor // 选项期注册、scan 后并入对应 skill.actions
+}
+
+type skillCatalog struct {
+	skills   []loadedSkill
+	revision string
 }
 
 // loadedSkill 是已加载 skill 的内部表示。
 type loadedSkill struct {
 	descriptor SkillDescriptor
 	dir        string // skill 目录的绝对路径
+	dirInfo    fs.FileInfo
 	prompt     string // SKILL.md body 内容
 	matchText  string // 用于关键词匹配的拼接文本
 	resources  []SkillResource
@@ -93,6 +107,18 @@ type SkillBoxOption func(*DefaultSkillBox)
 // WithSkillBoxName 设置 skill box 名称。
 func WithSkillBoxName(name string) SkillBoxOption {
 	return func(b *DefaultSkillBox) { b.name = name }
+}
+
+// WithRecursiveDiscovery 允许在分类目录内继续查找 SKILL.md。
+// 含有 SKILL.md 的目录是一个 skill 包，其内部文件按资源处理。默认只扫描一级子目录。
+func WithRecursiveDiscovery(enabled bool) SkillBoxOption {
+	return func(b *DefaultSkillBox) { b.recursive = enabled }
+}
+
+// WithHotReload 允许对文件型 SkillBox 显式调用 Reload。
+// 同时为快照生成内容版本，供 Agent 在续跑时核对目录。默认关闭。
+func WithHotReload(enabled bool) SkillBoxOption {
+	return func(b *DefaultSkillBox) { b.hotReload = enabled }
 }
 
 // WithAllowList 只加载指定名称的 skill，nil 或空列表表示允许所有。
@@ -156,20 +182,53 @@ func NewDefaultSkillBox(rootDir string, opts ...SkillBoxOption) (*DefaultSkillBo
 	for _, opt := range opts {
 		opt(b)
 	}
-	if err := b.scan(); err != nil {
+	if err := b.loadCatalog(true); err != nil {
 		return nil, err
 	}
-	b.mergePendingActions()
 	return b, nil
 }
 
 func (b *DefaultSkillBox) Name() string    { return b.name }
 func (b *DefaultSkillBox) RootDir() string { return b.rootDir }
 
+// Reload 重新扫描文件型 SkillBox。扫描成功后一次性发布目录，失败时保留原快照。
+// 调用方在文件更新完成后触发。仅启用了 [WithHotReload] 的文件型 SkillBox 支持重载。
+func (b *DefaultSkillBox) Reload() error {
+	if b.rootDir == "" || !b.hotReload {
+		return errors.New("skill box: reload requires a filesystem box with WithHotReload enabled")
+	}
+	b.reloadMu.Lock()
+	defer b.reloadMu.Unlock()
+	return b.loadCatalog(false)
+}
+
+// Snapshot 返回固定在当前目录版本的只读 SkillBox 及用于续跑校验的版本。
+// 资源目录和元数据固定，资源文件内容仍在读取时取得。静态 SkillBox 的版本为空。
+func (b *DefaultSkillBox) Snapshot() (*DefaultSkillBox, string) {
+	catalog := b.catalog.Load()
+	if catalog == nil {
+		return b, ""
+	}
+	if !b.hotReload {
+		return b, catalog.revision
+	}
+	view := &DefaultSkillBox{name: b.name, rootDir: b.rootDir, actionFuncs: b.actionFuncs}
+	view.catalog.Store(catalog)
+	return view, catalog.revision
+}
+
+func (b *DefaultSkillBox) loadedSkills() []loadedSkill {
+	if catalog := b.catalog.Load(); catalog != nil {
+		return catalog.skills
+	}
+	return nil
+}
+
 // ListSkills 返回所有已加载 skill 的元数据。
 func (b *DefaultSkillBox) ListSkills() []SkillDescriptor {
-	out := make([]SkillDescriptor, 0, len(b.skills))
-	for _, s := range b.skills {
+	skills := b.loadedSkills()
+	out := make([]SkillDescriptor, 0, len(skills))
+	for _, s := range skills {
 		out = append(out, copySkillDescriptor(s.descriptor))
 	}
 	return out
@@ -177,12 +236,12 @@ func (b *DefaultSkillBox) ListSkills() []SkillDescriptor {
 
 // MatchSkills 用关键词匹配返回按分数降序排列的结果。
 func (b *DefaultSkillBox) MatchSkills(_ context.Context, query string) []SkillMatchResult {
-	return matchSkills(b.skills, query)
+	return matchSkills(b.loadedSkills(), query)
 }
 
 // ListSkillResources 列出指定 skill 可读取的资源文件清单。
 func (b *DefaultSkillBox) ListSkillResources(name string) []SkillResource {
-	for _, s := range b.skills {
+	for _, s := range b.loadedSkills() {
 		if s.descriptor.Name == name {
 			return copySkillResources(s.resources)
 		}
@@ -200,11 +259,11 @@ func copySkillResources(src []SkillResource) []SkillResource {
 
 // ReadSkillResource 读取 skill 内指定路径的资源文件内容，失败时返回空字符串。
 func (b *DefaultSkillBox) ReadSkillResource(name, path string) string {
-	for _, s := range b.skills {
+	for _, s := range b.loadedSkills() {
 		if s.descriptor.Name != name {
 			continue
 		}
-		root, err := os.OpenRoot(s.dir)
+		root, err := s.openResourceRoot()
 		if err != nil {
 			return ""
 		}
@@ -220,7 +279,7 @@ func (b *DefaultSkillBox) ReadSkillResource(name, path string) string {
 
 // ReadSkillPrompt 读取 skill playbook 原文（SKILL.md body）。
 func (b *DefaultSkillBox) ReadSkillPrompt(name string) string {
-	for _, s := range b.skills {
+	for _, s := range b.loadedSkills() {
 		if s.descriptor.Name == name {
 			return s.prompt
 		}
@@ -230,7 +289,7 @@ func (b *DefaultSkillBox) ReadSkillPrompt(name string) string {
 
 // ListSkillActions 返回 skill 暴露的可执行 action 清单。
 func (b *DefaultSkillBox) ListSkillActions(name string) []SkillActionDescriptor {
-	for _, s := range b.skills {
+	for _, s := range b.loadedSkills() {
 		if s.descriptor.Name == name {
 			return copySkillActions(s.actions)
 		}
@@ -240,7 +299,7 @@ func (b *DefaultSkillBox) ListSkillActions(name string) []SkillActionDescriptor 
 
 // ActivateSkill 按名称激活 skill，返回展开视图。
 func (b *DefaultSkillBox) ActivateSkill(_ context.Context, name string) (*ActiveSkill, error) {
-	for _, s := range b.skills {
+	for _, s := range b.loadedSkills() {
 		if s.descriptor.Name == name {
 			return &ActiveSkill{
 				Skill:     copySkillDescriptor(s.descriptor),
@@ -293,119 +352,187 @@ func (b *DefaultSkillBox) RunSkillAction(ctx context.Context, skillName, actionN
 
 // findAction 在指定 skill 的 actions 里按名找 descriptor，未找到返 nil。
 func (b *DefaultSkillBox) findAction(skillName, actionName string) *SkillActionDescriptor {
-	for i := range b.skills {
-		if b.skills[i].descriptor.Name != skillName {
+	for _, s := range b.loadedSkills() {
+		if s.descriptor.Name != skillName {
 			continue
 		}
-		for j := range b.skills[i].actions {
-			if b.skills[i].actions[j].Name == actionName {
-				return &b.skills[i].actions[j]
+		for j := range s.actions {
+			if s.actions[j].Name == actionName {
+				return &s.actions[j]
 			}
 		}
 	}
 	return nil
 }
 
-// mergePendingActions 把选项期 WithSkillActionFunc 注册的 action 并入对应 skill 的 actions
-// （让 ListSkillActions / ActiveSkill.Actions 含程序化 action）；scan 之后调用一次。
-//
-// **同名去重**：同 (skill, action) 重复时后注册覆盖（防 listing 出现重复项）。
-func (b *DefaultSkillBox) mergePendingActions() {
-	if len(b.pendingActions) == 0 {
-		return
-	}
-	for i := range b.skills {
-		for _, pa := range b.pendingActions[b.skills[i].descriptor.Name] {
-			replaced := false
-			for j := range b.skills[i].actions {
-				if b.skills[i].actions[j].Name == pa.Name {
-					b.skills[i].actions[j] = pa // 覆盖同名 action
-					replaced = true
-					break
-				}
-			}
-			if !replaced {
-				b.skills[i].actions = append(b.skills[i].actions, pa)
-			}
-		}
-	}
-}
-
-// scan 扫描 rootDir 一级子目录，加载每个 SKILL.md 及同目录资源文件。
-func (b *DefaultSkillBox) scan() error {
-	entries, err := os.ReadDir(b.rootDir)
+func (b *DefaultSkillBox) loadCatalog(startup bool) error {
+	skills, err := b.scan(startup)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("skill box: scan %q: %w", b.rootDir, err)
+		return err
 	}
-
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
+	catalog := &skillCatalog{skills: skills}
+	if b.hotReload {
+		// 使用稳定的内容版本，重启后仍能识别同一个目录。函数实现的部署版本由业务声明。
+		type entry struct {
+			Dir        string
+			Descriptor SkillDescriptor
+			Prompt     string
+			Resources  []SkillResource
+			Actions    []SkillActionDescriptor
 		}
-		dir := filepath.Join(b.rootDir, e.Name())
-		skillFile := filepath.Join(dir, "SKILL.md")
-		data, err := os.ReadFile(skillFile)
+		entries := make([]entry, 0, len(skills))
+		for _, s := range skills {
+			entries = append(entries, entry{s.dir, s.descriptor, s.prompt, s.resources, s.actions})
+		}
+		data, err := json.Marshal(entries)
 		if err != nil {
-			continue
+			return fmt.Errorf("skill box: encode catalog revision: %w", err)
 		}
-		desc, body, err := ParseSkillMD(data)
-		if err != nil {
-			// **出声再跳过。** 静默 continue 的效果是 skill 凭空消失——业务在 listing
-			// 里找不到它，而不知道是自己 SKILL.md 写错了。这比「静默降级」还难查：
-			// 降级至少还有个东西在跑。
-			slog.Warn("skill: SKILL.md 解析失败，跳过", "dir", dir, "err", err)
-			continue
-		}
-		if desc.Name == "" {
-			slog.Warn("skill: SKILL.md 缺 name，跳过", "dir", dir)
-			continue
-		}
-		if b.allowList != nil && !b.allowList[desc.Name] {
-			continue
-		}
-		resources := scanResources(dir)
-		ls := loadedSkill{
-			descriptor: desc,
-			dir:        dir,
-			prompt:     body,
-			matchText:  buildMatchText(desc),
-			resources:  resources,
-			// actions 由 mergePendingActions 从 WithSkillActionFunc 程序化注册填充（frontmatter 声明不了 go action）
-		}
-		b.skills = append(b.skills, ls)
+		catalog.revision = fmt.Sprintf("skill-catalog-v1:%x", sha256.Sum256(data))
 	}
+	b.catalog.Store(catalog)
 	return nil
+}
+
+// scan 以稳定顺序遍历分类目录。遇到 skill 包后，它的子树交给资源扫描。
+func (b *DefaultSkillBox) scan(startup bool) ([]loadedSkill, error) {
+	root, err := os.OpenRoot(b.rootDir)
+	if err != nil {
+		if startup && errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("skill box: scan %q: %w", b.rootDir, err)
+	}
+	defer root.Close() // 只读目录句柄。
+	var skills []loadedSkill
+	seen := make(map[string]bool)
+	err = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || path == "." || !d.IsDir() {
+			return err
+		}
+		s, found, err := b.loadSkill(root, filepath.FromSlash(path))
+		if err == nil && s.descriptor.Name != "" {
+			name := s.descriptor.Name
+			if (b.recursive || b.hotReload) && seen[name] {
+				err = fmt.Errorf("duplicate skill name %q", name)
+			} else {
+				skills = append(skills, s)
+				seen[name] = true
+			}
+		}
+		if err != nil {
+			if !startup {
+				return fmt.Errorf("%s: %w", path, err)
+			}
+			slog.Warn("skill: 跳过无法加载的目录", "dir", path, "err", err)
+		}
+		if found || !b.recursive {
+			return fs.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("skill box: scan %q: %w", b.rootDir, err)
+	}
+	return skills, nil
+}
+
+func (b *DefaultSkillBox) loadSkill(root *os.Root, path string) (loadedSkill, bool, error) {
+	dir, err := root.OpenRoot(path)
+	if err != nil {
+		return loadedSkill{}, false, err
+	}
+	defer dir.Close() // 只读目录句柄。
+	const manifest = "SKILL.md"
+	entry, err := dir.Lstat(manifest)
+	if errors.Is(err, fs.ErrNotExist) {
+		return loadedSkill{}, false, nil
+	}
+	if err != nil {
+		return loadedSkill{}, true, err
+	}
+	if entry.Mode()&fs.ModeSymlink != 0 {
+		entry, err = dir.Stat(manifest)
+		if err != nil {
+			return loadedSkill{}, true, err
+		}
+	}
+	if !entry.Mode().IsRegular() {
+		return loadedSkill{}, true, errors.New("SKILL.md must be a regular file")
+	}
+	data, err := dir.ReadFile(manifest)
+	if err != nil {
+		return loadedSkill{}, true, err
+	}
+	desc, body, err := ParseSkillMD(data)
+	if err != nil {
+		return loadedSkill{}, true, err
+	}
+	if desc.Name == "" {
+		return loadedSkill{}, true, errors.New("SKILL.md name is required")
+	}
+	if b.allowList != nil && !b.allowList[desc.Name] {
+		return loadedSkill{}, true, nil
+	}
+	info, err := dir.Stat(".")
+	if err != nil {
+		return loadedSkill{}, true, err
+	}
+	resources, err := scanResources(dir)
+	if err != nil {
+		return loadedSkill{}, true, err
+	}
+	return loadedSkill{
+		descriptor: desc,
+		dir:        filepath.Join(b.rootDir, path),
+		dirInfo:    info,
+		prompt:     body,
+		matchText:  buildMatchText(desc),
+		resources:  resources,
+		actions:    b.pendingActions[desc.Name],
+	}, true, nil
+}
+
+// openResourceRoot 确认资源仍来自扫描时的目录。内存来源的 Dir 仅用于标记来源。
+func (s loadedSkill) openResourceRoot() (*os.Root, error) {
+	if s.dirInfo == nil {
+		return nil, fs.ErrNotExist
+	}
+	root, err := os.OpenRoot(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	info, err := root.Stat(".")
+	if err != nil || !os.SameFile(s.dirInfo, info) {
+		_ = root.Close() // 目录未通过检查，保留原错误。
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("skill resource directory changed")
+	}
+	return root, nil
 }
 
 // scanResources 扫描 skill 目录下所有非 SKILL.md 的文件，构建资源清单。
-func scanResources(dir string) []SkillResource {
+func scanResources(root *os.Root) ([]SkillResource, error) {
 	var resources []SkillResource
-	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || !d.Type().IsRegular() {
-			return nil
+	err := fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() || path == "SKILL.md" {
+			return err
 		}
-		rel, err := filepath.Rel(dir, path)
-		if err != nil {
-			return nil
-		}
-		if rel == "SKILL.md" {
-			return nil
-		}
+		rel := filepath.FromSlash(path)
 		rt := resourceType(rel)
 		resource := SkillResource{
 			Path:         rel,
 			ResourceType: rt,
 		}
 		if rt == "reference" {
-			loadReferenceMetadata(dir, &resource)
+			loadReferenceMetadata(root, &resource)
 		}
 		resources = append(resources, resource)
 		return nil
 	})
-	return resources
+	return resources, err
 }
 
 // resourceType 根据文件扩展名推断资源类型。

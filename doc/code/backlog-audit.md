@@ -59,7 +59,7 @@
 | ISSUE-97 / 发布迁移 / ISSUE-70 | 已关闭的内置行为与验收分开 | 内置 SQL/Redis 任务租约与拒绝陈旧写入已实现。旧部署执行迁移和真实并发验收合并到 A02。外部副作用需要应用幂等。 |
 | MCP Streamable HTTP | POST、会话生命周期、C01 和 C02 已关闭 | 回归覆盖独立推送、SSE 续订及图片和音频在 BasicAgent 到模型请求间的配对。 [C01 回归](../../mcp/http_sse_test.go) · [C02 回归](../../mcp/tool_media_test.go) |
 | Sandbox 后端可替换性 | 边界待决 Q01 | `sandbox/sandbox.go` 和 `sandbox/tool_test.go` 有接口与工具适配单测，仓内未提供跨后端可复用 conformance。 |
-| Skill 系统设计页 §待办 | 合并中心表 | 资源分层、调用预算、Go Action 及解析规则已实现。嵌套发现、热重载以及可选研究按真实诉求放入能力和待决项。已明确删除的 script/旧字段保留决策依据。 |
+| Skill 系统设计页 §待办 | C11 已落地所选能力 | 资源分层、调用预算、Go Action、可选递归发现、显式重载和累计解锁额度已实现。其他按场景触发的研究保留在[对照记录](../description/three-way-comparison/skill-system.md)。 |
 | Structured Output 历史草案 §7–9 | 工具路径关闭。strict 自动切换等已决非目标 | `agent_v2/structured_output.go` 与相关测试支撑当前 forced tool 路径。独立响应模式没有以实现事项进入活跃表。 |
 | 三类根因和悬空工具实施笔记 | 归档，剩余映射到活跃清单 | `WithToolTimeout`、软降落、错误分类与上游审批保留已有测试。悬空工具写时全库扫描、头部事件架构草案已明确不做。具体取消/历史余项按当前入口核验。 |
 | AG-UI 与 A2A 的运行终态 | D09 已修 | 存档哨兵、调用方取消和终局失败使用同一分类。回归覆盖安全错误正文、有效挂起和请求断开竞争、订阅及任务查询。 [AG-UI 回归](../../agui/run_outcome_test.go) · [SQLite 回归](../../sql/agui_run_outcome_test.go) · [A2A 回归](../../a2a/server/run_outcome_test.go) |
@@ -260,7 +260,7 @@ D06 已关闭。基线 `e185749` 连续以同一指针写入 `alpha/left` 和 `b
 | L289 | ① 调用方 ctx 已结束而业务错掩盖原因，需要对尚存入口确认，② GraphID 冲突已修 / NoPending 本地消费保留，③ 公开错误分类仍开。 |
 | L356/L363 | L356 ① visit 两维拆分延期 ② replay-safety 变调用单元属性延期。L363 ① 序列化 godoc 警示 ② 公开符号示例，按当前覆盖细查。 |
 | L373 | ① 第三层确定性内容压缩已兜底 ②a–d 单条可控裁剪已交付 ③ 压缩下界/换模型观察还有残余。 |
-| L393 | ① 文件热重载，② paths 条件激活，③ safe properties 权限，④ 递归子目录，⑤ 命名强校验 opt-in，⑥ Markdown shell 安全模型清晰前不做，⑦ MCP 作为 Skill 来源，⑧ 自迭代方向需立项。 |
+| L393 | ① 显式重载与 ④ 递归发现归 C11 完成。② paths 条件激活、③ safe properties、⑤ 严格命名、⑥ Markdown shell、⑦ MCP 来源、⑧ 自迭代保留原场景和立项条件。 |
 | L395/L403 | L395 ① 过滤前配额实际折损 ② 空 namespace 边界在非合规输入下才命中 ③ nil 元素修复。L403 ① 归属过滤修复 ② 预分配小瑕 ③ 恒真判断已移除。 |
 | L401 | ① 确认守护测试覆盖责任，② 全称断言 AST 普查，③ golden 可观察行为。 |
 | L404 | ① Reason 入参共享 ② errors.Join 多中断取首个 ③ 空 query 有兄弟的处理 ④ ListNamespaces 字节序已有契约和断言。 |
@@ -484,7 +484,7 @@ D06 已关闭。基线 `e185749` 连续以同一指针写入 `alpha/left` 和 `b
 | L390 | 🟡 fork_with_context 被接受但静默降级 已删（2026-08-26）：调研查实 context 键不在 agentskills.io 标准里、Claude C… | ✅ 已删（2026-08-26） | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/skill_tool.go](../../agent_v2/skill_tool.go) · 原文溯源 877aea13（仅文档溯源） |
 | L391 | 🔍 两处设计文档的开放项从没进过中心表（2026-08-26 盘点）：① skill-system.md 有一整节「待办（potential V2 work，按 ROI 排）」… | ✅ 已归置 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [doc/description/three-way-comparison/skill-system.md](../../doc/description/three-way-comparison/skill-system.md)、[doc/v2/fault-analysis-system.md](../../doc/v2/fault-analysis-system.md) · 原文溯源 877aea13（仅文档溯源） |
 | L392 | 🟢 redis ListNamespaces 会列出已删空的历史 ns（2026-09-07 归置，原是 redis/store_list.go 里的 TODO）：nsidx … | 🟢 已知限制（框架不回收） | 已知限制/P3 | Q17 | redis/store_list.go 索引允许已空 namespace。若有真实扇出成本再设回收。 · 现存入口 [redis/store_list.go](../../redis/store_list.go)、[redis/store.go](../../redis/store.go)、[agent_v2/basic_agent.go](../../agent_v2/basic_agent.go) · 基线缺旧引用 5b8d7ba7 · 原文溯源 877aea13（仅文档溯源） |
-| L393 | 🔵 skill 系统 P3 慎做 6 项 + 战略选择 2 项（2026-09-07 归置）：文件热重载 / paths 条件激活 / safe properties 权限模型… | 🔵 OPEN（按业务诉求触发） | 按需（八子项） | C11 | 六项为成熟度建议，两项是执行/信任战略。现有 Skill 加载和覆盖率修复独立。 · 现存入口 [doc/description/three-way-comparison/skill-system.md](../../doc/description/three-way-comparison/skill-system.md) · 原文溯源 877aea13（仅文档溯源） |
+| L393 | 🔵 skill 系统 P3 慎做 6 项 + 战略选择 2 项（2026-09-07 归置）：文件热重载 / paths 条件激活 / safe properties 权限模型… | 已完成所选能力 | 其余按场景立项 | C11 关闭 | 可选递归发现、显式重载和快照续跑已交付。编排和分发沿用图编排与内存来源。 · [现行契约](../v2/skill.md#文件目录与热重载) · [备选项](../description/three-way-comparison/skill-system.md) · 原文溯源 877aea13（仅文档溯源） |
 | L394 | 🔵 故障分析（RCA）系统——设计完、未实施（2026-09-07 归置）：一篇完整蓝图（业内调研 + 编排签名逐一 grep 过），按其 §12 分阶段。第二身份是 SDK … | 🔵 OPEN（等业务立项） | 按需 | Q06 | RCA 是可立项的系统设计，无核心 bug。 · 现存入口 [doc/v2/fault-analysis-system.md](../../doc/v2/fault-analysis-system.md) · 原文溯源 877aea13（仅文档溯源） |
 | L395 | 🔍 记忆注入的三条 LOW（审计 2026-08-26，判过、未修）：① 归属过滤跑在截断之后 ⟹ 越界项占掉注入名额（实测 SearchLimit=5 + 3 条越界排前面 … | 🔍 ①有代价 ②nit ③默认路径会 panic | 部分开放 | Q24 | ①非合规 backend 返回跨 owner 数据可消耗 WithLimit 后过滤的配额。② scope 小瑕。③ nil item 有 TestStoreMemory_NilSearchItemsSkipped。关联 L403。 · 原文溯源 c194ade2（仅文档溯源） |
 | L396 | 🔍 补一句「扇出跑几次」进 godoc（原措辞「口径更正」会让人去找一句已经不在的话——那句挂在 memoryCandidateCap 上，常量连同它已随 145562e 删除… | ✅ 已写进 gatherMemoryCandidates godoc「扇出跑几遍」（2026-10-23） | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 基线缺旧引用 145562e · 原文溯源 c194ade2（仅文档溯源） |

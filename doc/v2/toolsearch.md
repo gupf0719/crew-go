@@ -105,6 +105,14 @@ tools 节点这次执行上，节点成功后写进 channel；节点中断或失
 
 这是 eino/bigtool 都没有的一道额外防御——真 qwen 实测能触发（见 §6）。
 
+#### 累计解锁上限
+
+`MaxRevealed` 限制一个 BasicAgent 任务内累计解锁的不同延迟工具数，默认不限。该值对默认和自定义检索器都生效。`MaxResults` 仍是默认检索器的单次结果数。
+
+并行检索结束后按模型声明的调用顺序分配剩余额度，结束钩子否决的检索不会占用。已经解锁的名字重复命中照常返回。超额匹配的名字不进入解锁回执和下一轮工具表，工具的实际执行检查仍使用批次开始前的已提交集合。
+
+解锁集合随任务存档恢复，新任务重新获得完整额度。配置正数上限后，从同一任务继续须沿用原上限。启用上限时，自定义 `Retriever` 作为查询回调，发出编排信号的调用会收到失败结果。
+
 ---
 
 ## 3. 公开 API
@@ -116,6 +124,7 @@ type ToolSearchConfig struct {
     Deferred func(tool.Tool) bool     // 判定哪个工具延迟披露（true=延迟）；nil 或全 false = 无工具延迟（等于关闭）
     Retriever func(ctx context.Context, query string, candidates []tool.Tool) []string // nil = 默认关键词检索
     MaxResults int     // 默认关键词检索单次最多揭示几个（默认 5）；自定义 Retriever 时忽略
+    MaxRevealed int    // 一个任务累计解锁的不同延迟工具上限，非正值表示不限
     MinScore   float64 // 默认关键词检索的最低分阈值 [0,1]（默认 0=只要命中即算）；自定义 Retriever 时忽略
 }
 

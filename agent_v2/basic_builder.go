@@ -224,6 +224,8 @@ type BasicAgentBuilder struct {
 	finishToolResult func(ctx context.Context, toolName string, msg *schema.Message, failed bool, code string)
 	// useToolMemo 由 BasicAgent 启用。低阶 builder 的自定义 toolsFn 自行管理进度。
 	useToolMemo bool
+	// limitedToolSearch 在并行检索汇合后按工具调用顺序分配本任务的解锁额度。
+	limitedToolSearch *toolSearchTool
 	// turnGates / turnGateMaxVetoes 见 WithTurnGates：回合结束闸门（空 = 不建闸门节点）。
 	turnGates         []TurnGateFunc
 	turnGateMaxVetoes int
@@ -934,6 +936,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		name = "basic_agent"
 	}
 	backgroundNotes, finishToolResult, useToolMemo := b.backgroundNotes, b.finishToolResult, b.useToolMemo
+	limitedToolSearch := b.limitedToolSearch
 
 	modelNode := func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 		msgs, _ := compose_v2.Get(chs, basicMessagesCh)
@@ -1461,9 +1464,24 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// preHookFailure 记钩子之前那次失败的内容：钩子把失败改成成功时，报出来的原因用它。
 		preHookFailure := make([]string, len(toolCalls))
 		hookSignals := make([]compose_v2.Signals, 0, len(toolCalls))
+		var revealBudget revealedNames
+		if limitedToolSearch != nil {
+			revealBudget = newRevealedNames(revealed)
+		}
 		for i, r := range results {
 			if i >= len(toolCalls) {
 				break
+			}
+			var reveal []string
+			if revealBudget != nil && isToolSearchCall(r) {
+				admitted, dropped := turn.limit(i, revealBudget, limitedToolSearch.maxRevealed)
+				reveal = admitted
+				if dropped > 0 && !isFailedToolResult(r) {
+					r.Content = limitedToolSearch.revealReceipt(admitted, dropped)
+					if len(r.ContentBlocks) > 0 && r.ContentBlocks[0].Toolresult != nil {
+						r.ContentBlocks[0].Toolresult.Content = r.Content
+					}
+				}
 			}
 			// 还原成交给 OnToolEnd 的 ToolOutput（失败的结构化信息、审批拒绝、从工具账重放的，见 toolOutputFor）
 			to := toolOutputFor(r, toolCalls[i].ID, i < len(batch.ends) && batch.ends[i].replayed)
@@ -1549,6 +1567,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				failedAfterHook[i], codeAfterHook[i] = failed, to.Result.ErrorCode
 			} else {
 				failedAfterHook[i], codeAfterHook[i] = !before.Success, before.ErrorCode
+			}
+			if !failedAfterHook[i] {
+				for _, name := range reveal {
+					revealBudget[name] = true
+				}
 			}
 		}
 

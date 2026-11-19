@@ -25,7 +25,7 @@ type SkillContent struct {
 //     sandbox_bash 访问，不走本地路径）
 //   - Descriptor 统一净化（防不可信来源注入）；空 Name / 未过 allow-list 的条目静默跳过
 //
-// 天然线程安全（装配后只读，同 DefaultSkillBox scan-once 模型）。WithSkillActionFunc 等
+// 内存目录装配后只读，可并发访问。WithSkillActionFunc 等
 // SkillBoxOption 仍适用（go-func action 可注册到内存 skill）。
 func NewInMemorySkillBox(name string, contents []SkillContent, opts ...SkillBoxOption) (*DefaultSkillBox, error) {
 	b := &DefaultSkillBox{name: name}
@@ -35,7 +35,7 @@ func NewInMemorySkillBox(name string, contents []SkillContent, opts ...SkillBoxO
 	if b.name == "" {
 		b.name = "default"
 	}
-	b.skills = make([]loadedSkill, 0, len(contents))
+	skills := make([]loadedSkill, 0, len(contents))
 	for _, c := range contents {
 		desc := sanitizeDescriptor(c.Descriptor)
 		if desc.Name == "" {
@@ -44,14 +44,14 @@ func NewInMemorySkillBox(name string, contents []SkillContent, opts ...SkillBoxO
 		if b.allowList != nil && !b.allowList[desc.Name] {
 			continue
 		}
-		b.skills = append(b.skills, loadedSkill{
+		skills = append(skills, loadedSkill{
 			descriptor: desc,
 			dir:        c.Dir,
 			prompt:     c.Body,
 			matchText:  buildMatchText(desc),
-			// resources nil——远端无本地文件；actions 由 mergePendingActions 从 WithSkillActionFunc 填
+			actions:    b.pendingActions[desc.Name],
 		})
 	}
-	b.mergePendingActions()
+	b.catalog.Store(&skillCatalog{skills: skills})
 	return b, nil
 }

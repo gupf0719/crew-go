@@ -714,7 +714,7 @@ func (a *BasicAgent) runGraph(ctx context.Context, runCfg *runConfig, session *R
 }
 
 // buildInitialMessages 拼接 system + StoreMemory items + sess.SelfHistoryCompacted + 当前 input。
-func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSession, input *schema.Message) ([]*schema.Message, []*schema.Message, error) {
+func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSession, input *schema.Message, source *skill.SkillSource) ([]*schema.Message, []*schema.Message, error) {
 	var sysPreamble []*schema.Message
 	var msgs []*schema.Message
 	// PromptTemplate（如有）：preamble 渲染出「agent 是什么」的那一段（system + 可选 few-shot）。
@@ -737,8 +737,8 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	// Skill 集成：按 ActivationMode 分流：
 	//   - toolCall（V1 默认）：注入 activate_skill 工具 + system prompt 加 hint，LLM 推理时自决
 	//   - adaptive / pre_match：runtime 预激活 → skill body 直接注入 system prompt
-	if a.config.Skill != nil && a.config.Skill.SkillBox != nil {
-		mode := skillActivationMode(a.config.Skill)
+	if source != nil && source.SkillBox != nil {
+		mode := skillActivationMode(source)
 		injected := false // 标记 adaptive 路径是否真注入了 skill body
 		switch mode {
 		case skill.SkillActivationModeAdaptive, skill.SkillActivationModePreMatch:
@@ -747,7 +747,7 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 			// 给 BasicAgent.Run（HITL InterruptError / 用户 ctx.Cancel 不能 silent
 			// 走"无 skill"路径继续 Run）
 			isPreMatch := mode == skill.SkillActivationModePreMatch
-			selection, selErr := selectSkillAdaptive(ctx, input.Content, a.config.Skill.SkillBox, a.config.SkillSelector, isPreMatch)
+			selection, selErr := selectSkillAdaptive(ctx, input.Content, source.SkillBox, a.config.SkillSelector, isPreMatch)
 			if selErr != nil {
 				return nil, nil, fmt.Errorf("adaptive skill selection: %w", selErr)
 			}
@@ -769,7 +769,7 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 				}()
 			}
 			if selection.Skill != nil {
-				active, err := a.config.Skill.SkillBox.ActivateSkill(ctx, selection.Skill.Name)
+				active, err := source.SkillBox.ActivateSkill(ctx, selection.Skill.Name)
 				if err != nil {
 					// R5 audit H1 fix: control flow err 必须 propagate（与 selectSkillAdaptive
 					// 路径一致）。业务自定义 SkillBox.ActivateSkill 完全可能抛 InterruptError
@@ -2296,14 +2296,29 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	if !a.config.RouteToolOptIn {
 		grants.route = nil
 	}
-	dispatchToolkit := a.composeDispatchToolkit(grants, backgroundScopeFrom(ctx) != nil)
-	modelFn := a.makeModelFn(grants)
-	toolsFn := a.makeToolsFn(grants, dispatchToolkit)
+	// 同一次执行的预匹配、模型工具表和实际派发使用同一份目录版本。
+	cfg := a.config
+	var checkpointRevision string
+	if cfg.Skill != nil {
+		if box, ok := cfg.Skill.SkillBox.(*skill.DefaultSkillBox); ok {
+			view, revision := box.Snapshot()
+			checkpointRevision = revision
+			if view != box {
+				cfg.Skill = &skill.SkillSource{SkillBox: view, Options: cfg.Skill.Options}
+			}
+		}
+	}
+	dispatchToolkit := a.composeDispatchToolkit(cfg, grants, backgroundScopeFrom(ctx) != nil)
+	modelFn := a.makeModelFn(cfg, grants)
+	toolsFn := a.makeToolsFn(cfg, grants, dispatchToolkit)
+	preamble := func(ctx context.Context, input *BasicAgentPreambleInput) (*BasicAgentPreambleOutput, error) {
+		return a.preambleFn(ctx, input, cfg.Skill)
+	}
 
 	bld := NewBasicAgentBuilder(modelFn, toolsFn).
 		WithName(a.config.Name).
 		WithMaxRounds(resolveMaxRounds(ctx, a.config.MaxRounds)). // per-call 覆盖（ctx 无则构造期默认）
-		WithPreamble(a.preambleFn).                               // ISSUE-74 修
+		WithPreamble(preamble).                                   // ISSUE-74 修
 		WithPostamble(a.postambleFn)                              // ISSUE-75 修
 	if a.config.Hooks != nil {
 		bld = bld.WithAgentHooks(a.config.Hooks)
@@ -2327,6 +2342,10 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	if len(a.config.TurnGates) > 0 {
 		bld = bld.WithTurnGates(a.config.TurnGates, a.config.TurnGateMaxVetoes)
 	}
+	if search, ok := dispatchToolkit.Get(toolSearchToolName).(*toolSearchTool); ok && search.maxRevealed > 0 {
+		bld.limitedToolSearch = search
+		checkpointRevision += fmt.Sprintf("|tool-search-limit:%d", search.maxRevealed)
+	}
 	// 图身份：显式给的名字 + 结构指纹。只有指纹时任意两个结构相同的 BasicAgent 身份相同，一个进了另一个的存档槽
 	// （经 EnterRun 进入的壳在自己的阶段里裸调、跟它透传的那个同一个 ns）就把对方的挂起档读进来、用自己的工具接着跑，
 	// err == nil；名字不同时载入撞 ErrGraphIDConflict。自动名每次构造都变，不进身份——每个请求重建 agent 的调用方
@@ -2335,7 +2354,10 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 		bld.identityName = a.config.Name
 	}
 	g, err := bld.Compile()
-	return g, dispatchToolkit, err
+	if err != nil {
+		return nil, dispatchToolkit, err
+	}
+	return g.WithCheckpointRevision(checkpointRevision), dispatchToolkit, nil
 }
 
 // postambleFn 是 BasicAgentPostambleFn 实现——graph 末段节点跑业务收尾
@@ -2370,7 +2392,7 @@ func (a *BasicAgent) postambleFn(ctx context.Context, in *BasicAgentPostambleInp
 // **idempotent**：preamble 在 Resume 时完整重跑——业务自定义 Store 实现的 Search
 // 等回调必须支持多次调用同结果（除非业务自己读 ResumeContext 主动改写）。详见
 // `BasicAgentPreambleFn` godoc。
-func (a *BasicAgent) preambleFn(ctx context.Context, in *BasicAgentPreambleInput) (*BasicAgentPreambleOutput, error) {
+func (a *BasicAgent) preambleFn(ctx context.Context, in *BasicAgentPreambleInput, source *skill.SkillSource) (*BasicAgentPreambleOutput, error) {
 	if in == nil || in.UserInput == nil {
 		return nil, fmt.Errorf("agent %q: preamble input is nil", a.config.Name)
 	}
@@ -2379,7 +2401,7 @@ func (a *BasicAgent) preambleFn(ctx context.Context, in *BasicAgentPreambleInput
 		// fallback：理论不会发生（Run 入口已 WithSession 注入）；保守路径不 panic
 		session = sessionForCtx(ctx)
 	}
-	sysPreamble, msgs, err := a.buildInitialMessages(ctx, session, in.UserInput)
+	sysPreamble, msgs, err := a.buildInitialMessages(ctx, session, in.UserInput, source)
 	if err != nil {
 		return nil, err
 	}
@@ -2706,8 +2728,7 @@ func isFinalRound(ctx context.Context) bool {
 //
 // ReactiveCompact 循环最多 MaxAttempts 次，每次 compact 后重试，仍 prompt-too-long
 // 继续 compact 直到成功 / attempts 耗尽。
-func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
-	cfg := a.config
+func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants) BasicAgentModelFn {
 	// 业务自带同名工具 warn 在构造期一次而非每轮——
 	// 避免 modelFn 每轮 LLM 调用都打同样 warn → N 轮会话产生 N 条噪声
 	if cfg.Skill != nil && cfg.Skill.SkillBox != nil &&
@@ -3131,8 +3152,7 @@ func (a *BasicAgent) makeModelFn(grants memberGrants) BasicAgentModelFn {
 // + skill / tool_search 这些框架工具 + 按授予挂的转交 / 路由（没被授予时挂软失败桩）。绑定侧（makeModelFn）
 // 每轮另拼一份，两份注册同一组框架工具。类型标注（pushToolCategorizerCtx）也按这一份查——那是实际会被
 // 派发的实例。
-func (a *BasicAgent) composeDispatchToolkit(grants memberGrants, background bool) *tool.Toolkit {
-	cfg := a.config
+func (a *BasicAgent) composeDispatchToolkit(cfg Config, grants memberGrants, background bool) *tool.Toolkit {
 	// 只要有用户 toolkit 或 toolCall 模式 skill 集成，就需要 toolsFn。
 	// adaptive / pre_match 不注 activate_skill 工具，纯靠用户 toolkit 决定是否需要 toolsFn。
 	skillNeedsTool := cfg.Skill != nil && cfg.Skill.SkillBox != nil && skillActivationMode(cfg.Skill) == skill.SkillActivationModeToolCall
@@ -3236,8 +3256,7 @@ func (a *BasicAgent) composeDispatchToolkit(grants memberGrants, background bool
 // grants 同 makeModelFn：被授予时 dispatch toolkit 也要有 transfer_to_agent / route_to，否则 LLM
 // 那侧 bind 得到、执行这侧却报 tool-not-found（modelFn 的 bind toolkit 与本 fn 的
 // dispatch toolkit 是两份独立副本，见下面 dispatchToolkit 的注释）。
-func (a *BasicAgent) makeToolsFn(grants memberGrants, dispatchToolkit *tool.Toolkit) BasicAgentToolFn {
-	cfg := a.config
+func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolkit *tool.Toolkit) BasicAgentToolFn {
 	_, references := dispatchToolkit.Get(readSkillResourceToolName).(*skillReferenceTool)
 	// 派发侧「哪些工具被延迟了」只认 composeDispatchToolkit 实际算出来的那份名单（挂在框架那件 tool_search 上），
 	// 不重新跑 Deferred 谓词：两边各判一次的话，算名单时的例外（tool_search 这个名字、框架工具）这边抄不全——

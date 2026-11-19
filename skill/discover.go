@@ -2,14 +2,18 @@ package skill
 
 import (
 	"fmt"
-	"gopkg.in/yaml.v3"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // ParseSkillMD 解析 SKILL.md 内容，返回 (SkillDescriptor, body, error)。
 // SKILL.md 格式：以 --- 包裹的 YAML frontmatter + 正文。
 // 支持的 frontmatter 类型：string、bool、int、string list（`- item` 块状与 `[a, b]` flow 两种）。
+// 已支持的 frontmatter 字段按归一后的键检查重复声明。
 // descriptor 元数据已净化（防不可信来源注入）；正文 body 原样返回。
 //
 // **导出**供远程 skill 源（远端沙箱 / marketplace API 拉到 SKILL.md 原文）复用同一
@@ -182,11 +186,14 @@ func parseFrontmatter(fm string) (SkillDescriptor, error) {
 		*dst = out
 	}
 
-	for k, v := range raw {
+	seen := make(map[string]string)
+	for _, k := range slices.Sorted(maps.Keys(raw)) {
+		v := raw[k]
 		if v == nil { // `key:` 后面什么都没写——当没声明，不当空值
 			continue
 		}
-		switch normalizeKey(k) {
+		key := normalizeKey(k)
+		switch key {
 		case "name":
 			str(k, v, &desc.Name)
 		case "description":
@@ -209,11 +216,14 @@ func parseFrontmatter(fm string) (SkillDescriptor, error) {
 			boolean(k, v, &desc.DisableModelInvocation)
 		case "userinvocable":
 			boolean(k, v, &desc.UserInvocable)
+		default:
+			// 未知键及 metadata 扩展由来源管理，不加入已支持字段的别名检查。
+			continue
 		}
-		// ⚠️ **未知键不报错也不 warn**，这是有意的：schema 归生态所有（agentskills.io 标准
-		// 在演进、别家还有自己的厂商扩展），对一个我们不认识的键拒绝加载整份 SKILL.md，
-		// 是把生态里合法的文件挡在门外。厂商扩展按标准放 `metadata:` 底下，那是一个嵌套
-		// 映射——这里 case 里没有它，于是整块被忽略，**子键不会再泄漏到顶层**。
+		if previous, ok := seen[key]; ok {
+			return SkillDescriptor{}, fmt.Errorf("frontmatter 同一字段重复声明：%q 和 %q", previous, k)
+		}
+		seen[key] = k
 	}
 	if len(errs) > 0 {
 		return SkillDescriptor{}, fmt.Errorf("frontmatter 字段类型不对：%s", strings.Join(errs, "；"))

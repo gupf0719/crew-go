@@ -304,9 +304,9 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	info := &hook.AgentInfo{Name: a.config.Name, Type: "base", Round: 0}
 	var finalMessagesRef []*schema.Message
 	agentIn := &hook.AgentInput{Messages: []*schema.Message{input}}
-	// 后台任务只在顶层（不在另一个正在执行的任务里）生效，判在盖任务章之前（见 withBackgroundScope）
+	// 在盖任务章之前区分顶层与嵌套，由本次派发授予确定嵌套执行范围。
 	_, nested := enclosingTask(ctx)
-	ctx = withBackgroundScope(ctx, &a.config, !nested)
+	ctx = a.withBackgroundScope(ctx, nested, cfg.backgroundCallee)
 	// 「这是不是新任务」判在钩子之前：钩子里就可能发起调用（见 enterRunTask）
 	ctx = enterGraphRunTask(ctx, session)
 	// 调用方声明放弃了的任务（WithAbandonedTasks）：在记这次的输入、触发钩子之前收尾
@@ -479,7 +479,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	// AgentIn.Messages 退化 nil (Resume 没有新 input — 走 cp 重建), 业务 hook 若依赖
 	// messages 可从 sess.Events 取 ResumeContext.UserInputs.
 	agentInResume := &hook.AgentInput{}
-	ctx = withBackgroundScope(ctx, &a.config, true) // Resume 只在顶层调（见 commonResumePrep）
+	ctx = a.withBackgroundScope(ctx, false, nil) // 嵌套续跑经原调用点进入成员的 Run。
 	ctx = enterGraphResumeTask(ctx, session)
 	var startErr error
 	ctx, startErr = CallAgentStart(ctx, a.config.Hooks, info, agentInResume)
@@ -2412,6 +2412,9 @@ func (a *BasicAgent) preambleFn(ctx context.Context, in *BasicAgentPreambleInput
 	}
 	// 会话历史记原始 input 的逻辑在 buildInitialMessages 末段——那里有 prior，nonce 去重要
 	// 看它（见那处注释）。
+	if sc := backgroundScopeFrom(ctx); sc != nil && sc.invocation != "" {
+		stripBackgroundInvocationHandles(msgs)
+	}
 	return &BasicAgentPreambleOutput{System: sysPreamble, Messages: msgs}, nil
 }
 
@@ -3472,7 +3475,13 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 						if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
 							return nil, err
 						}
+						if !record && compose_v2.GetOwner(ctx) != compose_v2.GetOwner(c) {
+							return tool.Failure(tool.ErrCodeInvalidArguments, "可后台调用须沿用当前调用的主体"), nil
+						}
 						if name != tc.Function.Name {
+							if !record {
+								return tool.Failure(tool.ErrCodeInvalidArguments, "可后台调用须沿用通过审批和后台准入的工具名"), nil
+							}
 							if _, rewritten := dispatchToolkit.Get(name).(*conversationTool); conversation || rewritten {
 								return tool.Failure(tool.ErrCodeInvalidArguments, "会话工具须以通过审批的名称执行"), nil
 							}
@@ -3504,9 +3513,18 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 			// **可后台的调用**（见 background_task.go）：在后台 goroutine 里跑，YieldAfter 之内返回就跟同步执行一样往下走；
 			// 到点了还没返回就转入后台，这次的 tool_result 换成任务 id。
 			if sc := backgroundScopeFrom(callCtx); !conversation && backgroundEligible(sc, minted, target) {
+				renderCfg := cfg
+				if sc.invocation != "" && cfg.ToolResultSpill != nil {
+					// 普通转存按会话授权，嵌套后台结果只能交给发起它的子调用。
+					limit := cfg.ToolResultSpill.threshold()
+					if cfg.ToolResultMaxBytes > 0 {
+						limit = min(limit, cfg.ToolResultMaxBytes)
+					}
+					renderCfg.ToolResultMaxBytes, renderCfg.ToolResultSpill = limit, nil
+				}
 				// 后台任务结束时没有 OnToolEnd 这一步，当场按大小处理（deferSize=false）
 				render := func(c context.Context, r *tool.Result) bgRendered {
-					rc := renderToolContent(c, &cfg, false, tc.Function.Name, r, false)
+					rc := renderToolContent(c, &renderCfg, false, tc.Function.Name, r, false)
 					return bgRendered{content: rc.content, spillID: rc.spillID, spillInfo: rc.spillInfo, parts: rc.parts}
 				}
 				bo, started := sc.cfg.Manager.call(callCtx, sc, tc, cfg.ToolTimeout, invokeWith(false), render)
@@ -3607,6 +3625,14 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 			toolMsg := schema.ToolResultMessage(tc.ID, content)
 			toolMsg.ContentBlocks[0].Toolresult.Parts = rendered.parts
 			annotateSizedToolResult(toolMsg, sizedToolContent{origBytes: rendered.origBytes, spillID: rendered.spillID, spillInfo: rendered.spillInfo})
+			if _, ok := target.(*backgroundTaskTool); ok && res != nil {
+				if id, _ := res.Metadata[backgroundTaskReceipt].(string); id != "" {
+					toolMsg.Annotations = map[string]any{backgroundTaskReceipt: id}
+					if res.Metadata[backgroundScopedResult] == true {
+						toolMsg.Annotations[backgroundScopedResult] = true
+					}
+				}
+			}
 			if rendered.pending {
 				if toolMsg.Annotations == nil {
 					toolMsg.Annotations = map[string]any{}

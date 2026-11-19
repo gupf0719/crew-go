@@ -294,7 +294,7 @@ func MicroCompactRun(ctx context.Context, messages []*schema.Message, cfg *Micro
 				"[较早的工具输出已清理；全文仍可用 %s 取回，id=%q]", ReadToolOutputToolName, sid))
 			continue
 		}
-		if offloadStore != nil {
+		if offloadStore != nil && m.Annotations[backgroundScopedResult] != true {
 			key, err := putMicroCompactOffload(ctx, offloadStore, offloadNS, m, hasSink)
 			if err == nil {
 				out[i] = cloneToolResultWithOffloadRef(m, key, microCompactPreviewBytes, cfg.OffloadReadToolName)

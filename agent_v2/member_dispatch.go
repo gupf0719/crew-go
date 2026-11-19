@@ -106,7 +106,8 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 		var events []*AgentEvent
 		err := lanes.run(ctx, func(c context.Context, s *RunSession) error {
 			var runErr error
-			events, runErr = m.agent.Run(c, s, cloneCalleeInput(m.input), grants.regrantOpts(m.agent)...)
+			opts := append(grants.regrantOpts(m.agent), withBackgroundCallee(m.agent))
+			events, runErr = m.agent.Run(c, s, cloneCalleeInput(m.input), opts...)
 			return runErr
 		})
 		if err != nil {

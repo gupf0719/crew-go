@@ -157,7 +157,7 @@ type Config struct {
 
 	// BackgroundTasks 是长时间运行工具的后台执行配置（nil = 关闭）——点名的工具一次调用跑过 YieldAfter 还没返回
 	// 就转入后台、先给模型一个任务 id，结束后作为通知送进对话，并注入 background_task。经 [WithBackgroundTasks]
-	// 设，只在顶层生效，见 background_task.go。
+	// 设，适用于顶层及框架在图节点内派发的 BasicAgent。
 	BackgroundTasks *BackgroundTasksConfig
 
 	// SkillModelResolver 是 P2.B 解析 skill frontmatter `model: <name>` 字段为

@@ -33,6 +33,8 @@ type runConfig struct {
 	handoffGrant *handoffGrant
 	// routeGrant 是上层交给本次调用的路由能力授予（见 routeGrant），规矩同 handoffGrant。
 	routeGrant *routeGrant
+	// backgroundCallee 仅授予本次嵌套派发指定的 BasicAgent。
+	backgroundCallee *BasicAgent
 
 	// abandoned 见 WithAbandonedTasks。beginRunActivity 校验并登记，abandonTasksAtEntry 收尾。
 	abandoned []abandonedTask

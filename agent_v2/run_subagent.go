@@ -248,6 +248,7 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	var events []*AgentEvent
 	// 这次调用交给前端的流单独记一份（成功时随完成记录声明，见 compose_v2.WithStreams），同时登记进所在的那段执行
 	subCtx, streams := compose_v2.BeginStreamScope(subCtx)
+	opts = append(opts[:len(opts):len(opts)], withBackgroundCallee(sub))
 	// 被调方拿调用方显式交给它的那几份（opts），拿不到调用方那一层放给 RegrantFromNode 的那份——孙辈
 	// 拿到的是空的（见 shadowNodeGrants）。
 	sigs, err := compose_v2.CaptureSignals(shadowNodeGrants(subCtx), func(c context.Context) error {

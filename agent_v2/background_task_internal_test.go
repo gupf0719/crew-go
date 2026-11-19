@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"crew-go/schema"
+	"crew-go/tool"
 )
 
 func terminalTask(id, conv, agent string, endedAt time.Time) *bgTask {
@@ -61,7 +62,10 @@ func TestBackgroundTask_ExpiredAndExcessTasksSwept(t *testing.T) {
 	fresh := terminalTask("bg_fresh", "o/c", "a", now)
 	running := &bgTask{id: "bg_run", conv: "o/c", agent: "a", admitted: true, status: BackgroundTaskRunning, startedAt: now.Add(-time.Hour), done: make(chan struct{})}
 	insertTasks(m, old, fresh, running)
-	m.lookup("o/c", "bg_fresh")
+	if _, ok := m.Get("bg_old"); ok {
+		t.Fatal("宿主查询不应保留已过期的结局")
+	}
+	m.lookup(&backgroundScope{conv: "o/c"}, nil, "bg_fresh")
 	if _, ok := m.tasks["bg_old"]; ok {
 		t.Fatal("过了保留期的任务没被清掉")
 	}
@@ -87,11 +91,27 @@ func TestBackgroundTask_ExpiredAndExcessTasksSwept(t *testing.T) {
 	for i := 0; i < backgroundMaxRetainedPerConv+5; i++ {
 		insertTasks(m2, terminalTask(fmt.Sprintf("bg_%03d", i), "o/full", "a", now.Add(time.Duration(i)*time.Millisecond)))
 	}
-	m2.lookup("o/full", "bg_000")
+	m2.lookup(&backgroundScope{conv: "o/full"}, nil, "bg_000")
 	if n := len(m2.byConv["o/full"]); n != backgroundMaxRetainedPerConv {
 		t.Fatalf("一个会话最多留 %d 个结束了的任务，留了 %d 个", backgroundMaxRetainedPerConv, n)
 	}
 	if _, ok := m2.tasks["bg_000"]; ok {
 		t.Fatal("超出保留个数时应先丢最早的")
+	}
+}
+
+func TestBackgroundTask_SnapshotPublishesOnlySettledResult(t *testing.T) {
+	m := NewBackgroundTaskManager(nil)
+	task := &bgTask{id: "bg_rendering", conv: "o/c", returned: true, status: BackgroundTaskRunning,
+		res: tool.Success("正被整理的返回值")}
+	insertTasks(m, task)
+	before, ok := m.Get(task.id)
+	if !ok || before.Status != BackgroundTaskRunning || before.Result != nil || before.Err != nil || !before.EndedAt.IsZero() {
+		t.Fatalf("整理完成前快照应仅报告运行中，得到 %+v", before)
+	}
+	task.status, task.endedAt = BackgroundTaskCompleted, time.Now()
+	after, ok := m.Get(task.id)
+	if !ok || after.Status != BackgroundTaskCompleted || after.Result != task.res || after.EndedAt.IsZero() {
+		t.Fatalf("终态提交后快照应有结局，得到 %+v", after)
 	}
 }

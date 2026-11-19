@@ -650,7 +650,8 @@ func (h *HandoffAgent) buildComposeGraph(
 					var runErr error
 					events, runErr = ag.Run(lc, s, cloneCalleeInput(input),
 						withHandoffGrant(grant),
-						withRouteGrant(route.regrant(ag)))
+						withRouteGrant(route.regrant(ag)),
+						withBackgroundCallee(ag))
 					return runErr
 				})
 			})

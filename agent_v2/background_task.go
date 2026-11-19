@@ -18,23 +18,22 @@ package agent_v2
 //   - **这次请求的环境不给它**：任务可能比请求活得久。编排钩子（两层）换成空的——它们往这次请求的流里写
 //     （agui 的 SSE、a2a 的事件），请求结束之后再写就写进了已经返回的连接；checkpointer 也不给——后台里跑的
 //     嵌套 agent 中断时会留下一份没人续的存档。调用主体、store 留着。
-//   - **谁能转后台**：只有顶层 agent（不在另一个正在执行的任务里的那个——一场对话里面向用户的那个）。编排成员、
-//     被当工具调的 agent 照旧同步跑：它们这一次调用结束之后，没有一个确定会再来、又不会跟兄弟撞上的模型调用
-//     能接住这个结果。
+//   - **谁能转后台**：顶层 BasicAgent 和框架在图节点内明确派发的 BasicAgent。嵌套范围绑定任务和子图
+//     namespace，模型只访问本次子调用消息流中已提交句柄对应的任务。
 //   - **作用域**：任务按调用方身份 + 会话（没有会话 ID 时按任务）分，跟转存同一把尺（[conversationScope]）。
-//     查询、等待、取消只认当前会话里的任务；结束通知只发给开它的那个 agent。
+//     顶层和各嵌套实例各自查询、等待、取消自己的范围。结束通知还要求匹配发起的 agent。
 //   - **通知**：任务结束后，开它的 agent 下一次调模型时（`OnModelStart` 之前），框架往消息流末尾追加一条通知
 //     （user 消息，带 [BackgroundTaskNotificationAnnotation]），随这一轮的产出一起写进消息流与会话历史。
 //     **送达按「已提交的消息流里看到它」记**：之后的模型节点、收尾节点（return-direct 收尾也经过它）读到的消息流
 //     （都是已提交的）里有它就记为送达——那一轮没成（模型调用失败、写入被回滚）就看不到它、下次再发；送达跟
 //     哪个任务、哪个 session 对象无关。那一批工具中断、任务随后被放弃时也不算送达（对话没有往下走），下一个任务
-//     再发——开了会话历史时通知已经记进历史，下一个任务的 prior 里就有它，同样记为送达、不再重发。模型已经经 background_task 拿到过结果的不再通知。它不是用户说的话：框架挑「用户这一轮
+//     再发——开了会话历史时通知已经记进历史，下一个任务的 prior 里就有它，同样记为送达、不再重发。经 background_task 取得的结局也在工具结果提交后确认。框架挑「用户这一轮
 //     的输入」的地方跳过它（[IsBackgroundTaskNotification]）。
-//   - **生命周期**：任务归 [BackgroundTaskManager]，跟 Run 无关——Run 结束、续跑、放弃都不影响它；进程退出前
-//     [BackgroundTaskManager.Close]。不落盘：进程重启之后任务与结果都没了，模型再查得到「没找到」。续跑时转入
-//     后台的那次调用命中工具账、不再执行，模型看到的还是同一个任务 id。
+//   - **生命周期**：任务归 [BackgroundTaskManager]，Run 结束或放弃后仍可由宿主查找或取消；进程退出前
+//     [BackgroundTaskManager.Close]。存档保存已产出的句柄和已提交的消息。运行中的工具和未交付的结局
+//     留在管理器中，管理器丢失时查询返回 not_found。工具账恢复已转入后台的句柄，避免再次启动工具。
 //   - **上限**：同时在跑的任务数有全局与每个会话两道上限；到了上限的调用不转后台、照旧同步等（跟没开这个功能
-//     一样，工具超时照常生效）。转入后台的任务最长跑 MaxDuration，超了取消。
+//     一样，工具超时照常生效）。到 MaxDuration 时取消工具的 ctx，名额在它返回后释放。
 
 import (
 	"context"
@@ -43,6 +42,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -62,6 +62,15 @@ const BackgroundTaskAnnotation = "crew_background_task"
 
 // BackgroundTaskNotificationAnnotation 盖在框架送进对话的任务结束通知上，值是任务 id。
 const BackgroundTaskNotificationAnnotation = "crew_background_task_notification"
+
+// backgroundTaskReceipt 由 background_task 标记显式返回的终态，在消息提交后才确认送达。
+const backgroundTaskReceipt = "crew_background_task_receipt"
+
+// 会话历史保留可展示的句柄。只认本次图中生产的私有授予标记。
+const backgroundInvocationHandle = "crew_background_invocation_handle"
+
+// 嵌套结局可以裁剪，其全文不能进入按会话读取的通用转存。
+const backgroundScopedResult = "crew_background_scoped_result"
 
 // IsBackgroundTaskNotification 报这条消息是不是框架送进对话的后台任务结束通知。
 //
@@ -135,7 +144,7 @@ type BackgroundTaskManagerConfig struct {
 	MaxRunning int
 	// MaxRunningPerConversation 是一个会话里同时在跑的后台任务上限，默认 8。
 	MaxRunningPerConversation int
-	// MaxDuration 是一个任务最长跑多久（从工具开始执行算），默认 1 小时；超了取消，任务记为失败。
+	// MaxDuration 是从工具开始执行到取消 ctx 的时限，默认 1 小时。工具因超时返回错误时任务记为失败。
 	MaxDuration time.Duration
 	// Retention 是结束了的任务保留多久，默认 1 小时。过期之后查询得到「没找到」，没送达的通知也不再发。
 	Retention time.Duration
@@ -222,9 +231,9 @@ func (c *BackgroundTasksConfig) maxWait() time.Duration {
 	return c.MaxWait
 }
 
-// WithBackgroundTasks 让长时间运行的工具转入后台（仅 BasicAgent，且只在顶层生效）：点名的工具一次调用跑过
-// YieldAfter 还没返回，就先给模型一个任务 id、这一轮接着往下走；它在后台跑完之后，结果在这个 agent 下一次调
-// 模型时作为通知送进对话。同时注入 background_task 工具，让模型查询、等待、取消、列出。
+// WithBackgroundTasks 让 BasicAgent 的长时间运行工具转入后台。点名的工具运行超过
+// YieldAfter 时先返回任务 ID。background_task 可用于查询、等待、取消和列出任务。
+// 支持顶层 BasicAgent 与在图节点内由框架明确派发的 BasicAgent。
 //
 //	mgr := agent_v2.NewBackgroundTaskManager(nil)
 //	defer mgr.Close(context.Background())
@@ -238,8 +247,8 @@ func (c *BackgroundTasksConfig) maxWait() time.Duration {
 //	    }),
 //	)
 //
-// 跨 Run 收通知要有会话 ID（`compose_v2.WithThreadIDCtx`）：没有时任务按「任务」分，Run 结束、开了新任务之后
-// 就查不到、也收不到了。完整说明见 background_task.go。
+// 顶层 Agent 跨 Run 收通知需要会话 ID（compose_v2.WithThreadIDCtx）。
+// 嵌套任务由发起它的子调用持原句柄接收，子调用结束后可由宿主经管理器取回结果。
 func WithBackgroundTasks(cfg *BackgroundTasksConfig) Option {
 	return func(c *Config) {
 		c.BackgroundTasks = cfg
@@ -280,6 +289,7 @@ var (
 type bgTask struct {
 	id, toolName, args string
 	conv               string // 会话作用域（[conversationScope]）
+	invocation         string // 嵌套调用的任务及子图身份，顶层为空
 	agent              string // 开它的 agent（通知发给它）
 	owner, convID      string // 开它时的调用方身份、会话 ID（快照用）
 	task               string // 开它时的任务（RunID）
@@ -304,11 +314,15 @@ type bgTask struct {
 }
 
 func (t *bgTask) snapshotLocked() BackgroundTask {
-	return BackgroundTask{
+	snapshot := BackgroundTask{
 		ID: t.id, ToolName: t.toolName, Arguments: t.args,
 		Agent: t.agent, Owner: t.owner, ConversationID: t.convID, TaskID: t.task,
-		Status: t.status, StartedAt: t.startedAt, EndedAt: t.endedAt, Result: t.res, Err: t.err,
+		Status: t.status, StartedAt: t.startedAt,
 	}
+	if t.terminal() {
+		snapshot.EndedAt, snapshot.Result, snapshot.Err = t.endedAt, t.res, t.err
+	}
+	return snapshot
 }
 
 func (t *bgTask) terminal() bool {
@@ -321,6 +335,10 @@ func (m *BackgroundTaskManager) Get(id string) (BackgroundTask, bool) {
 	defer m.mu.Unlock()
 	t := m.tasks[id]
 	if t == nil {
+		return BackgroundTask{}, false
+	}
+	if now := time.Now(); t.terminal() && now.Sub(t.endedAt) > m.cfg.Retention {
+		m.sweepConvLocked(t.conv, now)
 		return BackgroundTask{}, false
 	}
 	return t.snapshotLocked(), true
@@ -372,6 +390,7 @@ func (m *BackgroundTaskManager) Close(ctx context.Context) error {
 type backgroundScope struct {
 	cfg           *BackgroundTasksConfig
 	conv          string
+	invocation    string
 	owner, convID string
 	agent         string
 	task          string
@@ -379,26 +398,76 @@ type backgroundScope struct {
 
 type backgroundScopeKey struct{}
 
-// withBackgroundScope 在 BasicAgent 的 Run / Resume 入口放这次调用的后台任务作用域：顶层、开了后台任务时
-// 非空，否则放 nil——盖掉从调用方继承来的那份（顶层 agent 的工具里调起的子 agent 不该转后台、不该收父的通知）。
-func withBackgroundScope(ctx context.Context, cfg *Config, topLevel bool) context.Context {
-	var sc *backgroundScope
-	if topLevel && cfg.BackgroundTasks != nil {
-		owner, conv := conversationScope(ctx)
-		sc = &backgroundScope{
-			cfg:    cfg.BackgroundTasks,
-			conv:   owner + "/" + conv,
-			owner:  compose_v2.GetOwner(ctx),
-			convID: compose_v2.GetThreadID(ctx),
-			agent:  cfg.Name,
-			task:   currentHistoryTask(ctx),
+func withBackgroundCallee(agent Agent) RunOption {
+	return func(cfg *runConfig) {
+		cfg.backgroundCallee, _ = agent.(*BasicAgent)
+	}
+}
+
+// withBackgroundScope 在入口固定执行归属，覆盖可能继承的父作用域。
+// 嵌套运行只接受框架派发时授予本 Agent 的子图位置。
+func (a *BasicAgent) withBackgroundScope(ctx context.Context, nested bool, callee *BasicAgent) context.Context {
+	cfg := a.config.BackgroundTasks
+	if cfg == nil {
+		return context.WithValue(ctx, backgroundScopeKey{}, (*backgroundScope)(nil))
+	}
+	task, ns := currentHistoryTask(ctx), compose_v2.GetGraphNS(ctx)
+	var invocation string
+	if nested {
+		if callee != a || !compose_v2.WithinNodeScope(ctx) || task == "" || ns == "" || historySuppressed(ctx) {
+			return context.WithValue(ctx, backgroundScopeKey{}, (*backgroundScope)(nil))
 		}
+		invocation = identityString(task, ns, a.Name())
+	}
+	owner, conv := conversationScope(ctx)
+	sc := &backgroundScope{
+		cfg: cfg, conv: owner + "/" + conv, invocation: invocation,
+		owner: compose_v2.GetOwner(ctx), convID: compose_v2.GetThreadID(ctx),
+		agent: a.Name(), task: task,
 	}
 	return context.WithValue(ctx, backgroundScopeKey{}, sc)
 }
 
+// canAccess 同时核对会话和发起位置。嵌套实例需要已经交付到本次消息流的句柄，
+// 防止父节点废弃一次产出并重做同一位置时捡起旧结果。
+func (sc *backgroundScope) canAccess(t *bgTask, committedHandles map[string]bool) bool {
+	return t.conv == sc.conv && t.invocation == sc.invocation &&
+		(sc.invocation == "" || committedHandles[t.id])
+}
+
+func (sc *backgroundScope) handlesIn(msgs []*schema.Message) map[string]bool {
+	if sc.invocation == "" {
+		return nil
+	}
+	ids := make(map[string]bool)
+	for _, msg := range msgs {
+		if msg != nil && msg.Role == schema.RoleTool {
+			if id, _ := msg.Annotations[backgroundInvocationHandle].(string); id != "" {
+				ids[id] = true
+			}
+		}
+	}
+	return ids
+}
+
+// stripBackgroundInvocationHandles 导入前文时只保留展示身份。续跑读取的 channel 不经过这里。
+func stripBackgroundInvocationHandles(msgs []*schema.Message) {
+	for i, msg := range msgs {
+		if msg != nil && msg.Annotations[backgroundInvocationHandle] != nil {
+			message := *msg
+			message.Annotations = maps.Clone(msg.Annotations)
+			delete(message.Annotations, backgroundInvocationHandle)
+			msgs[i] = &message
+		}
+	}
+}
+
 func backgroundScopeFrom(ctx context.Context) *backgroundScope {
 	sc, _ := ctx.Value(backgroundScopeKey{}).(*backgroundScope)
+	if sc != nil && (compose_v2.GetOwner(ctx) != sc.owner || compose_v2.GetThreadID(ctx) != sc.convID) {
+		// 钩子更换身份时，工具按同步路径使用新的上下文，后台范围仍由原调用入口持有。
+		return nil
+	}
 	return sc
 }
 
@@ -456,7 +525,7 @@ func (m *BackgroundTaskManager) start(callCtx context.Context, sc *backgroundSco
 	tctx, cancel := context.WithCancelCause(tctx)
 	t := &bgTask{
 		id: newBackgroundTaskID(), toolName: tc.Function.Name, args: tc.Function.Arguments,
-		conv: sc.conv, agent: sc.agent, owner: sc.owner, convID: sc.convID, task: sc.task,
+		conv: sc.conv, invocation: sc.invocation, agent: sc.agent, owner: sc.owner, convID: sc.convID, task: sc.task,
 		startedAt: time.Now(), cancel: cancel, done: make(chan struct{}),
 	}
 	m.live[t] = struct{}{}
@@ -466,8 +535,17 @@ func (m *BackgroundTaskManager) start(callCtx context.Context, sc *backgroundSco
 		defer m.wg.Done()
 		defer stopTimer()
 		defer cancel(nil)
-		res, err := invokeRecovered(tctx, t.toolName, invoke)
-		m.finish(keep, t, res, err, context.Cause(tctx), render)
+		var res *tool.Result
+		var err error
+		returned := false
+		defer func() {
+			if !returned {
+				err = fmt.Errorf("tool %q exited without returning", t.toolName)
+			}
+			m.finish(keep, t, res, err, context.Cause(tctx), render)
+		}()
+		res, err = invokeRecovered(tctx, t.toolName, invoke)
+		returned = true
 	}()
 	return t
 }
@@ -715,7 +793,7 @@ func (m *BackgroundTaskManager) sweepConvLocked(conv string, now time.Time) {
 // ── 通知 ──
 
 // backgroundNotes 是模型节点这一轮要送进对话的任务结束通知。msgs 是这一轮开始时已提交的消息流：先按它记下已经送达
-// 的（backgroundSeen），再挑出还没送达的。不在顶层、没开后台任务时返回 nil。
+// 的（backgroundSeen），再挑出当前范围里还没送达的。
 func backgroundNotes(ctx context.Context, msgs []*schema.Message) []*schema.Message {
 	sc := backgroundScopeFrom(ctx)
 	if sc == nil {
@@ -733,16 +811,17 @@ func backgroundSeen(ctx context.Context, msgs []*schema.Message) {
 }
 
 func (m *BackgroundTaskManager) seen(sc *backgroundScope, msgs []*schema.Message) {
+	handles := sc.handlesIn(msgs)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.seenLocked(sc, msgs)
+	m.seenLocked(sc, handles, msgs)
 }
 
 // seenLocked：这个作用域里有结束了、还没送达的任务时才扫一遍消息流。
-func (m *BackgroundTaskManager) seenLocked(sc *backgroundScope, msgs []*schema.Message) {
+func (m *BackgroundTaskManager) seenLocked(sc *backgroundScope, handles map[string]bool, msgs []*schema.Message) {
 	pending := false
 	for _, t := range m.byConv[sc.conv] {
-		if t.terminal() && !t.delivered {
+		if t.terminal() && !t.delivered && sc.canAccess(t, handles) {
 			pending = true
 			break
 		}
@@ -750,21 +829,31 @@ func (m *BackgroundTaskManager) seenLocked(sc *backgroundScope, msgs []*schema.M
 	if !pending {
 		return
 	}
-	for id := range notedTaskIDs(msgs) {
-		if t := m.tasks[id]; t != nil && t.conv == sc.conv {
+	for _, msg := range msgs {
+		if msg == nil {
+			continue
+		}
+		id, _ := msg.Annotations[BackgroundTaskNotificationAnnotation].(string)
+		if msg.Role == schema.RoleTool {
+			if receipt, _ := msg.Annotations[backgroundTaskReceipt].(string); receipt != "" {
+				id = receipt
+			}
+		}
+		if t := m.tasks[id]; t != nil && t.terminal() && sc.canAccess(t, handles) {
 			t.delivered = true
 		}
 	}
 }
 
 func (m *BackgroundTaskManager) notes(sc *backgroundScope, msgs []*schema.Message) []*schema.Message {
+	handles := sc.handlesIn(msgs)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sweepConvLocked(sc.conv, time.Now())
-	m.seenLocked(sc, msgs)
+	m.seenLocked(sc, handles, msgs)
 	var due []*bgTask
 	for _, t := range m.byConv[sc.conv] {
-		if t.agent == sc.agent && t.terminal() && !t.delivered {
+		if t.agent == sc.agent && t.terminal() && !t.delivered && sc.canAccess(t, handles) {
 			due = append(due, t)
 		}
 	}
@@ -783,20 +872,6 @@ func (m *BackgroundTaskManager) notes(sc *backgroundScope, msgs []*schema.Messag
 		notes = append(notes, n)
 	}
 	return notes
-}
-
-// notedTaskIDs 收消息流里已有的任务结束通知。
-func notedTaskIDs(msgs []*schema.Message) map[string]bool {
-	ids := map[string]bool{}
-	for _, msg := range msgs {
-		if msg == nil || msg.Annotations == nil {
-			continue
-		}
-		if id, ok := msg.Annotations[BackgroundTaskNotificationAnnotation].(string); ok && id != "" {
-			ids[id] = true
-		}
-	}
-	return ids
 }
 
 // terminalTextLocked 是结局的说明：哪次调用、用时多久、结果是什么。通知与 background_task 用的都是它。
@@ -819,12 +894,19 @@ func (t *bgTask) terminalPrefixLocked() string {
 
 // backgroundHandleMessage 是转入后台时交给模型的 tool_result：任务 id 与怎么拿结果。
 func backgroundHandleMessage(tc schema.ToolCall, t *bgTask, waited time.Duration) *schema.Message {
+	notice := "它结束后结果会作为通知自动发给你，在那之前可以先处理别的事、或先回复用户。"
+	if t.invocation != "" {
+		notice = "本次子调用仍在继续时可以收到完成通知。子调用完成后，宿主可按任务 id 查看结果。"
+	}
 	content := fmt.Sprintf("【已转入后台】%s 运行超过 %s 仍未结束，已转入后台继续执行，任务 id=%q。\n"+
-		"它结束后结果会作为通知自动发给你，在那之前可以先处理别的事、或先回复用户。确实需要它的结果才能往下做时，"+
+		"%s确实需要它的结果才能往下做时，"+
 		"用 %s 等它（action=\"wait\"）；也可以查询（action=\"status\"）或取消（action=\"cancel\"）。",
-		tc.Function.Name, waited, t.id, BackgroundTaskToolName)
+		tc.Function.Name, waited, t.id, notice, BackgroundTaskToolName)
 	msg := schema.ToolResultMessage(tc.ID, content)
 	msg.Annotations = map[string]any{BackgroundTaskAnnotation: t.id}
+	if t.invocation != "" {
+		msg.Annotations[backgroundInvocationHandle] = t.id
+	}
 	return msg
 }
 
@@ -836,6 +918,10 @@ func newBackgroundTaskID() string {
 
 // ── background_task 工具 ──
 
+type backgroundTaskTool struct{ *tool.FuncTool }
+
+func (*backgroundTaskTool) isFrameworkMinted() {}
+
 // newBackgroundTaskTool 是框架铸的查询 / 等待 / 取消 / 列出工具。
 func newBackgroundTaskTool() tool.Tool {
 	schemaDef := map[string]any{
@@ -843,16 +929,15 @@ func newBackgroundTaskTool() tool.Tool {
 		"properties": map[string]any{
 			"action": map[string]any{
 				"type": "string", "enum": []string{"status", "wait", "cancel", "list"},
-				"description": "status：查一次状态（不等）；wait：等它结束（最多 timeout_seconds 秒）；cancel：取消它；list：列出当前会话里的后台任务",
+				"description": "status：查一次状态；wait：等它结束（最多 timeout_seconds 秒）；cancel：取消它；list：列出本次运行可访问的后台任务",
 			},
 			"id":              map[string]any{"type": "string", "description": "任务 id（转入后台时给出的那个）；list 不需要"},
 			"timeout_seconds": map[string]any{"type": "integer", "description": "wait 最多等多少秒，默认 30"},
 		},
 		"required": []string{"action"},
 	}
-	desc := "查询、等待、取消转入后台的工具调用。工具运行太久时会转入后台并给出一个任务 id，它结束后结果会自动作为通知发给你——" +
-		"不需要反复用 status 轮询；确实需要它的结果才能往下做时用 wait。"
-	return markMinted(tool.NewFuncTool(BackgroundTaskToolName, desc, schemaDef, backgroundTaskAction))
+	desc := "查询、等待、取消转入后台的工具调用。工具转入后台时会给出任务 id。需要在本次运行取得结果时可用 wait。"
+	return &backgroundTaskTool{FuncTool: tool.NewFuncTool(BackgroundTaskToolName, desc, schemaDef, backgroundTaskAction)}
 }
 
 // backgroundTaskAction 是 background_task 的实现。参数有问题、任务找不到时返回给模型看的失败结果；ctx 被取消时
@@ -863,9 +948,13 @@ func backgroundTaskAction(ctx context.Context, args map[string]any) (*tool.Resul
 		return tool.Failure("unavailable", "这里没有开启后台任务"), nil
 	}
 	m := sc.cfg.Manager
+	var handles map[string]bool
+	if batch := toolBatchFrom(ctx); batch != nil {
+		handles = sc.handlesIn(batch.messages)
+	}
 	action, _ := args["action"].(string)
 	if action == "list" {
-		return &tool.Result{Success: true, Output: m.listText(sc.conv)}, nil
+		return tool.Success(m.listText(sc, handles)), nil
 	}
 	if action != "status" && action != "wait" && action != "cancel" {
 		return tool.Failure("invalid_arguments", fmt.Sprintf("不认识的 action %q——可选 status / wait / cancel / list", action)), nil
@@ -874,9 +963,9 @@ func backgroundTaskAction(ctx context.Context, args map[string]any) (*tool.Resul
 	if id == "" {
 		return tool.Failure("invalid_arguments", "缺少 id——用转入后台时给出的那个；要看有哪些任务用 action=\"list\""), nil
 	}
-	t := m.lookup(sc.conv, id)
+	t := m.lookup(sc, handles, id)
 	if t == nil {
-		return tool.Failure("not_found", fmt.Sprintf("没找到任务 id=%q（可能已过期、服务重启后丢失，或不属于当前会话）", id)), nil
+		return tool.Failure("not_found", fmt.Sprintf("没找到任务 id=%q（可能已过期、服务重启后丢失，或不属于当前执行范围）", id)), nil
 	}
 	switch action {
 	case "wait":
@@ -899,13 +988,13 @@ func backgroundTaskAction(ctx context.Context, args map[string]any) (*tool.Resul
 	return m.describe(t, action == "cancel"), nil
 }
 
-// lookup 按 id 找当前会话作用域里的任务；别的会话的当作没有（不透露它存在）。
-func (m *BackgroundTaskManager) lookup(conv, id string) *bgTask {
+// lookup 按 id 找当前范围可访问的任务。
+func (m *BackgroundTaskManager) lookup(sc *backgroundScope, handles map[string]bool, id string) *bgTask {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.sweepConvLocked(conv, time.Now())
+	m.sweepConvLocked(sc.conv, time.Now())
 	t := m.tasks[id]
-	if t == nil || t.conv != conv {
+	if t == nil || !sc.canAccess(t, handles) {
 		return nil
 	}
 	return t
@@ -947,41 +1036,50 @@ func waitBackgroundTask(ctx context.Context, t *bgTask, d time.Duration) error {
 	}
 }
 
-// describe 是 status / wait / cancel 交给模型的说明。结局已定时一并交出结果，记为已送达（不再通知）。
+// describe 给 status / wait / cancel 生成结果。结局已定时，带上由已提交的消息流消费的回执。
 func (m *BackgroundTaskManager) describe(t *bgTask, cancelling bool) *tool.Result {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if t.terminal() {
-		t.delivered = true
+		result := tool.Success(t.terminalTextLocked())
+		result.Metadata = map[string]any{backgroundTaskReceipt: t.id}
+		if t.invocation != "" {
+			result.Metadata[backgroundScopedResult] = true
+		}
 		if len(t.parts) > 0 {
 			parts := append([]schema.ToolResultPart{{Text: strings.TrimSuffix(t.terminalPrefixLocked(), "\n")}}, t.parts...)
-			return &tool.Result{Success: true, Output: schema.ToolResultPartsText(parts), Parts: parts}
+			result.Output, result.Parts = schema.ToolResultPartsText(parts), parts
 		}
-		return tool.Success(t.terminalTextLocked())
+		return result
 	}
 	elapsed := time.Since(t.startedAt).Round(time.Second)
 	if cancelling {
-		return tool.Success(fmt.Sprintf("已请求取消任务 id=%q（%s，已运行 %s），它还没停下（工具可能不响应取消）；结束后结果会通知你。", t.id, t.toolName, elapsed))
+		return tool.Success(fmt.Sprintf("已请求取消任务 id=%q（%s，已运行 %s），它还没停下（工具可能不响应取消）。", t.id, t.toolName, elapsed))
 	}
-	return tool.Success(fmt.Sprintf("任务 id=%q（%s）仍在运行，已运行 %s。它结束后结果会自动通知你；确实需要结果才能往下做时用 action=\"wait\"。",
+	return tool.Success(fmt.Sprintf("任务 id=%q（%s）仍在运行，已运行 %s。需要在本次运行取得结果时可用 action=\"wait\"。",
 		t.id, t.toolName, elapsed))
 }
 
-// listText 列出当前会话作用域里的任务，最近的在前。
-func (m *BackgroundTaskManager) listText(conv string) string {
+// listText 列出当前范围可访问的任务，最近的在前。
+func (m *BackgroundTaskManager) listText(sc *backgroundScope, handles map[string]bool) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.sweepConvLocked(conv, time.Now())
-	list := m.byConv[conv]
+	m.sweepConvLocked(sc.conv, time.Now())
+	var list []*bgTask
+	for _, t := range m.byConv[sc.conv] {
+		if sc.canAccess(t, handles) {
+			list = append(list, t)
+		}
+	}
 	if len(list) == 0 {
-		return "当前会话里没有后台任务。"
+		return "当前执行范围里没有后台任务。"
 	}
 	var b strings.Builder
 	n := len(list)
 	if n > backgroundListMax {
-		fmt.Fprintf(&b, "当前会话里的后台任务（共 %d 个，列出最近 %d 个）：\n", n, backgroundListMax)
+		fmt.Fprintf(&b, "当前执行范围里的后台任务（共 %d 个，列出最近 %d 个）：\n", n, backgroundListMax)
 	} else {
-		fmt.Fprintf(&b, "当前会话里的后台任务（%d 个）：\n", n)
+		fmt.Fprintf(&b, "当前执行范围里的后台任务（%d 个）：\n", n)
 	}
 	now := time.Now()
 	for i := n - 1; i >= 0 && n-1-i < backgroundListMax; i-- {

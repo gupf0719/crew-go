@@ -69,10 +69,10 @@ LangGraph 1.2.18 把 `DeltaChannel` 的默认快照间隔从每 1,000 次更新�
   模型发出调用后可继续生成。应用负责执行，在后续请求用原 `call_id` 交回结果，并管理任务保存、去重和取消。
   [Async tool calling](https://developers.openai.com/api/docs/guides/async-tool-calling)
 
-crew-go 顶层 BasicAgent 的 `WithBackgroundTasks` 可将点名的工具在运行超过 `YieldAfter` 后转入后台，
-先返回任务 ID。模型可通过 `background_task` 查、等、取消，也能在发起方下一次调模型时收到结果通知。
-任务由进程内 `BackgroundTaskManager` 持有。配置 Checkpointer 时，工具账可以恢复任务 ID。进程重启后
-原任务与结果会消失。独立子 agent thread、宿主唤醒和跨进程任务恢复需要额外的任务所有权协议。现有 `Inbox`
+crew-go 的 `WithBackgroundTasks` 可将顶层或明确派发的子 BasicAgent 中点名的工具转入后台，先返回任务 ID。
+模型通过 `background_task` 查询、等待或取消，发起执行还可收到结果通知。嵌套范围按会话和子调用定位，授权来自当前图中已提交的句柄。
+进程内 `BackgroundTaskManager` 持有执行及待交付结果，工具账在 Checkpointer 中保存句柄。重启后，恢复原句柄仍能阻止工具重跑，
+查询会报告原管理器中的任务不可用。显式持久后台子 Agent 另有独立存档、租约和宿主唤醒协议。现有 `Inbox`
 和 `WithTurnGate` 已覆盖同一回合的插话与收尾反馈。
 [后台工具](../../v2/background-tasks.md) · [执行控制](../../v2/execution-control.md) · [可恢复的后台子 Agent](../../v2/durable-background-agent.md)
 

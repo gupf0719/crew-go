@@ -414,8 +414,8 @@ func TestBackgroundTask_OtherConversationCannotTouch(t *testing.T) {
 	waitTerminal(t, mgr, id)
 }
 
-// TestBackgroundTask_NestedAgentRunsSync：编排成员不转后台——它这一步结束之后没有一个确定会再来的模型调用能接住结果。
-func TestBackgroundTask_NestedAgentRunsSync(t *testing.T) {
+// TestBackgroundTask_UnaddressedNestedAgentRunsSync 检查业务包装的裸 Run 不会继承外层派发资格。
+func TestBackgroundTask_UnaddressedNestedAgentRunsSync(t *testing.T) {
 	mgr := agent_v2.NewBackgroundTaskManager(nil)
 	closeMgr(t, mgr)
 	tk := tool.NewToolkit()
@@ -426,20 +426,14 @@ func TestBackgroundTask_NestedAgentRunsSync(t *testing.T) {
 		}))
 	m := &bgScriptModel{steps: []func([]*schema.Message) (*schema.Message, error){callStep("build", `{}`)}}
 	inner := bgAgent("inner", m, tk, bgConfig(mgr))
-	seq := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("seq")).AddStep("step", inner)
+	wrapped := struct{ agent_v2.Agent }{inner}
+	seq := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("seq")).AddStep("step", wrapped)
 	if _, err := seq.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("构建")); err != nil {
 		t.Fatal(err)
 	}
 	in := m.input(1)
 	if got := in[len(in)-1].Content; got != "NESTED-RESULT" {
-		t.Fatalf("编排成员里的可后台工具应同步跑完，模型看到：\n%s", got)
-	}
-	for _, msg := range m.input(0) {
-		for _, tc := range schema.GetToolCalls(msg) {
-			if tc.Function.Name == agent_v2.BackgroundTaskToolName {
-				t.Fatal("编排成员不该拿到 background_task")
-			}
-		}
+		t.Fatalf("业务包装内裸调的工具应同步跑完，模型看到：\n%s", got)
 	}
 }
 

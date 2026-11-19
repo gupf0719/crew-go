@@ -144,6 +144,19 @@ events, _ := ra.Run(ctx, sess, schema.UserMessage("..."))
 普通补答重挂时直接交付新授权请求。用户确认某一轮带外授权后，只等待该问题推进，看到新授权
 请求即交回调用方。完整待答快照自带 artifact 基线。
 
+### 远端终局后的原请求重发
+
+远端任务明确失败、被拒绝或取消后，宿主重试同一次调用会重发原请求。最终消息省略 `taskId`，内容和作用域匹配且
+`contextId` 为空或等于旧线程时，客户端沿用旧线程并在 `referenceTaskIds` 引用最近一个确认终局的任务。
+业务拦截器选了另一远端线程时，保留它提供的线程。新任务按自己的 ID 和轮次提问。有效续答使用当前待答任务的
+`taskId`，GetTask 和订阅重挂只读取原任务。普通 `WithContinuation` 句柄随原任务终止而失效。
+
+引用按宿主调用位置保存，随宿主存档恢复。顶层直接调用时，用原 `RunSession`、原 RunID 和原请求重试可带上引用。
+调用 `NextTask` 后发起的是独立请求。SDK 发消息前核对所选接口、调用主体、会话、上下文与最终请求的租户字段，以及拦截器处理后的消息内容。
+接口或身份变化时，新请求也省略从失败记录得知的旧线程。首次请求、仅确认任务不存在和缺少原请求身份的旧存档均省略引用。
+旧存档仍可按已保存的任务 ID 续答或重挂。业务拦截器替换上下文而使本次操作无法核对归属时，也会省略框架引用。
+[跨层回归](../../a2a/gate_task_reference_test.go)
+
 ## RemoteOption 速查
 
 | Option | 作用 | 适用 |
@@ -152,7 +165,7 @@ events, _ := ra.Run(ctx, sess, schema.UserMessage("..."))
 | `WithDescription(desc)` | override 描述（默认 AgentCard.Description）| tool 形态能力发现 |
 | `WithClientOptions(opts...)` | 透传 a2aclient FactoryOption：auth header / 自定义 transport | 鉴权 |
 | `WithJSONRPCHTTPClient(client)` | 指定 JSON-RPC 的 HTTP client，保留 GetTask 的 401/403 分类 | 自定义 HTTP client |
-| `WithHumanGate()` | 远程**普通追问**（input-required）抛 InterruptError 走真人 HITL（默认返追问让 host LLM 自动补）。**远端的审批请求不归它管、一律交给真人**：挂起清单标了审批的问题、声明式断点和任务状态 AUTH_REQUIRED 都会抛中断（宿主模型不能替人批准远端操作）；别家把审批写成纯文本追问时识别不了，对端不是 crew-go 时要真人把关就开它。AUTH_REQUIRED 的凭证走带外通道（规范 §7.6）：按审批问人，人没有拒绝就不发消息、重新挂上那个任务（先轮询到它离开 AUTH_REQUIRED，最多等 30 秒、到时仍停着就再问一次人；之后已结束取终态，还在跑的支持流式就订阅、不支持就接着轮询），拒绝时取消远端任务、这次调用报错。等人答复的那一问按调用位置记进 host 存档：没拿到答复不联系远端、原样再问，远端任务结束后清掉真人记录，失败重试时发原始请求；改问普通追问时，宿主节点重跑会拿回原追问及续接句柄，几次调用 / 并行分支各续各的，续跑不依赖原 session；在节点执行里被调起时这次调用一律在它自己的相位里问，不占调用它的那段代码的提问序号（调用方按进度跳过它时后面的提问不挪位）；相位名在节点体、工具函数体里按远端 + 请求内容 + 第几次定——请求在续跑之间变了就是另一次调用，要么把拼好的请求记下来、要么经 RunSubAgent + WithCallKey 调；在别人给的相位里（框架交接、被交接的业务壳、钩子）按外层相位名 + 远端 + 第几次定、不看请求内容；引擎钩子 / 条件边里远端要人时报错 | 无 LLM 编排嵌远程 / 人类确认 |
+| `WithHumanGate()` | 远程**普通追问**（input-required）抛 InterruptError 走真人 HITL（默认返追问让 host LLM 自动补）。**远端的审批请求不归它管、一律交给真人**：挂起清单标了审批的问题、声明式断点和任务状态 AUTH_REQUIRED 都会抛中断（宿主模型不能替人批准远端操作）；别家把审批写成纯文本追问时识别不了，对端不是 crew-go 时要真人把关就开它。AUTH_REQUIRED 的凭证走带外通道（规范 §7.6）：按审批问人，人没有拒绝就不发消息、重新挂上那个任务（先轮询到它离开 AUTH_REQUIRED，最多等 30 秒、到时仍停着就再问一次人；之后已结束取终态，还在跑的支持流式就订阅、不支持就接着轮询），拒绝时取消远端任务、这次调用报错。等人答复的那一问按调用位置记进 host 存档：没拿到答复不联系远端、原样再问，远端任务结束后清掉真人记录，失败后按[重发规则](#远端终局后的原请求重发)发原始请求；改问普通追问时，宿主节点重跑会拿回原追问及续接句柄，几次调用 / 并行分支各续各的，续跑不依赖原 session；在节点执行里被调起时这次调用一律在它自己的相位里问，不占调用它的那段代码的提问序号（调用方按进度跳过它时后面的提问不挪位）；相位名在节点体、工具函数体里按远端 + 请求内容 + 第几次定——请求在续跑之间变了就是另一次调用，要么把拼好的请求记下来、要么经 RunSubAgent + WithCallKey 调；在别人给的相位里（框架交接、被交接的业务壳、钩子）按外层相位名 + 远端 + 第几次定、不看请求内容；引擎钩子 / 条件边里远端要人时报错 | 无 LLM 编排嵌远程 / 人类确认 |
 | `WithHooks(h)` | agent 形态观测（fire OnAgentStart/End 对）| agent 形态嵌编排 |
 | `WithObservability(obs)` | a2a 跨进程 trace：建 `invoke_agent` CLIENT span，把 W3C trace context（traceparent / tracestate / baggage）写进出站 `Message.metadata` | 跨进程 trace 串联 |
 | `WithDiscoveryAgentName(name)` | **仅 FromService**：限发现指定 agentName（同 service 多 Agent Card 精确路由）| 服务发现 |

@@ -57,6 +57,7 @@ type RemoteAgent struct {
 	hooks     hook.Hooks                   // WithHooks 注入；nil 时 NoOp（agent 形态观测见 WithHooks godoc）
 	obs       *observability.Observability // WithObservability 注入；nil 时无 a2a 跨语言 trace
 	binding   string                       // 普通追问句柄绑定创建它的客户端实例。
+	taskRoute string                       // 所选接口的任务寻址身份，跨客户端实例稳定。
 }
 
 var _ agent_v2.Agent = (*RemoteAgent)(nil)
@@ -83,13 +84,19 @@ func NewRemoteAgentFromCard(ctx context.Context, card *a2atypes.AgentCard, opts 
 	for _, o := range opts {
 		o(cfg)
 	}
-	clientOpts := cfg.clientOpts
-	if !slices.Contains(clientOpts, a2aclient.WithDefaultsDisabled()) {
-		clientOpts = append([]a2aclient.FactoryOption{jsonRPCHTTPClient(nil)}, clientOpts...)
+	clientOpts := []a2aclient.FactoryOption{a2aclient.WithCallInterceptors(taskReferenceInterceptor{reset: true})}
+	if !slices.Contains(cfg.clientOpts, a2aclient.WithDefaultsDisabled()) {
+		clientOpts = append(clientOpts, jsonRPCHTTPClient(nil))
 	}
+	clientOpts = append(clientOpts, cfg.clientOpts...)
+	clientOpts = append(clientOpts, a2aclient.WithCallInterceptors(taskReferenceInterceptor{}))
 	client, err := a2aclient.NewFromCard(ctx, card, clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("a2a: create client for agent %q: %w", card.Name, err)
+	}
+	taskRoute, err := selectedTaskRoute(client, card)
+	if err != nil {
+		return nil, fmt.Errorf("a2a: identify task route for agent %q: %w", card.Name, errors.Join(err, client.Destroy()))
 	}
 	name := cfg.name
 	if name == "" {
@@ -98,7 +105,7 @@ func NewRemoteAgentFromCard(ctx context.Context, card *a2atypes.AgentCard, opts 
 	desc := firstNonEmpty(cfg.description, card.Description)
 	desc = firstNonEmpty(desc, "delegate a task to the remote A2A agent "+card.Name)
 	return &RemoteAgent{client: client, card: card, name: name, desc: desc, humanGate: cfg.humanGate,
-		hooks: cfg.hooks, obs: cfg.obs, binding: rand.Text()}, nil
+		hooks: cfg.hooks, obs: cfg.obs, binding: rand.Text(), taskRoute: taskRoute}, nil
 }
 
 // Name 返回 agent/tool 名（OpenAI 合规）。
@@ -356,6 +363,26 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 		}
 	}
 
+	var origin taskRequestOrigin
+	trackRestart := !explicit && (byPosition || sessionHandles)
+	exchange := &taskReferenceExchange{route: a.taskRoute, retryContext: contextID}
+	if explicit {
+		// 显式续接不能凭旧句柄重开任务。若远端切到真人 gate，保留原始委派以供后续处理。
+		origin = sessionQuestion.Origin
+	} else if trackRestart {
+		exchange.previous = a.loadFailedTaskReference(ctx, session, pos)
+		switch {
+		case pend.TaskID != "":
+			origin = pend.Origin
+		case handleWaiting:
+			origin = sessionQuestion.Origin
+		case taskID == "" && exchange.previous.TaskID != "":
+			// 会话中的线程可能属于旧作用域，等 SDK 确认出站归属后再使用。
+			contextID = ""
+		}
+	}
+	ctx = context.WithValue(ctx, taskReferenceExchangeKey{}, exchange)
+
 	var (
 		result       = newRemoteOutput(a.name) // 远程应答的文本与非文本 part（raw/url/data → File/Data block）
 		lastState    a2atypes.TaskState
@@ -525,6 +552,7 @@ func (a *RemoteAgent) consume(ctx context.Context, session *agent_v2.RunSession,
 		}
 	}
 	if msg != nil {
+		exchange.newRequest = trackRestart && msg.TaskID == ""
 		source = a.client.SendStreamingMessage(ctx, &a2atypes.SendMessageRequest{Message: msg})
 	}
 
@@ -572,6 +600,9 @@ stream:
 				askSnapshot = v
 				break stream
 			}
+			if isTerminalFailure(lastState) {
+				break stream
+			}
 		case *a2atypes.TaskStatusUpdateEvent:
 			if v.TaskID != "" {
 				newTaskID = string(v.TaskID)
@@ -586,7 +617,7 @@ stream:
 				statusMsgID = v.Status.Message.ID
 				statusParts = v.Status.Message.Parts
 			}
-			if waitsForInput(lastState) {
+			if waitsForInput(lastState) || isTerminalFailure(lastState) {
 				break stream
 			}
 		case *a2atypes.TaskArtifactUpdateEvent:
@@ -610,6 +641,13 @@ stream:
 		result.retract(ctx)
 		return nil, fmt.Errorf("a2a: remote agent %q stream ended while task %s was still running; retry the continuation", a.card.Name, taskID)
 	}
+	reportedTaskID := firstNonEmpty(newTaskID, taskID)
+	if waitsForInput(lastState) && reportedTaskID == "" {
+		return nil, fmt.Errorf("a2a: remote agent %q asked for input without a task id, the answer could not be routed back to it", a.card.Name)
+	}
+	if exchange.sent.Scope != "" {
+		origin, contextID = exchange.sent, exchange.sentContext
+	}
 	auth := lastState == a2atypes.TaskStateAuthRequired
 	if sessionHandles && !auth {
 		// 远端回应了、不再停在授权上：session 上的授权等待标记清掉。曾经在重新挂上之前就清，一次超时之后人的答复被当成
@@ -627,6 +665,19 @@ stream:
 	if auth {
 		q = firstNonEmpty(statusMsg, "the remote agent needs authorization to proceed") + "\n(" + authAnswerHint + ")"
 	}
+	var failed failedTaskReference
+	terminalFailure := isTerminalFailure(lastState)
+	if terminalFailure && trackRestart && origin.Scope == exchange.scope && origin.Payload != "" &&
+		(taskID == "" || reportedTaskID == taskID) {
+		failed = failedTaskReference{
+			TaskID: reportedTaskID, ContextID: firstNonEmpty(newContextID, contextID), Origin: origin,
+		}
+	}
+	if failed.TaskID != "" || (exchange.previous.TaskID != "" && !terminalFailure) {
+		if err := a.saveFailedTaskReference(ctx, session, pos, failed); err != nil {
+			return nil, fmt.Errorf("a2a: remote agent %q: record the terminal task reference: %w", a.card.Name, err)
+		}
+	}
 	// 远端给出结局时清除旧问题。新的普通追问或真人提问各自覆盖记录，发送或读取失败时保留原问题供续跑。
 	if byPosition && pend.TaskID != "" && !waitsForInput(lastState) {
 		if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), gatePending{}); err != nil {
@@ -638,11 +689,7 @@ stream:
 
 	switch lastState {
 	case a2atypes.TaskStateInputRequired, a2atypes.TaskStateAuthRequired:
-		askTask := firstNonEmpty(newTaskID, taskID)
-		if askTask == "" {
-			// 缺少任务句柄会让下一次调用重发原始请求，反复问同一个问题。
-			return nil, fmt.Errorf("a2a: remote agent %q asked for input without a task id, the answer could not be routed back to it", a.card.Name)
-		}
+		askTask := reportedTaskID
 		var artifacts []seenArtifact
 		switch {
 		case askSnapshot != nil:
@@ -657,7 +704,7 @@ stream:
 			rec := gatePending{
 				TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: 1,
 				Question: q, QuestionMsgID: statusMsgID, Items: items, SeenArtifacts: artifacts,
-				Binding: a.binding, AnswerUnsent: true,
+				Binding: a.binding, AnswerUnsent: true, Origin: origin,
 			}
 			out := a.askForContinuation(session, rec)
 			if byPosition {
@@ -678,7 +725,7 @@ stream:
 			}
 			session.SetValue(a.pendingKey(session), gatePending{
 				TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round,
-				Question: q, QuestionMsgID: statusMsgID, Items: items, Auth: auth, AnswerUnsent: true,
+				Question: q, QuestionMsgID: statusMsgID, Items: items, Auth: auth, AnswerUnsent: true, Origin: origin,
 			})
 			a.storeAuthWait(session, auth)
 			a.storeHandleWaiting(session, true, artifacts)
@@ -712,7 +759,7 @@ stream:
 		}
 		// 记的是已经发生的事：远端这个任务在等人答这一问
 		rec := gatePending{TaskID: askTask, ContextID: firstNonEmpty(newContextID, contextID), Round: round, Question: q, Items: items, Auth: auth,
-			QuestionMsgID: statusMsgID, SeenArtifacts: artifacts, AnswerUnsent: true}
+			QuestionMsgID: statusMsgID, SeenArtifacts: artifacts, AnswerUnsent: true, Origin: origin}
 		if err := compose_v2.SaveStepResult(ctx, gateStepKey(pos), rec); err != nil {
 			return nil, fmt.Errorf("a2a: remote agent %q: record the pending question: %w", a.card.Name, err)
 		}
@@ -901,6 +948,10 @@ func gateMessageID(pos, taskID string, round int) string {
 // waitsForInput 判断远端任务停在等人的状态上（input-required / auth-required）。
 func waitsForInput(st a2atypes.TaskState) bool {
 	return st == a2atypes.TaskStateInputRequired || st == a2atypes.TaskStateAuthRequired
+}
+
+func isTerminalFailure(state a2atypes.TaskState) bool {
+	return state.Terminal() && state != a2atypes.TaskStateCompleted
 }
 
 // needsHuman 判断挂起清单里有没有需要调用方确认的工具审批或断点。
@@ -1546,6 +1597,8 @@ type gatePending struct {
 	// FollowUp 记返回给宿主的普通追问，节点重跑时原样交回。Binding 限制恢复该句柄的客户端实例。
 	FollowUp *schema.Message `json:"follow_up,omitempty"`
 	Binding  string          `json:"binding,omitempty"`
+	// Origin 指向最初委派，终局后只给同一范围内的相同请求重用。
+	Origin taskRequestOrigin `json:"origin,omitzero"`
 }
 
 func init() {

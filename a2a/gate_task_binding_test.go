@@ -38,6 +38,7 @@ import (
 type gateRemote struct {
 	mu     sync.Mutex
 	got    []string
+	wires  []gateWireMessage
 	conts  atomic.Int32
 	onCont func(n int32) a2atypes.TaskState // 第 n 次续任务（从 1 起）怎么结束；返回 Completed 则完成
 	// contDelay 是续任务时远端收下答复之后、发出结局之前停多久（其间任务仍停在原来那一问上，contWorking 时先切到 working）
@@ -46,10 +47,21 @@ type gateRemote struct {
 	working     atomic.Bool // contWorking 时已经发出 working
 }
 
-func (g *gateRemote) record(s string) {
+type gateWireMessage struct {
+	messageID               string
+	target, task            a2atypes.TaskID
+	requestContext, context string
+	references              []a2atypes.TaskID
+}
+
+func (g *gateRemote) record(e *a2asrv.ExecutorContext, s string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.got = append(g.got, s)
+	g.wires = append(g.wires, gateWireMessage{
+		messageID: e.Message.ID, target: e.Message.TaskID, task: e.TaskID,
+		requestContext: e.Message.ContextID, context: e.ContextID, references: slices.Clone(e.Message.ReferenceTasks),
+	})
 }
 
 func (g *gateRemote) snapshot() []string {
@@ -58,10 +70,16 @@ func (g *gateRemote) snapshot() []string {
 	return append([]string(nil), g.got...)
 }
 
+func (g *gateRemote) requests() []gateWireMessage {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.wires)
+}
+
 func (g *gateRemote) exec(execCtx *a2asrv.ExecutorContext, yield func(a2atypes.Event, error) bool) {
 	txt := inputText(execCtx)
 	if execCtx.StoredTask == nil {
-		g.record("new:" + txt)
+		g.record(execCtx, "new:"+txt)
 		if !yield(a2atypes.NewSubmittedTask(execCtx, execCtx.Message), nil) {
 			return
 		}
@@ -75,7 +93,7 @@ func (g *gateRemote) exec(execCtx *a2asrv.ExecutorContext, yield func(a2atypes.E
 			a2atypes.NewMessage(a2atypes.MessageRoleAgent, a2atypes.NewTextPart("新任务办了:"+txt))), nil)
 		return
 	}
-	g.record("cont:" + txt)
+	g.record(execCtx, "cont:"+txt)
 	if g.contWorking {
 		if !yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateWorking, nil), nil) {
 			return
@@ -88,8 +106,8 @@ func (g *gateRemote) exec(execCtx *a2asrv.ExecutorContext, yield func(a2atypes.E
 		state = g.onCont(g.conts.Add(1))
 	}
 	switch state {
-	case a2atypes.TaskStateFailed:
-		yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateFailed,
+	case a2atypes.TaskStateFailed, a2atypes.TaskStateRejected, a2atypes.TaskStateCanceled:
+		yield(a2atypes.NewStatusUpdateEvent(execCtx, state,
 			a2atypes.NewMessage(a2atypes.MessageRoleAgent, a2atypes.NewTextPart("远端出错"))), nil)
 	case a2atypes.TaskStateInputRequired:
 		yield(a2atypes.NewStatusUpdateEvent(execCtx, a2atypes.TaskStateInputRequired,
@@ -151,6 +169,7 @@ func checkAskedAgainForNewTask(t *testing.T, r *gateRemote, asked, ids []string,
 	if final != "续任务办了:答#2" {
 		t.Errorf("final = %q，want 续任务办了:答#2", final)
 	}
+	checkGateReplacementWire(t, r)
 }
 
 // TestHumanGate_RemoteFailed_ResumeAsksAgainForNewTask：纯续跑。答过之后远端任务失败，节点以普通错停下，续跑重试

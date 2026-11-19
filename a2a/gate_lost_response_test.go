@@ -225,6 +225,11 @@ func TestHumanGate_TaskVanished_StartsNewTask(t *testing.T) {
 	if len(asked) != 2 || ids[0] == ids[1] || final != "续任务办了:答#2" {
 		t.Errorf("应对新任务重新问一次（新 ID）、答复续上新任务：问过 %q，ID %q，final=%q", asked, ids, final)
 	}
+	for _, request := range r.requests() {
+		if len(request.references) != 0 {
+			t.Errorf("只知道任务已消失时不应发终局引用：%+v", request)
+		}
+	}
 }
 
 // 远端收下了答复、还在办（执行器发出结局之前任务仍停在原来那一问上），响应丢了：重试时不重发、也不把原来那一问当成新的一问

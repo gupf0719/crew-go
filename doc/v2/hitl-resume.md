@@ -37,7 +37,7 @@ HITL 全称 **Human-In-The-Loop**——agent 跑到某一步需要 user 决策�
 | **A. 业务工具 ask_user** | `agent_v2.NewAskUserTool()` 内置工具（业务从 toolkit 调用）| LLM 主动问用户：要不要继续 / 选 A 还是 B / 输入参数 |
 | **B. Hook 主动暂停** | 业务自定义 Hook（`OnAgentStart` + `OnModelEnd` 双触发；**顶层 agent 靠 OnModelEnd 产 cp**——OnAgentStart 在 graph 启动前抛不产 cp，此时对该 sid `Resume` 会返 `errors.Is(err, compose_v2.ErrNoPendingCheckpoint)`（R33 GA-M2 fail-fast，旧行为是误导性内部错/垃圾 final），详 §11.1/§11.3）| 用户暂停按钮 / 配额耗尽 / 政策审查 |
 | **C. ctx 超时被动** | ctx.DeadlineExceeded（不是真 HITL，但走类似 cp 路径）| 长任务被外部 cancel，希望 Resume 时续跑而非重做 |
-| **D. 声明式断点** | 引擎在超步边界上停（`GraphBuilder.WithInterruptBefore/After`、RunOption、GraphAgent `WithGraphInterruptBefore/After`），Reason=`breakpoint`、`AskQuery.Breakpoint` 写停在哪 | 调试 / 逐步执行 / 「到这儿先停一下」的位置闸门；续跑（带不带答案都行）就是放行，详见 [execution-control.md](execution-control.md) §1 |
+| **D. 声明式断点** | 引擎在超步边界上停，图可在编译期或运行期声明，GraphAgent 也支持构造和单次调用配置。Reason 为 `breakpoint`，`AskQuery.Breakpoint` 记录位置 | 调试和逐步执行，续跑放行当前边界。 [配置方式](execution-control.md#11-用法) |
 
 A/B 是真 HITL（user 提供答案），C 是被动恢复（无 user 答案），D 是位置闸门（不带问题，续跑即放行）。
 

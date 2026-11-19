@@ -401,7 +401,7 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, p.Name())
+	ctx, activity, err := beginRunActivity(ctx, cfg, session, p)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +510,7 @@ func (p *PlanAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 	// compose_v2 channel), framework 拿不到. info.Round 保持 0 是 by-design — 业务
 	// 关心 plan 步数从 sess.Events 内 PlanStep event 计数 (业务自填 metric).
 	info := &hook.AgentInfo{Name: p.Name(), Type: "plan", Round: 0}
-	prep, newCtx, err := commonResumePrep(ctx, "plan agent", p.Name(), sessionID, opts, info, p.hooks, p.historySubs())
+	prep, newCtx, err := commonResumePrep(ctx, "plan agent", p, sessionID, opts, info, p.hooks, p.historySubs())
 	if err != nil {
 		return nil, err
 	}

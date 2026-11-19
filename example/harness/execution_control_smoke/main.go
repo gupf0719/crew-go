@@ -48,7 +48,7 @@ func main() {
 	fmt.Println("\n=== 全部通过 ===")
 }
 
-// ① GraphAgent 配 AllNodes 断点：每个超步边界停一次，每次 Resume 恰好越过一个边界。
+// ① 给 GraphAgent 的每次调用传 AllNodes 断点，每次 Resume 恰好越过一个边界。
 func stepThroughBreakpoints() {
 	fmt.Println("=== ① 声明式断点：逐步执行 ===")
 	inCh := compose_v2.LastValue[*schema.Message]("__ecs_in__")
@@ -80,11 +80,10 @@ func stepThroughBreakpoints() {
 			out, _ := compose_v2.Get(chs, outCh)
 			return out
 		}),
-		agent_v2.WithGraphInterruptBefore(compose_v2.AllNodes),
 	)
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
 	sess := agent_v2.NewRunSession()
-	_, err = ga.Run(ctx, sess, schema.UserMessage("job"))
+	_, err = ga.Run(ctx, sess, schema.UserMessage("job"), agent_v2.WithRunInterruptBefore(compose_v2.AllNodes))
 	for stops := 0; ; stops++ {
 		ie, ok := compose_v2.IsInterrupt(err)
 		if !ok {
@@ -99,7 +98,7 @@ func stepThroughBreakpoints() {
 		if len(trail) != stops {
 			log.Fatalf("第 %d 次停下时该执行过 %d 个节点，实际 %v", stops+1, stops, trail)
 		}
-		_, err = ga.Resume(ctx, sess.RunID)
+		_, err = ga.Resume(ctx, sess.RunID, agent_v2.WithResumeInterruptBefore(compose_v2.AllNodes))
 	}
 	if strings.Join(trail, ",") != "fetch,transform,publish" {
 		log.Fatalf("执行顺序不对：%v", trail)

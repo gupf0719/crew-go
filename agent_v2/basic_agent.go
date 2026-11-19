@@ -274,7 +274,7 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, a.config.Name)
+	ctx, activity, err := beginRunActivity(ctx, cfg, session, a)
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +442,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	// **P0 observability fix**: info + hooks 传 commonResumePrep 让 Abort 路径
 	// 也 fire OnAgentStart + OnAgentEnd 让 observability 完整记录 resume 计数.
 	info := &hook.AgentInfo{Name: a.config.Name, Type: "base", Round: 0}
-	prep, newCtx, err := commonResumePrep(ctx, "basic agent", a.config.Name, sessionID, opts, info, a.config.Hooks, []Agent{a})
+	prep, newCtx, err := commonResumePrep(ctx, "basic agent", a, sessionID, opts, info, a.config.Hooks, []Agent{a})
 	if err != nil {
 		return nil, err
 	}

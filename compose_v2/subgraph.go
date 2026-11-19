@@ -144,7 +144,7 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 
 		// 嵌套 cp 物理分离：从 ctx 取 Checkpointer + sessionID + 父 ns，算子 ns
 		var cper Checkpointer
-		if !checkpointingDisabled(ctx) {
+		if !IsCheckpointingDisabled(ctx) {
 			cper = GetCheckpointer(ctx)
 		}
 		sid := GetSessionID(ctx)

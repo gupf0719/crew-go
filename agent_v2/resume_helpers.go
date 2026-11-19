@@ -118,7 +118,8 @@ func resolveAbortHistoryStore(ctx context.Context, key HistoryKey, cfg resumeCon
 // 的结果，而那时写入器还没起（`startHistory` 在本函数返回之后）。编排传自己的
 // `historySubs()`，BasicAgent 传 `[]Agent{a}`（它自己就实现了 historyConfigProvider）。
 // 传 nil 表示这条路不接历史。
-func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID string, opts []ResumeOption, info *hook.AgentInfo, hooks hook.Hooks, subs []Agent) (*resumePrep, context.Context, error) {
+func commonResumePrep(ctx context.Context, agentTypeName string, ag Agent, sessionID string, opts []ResumeOption, info *hook.AgentInfo, hooks hook.Hooks, subs []Agent) (*resumePrep, context.Context, error) {
+	agentName := ag.Name()
 	// 0. Resume 只在顶层调：在一个正在执行的任务里，续跑的要么是这个任务本身（它正在跑，用不着
 	// 续），要么是另一个任务——那得先 DetachTask 拿一个跟当前执行无关的 ctx，否则当前执行留在 ctx
 	// 上的位置、答案、新开信号全被带进那个任务（见 enclosingTask）。排在一切之前：Abort 分支会删存档。
@@ -146,6 +147,14 @@ func commonResumePrep(ctx context.Context, agentTypeName, agentName, sessionID s
 
 	// 2. parse opts
 	rcfg := applyResumeOptions(opts)
+	if err := rcfg.breakpoints.validate(ag); err != nil {
+		return nil, ctx, err
+	}
+	if g, ok := ag.(*GraphAgent); ok && rcfg.action != ResumeActionAbort {
+		if err := g.checkBreakpointsResumable(ctx, rcfg.breakpoints); err != nil {
+			return nil, ctx, err
+		}
+	}
 
 	// sessionID 与 WithResumeSession 传入的 session.RunID 是同一个任务身份的两份声明：对不上就是
 	// 两个互斥的意图，拒（排在 Abort 分支之前——它会删存档）。放行的话存档按 sessionID 续、嵌套层

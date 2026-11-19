@@ -166,7 +166,7 @@ func (l *LoopAgent) Run(ctx context.Context, session *RunSession, input *schema.
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, l.Name())
+	ctx, activity, err := beginRunActivity(ctx, cfg, session, l)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +251,7 @@ func (l *LoopAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 		hooks = hook.NoOpHooks{}
 	}
 	info := &hook.AgentInfo{Name: l.Name(), Type: "loop", Round: 0}
-	prep, newCtx, err := commonResumePrep(ctx, "loop agent", l.Name(), sessionID, opts, info, hooks, l.historySubs())
+	prep, newCtx, err := commonResumePrep(ctx, "loop agent", l, sessionID, opts, info, hooks, l.historySubs())
 	if err != nil {
 		return nil, err
 	}

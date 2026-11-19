@@ -37,7 +37,7 @@ LangGraph 版本戳解决、而纯结构做法解决不了的一类：运行期�
 | 续跑标记泄漏给后进入的子图 | LangGraph `4e9ed36f7` / `03bf149eb` | 只有恢复出来的那个边界不判；子图有自己的 Run 与存档 |
 | 入口那批（START 的后继）不判断点 | eino `69139992` | 入口也判；哨兵 `TestBreakpoint_BeforeStopsWholeSuperstep` |
 | 循环里同一子图节点第二次访问复用了上一次的子图存档 | eino `5b1ab13a` | 子图 ns 带 visit 维，原有约定 |
-| 某个入口静默丢掉运行期断点 | LangGraph `87f1c8eb9` | GraphAgent 的 Run 与 Resume 都带；哨兵 `TestGraphAgent_Breakpoint_StepThroughCarriedOnResume` |
+| 某个入口静默丢掉运行期断点 | LangGraph `87f1c8eb9` | GraphAgent 的 Run 与 Resume 均消费各自的调用级配置，与构造期断点取并集。 [双入口回归](../../../agent_v2/graph_agent_breakpoint_test.go) |
 | 停下时返回值不带标记（与正常结束不可区分） | LangGraph `main.py:4033-4043` | 返回 `InterruptError`，`AskQuery.Breakpoint` 写停在哪 |
 | 外部中断与 after 断点共用 `AfterNodes` 字段，分不出 | eino `graph_run.go:476-490` | Reason + `Breakpoint` 字段，由框架填（`Ask` 清掉业务填的；直接构造 `InterruptError` 时业务别填它） |
 
@@ -46,6 +46,10 @@ LangGraph 版本戳解决、而纯结构做法解决不了的一类：运行期�
 LangGraph 文档明确不推荐静态断点做 HITL，定位是调试 / 逐步执行（`579c7831b` 的 add-human-in-the-loop.md）。推断的原因：
 断点不带问题、没有答案通道、按节点名同停同放、运行期配置不持久化。我们的断点返回带 ID 的挂起、能经 Resume / AG-UI / A2A
 走完一圈，但仍然**不带问题内容、不能改状态**——所以文档里写的是「位置闸门（继续或放弃）」，要人看着内容批准用 `Ask` 或工具审批。
+
+GraphAgent 的临时诊断沿用同一条 Resume 路径。存档记下命中位置和中断 ID，下一次调用给出新的断点列表。
+运行期断点继续与图及 GraphAgent 原有的断点取并集，其他内置编排在任务准入前拒绝诊断选项。
+[具体用法](../../v2/execution-control.md#11-用法)
 
 ## 二、节点超时与重试
 

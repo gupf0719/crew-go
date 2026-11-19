@@ -43,9 +43,7 @@ type GraphAgent struct {
 	inputWriter  GraphInputWriter
 	outputReader GraphOutputReader
 	hooks        hook.Hooks
-	// interruptBefore / interruptAfter 见 WithGraphInterruptBefore / WithGraphInterruptAfter。
-	interruptBefore []compose_v2.NodeID
-	interruptAfter  []compose_v2.NodeID
+	breakpoints  graphBreakpoints
 }
 
 // GraphInputWriter 把 input message 翻译成 graph 初始 channel writes。
@@ -90,15 +88,8 @@ func NewGraphAgent(graph *compose_v2.Graph, opts ...GraphAgentOption) *GraphAgen
 	}
 	if g.graph != nil {
 		g.graph = g.graph.WithCheckpointOwner("graph_agent:" + g.name)
-		for _, bp := range []struct {
-			opt string
-			ids []compose_v2.NodeID
-		}{{"WithGraphInterruptBefore", g.interruptBefore}, {"WithGraphInterruptAfter", g.interruptAfter}} {
-			for _, id := range bp.ids {
-				if id != compose_v2.AllNodes && !g.graph.HasNode(id) {
-					panic(fmt.Sprintf("NewGraphAgent: %s 里的节点 %q 不在这张图里", bp.opt, id))
-				}
-			}
+		if err := g.graph.ValidateBreakpointNodes(g.breakpoints.before, g.breakpoints.after); err != nil {
+			panic(fmt.Sprintf("NewGraphAgent: %v", err))
 		}
 	}
 	return g
@@ -113,14 +104,15 @@ func NewGraphAgent(graph *compose_v2.Graph, opts ...GraphAgentOption) *GraphAgen
 //
 // Run 与每次 Resume 都带上这组断点（逐步执行时每次 Resume 停在下一个边界）。只作用于这张图自己的节点：
 // 节点里调起的 agent、子图里的节点不受影响（子图的断点在子图的 builder 上设）。节点名不在图里时构造期 panic。
+// 一次调用的附加断点用 [WithRunInterruptBefore] 或 [WithResumeInterruptBefore]。
 func WithGraphInterruptBefore(nodes ...compose_v2.NodeID) GraphAgentOption {
-	return func(g *GraphAgent) { g.interruptBefore = append(g.interruptBefore, nodes...) }
+	return func(g *GraphAgent) { g.breakpoints.before = append(g.breakpoints.before, nodes...) }
 }
 
 // WithGraphInterruptAfter 给这个 GraphAgent 加 after 断点：nodes 中的节点所在的超步整体提交之后停下。
 // 其余同 [WithGraphInterruptBefore]；语义见 compose_v2.GraphBuilder.WithInterruptAfter。
 func WithGraphInterruptAfter(nodes ...compose_v2.NodeID) GraphAgentOption {
-	return func(g *GraphAgent) { g.interruptAfter = append(g.interruptAfter, nodes...) }
+	return func(g *GraphAgent) { g.breakpoints.after = append(g.breakpoints.after, nodes...) }
 }
 
 // errBreakpointNeedsCheckpointer 是 GraphAgent 配了断点、ctx 上却没有 checkpointer。实现
@@ -138,26 +130,20 @@ func (e *errBreakpointNeedsCheckpointer) NonRetryable() {}
 
 // checkBreakpointsResumable：配了断点（GraphAgent 自己的，或者图编译期声明的）就得有 checkpointer。停在断点
 // 上只能经 Resume 续（Resume 要存档），没有存档时这个任务每次都停在第一个断点、永远过不去——Run 入口就拒。
-func (g *GraphAgent) checkBreakpointsResumable(ctx context.Context) error {
-	if len(g.interruptBefore)+len(g.interruptAfter) == 0 && !g.graph.HasBreakpoints() {
+func (g *GraphAgent) checkBreakpointsResumable(ctx context.Context, extra graphBreakpoints) error {
+	if g.breakpoints.empty() && extra.empty() && !g.graph.HasBreakpoints() {
 		return nil
 	}
-	if compose_v2.GetCheckpointer(ctx) != nil {
+	if compose_v2.GetCheckpointer(ctx) != nil && !compose_v2.IsCheckpointingDisabled(ctx) {
 		return nil
 	}
 	return &errBreakpointNeedsCheckpointer{name: g.Name()}
 }
 
-// breakpointOptions 把这个 GraphAgent 的断点转成引擎选项（Run 与 Resume 都带）。
-func (g *GraphAgent) breakpointOptions() []compose_v2.RunOption {
-	var opts []compose_v2.RunOption
-	if len(g.interruptBefore) > 0 {
-		opts = append(opts, compose_v2.WithInterruptBefore(g.interruptBefore...))
-	}
-	if len(g.interruptAfter) > 0 {
-		opts = append(opts, compose_v2.WithInterruptAfter(g.interruptAfter...))
-	}
-	return opts
+// appendBreakpointOptions 把构造期和本次调用的断点一并交给引擎。
+func (g *GraphAgent) appendBreakpointOptions(opts []compose_v2.RunOption, extra graphBreakpoints) []compose_v2.RunOption {
+	opts = append(opts, compose_v2.WithCheckpointedBreakpoints())
+	return extra.appendOptions(g.breakpoints.appendOptions(opts))
 }
 
 // GraphAgentOption 配置 GraphAgent。
@@ -232,18 +218,18 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 		return nil, fmt.Errorf("graph agent %q: output reader required (use WithGraphOutputReader)", g.Name())
 	}
 	cfg := applyRunOptions(opts)
+	if err := g.checkBreakpointsResumable(ctx, cfg.breakpoints); err != nil {
+		return nil, err
+	}
 	if err := resolveRunSession(ctx, &session, g.Name()); err != nil {
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, g.Name())
+	ctx, activity, err := beginRunActivity(ctx, cfg, session, g)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { activity.finish(ctx, session) }()
-	if err := g.checkBreakpointsResumable(ctx); err != nil {
-		return nil, err
-	}
 	ctx = WithSession(ctx, session)
 
 	// 会话历史写入器。**subs 传 nil 是实情不是省事**：GraphAgent 没有静态子列表
@@ -429,7 +415,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	// DAG 无统一 "round" 语义 (业务可能是 N 节点串行 / fanout / 循环等). info.Round 保持
 	// 0 是 by-design — 业务想看节点执行数走 crew.node.executions{crew.node.id=...}.
 	info := &hook.AgentInfo{Name: g.Name(), Type: "graph", Round: 0}
-	prep, newCtx, err := commonResumePrep(ctx, "graph agent", g.Name(), sessionID, opts, info, hooks, nil /* GraphAgent 无静态子列表，历史配置只能来自 ctx */)
+	prep, newCtx, err := commonResumePrep(ctx, "graph agent", g, sessionID, opts, info, hooks, nil /* GraphAgent 无静态子列表，历史配置只能来自 ctx */)
 	if err != nil {
 		return nil, err
 	}
@@ -467,7 +453,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 		compose_v2.WithCheckpointer(cper),
 		compose_v2.WithSessionID(sessionID),
 	}
-	runOpts = append(runOpts, g.breakpointOptions()...)
+	runOpts = g.appendBreakpointOptions(runOpts, rcfg.breakpoints)
 	// **R31 audit 视角 C HIGH-1 fix**：与 runGraph 路径对称——嵌套场景下 caller 持
 	// GraphAgent 引用直接 .Resume 时 ctx 中含父推 graphNS——必须 forward 让
 	// LoadNS(sid, ns) 拿到正确 ns 下子 cp，避免拿父 cp 报 channel not registered。
@@ -569,7 +555,7 @@ func (g *GraphAgent) runGraph(
 	// （`withImportOverlay`，子图独家）。⚠️ 这里尤其不能靠「写 LastValue 所以幂等」来省判断
 	// ——`inputWriter` 是**业务提供的**，业务完全可以往 Append channel 写。
 	runOpts := []compose_v2.RunOption{compose_v2.WithInitialWrites(g.inputWriter(input)...)}
-	runOpts = append(runOpts, g.breakpointOptions()...)
+	runOpts = g.appendBreakpointOptions(runOpts, runCfg.breakpoints)
 	if cper != nil {
 		runOpts = append(runOpts,
 			compose_v2.WithCheckpointer(cper),

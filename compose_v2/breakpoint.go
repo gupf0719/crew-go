@@ -100,16 +100,35 @@ func checkBreakpointNodes(nodes map[NodeID]NodeFunc, kind string, ids []NodeID) 
 	return nil
 }
 
-// errInvalidBreakpoint 是断点配置用不了：运行期断点选项里有不认识的节点名，或者断点设在一张没法续跑的
-// 嵌套图上（见 breakpointStop）。实现 [NonRetryable]：配置错重试必然一样；不用 [ErrRunAborted]——节点名
-// 写错时它抛在图开始执行之前、一个字节都没写过，带上那个哨兵会让出口清掉同一个槽里与这次无关的存档
-// （比如这次本来要续的那份）；嵌套图那种本来就没有存档。
+// errInvalidBreakpoint 表示断点节点无效，或接入方无法从断点续跑。实现 [NonRetryable]。
+// 配置错误由调用方修正，原任务的存档保留给有效的续跑请求。
 type errInvalidBreakpoint struct{ msg string }
 
 func (e *errInvalidBreakpoint) Error() string { return e.msg }
 
 // NonRetryable 实现 [NonRetryable]。
 func (e *errInvalidBreakpoint) NonRetryable() {}
+
+// ValidateBreakpointNodes 校验运行期 before 和 after 断点的节点名。
+// 允许 [AllNodes]，未知节点与起止节点返回不可重试错误。
+func (g *Graph) ValidateBreakpointNodes(before, after []NodeID) error {
+	if g == nil {
+		return &errInvalidBreakpoint{msg: "breakpoint validation requires a graph"}
+	}
+	if err := checkBreakpointNodes(g.nodes, "before", before); err != nil {
+		return &errInvalidBreakpoint{msg: "compose_v2.WithInterruptBefore: " + err.Error()}
+	}
+	if err := checkBreakpointNodes(g.nodes, "after", after); err != nil {
+		return &errInvalidBreakpoint{msg: "compose_v2.WithInterruptAfter: " + err.Error()}
+	}
+	return nil
+}
+
+// WithCheckpointedBreakpoints 要求声明了断点的图通过 Checkpointer 续跑。
+// 适用于调用方只能按 session ID 续跑的入口。断点配置为空时不要求存档。
+func WithCheckpointedBreakpoints() RunOption {
+	return func(c *runOptions) { c.checkpointedBreakpoints = true }
+}
 
 // WithInterruptBefore 给本次 Run 加 before 断点：超步边界上即将执行的节点里有 nodes 中的（或传
 // [AllNodes]），就在这个超步开始之前停下，这个超步一个节点都不执行。语义与停下之后怎么继续见

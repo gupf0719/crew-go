@@ -292,7 +292,7 @@ func (r *RoutingAgent) Run(ctx context.Context, session *RunSession, input *sche
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, r.Name())
+	ctx, activity, err := beginRunActivity(ctx, cfg, session, r)
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +382,7 @@ func (r *RoutingAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	// info.Round 保持 0 是 by-design — 业务关心路由选中哪个 agent 走 trace span 看,
 	// metric 维度走 crew.node.executions（按 crew.node.id 分）.
 	info := &hook.AgentInfo{Name: r.Name(), Type: "routing", Round: 0}
-	prep, newCtx, err := commonResumePrep(ctx, "routing agent", r.Name(), sessionID, opts, info, hooks, r.historySubs())
+	prep, newCtx, err := commonResumePrep(ctx, "routing agent", r, sessionID, opts, info, hooks, r.historySubs())
 	if err != nil {
 		return nil, err
 	}

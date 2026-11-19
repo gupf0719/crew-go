@@ -14,7 +14,8 @@ import (
 type RunOption func(*runConfig)
 
 type runConfig struct {
-	orchHooks OrchestrationHooks
+	orchHooks   OrchestrationHooks
+	breakpoints graphBreakpoints
 
 	// per-call 覆盖构造期 Config（仅本次 Run 生效，不进 cp、不跨 Resume）。
 	// v1→v2 迁移（commit ad2743e 删 v1 agent/ 包）丢失的 ISSUE-18 能力此处补回。
@@ -434,6 +435,7 @@ type resumeConfig struct {
 	userText           string                     // 非寻址型「用户这轮说了什么」
 	orchHooks          OrchestrationHooks
 	session            *RunSession // 续传给 framework 让事件累积到同一对象
+	breakpoints        graphBreakpoints
 
 	// per-call 覆盖（对齐 eino/langgraph：resume 本身是一次正常调用，能重传 per-call；
 	// 仅本次 Resume 生效、不进 cp）。无则回退构造期默认（不继承上次 Run 的覆盖）。

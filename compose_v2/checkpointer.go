@@ -748,7 +748,12 @@ func WithoutCheckpointing(ctx context.Context) context.Context {
 	return context.WithValue(ctx, checkpointingDisabledKey{}, true)
 }
 
-func checkpointingDisabled(ctx context.Context) bool {
+// IsCheckpointingDisabled 报当前执行是否经 [WithoutCheckpointing] 关闭存档。
+// 显式放弃仍可经 [GetCheckpointer] 取得后端。
+func IsCheckpointingDisabled(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
 	disabled, _ := ctx.Value(checkpointingDisabledKey{}).(bool)
 	return disabled
 }

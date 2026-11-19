@@ -173,6 +173,9 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 
 	// 1. 身份（位置 + 输入内容 / call key / 只取位置）与子 ns，见 enterNestedCall
 	rc := applyRunOptions(opts)
+	if err := rc.breakpoints.validate(sub); err != nil {
+		return nil, err
+	}
 	call, subCtx, err := enterNestedCall(ctx, name, rc.callKey, input, mode.positional, rc.rerunnable)
 	if err != nil {
 		return nil, fmt.Errorf("RunSubAgent: %w", err)

@@ -193,7 +193,7 @@ func (s *SequentialAgent) Run(ctx context.Context, session *RunSession, input *s
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, s.Name())
+	ctx, activity, err := beginRunActivity(ctx, cfg, session, s)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +288,7 @@ func (s *SequentialAgent) Resume(ctx context.Context, sessionID string, opts ...
 		hooks = hook.NoOpHooks{}
 	}
 	info := &hook.AgentInfo{Name: s.Name(), Type: "sequential", Round: 0}
-	prep, newCtx, err := commonResumePrep(ctx, "sequential agent", s.Name(), sessionID, opts, info, hooks, s.historySubs())
+	prep, newCtx, err := commonResumePrep(ctx, "sequential agent", s, sessionID, opts, info, hooks, s.historySubs())
 	if err != nil {
 		return nil, err
 	}

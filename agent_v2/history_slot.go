@@ -782,8 +782,12 @@ func CloseAbandonedTaskHistory(ctx context.Context, destination TaskHistoryDesti
 	return store.Append(ctx, key, closers)
 }
 
-// beginRunActivity 登记本次执行和要放弃的任务，在建历史写入器和盖章之前校验新任务的存档。
-func beginRunActivity(ctx context.Context, tasks []abandonedTask, session *RunSession, agentName string) (context.Context, *runActivity, error) {
+// beginRunActivity 先校验本次调用的断点，再登记本次执行和要放弃的任务。
+func beginRunActivity(ctx context.Context, cfg runConfig, session *RunSession, ag Agent) (context.Context, *runActivity, error) {
+	if err := cfg.breakpoints.validate(ag); err != nil {
+		return ctx, nil, err
+	}
+	tasks, agentName := cfg.abandoned, ag.Name()
 	ids := make([]string, len(tasks))
 	for i, task := range tasks {
 		id := task.id

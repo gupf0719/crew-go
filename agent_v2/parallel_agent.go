@@ -221,7 +221,7 @@ func (p *ParallelAgent) Run(ctx context.Context, session *RunSession, input *sch
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, p.Name())
+	ctx, activity, err := beginRunActivity(ctx, cfg, session, p)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +311,7 @@ func (p *ParallelAgent) Resume(ctx context.Context, sessionID string, opts ...Re
 	// 概念 (区别于 BasicAgent.ReAct 循环 / SequentialAgent.step / LoopAgent.iteration).
 	// info.Round 保持 0 是 by-design — 业务想看 fanout branch 数走 crew.fanout.branches.
 	info := &hook.AgentInfo{Name: p.Name(), Type: "parallel", Round: 0}
-	prep, newCtx, err := commonResumePrep(ctx, "parallel agent", p.Name(), sessionID, opts, info, hooks, p.historySubs())
+	prep, newCtx, err := commonResumePrep(ctx, "parallel agent", p, sessionID, opts, info, hooks, p.historySubs())
 	if err != nil {
 		return nil, err
 	}

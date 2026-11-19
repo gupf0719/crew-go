@@ -229,7 +229,7 @@ func (r *ReflectAgent) Run(ctx context.Context, session *RunSession, input *sche
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, r.Name())
+	ctx, activity, err := beginRunActivity(ctx, cfg, session, r)
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +314,7 @@ func (r *ReflectAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 		hooks = hook.NoOpHooks{}
 	}
 	info := &hook.AgentInfo{Name: r.Name(), Type: "reflect", Round: 0}
-	prep, newCtx, err := commonResumePrep(ctx, "reflect agent", r.Name(), sessionID, opts, info, hooks, r.historySubs())
+	prep, newCtx, err := commonResumePrep(ctx, "reflect agent", r, sessionID, opts, info, hooks, r.historySubs())
 	if err != nil {
 		return nil, err
 	}

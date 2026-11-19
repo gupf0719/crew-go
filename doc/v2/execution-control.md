@@ -8,7 +8,7 @@
 
 | 能力 | 入口 | 一句话 | 跑一个 |
 |---|---|---|---|
-| 声明式断点 | `GraphBuilder.WithInterruptBefore/After`、RunOption `compose_v2.WithInterruptBefore/After`、GraphAgent `WithGraphInterruptBefore/After`；`compose_v2.AllNodes` 通配 | 跑到某个节点之前 / 之后停下，不改节点代码；续跑就是放行 | `example/harness/execution_control_smoke` ① |
+| 声明式断点 | `GraphBuilder.WithInterruptBefore/After`、`compose_v2.WithInterruptBefore/After`、GraphAgent 构造或调用选项；`compose_v2.AllNodes` 通配 | 在命中节点所在的超步前后停下，续跑放行这个边界 | [断点用法](#11-用法) |
 | 节点超时 | `compose_v2.WithNodeTimeout(d)`、`WithNodeIdleTimeout(d)`（子图节点经 `WithSubgraphNodeOptions`） | 每次尝试可同时限制总耗时和连续无进度时长，失败为 `*NodeTimeoutError` | [节点超时回归](../../compose_v2/node_idle_timeout_test.go) |
 | 节点级重试 | `compose_v2.WithNodeRetry(cfg)` | 节点失败后在同一超步里原地重试；记进节点私有态的步骤与 `RunSubAgent` 已完成的调用不重做，节点体里其余的副作用照常重放 | 同上 |
 | 审批只读放行 | `agent_v2.WithApprovalMode(agent_v2.ApprovalAskWrites)`；只读声明 `tool.WithReadOnly()` / `tool.ReadOnlyDeclarer`；MCP `mcp.WithTrustedClient` | 只读工具直接执行，其余执行前问人；审批方式自动写进系统提示 | ② |
@@ -26,18 +26,25 @@ b := compose_v2.NewBuilder().WithName("pipeline").WithInterruptBefore("deploy")
 // 运行期：只这一次 Run、只这一层图，跟编译期的取并集
 err := compose_v2.Run(ctx, g, cm, compose_v2.WithInterruptAfter(compose_v2.AllNodes))
 
-// GraphAgent：构造时给，Run 与每次 Resume 都带上
+// GraphAgent 构造期断点在 Run 和每次 Resume 生效。
 ga := agent_v2.NewGraphAgent(g, agent_v2.WithGraphAgentName("pipeline"),
     agent_v2.WithGraphInputWriter(writeIn), agent_v2.WithGraphOutputReader(readOut),
-    agent_v2.WithGraphInterruptBefore(compose_v2.AllNodes)) // 逐步执行
+    agent_v2.WithGraphInterruptBefore("deploy"))
 ```
 
-节点名必须是这张图的节点（或 `AllNodes`）：编译期写错 `Compile` 报错，运行期写错 `Run` 入口报错（不重试、不碰
-存档），GraphAgent 写错构造期 panic。节点不能叫 `"*"`（那是通配）。
+临时诊断时，给 `GraphAgent.Run` 传 `agent_v2.WithRunInterruptBefore` 或 `WithRunInterruptAfter`，给
+`GraphAgent.Resume` 传 `WithResumeInterruptBefore` 或 `WithResumeInterruptAfter`。同一次调用的声明取并集，
+并与编译期和 GraphAgent 构造期的断点一起判定。调用级列表只对本次生效，挂起档记录命中位置和中断 ID。
+下一次 Resume 省略这些选项时，后续边界只按编译期和构造期的断点判定。
+要逐步执行，可在每次调用传 `compose_v2.AllNodes` 作为相应选项的节点列表。
 
-GraphAgent 配了断点（它自己的，或者图编译期声明的）时 ctx 上必须有 checkpointer：停在断点上只能经 Resume 续，Resume
-要存档；没有存档时这个任务每次都停在第一个断点、永远过不去。Run 入口就报错（不可重试，一个节点都不执行）。直接调
-`compose_v2.Run` 的顶层调用方没有 checkpointer 也能用断点，自己留快照续跑（§1.3）。
+节点名必须属于当前图，另可用 `compose_v2.AllNodes` 通配。编译期错误由 `Compile` 返回，GraphAgent 构造期错误会 panic。
+运行期节点写错时返回不可重试错误，GraphAgent 在登记任务或放弃旧任务前完成这项校验。
+其他内置编排会拒绝带节点列表的调用级断点选项。
+
+GraphAgent 使用断点时需要启用 checkpointer。引擎在执行节点前核对生效的存档配置与 RunID，
+断点命中后按该任务续跑。
+直接调用顶层 `compose_v2.Run` 时，也可保留快照后自行续跑（§1.3）。
 
 ### 1.2 停在哪
 
@@ -93,7 +100,7 @@ InterruptID 由任务代号、ns、边界上的成员（实例身份与访问次
 停下时算一次，随挂起清单进存档，续跑不重算。
 [AG-UI](agui.md#声明式断点) 在 `RUN_FINISHED` 的中断项 metadata 中提供位置，
 [A2A](a2a.md#声明式断点) 在 `input-required` 的 `crew.pending` 项中提供位置。
-两个协议都用任务当前的 InterruptID 绑定继续动作，图从该边界放行。
+两个协议都用任务当前的 InterruptID 绑定继续动作。临时断点列表由 Go 调用方通过 Run 或 Resume 选项提供。
 
 ### 1.5 嵌套
 
@@ -101,8 +108,8 @@ InterruptID 由任务代号、ns、边界上的成员（实例身份与访问次
   在父图里生效；停下时中断照常冒到最外层，最外层续跑放行。
 - 嵌在别的节点里、又没有 checkpointer 的图停在断点上**报错而不是停**：没有存档可续，续跑会从头再跑那张图、停在同一个
   断点，永远过不去（节点副作用每续一次重放一次）。给整棵图配上 checkpointer，或把断点设在顶层图上。
-- GraphAgent 的断点只作用于这张图自己的节点；节点里调起的 agent 不受影响。其余编排（Sequential / Routing / …）不暴露
-  断点——它们的内部节点名不是 API。
+- GraphAgent 的断点只作用于当前图。节点经 `agent_v2.RunSubAgent` 调用 GraphAgent 时可给被调方显式传
+  `WithRunInterruptBefore` 或 `WithRunInterruptAfter`。子档继续使用所在 namespace，已完成调用按原记录重放。
 
 ### 1.6 它不是什么
 
@@ -342,7 +349,7 @@ ag := agent_v2.NewBasicAgent(agent_v2.WithName("support"), agent_v2.WithModel(m)
 | 续跑不重复停 | 只判新算出的边界；恢复出来的边界按 `FrontierStarted` + 是否停在断点上分三种 | 存档里存的是算好的下一批成员，恢复即放行是结构性的；只有「还没开始执行、也不是停在断点上」的边界才需要按这次 Run 的配置重判（运行期断点每次 Run 可以不同） | 持久化「已放行」的边界 ID（部分失败续跑时 frontier 被收窄、ID 对不上）；按档位 `Status` 推断（Status 只是报告位） |
 | 断点与软取消等同一边界的停止 | 断点先判 | after 断点只在超步刚提交那一刻判，别的停止先落档的话续跑时不再判 after、它就被越过；before 会重判，但要多停一次、而且那一次停下的不是断点挂起 | — |
 | 编译期 vs 运行期断点 | 取并集 | 编译期的是图的一部分（闸门），不该被一次调用关掉；运行期的是调试时加的 | 运行期整体替换编译期 |
-| 没有 checkpointer 的断点 | 嵌套图停下时报错；GraphAgent 在 Run 入口报错；直接调 `compose_v2.Run` 的顶层不限（调用方自己留快照续） | 停下之后无档可续：嵌套图续跑必然活锁，GraphAgent 的 Resume 必然失败、重跑又停在第一个断点 | 照停（活锁 / 永远停在第一个断点）、静默忽略（接受了却不生效） |
+| 没有 checkpointer 的断点 | 嵌套图停下时报错，GraphAgent 在节点执行前拒绝。直接调 `compose_v2.Run` 的顶层调用方可自己保留快照 | GraphAgent 的续跑依赖挂起档，嵌套图也需要定位到原边界 | 照停（续跑后仍停在原边界），忽略断点 |
 | 节点超时 | 协作式：取消 ctx、等返回、失效可见、迟到成功丢弃 | Go 不能安全中止 goroutine；放弃等待会让副作用与存档写发生在无人能拦的时刻，还要给每个写入口加栅栏 | 超时后放弃 goroutine、靠栅栏挡迟到写 |
 | 超时错误的形状 | `*NodeTimeoutError`，不在链上露出 `DeadlineExceeded` | 节点超时是一次执行失败，不是调用方 ctx 到期；露出来会被出口判成挂起（存档标「等续跑」而不是失败现场） | 直接返回 `ctx.Err()` 的包装 |
 | 节点重试 | 节点体外套 `RunWithRetry`，每次尝试一个投递收集器 | 复用已有的「同一次调用」语义（编号退回、账本分层、信号按尝试收、嵌套图续跑）；投递收集器不分开的话失败尝试的投递会漏进结果 | 在节点里手写循环（编号不退回，答过的问题重问） |

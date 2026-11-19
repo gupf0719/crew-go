@@ -74,8 +74,9 @@ type runOptions struct {
 
 	// interruptBefore / interruptAfter 见 WithInterruptBefore / WithInterruptAfter：运行期断点，只本次
 	// Run、只本层图，与图上编译期声明的取并集。
-	interruptBefore []NodeID
-	interruptAfter  []NodeID
+	interruptBefore         []NodeID
+	interruptAfter          []NodeID
+	checkpointedBreakpoints bool
 }
 
 // withImportOverlay 是**两条路径都生效**的 baseline：新开与续跑都在 `OnGraphStart` 之前、
@@ -641,11 +642,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		opt(cfg)
 	}
 	// 运行期断点的节点名在这里校验——此刻一个字节都还没动，报错不碰存档（见 errInvalidBreakpoint）
-	if err := checkBreakpointNodes(g.nodes, "before", cfg.interruptBefore); err != nil {
-		return &errInvalidBreakpoint{msg: "compose_v2.WithInterruptBefore: " + err.Error()}
-	}
-	if err := checkBreakpointNodes(g.nodes, "after", cfg.interruptAfter); err != nil {
-		return &errInvalidBreakpoint{msg: "compose_v2.WithInterruptAfter: " + err.Error()}
+	if err := g.ValidateBreakpointNodes(cfg.interruptBefore, cfg.interruptAfter); err != nil {
+		return err
 	}
 	breakBefore := g.breakBefore.with(cfg.interruptBefore)
 	breakAfter := g.breakAfter.with(cfg.interruptAfter)
@@ -681,7 +679,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	//
 	// graphNS 同批回落：不回落的话「ctx push 了 ns + 裸 Run」会让根档落在 ""、子档落在
 	// `ctxNS/...`——根不是子的 ns 祖先，树自身错位。
-	if checkpointingDisabled(ctx) {
+	if IsCheckpointingDisabled(ctx) {
 		cfg.checkpointer = nil
 	} else if binding, ok := boundCheckpointerFrom(ctx); ok {
 		cfg.checkpointer = binding.cp
@@ -690,6 +688,10 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	}
 	if cfg.sessionID == "" {
 		cfg.sessionID = GetSessionID(ctx)
+	}
+	if cfg.checkpointedBreakpoints && (!breakBefore.empty() || !breakAfter.empty()) &&
+		(cfg.checkpointer == nil || cfg.sessionID == "") {
+		return &errInvalidBreakpoint{msg: "breakpoints require an active checkpointer and session ID"}
 	}
 	detachedSID = cfg.sessionID
 	if cfg.graphNS == "" {

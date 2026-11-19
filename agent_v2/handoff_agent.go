@@ -264,7 +264,7 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 		return nil, err
 	}
 	// 放弃任务的声明在建写入器、盖任务章之前校验：拒绝时什么都还没做
-	ctx, activity, err := beginRunActivity(ctx, cfg.abandoned, session, h.Name())
+	ctx, activity, err := beginRunActivity(ctx, cfg, session, h)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +349,7 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 		hooks = hook.NoOpHooks{}
 	}
 	info := &hook.AgentInfo{Name: h.Name(), Type: "handoff", Round: 0}
-	prep, newCtx, err := commonResumePrep(ctx, "handoff agent", h.Name(), sessionID, opts, info, hooks, h.historySubs())
+	prep, newCtx, err := commonResumePrep(ctx, "handoff agent", h, sessionID, opts, info, hooks, h.historySubs())
 	if err != nil {
 		return nil, err
 	}

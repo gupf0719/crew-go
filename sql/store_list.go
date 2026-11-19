@@ -45,8 +45,11 @@ func (s *Store) ListNamespaces(ctx context.Context, opts ...store.ListOption) ([
 			return nil, err
 		}
 		nsCond, nsArgs := nsExactOrDescendantSQL(s.dialect, cfg.Prefix, 1)
-		where = " WHERE " + nsCond
+		where = nsCond
 		args = nsArgs
+	}
+	if where = s.withLiveRows(where); where != "" {
+		where = " WHERE " + where
 	}
 
 	if cfg.MaxDepth > 0 {

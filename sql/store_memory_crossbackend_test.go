@@ -3,10 +3,12 @@ package sql_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
 	"crew-go/agent_v2"
+	"crew-go/compose_v2"
 	"crew-go/model"
 	"crew-go/schema"
 	agentSQL "crew-go/sql"
@@ -118,5 +120,68 @@ func TestStoreMemory_InjectionIsIdenticalAcrossBackends(t *testing.T) {
 	// 正向断言：注入的确实是那条记忆，不是空壳（否则「两边相同」在空内容上恒真）
 	if memInj[0].Content != seeded {
 		t.Errorf("注入内容应是写下的那条答复 %q，得到 %q", seeded, memInj[0].Content)
+	}
+}
+
+func TestSQLiteTTLStoreMemoryKeepsConversationHistory(t *testing.T) {
+	db := newSQLiteDB(t)
+	ctx := compose_v2.WithThreadIDCtx(t.Context(), "conversation")
+	st := newTTLTestStore(t, db, agentSQL.SQLite{}, agentSQL.DefaultStoreTable)
+	if err := st.Setup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	history := agentSQL.NewHistoryStore(db, agentSQL.SQLite{})
+	if err := history.Setup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const topic = "accounting"
+	const previous = topic + " 上一轮留在对话记录里的答复"
+	const permanent = topic + " 仍有效的长期记忆"
+	ns := store.NS("mem")
+	m := &echoModel{reply: previous}
+	ag := agent_v2.NewBasicAgent(
+		agent_v2.WithName("bot"), agent_v2.WithModel(m),
+		agent_v2.WithStore(st), agent_v2.WithStoreMemory(ns, nil), agent_v2.WithHistory(history, "owner"),
+	)
+	if _, err := ag.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("第一轮")); err != nil {
+		t.Fatal(err)
+	}
+	items, err := st.Search(ctx, ns)
+	if err != nil || len(items) != 1 || items[0].Value != previous {
+		t.Fatalf("首轮应把真实答复写入长期记忆，得到 %v，err=%v", items, err)
+	}
+	item := items[0]
+	if err := st.Put(ctx, item.Namespace, item.Key, item.Value, store.WithTTL(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	ttlExec(t, db, "UPDATE crew_store SET expires_at_ms = -1 WHERE ns = ? AND data_key = ?",
+		item.Namespace.String(), item.Key)
+	if err := st.Put(ctx, store.NS("mem", "other"), "live", permanent); err != nil {
+		t.Fatal(err)
+	}
+
+	m.reply = "本轮已完成"
+	events, err := ag.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage(topic))
+	if err != nil || len(m.captured) != 2 {
+		t.Fatalf("第二轮应正常送模，调用次数 %d，err=%v", len(m.captured), err)
+	}
+	var historyCount, memoryCount int
+	for _, msg := range m.captured[1] {
+		injected, _ := msg.Annotations[agent_v2.StoreInjectedAnnotation].(bool)
+		switch msg.Content {
+		case previous:
+			if injected || msg.Role != schema.RoleAssistant {
+				t.Fatalf("已到期的记忆只能从会话记录读取，得到 %+v", msg)
+			}
+			historyCount++
+		case permanent:
+			if !injected {
+				t.Fatalf("仍有效的记忆应实际进入送模输入，得到 %+v", msg)
+			}
+			memoryCount++
+		}
+	}
+	if final := agent_v2.FinalMessage(events); historyCount != 1 || memoryCount != 1 || final == nil || final.Content != m.reply {
+		t.Fatalf("应读到原始会话消息和仍有效的记忆，历史 %d，记忆 %d，最终消息 %+v", historyCount, memoryCount, final)
 	}
 }

@@ -51,7 +51,7 @@ func (s *Store) Search(ctx context.Context, namespacePrefix store.Namespace, opt
 	}
 	args = append(args, filterArgs...)
 
-	where := nsCond
+	where := s.withLiveRows(nsCond)
 	if filterCond != "" {
 		where += " AND " + filterCond
 	}
@@ -64,7 +64,7 @@ func (s *Store) Search(ctx context.Context, namespacePrefix store.Namespace, opt
 	//   - 同 `updated_at` 时回落 (ns, data_key)。业务若用秒级 `TIMESTAMP` 列（不调
 	//     Setup 自建表时可能如此），一次突发写入会全落进同一秒 ⟹ 退化成字典序。
 	//     框架自带 DDL 用 TIMESTAMPTZ / TIMESTAMP(6)，不受影响。
-	//   - **`updated_at` 上没有索引**（Setup 只建 (ns)）。数据量大时这条 ORDER BY 会
+	//   - **`updated_at` 上没有索引**。数据量大时这条 ORDER BY 会
 	//     走排序而不是索引扫描。
 	q := fmt.Sprintf(
 		`SELECT ns, data_key, value, created_at, updated_at FROM %s WHERE %s ORDER BY updated_at DESC, ns, data_key LIMIT %d OFFSET %d`,

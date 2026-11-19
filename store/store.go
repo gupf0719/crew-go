@@ -232,7 +232,8 @@ type Store interface {
 //	    // 走 WithTTL 路径
 //	}
 //
-// InMemoryStore + SQL 后端不实现 TTLAware（返 ErrTTLNotSupported，SQL 待 Phase 2 加 expires_at 列）；Redis 后端实现并返 true。
+// Redis Store 和通过 sql.NewTTLStore 构造的 SQL Store 实现并返回 true。
+// InMemoryStore 和 sql.NewStore 构造的普通 SQL Store 通过 ErrTTLNotSupported 报告不支持。
 type TTLAware interface {
 	SupportsTTL() bool
 }

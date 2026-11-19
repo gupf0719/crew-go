@@ -123,7 +123,7 @@ func (s *InMemoryStore) Put(ctx context.Context, namespace Namespace, key string
 		opt(&cfg)
 	}
 	if cfg.ttl != 0 {
-		// InMemoryStore 不实现 TTLAware；业务想用 TTL 用 Redis 后端（sql/PG 暂不支持，待 Phase 2）。
+		// InMemoryStore 不实现 TTLAware，调用方可按后端能力选择支持 TTL 的 Store。
 		return ErrTTLNotSupported
 	}
 	// 存的是值的 JSON 形状（见 NormalizeValue），跟持久后端读回的一样；编不成 JSON 的值在这里报错

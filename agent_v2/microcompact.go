@@ -92,10 +92,7 @@ type MicroCompactConfig struct {
 	// 全局共享 (audit HIGH-B2 + LOW-A3 fix: 之前默认全局 NS 跨 sess 同 callID 撞 key,
 	// 业务自定义 tool ID 测试场景 silent 覆盖前 sess 内容).
 	//
-	// **业务自管 cleanup 责任**: store offload data 不走 cp.DeleteSubtree 自动清,
-	// 业务可走以下任一路径管 lifecycle:
-	//   - 用 TTL-aware 后端 (Redis EXPIRE / mem0 内置 TTL), store.Put 加
-	//     store.WithTTL(d) 让 backend 自动过期
+	// 框架按永久条目卸载。Checkpointer 清理只处理存档，应用负责清理 Store：
 	//   - cron sweeper: 业务定期 store.Search(NS("_micro_offload"))+逐个 Delete
 	//   - per-sid Run 完成时业务调 store.Search(NS("_micro_offload", sid)) 逐个删
 	//   - 业务 backend (mem0 / Pinecone) 走自己的清理 API

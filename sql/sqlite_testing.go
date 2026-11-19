@@ -36,10 +36,10 @@ var sqliteDBSeq atomic.Uint64
 //
 // # ⚠️ 它覆盖什么、不覆盖什么
 //
-// **覆盖**：跨方言共有的语义契约。本模块的 SQL 主体是**同一份字符串**，只有占位符
-// 与 filter 的 JSONField* 片段经 dialect 渲染——ns 子树匹配、UPSERT 幂等、round-trip、批量，
+// **覆盖**：跨方言共有的语义契约。核心查询共享 SQL 主体，方言提供占位符、
+// filter 的 JSONField* 片段和 TTL 时钟。ns 子树匹配、UPSERT 幂等、round-trip、批量，
 // 以及 filter 语义（三个 JSONField* 方法按 conformance 逐格与另两个方言对齐）都在此列。
-// TTL 只覆盖**拒绝路径**（不支持 → 返 `ErrTTLNotSupported`），过期那条子测试是 SKIP。
+// 普通 Store 验证拒绝 TTL 的路径，经 [NewTTLStore] 构造的 Store 验证实际过期。
 //
 // **不覆盖**：方言私有部分——PG 的 JSONB 存储与 planner 行为（`JSONFieldNumericCompare`
 // 的守卫为什么必须是 CASE 只有真 PG 能证明）、MySQL 的 JSON 类型优先级与主键 3072 字节

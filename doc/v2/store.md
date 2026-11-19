@@ -269,7 +269,7 @@ type Store interface {
 //       // 走 WithTTL 路径
 //   }
 //
-// InMemoryStore + SQL 后端不实现 TTLAware；Redis 后端实现并返 true。
+// Redis Store 与 sql.NewTTLStore 返回的 Store 实现 TTLAware。
 type TTLAware interface {
     SupportsTTL() bool
 }
@@ -286,8 +286,9 @@ func NewInMemoryStore() *InMemoryStore
 
 // crew-go/sql.NewStore (Stage 2 已落地)
 //   NewStore(db *sql.DB, dialect Dialect, opts ...StoreOption) *sql.Store
-//   // PG + MySQL via Dialect, 业务自管 driver + 连接池
-//   // 不实现 TTLAware (PoC 不做 expires_at 列)
+//   // 普通 SQL Store，由应用管理 driver 和连接池。
+//   NewTTLStore(db *sql.DB, dialect Dialect, opts ...StoreOption) (*sql.TTLStore, error)
+//   // PostgreSQL、MySQL、SQLite 可选到期模式，见 §3.4.2。
 
 // crew-go/redis.NewStore (Stage 2.5 已落地)
 //   NewStore(rdb *redis.Client, opts ...StoreOption) *redis.Store
@@ -305,7 +306,7 @@ func NewInMemoryStore() *InMemoryStore
 业务"SDK 自选 backend"承诺 — 三 backend 都过 conformance, 但部分 capability 是
 backend opt-in. 业务跨 backend 切换前**必查**此矩阵:
 
-| Capability | InMem | sql (PG/MySQL) | redis |
+| Capability | InMem | sql (PostgreSQL/MySQL/SQLite) | redis |
 |---|---|---|---|
 | Get / Put / Delete 基础 KV | ✅ | ✅ | ✅ |
 | Search 6 比较 op (`$eq/$ne/$gt/$gte/$lt/$lte`) | ✅ | ✅ | ✅ |
@@ -321,7 +322,7 @@ backend opt-in. 业务跨 backend 切换前**必查**此矩阵:
 | ListNamespaces **WithListSuffix** | ✅ | ❌ (`ErrUnsupportedFilterOp`) | ✅ |
 | ListNamespaces WithListMaxDepth | ✅ | ✅ | ✅ |
 | Batch (per-Op error 隔离 best-effort) | ✅ | ✅ | ✅ |
-| **TTLAware** (`WithTTL` + 自动 EXPIRE) | ❌ | ❌ (PoC 不做 expires_at) | ✅ (Redis EXPIRE) |
+| **TTLAware** (`WithTTL`) | ❌ | ✅（`NewTTLStore`） | ✅（Redis 原生期限） |
 | filter value 含 `json.Number`（业务 `json.Decoder.UseNumber()` 路径） | ✅ | ✅（`numericArg` 先按 int64 绑参保精度、再退 float64；2026-09-04 起） | ✅ |
 | 跨进程 wire (`MarshalCheckpoint` round-trip) | ✅ (单进程) | ✅ | ✅ |
 | 持久化 (重启不丢) | ❌ (进程内存) | ✅ (disk fsync) | ⚠️ (业务必配 `appendonly yes`) |
@@ -336,11 +337,35 @@ backend opt-in. 业务跨 backend 切换前**必查**此矩阵:
   用 VARBINARY. 漏了的话 MySQL 上逐字节不同的 namespace / key / 会话落进同一行 (`utf8mb4_bin`
   忽略尾随空格, 默认的 `utf8mb4_0900_ai_ci` 还不区分大小写和重音; 互相覆盖、删一个带走另一个),
   PG 上 ListNamespaces 的次序与分页窗口跟着库的排序规则变, 都 err == nil.
-- **TTL**: 业务 `WithTTL` 在 InMem/sql 返 `ErrTTLNotSupported`, redis 走 EXPIRE.
-  业务用 `if ta, ok := st.(store.TTLAware); ok && ta.SupportsTTL()` 显式判断
-  跨 backend 兼容.
+- **TTL**。通过 `store.TTLAware` 检查后端能力。普通 SQL Store 和 InMemoryStore 对正时长返回
+  `ErrTTLNotSupported`。SQL 到期模式的读写和清扫见下一节。
 - **持久化**: Redis 默认 `appendonly no` 业务 crash 丢 1h cp. 必读 `redis/doc.go`
   "Redis 持久化配置" 章节.
+
+### 3.4.2 SQL Store TTL
+
+在 PostgreSQL、MySQL 或 SQLite 上用 `NewTTLStore` 按表启用过期。可传 `WithStoreTable` 选择表名。
+调用 `Setup` 建表或升级已有表。迁移增加可空的 `expires_at_ms BIGINT` 和过期索引，迁移前的行默认永久。
+启用前把该表的读写入口统一切换到 TTL Store。应用自管 schema 时须提供可写、可空且默认 NULL 的同名列。
+
+```go
+st, err := crewsql.NewTTLStore(db, crewsql.Postgres{})
+if err != nil {
+    return err
+}
+if err := st.Setup(ctx); err != nil {
+    return err
+}
+return st.Put(ctx, store.NS("tenant", "draft"), "draft-1", "draft", store.WithTTL(20*time.Minute))
+```
+
+- **期限**。正时长向上取整为毫秒。缺省、零值或负时长表示永久。每次 Put 重设期限，覆盖存活条目保留首次创建时间，重写已到期键开始新的生命周期。
+- **可见性**。数据库时间达到期限即隐藏。Get 返回 `(nil, nil)`，Search 将到期条件与查询过滤一起下推，再排序分页。ListNamespaces 只从至少有一个存活项的命名空间枚举，再做深度截断、去重和分页。Batch 沿用各操作的语义。
+- **保留和清扫**。到期行保留到显式删除、覆盖或 `SweepExpired(ctx)` 清扫。清扫用一条带期限条件的 DELETE，返回实际删除的行数，调度频率由调用方决定。HistoryStore 和 Checkpointer 各自管理留存。
+- **时钟**。期限和可见性都用数据库语句的 UTC Unix 毫秒。PostgreSQL 使用 `statement_timestamp()`，MySQL 从 `UTC_TIMESTAMP(6)` 计算，SQLite 使用日期函数的 `now`。会话时区不参与比较。语句开始后的执行或锁等待会消耗已开始计量的期限。创建和更新时间沿用普通 SQL Store 的应用侧 UTC 时钟。
+  [PostgreSQL 时间函数](https://www.postgresql.org/docs/current/functions-datetime.html) ·
+  [MySQL 时间函数](https://dev.mysql.com/doc/refman/8.4/en/date-and-time-functions.html) ·
+  [SQLite 时间函数](https://www.sqlite.org/lang_datefunc.html)
 
 ### 3.5 sentinel error 速查表
 
@@ -826,7 +851,7 @@ type InMemoryStore struct {
 ### PoC **不**包含（后续版本按需补）
 
 - ✅ **后续已补**：语义搜索 seam（`store.Embedder` + `IndexConfig`，`InMemoryStore` 配 `WithIndex` 后真做余弦 + max pooling）。框架只做 seam 不绑供应商；接 mem0 / 向量库当后端仍是另一条独立的路
-- ✅ **后续已补** TTL：`redis/` Store 实现（Redis 原生 `EXPIRE`）；`InMemoryStore` + `sql/` 不实现 `TTLAware`、`WithTTL` 返 `ErrTTLNotSupported`（SQL 待 Phase 2 加 `expires_at` 列）
+- ✅ **后续已补** TTL：Redis Store 使用原生期限，SQL 可用 [NewTTLStore](#342-sql-store-ttl) 按表启用期限和显式清扫。
 - ✅ **后续已补** 生产后端：`redis/`（Store + Checkpointer）+ `sql/`（PG + MySQL，Store + Checkpointer）独立 module 已落地（conformance + 测试过）；`Mem0Store` 仍业务自 wrap（mem0 SDK 实现 `store.Store` 接口）
 - ❌ async 双版本接口（Go 用 goroutine 调即可，不需要 sync/async 双套）
 - ❌ Batch 原子事务（best-effort 是所有后端唯一合法的语义，2026-09-07 `d6d06312` 定；Store 契约不提供事务；需要原子性只能绕开 Store 直接操作底层数据库）

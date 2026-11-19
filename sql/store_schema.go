@@ -6,9 +6,10 @@ import (
 	"fmt"
 )
 
-// Setup 创建 Store 表 + 索引.
+// Setup 创建 Store 表和索引。经 [NewTTLStore] 构造时，也会为已有表增加可空的
+// expires_at_ms 列和过期索引，已有记录默认永久。TTL 迁移可重跑。
 //
-// **业务部署模式 (重要 — audit iter-5 视角 2/4 H1+H7)**:
+// **普通 Store 的建表模式**:
 //
 //   - **PG**: 用 `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS` —
 //     **幂等**, 多 pod 并发跑 OK.
@@ -28,7 +29,8 @@ import (
 //	if err := store.Setup(ctx); err != nil { ... }
 //
 // **业务自管**: 表名通过 NewStore option WithStoreTable 配置; column 名固定
-// (ns / data_key / value / created_at / updated_at); 业务想自管 schema (e.g.,
+// (ns / data_key / value / created_at / updated_at，TTL 模式另需可写且默认 NULL 的 BIGINT
+// expires_at_ms); 业务想自管 schema (e.g.,
 // 加自己的索引 / 列) 可以**不调 Setup** 自己 CREATE TABLE — 仅需保证列名 + PK
 // 一致 (`PRIMARY KEY (ns, data_key)` 必建, 否则 UPSERT silent INSERT 重复行), 且
 // **ns / data_key 按字节比较与排序**: PG 声明 `COLLATE "C"`, MySQL 用 VARBINARY, SQLite
@@ -36,12 +38,14 @@ import (
 // 尾随空格, 默认的 utf8mb4_0900_ai_ci 还不区分大小写和重音——PG 上 ListNamespaces 的次序随库
 // 的排序规则变 (理由见下面各方言的建表注释).
 //
-// **业务自定义 dialect** (e.g., CockroachDB / TiDB) 业务自管 schema, Setup() 仅
-// 支持 PostgresDialect / MySQLDialect.
+// 业务自定义 dialect 自管 schema。Setup 支持内置 PostgreSQL、MySQL 和 SQLite 方言。
 func (s *Store) Setup(ctx context.Context) error {
 	migrations, err := s.storeMigrations()
 	if err != nil {
 		return err
+	}
+	if s.ttlClock != "" {
+		return s.setupTTL(ctx, migrations[0])
 	}
 	for i, m := range migrations {
 		if _, err := s.db.ExecContext(ctx, m); err != nil {

@@ -3,6 +3,7 @@ package sql_test
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"regexp"
 	"testing"
 	"time"
@@ -170,8 +171,8 @@ func TestStore_Put_WithTTL_Returns_ErrTTLNotSupported(t *testing.T) {
 	st := agentSQL.NewStore(db, agentSQL.Postgres{})
 
 	err := st.Put(context.Background(), store.NS("a"), "k", "v", store.WithTTL(5*time.Minute))
-	if err == nil {
-		t.Error("Put + WithTTL should return ErrTTLNotSupported")
+	if !errors.Is(err, store.ErrTTLNotSupported) {
+		t.Errorf("普通 SQL Store 应返回 ErrTTLNotSupported，得到 %v", err)
 	}
 }
 

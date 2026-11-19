@@ -1,10 +1,10 @@
 # 项目待办
 
-2026-11-19 以 `origin/test` 的 `dfdf48e` 为基线。终局扇出、持久续跑准入、跨分区清档、剩余六项缺陷及 C01–C07 已合入。2026-11-18 核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
+2026-11-19 以 `origin/test` 的 `67ac5b8` 为基线。终局扇出、持久续跑准入、跨分区清档、剩余六项缺陷及 C01–C08 已合入。2026-11-18 核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **52 项**。P1 **0**、P2 **4**、P3 **48**。缺陷 **0**、能力缺口 **10**、待决 **26**、验收 **16**。
+共 **51 项**。P1 **0**、P2 **4**、P3 **47**。缺陷 **0**、能力缺口 **9**、待决 **26**、验收 **16**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -26,7 +26,6 @@
 
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
-| C09 | 能力缺口 | SQL Store 可选 TTL | 已有清理流程和显式删除。定义到期后的读取、命名空间枚举、历史保留和跨方言时钟行为。历史 TODO 358。 |
 | C10 | 能力缺口 | Handoff 确定性退回和缺 transfer 的诊断 | 阶段 3 是可选拓扑，忘装 transfer 的软提示需能区分合法终点。两条分别验收。历史 TODO 359、518。 [Handoff](../v2/handoff.md) |
 | C11 | 能力缺口 | Skill 递归发现、热更新与产品化选项 | 结合实际场景选递归发现、重载、按需工具激活上限、技能编排和可选分发方式。既有资源分层、解析、Go Action 与调用预算已经实现。 [Skill](../v2/skill.md) · [历史备选项](../description/three-way-comparison/skill-system.md) |
 | C12 | 能力缺口 | 用户授权后的历史查询与摘要后 notes | 明确键空间、可读用户和检索结果来源，保留现有存储或消息投影的访问约束。历史 TODO 406、415。 |
@@ -76,6 +75,8 @@
 | Q27 | 待决 | 持久化业务状态演进与按执行 namespace 查历史 | ISSUE-70 Phase 4 的通用状态迁移需要版本化调用方。SelfHistoryByNS 希望按执行 namespace 查写入记录，先核对执行位置能否成为历史身份。 [ISSUE-70](../issue/issue-70-checkpoint-evolution.md) |
 
 ## 已关闭及归并去向
+
+- **C09 已实现。** SQL Store 可按表启用 TTL，旧行保持永久。Get、Search、ListNamespaces 和 Batch 使用数据库时钟检查可见性，显式清扫只清当前 Store 表。 [用法](../v2/store.md#342-sql-store-ttl) · [跨层回归](../../sql/store_ttl_test.go)
 
 - **C08 已实现。** 支持按供应商返回的标签词元概率校准 LLM 路由置信度。跨层回归覆盖校准后的门槛判定、元数据缺失和普通 classifier 的接手。真实业务校准和接管门槛由 A03 验收。 [用法](../v2/route-decider.md#48-校准-llm-路由的置信度) · [跨层回归](../../decision/llm_route_decider_test.go)
 

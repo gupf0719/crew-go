@@ -22,9 +22,8 @@ import (
 //
 // **覆盖**：跨方言共有的语义契约——ns 子树匹配、UPSERT 幂等、round-trip、
 // 批量、并发、filter 语义（三个 JSONField* 方法的行为按 conformance 逐格与另两个方言
-// 对齐）。SQL 主体在本模块是**同一份字符串**，只有占位符与 JSONField* 片段经 dialect
-// 渲染。TTL 只覆盖**拒绝路径**（不支持 → 返 `ErrTTLNotSupported`）——sql 后端不支持
-// TTL，过期那条子测试在这里是 SKIP。
+// 对齐）。核心查询在本模块共享，占位符与 JSONField* 片段经 dialect 渲染。
+// 普通 Store 与 [TTLStore] 分开运行 conformance，分别覆盖拒绝和实际过期路径。
 //
 // **不覆盖**：方言私有部分——PG 的 JSONB 存储与 planner 行为、MySQL 的 JSON 类型
 // 优先级、两者各自的锁与并发语义、类型精度。想覆盖那些只能连真库。

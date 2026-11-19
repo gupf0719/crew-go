@@ -27,7 +27,7 @@
 | **layer 数据模型** | 单层 KV（业务任意 JSON value） | 单层 KV（dict value）| byte blob | 4 层独立（session/kv/messages/compacted）|
 | **search 能力** | filter（MongoDB 风格子集）+ 预留语义 query | filter + 语义搜索（IndexConfig）| ❌ | ❌（按用途取 messages） |
 | **list_namespaces** | prefix/suffix/maxDepth | `match_conditions: tuple[MatchCondition]`（prefix/suffix `path` 内含通配符 `*`）+ `max_depth` | ❌ | ❌ |
-| **TTL** | 接口预留 `WithTTL` + `SupportsTTL`（PoC InMemoryStore 返错）| `TTLConfig` + `refresh_on_read` 三态 + 后端实现 | ❌ | ❌ |
+| **TTL** | Redis 原生期限，SQL 用 `NewTTLStore` 启用期限与显式清扫 | `TTLConfig` + `refresh_on_read` 三态 + 后端实现 | ❌ | ❌ |
 | **注入业务节点机制** | ctx 注入（`store.FromContext`）+ Agent `WithStore` option | node 函数：typed Protocol 匹配（`_runnable.py:206-244` 共 **6 个** `_RunnableWith*` Protocol 变体覆盖 store/writer/config 组合）；node 级 `Runtime` dataclass **6 字段**（[runtime.py:90,163-186](../../../langgraph/libs/langgraph/langgraph/runtime.py)：context/store/stream_writer/previous/execution_info/server_info）；tool 函数：`InjectedStore(InjectedToolArg)` 注 store + `InjectedState` 注 state + langchain_core 的 `InjectedToolCallId` 注 tool_call_id + `ToolRuntime`（[tool_node.py:1560-1628](../../../langgraph/libs/prebuilt/langgraph/prebuilt/tool_node.py) dataclass **9 字段一站式注入**=state/context/config/stream_writer/tools/tool_call_id/store/execution_info/server_info）；`compile(store=...)` 编译时挂载 | 不适用 | 业务直接持有 store 实例 |
 | **跟 Checkpointer 关系** | 并存，独立持久化层 | 并存，独立持久化层 | 仅 Checkpointer | 不含 cp 概念（只关心 session 产品语义）|
 | **value 序列化** | JSON 兼容 any（业务自负）| JSON 可序列化 dict | byte 流 | bytes |
@@ -239,9 +239,12 @@ LangGraph 每方法都有 sync/async 双版本（`get` + `aget` 等）。我们�
 
 ### 5. 无后台 TTL 清理 goroutine
 
-LangGraph PostgresStore 有 `sweep_interval_minutes` 定期清过期。我们**不用后台 sweep goroutine**——TTL 走后端原生能力。
+LangGraph PostgresStore 有 `sweep_interval_minutes` 定期清过期。crew-go 将 SQL 清扫调度交给调用方。
 
-**取舍合理性**：`redis/` Store 已实现 TTL（Redis 原生 `EXPIRE` 懒过期、无需 sweep，`redis/store.go::SupportsTTL` 返 true）；`InMemoryStore` + `sql/` Store 暂不支持（不实现 `TTLAware`，`WithTTL` 返 `ErrTTLNotSupported`；SQL 待 Phase 2 加 `expires_at` 列——未做，已进中心 backlog）。无 LangGraph 式定期 sweep——Redis 原生 EXPIRE 替代。
+**2026-11-19 更新**。Redis 沿用原生期限。参考 LangGraph 的期限列和显式清扫，以及同源项目的按表启用方式，
+crew-go 通过 `sql.NewTTLStore` 统一读写到期表。到期以数据库语句的 UTC Unix 毫秒判定。
+读取始终应用固定期限，写入更新期限，调用方决定清扫频率。
+会话历史和图存档由各自的后端管理。 [SQL Store TTL](../../v2/store.md#342-sql-store-ttl)
 
 ## filter 类型不匹配语义：报错还是不命中（2026-09-03 调研并拍板 ③，09-04 落地）
 

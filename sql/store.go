@@ -15,7 +15,8 @@ import (
 // option 改名.
 const DefaultStoreTable = "crew_store"
 
-// Store 是 store.Store 接口的 SQL 共享实现. 通过 Dialect 注入支持 PG/MySQL.
+// Store 是 store.Store 接口的 SQL 共享实现，通过 Dialect 支持 PostgreSQL、MySQL 和 SQLite。
+// 需要为条目设置过期时间时使用 [NewTTLStore]。
 //
 // **业务接入**:
 //
@@ -37,6 +38,8 @@ type Store struct {
 	db      *dbsql.DB
 	dialect Dialect
 	table   string
+	// ttlClock 是 [NewTTLStore] 选用的数据库 UTC Unix 毫秒表达式。
+	ttlClock string
 }
 
 // StoreOption 配置 Store 行为.
@@ -75,9 +78,10 @@ func (s *Store) Get(ctx context.Context, namespace store.Namespace, key string) 
 	}
 
 	ph := s.dialect.Placeholder
+	where := s.withLiveRows(fmt.Sprintf("ns = %s AND data_key = %s", ph(1), ph(2)))
 	q := fmt.Sprintf(
-		`SELECT value, created_at, updated_at FROM %s WHERE ns = %s AND data_key = %s`,
-		s.table, ph(1), ph(2),
+		`SELECT value, created_at, updated_at FROM %s WHERE %s`,
+		s.table, where,
 	)
 
 	var (
@@ -117,10 +121,8 @@ func (s *Store) Put(ctx context.Context, namespace store.Namespace, key string, 
 		return s.Delete(ctx, namespace, key)
 	}
 
-	// PoC: SQL backend 暂不支持 TTL (Phase 2 加 expires_at 列后再开启).
-	// 业务调 WithTTL 时返 ErrTTLNotSupported (跟 InMemoryStore 一致).
 	cfg := store.ParsePutOptions(opts...)
-	if cfg.TTL > 0 {
+	if cfg.TTL > 0 && s.ttlClock == "" {
 		return store.ErrTTLNotSupported
 	}
 
@@ -136,18 +138,25 @@ func (s *Store) Put(ctx context.Context, namespace store.Namespace, key string, 
 	}
 
 	now := time.Now().UTC()
-	ph := s.dialect.Placeholder
-	upsert := s.dialect.UpsertSuffix(
-		[]string{"ns", "data_key"},
-		[]string{"value", "updated_at"},
-	)
-
-	q := fmt.Sprintf(
-		`INSERT INTO %s (ns, data_key, value, created_at, updated_at) VALUES (%s, %s, %s, %s, %s) %s`,
-		s.table, ph(1), ph(2), ph(3), ph(4), ph(5), upsert,
-	)
-
-	if _, err := s.db.ExecContext(ctx, q, joinNS(namespace), key, bindJSON(valueJSON), now, now); err != nil {
+	args := []any{joinNS(namespace), key, bindJSON(valueJSON), now, now}
+	var q string
+	if s.ttlClock != "" {
+		q = s.ttlPutSQL()
+		var lifetime any
+		if cfg.TTL > 0 {
+			// 正时长按毫秒向上取整。先减一避免接近 Duration 上限时溢出。
+			lifetime = int64((cfg.TTL-1)/time.Millisecond) + 1
+		}
+		args = append(args, lifetime)
+	} else {
+		ph := s.dialect.Placeholder
+		upsert := s.dialect.UpsertSuffix([]string{"ns", "data_key"}, []string{"value", "updated_at"})
+		q = fmt.Sprintf(
+			`INSERT INTO %s (ns, data_key, value, created_at, updated_at) VALUES (%s, %s, %s, %s, %s) %s`,
+			s.table, ph(1), ph(2), ph(3), ph(4), ph(5), upsert,
+		)
+	}
+	if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
 		return fmt.Errorf("sql store put: %w", err)
 	}
 	return nil
@@ -170,13 +179,5 @@ func (s *Store) Delete(ctx context.Context, namespace store.Namespace, key strin
 	return nil
 }
 
-// **audit iter-4 视角 1 H2 修**: 不实现 `store.TTLAware` 接口 —
-// `store/conformance/ttl.go:22-25` contract 明示 "实现了 TTLAware 必须返 true,
-// false 没意义". sql.Store PoC 不支持 TTL → **不实现接口**, 业务 type-assert
-// `(store.TTLAware)` 返 (_, false) → conformance TTL 子测试走"不支持"路径 skip.
-// Phase 2 加 expires_at 列时再加 SupportsTTL() bool { return true } 方法.
-
 // 编译期 interface 实现检查.
 var _ store.Store = (*Store)(nil)
-
-// **不实现 store.TTLAware** — audit iter-4 视角 1 H2 修 (见上 SupportsTTL godoc).

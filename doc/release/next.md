@@ -67,6 +67,12 @@ CREATE TABLE IF NOT EXISTS crew_checkpoint_task_lease (
 
 已有 Checkpointer 数据库重跑 `Checkpointer.Setup`，创建任务租约表。存档表的身份列沿用 SQLite 默认的 `BINARY` 排序规则。
 
+### 启用 SQL Store TTL
+
+PostgreSQL、MySQL 和 SQLite 用 `sql.NewTTLStore` 按表启用。部署时先对此表运行 `Setup`，
+增加可空的 `expires_at_ms` 列和索引，旧行计为永久。随后统一切换该表的读写入口，再开始写带期限的条目。
+回退前确认需要保留与清扫的行，普通 SQL Store 会读取表中仍存在的行。 [SQL Store TTL](../v2/store.md#342-sql-store-ttl)
+
 ## 迁移现有 Redis 存档
 
 Redis Checkpointer 将任务 ID 编为独立的 base64url 键段，namespace 及三个枚举索引沿用原值。

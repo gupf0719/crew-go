@@ -35,6 +35,7 @@ import (
 // compose_v2.Ask 问用户）、调用方的 ctx 已结束、软取消、陈旧写回、存档不可续与
 // compose_v2.ErrRunAborted。它看的是调用方 ctx 的状态，不看错误链上有没有
 // context.DeadlineExceeded：决策服务自己的请求超时正是该升级的情形。
+// 普通档和影子档返回判断后，框架也会在采纳或升级前核对调用方 ctx。
 //
 // 决策方在 RoutingAgent 的 classify 节点里执行，所以可以调 compose_v2.Ask 做 HITL。
 // 每一档有自己的提问身份：不同档的提问不会共用一个答案位，哪怕 Resume 时前面某一档
@@ -639,7 +640,7 @@ func (r *RoutingAgent) decisionRouter(parentSession *RunSession) RoutingAgentRou
 			// 以失败收尾后重新调用时身份带上重试代数，见 routeStageMemo.Retry。身份里不必带
 			// 节点的访问序号：子命名空间、提问 ID、私有态键各自已经含它。
 			dctx := compose_v2.WithCurrentToolCallContext(WithoutHistoryCtx(ctx), deciderCallID(st.name, retry), 0)
-			dec, err := st.decide(dctx, req)
+			dec, err := callRouteDecider(dctx, st.decide, req)
 			if err != nil {
 				if compose_v2.MustPropagate(ctx, err) {
 					if _, interrupted := compose_v2.IsInterrupt(err); interrupted {
@@ -670,6 +671,9 @@ func (r *RoutingAgent) decisionRouter(parentSession *RunSession) RoutingAgentRou
 
 		if classify != nil {
 			out, err := classify(ctx, input, retry)
+			if err == nil {
+				err = ctx.Err()
+			}
 			if err != nil {
 				// 必须往上抛的错误（典型是 classifier 在问用户）不动进度：Resume 时要原样
 				// 重放前面各档，才走得回 classifier 去兑现那个提问。classifier 里几路都定了
@@ -792,7 +796,19 @@ func callShadowDecider(ctx context.Context, d RouteDecider, req RouteRequest) (d
 			err = panicerr.WrapOpaque("shadow decider panicked", pe)
 		}
 	}()
-	return d(ctx, req)
+	return callRouteDecider(ctx, d, req)
+}
+
+// callRouteDecider 在调用方仍可运行时调决策方，并在采纳或升级前再次核对取消。
+func callRouteDecider(ctx context.Context, d RouteDecider, req RouteRequest) (RouteDecision, error) {
+	if err := ctx.Err(); err != nil {
+		return RouteDecision{}, err
+	}
+	dec, err := d(ctx, req)
+	if err == nil {
+		err = ctx.Err()
+	}
+	return dec, err
 }
 
 // copyInput 给决策方一份输入的拷贝：结构体、Annotations、Metadata、ContentBlocks 及其

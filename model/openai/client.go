@@ -459,12 +459,14 @@ func (c *Client) convertResponse(resp *openaiResponse) *schema.Message {
 		Refusal: choice.Message.Refusal,
 	}
 
-	// 填充元数据（完成原因 + 使用量 + model name + provider）
-	if choice.FinishReason != "" || resp.Usage != nil || resp.Model != "" || c.system != "" {
+	// 填充元数据。可选概率字段独立解码，兼容端点的扩展格式不影响普通文本生成。
+	logprobs := decodeChatLogprobs(choice.Logprobs)
+	if choice.FinishReason != "" || resp.Usage != nil || resp.Model != "" || c.system != "" || logprobs != nil {
 		msg.Metadata = &schema.MessageMetadata{
 			FinishReason: choice.FinishReason,
 			Model:        resp.Model, // observability gen_ai.request.model / response.model
 			System:       c.system,   // observability gen_ai.provider.name
+			Logprobs:     logprobs,
 		}
 		if resp.Usage != nil {
 			msg.Metadata.Usage = resp.Usage.toSchema()
@@ -956,8 +958,9 @@ type openaiResponse struct {
 }
 
 type openaiChoice struct {
-	Message      openaiMessage `json:"message"`
-	FinishReason string        `json:"finish_reason"`
+	Message      openaiMessage   `json:"message"`
+	FinishReason string          `json:"finish_reason"`
+	Logprobs     json.RawMessage `json:"logprobs"`
 }
 
 type openaiUsage struct {

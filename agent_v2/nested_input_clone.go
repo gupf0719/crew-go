@@ -112,11 +112,13 @@ func cloneCalleeInput(m *schema.Message) *schema.Message {
 				}
 				cp := *p
 				cp.Bytes = slices.Clone(p.Bytes)
+				cp.Logprob = clonePtr(p.Logprob)
 				cp.TopLogprobs = slices.Clone(p.TopLogprobs)
 				for j, top := range cp.TopLogprobs {
 					if top != nil {
 						copyTop := *top
 						copyTop.Bytes = slices.Clone(top.Bytes)
+						copyTop.Logprob = clonePtr(top.Logprob)
 						cp.TopLogprobs[j] = &copyTop
 					}
 				}

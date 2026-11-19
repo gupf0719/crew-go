@@ -31,6 +31,30 @@ func TestSQLiteHistoryStore_Conformance(t *testing.T) {
 	})
 }
 
+func TestSQLiteHistoryStoreReadsLegacyNumericLogprobTokens(t *testing.T) {
+	h, db := newSQLiteHistory(t)
+	ctx := t.Context()
+	key := agent_v2.HistoryKey{Owner: "deskbot", ConvID: "old-conversation"}
+	payload := []byte(`{"id":"old","role":"assistant","content":"答复","metadata":{"logprobs":[
+		{"token":65,"bytes":[65],"logprob":0,"topLogprobs":[{"token":66,"bytes":[66],"logprob":-2}]}
+	]}}`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO crew_history (owner, conv_id, payload, msg_id, task, agent)
+		VALUES (?, ?, ?, ?, '', '')`, key.Owner, key.ConvID, payload, "old"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := agent_v2.LoadAllHistory(ctx, h, key)
+	if err != nil || len(got) != 1 || got[0].Content != "答复" || got[0].Metadata == nil ||
+		len(got[0].Metadata.Logprobs) != 1 {
+		t.Fatalf("旧记录应能通过真实历史后端读取，得到 %+v，err=%v", got, err)
+	}
+	p := got[0].Metadata.Logprobs[0]
+	if p == nil || p.Token != 65 || p.TokenText != "" || p.Logprob == nil || *p.Logprob != 0 ||
+		len(p.TopLogprobs) != 1 || p.TopLogprobs[0] == nil || p.TopLogprobs[0].Token != 66 ||
+		p.TopLogprobs[0].Logprob == nil || *p.TopLogprobs[0].Logprob != -2 {
+		t.Fatalf("旧的数字词元与概率应保持原值，得到 %+v", p)
+	}
+}
+
 // TestSQLiteHistoryStore_BatchIsAtomic：一批中途插入失败，整批都不留。半批落盘 = tool_call 在、
 // tool_result 不在，下次喂给模型就是孤儿调用。
 func TestSQLiteHistoryStore_BatchIsAtomic(t *testing.T) {

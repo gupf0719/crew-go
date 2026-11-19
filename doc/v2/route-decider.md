@@ -13,6 +13,7 @@
 | 接入 RoutingAgent | [`agent_v2/routing_agent.go`](../../agent_v2/routing_agent.go)：`buildComposeGraph` 装配升级链，`classifierStage` 是 classifier 那一档 |
 | 路由决策事件 | [`agent_v2/route_decision_event.go`](../../agent_v2/route_decision_event.go)：`RouteDecisionAction` / `RouteDecisionOf` |
 | 决策模型实现 | [`decision/`](../../decision/)：`decision.Client`（决策模型客户端，System One 与 OpenAI Decisions 两种线上格式）与 `decision.NewRouteDecider`；每家服务方一个子包，[`decision/jev`](../../decision/jev/jev.go) 接 TypeSafe 的 Jev，[`decision/bailian`](../../decision/bailian/bailian.go) 接阿里云百炼的决策模型；两种线上格式的接法见 §4.1 |
+| 带校准的 LLM 路由 | [`decision.NewLLMRouteDecider`](../../decision/llm_route_decider.go) 取 Chat Completions 的标签词元概率，接业务校准后作为决策档，见 §4.8 |
 | 测试 | [`route_decider_test.go`](../../agent_v2/route_decider_test.go) / [`route_decider_shadow_test.go`](../../agent_v2/route_decider_shadow_test.go) / [`route_decider_internal_test.go`](../../agent_v2/route_decider_internal_test.go) / [`decision/`](../../decision/) 及两个子包的 `*_test.go` |
 | 实测 | 路由评测 [`example/decision/routing_eval`](../../example/decision/routing_eval/main.go)（Jev 与百炼都接了），报告存档 [`REPORT.md`](../../example/decision/routing_eval/REPORT.md)（Jev）与 [`REPORT_bailian.md`](../../example/decision/routing_eval/REPORT_bailian.md)（加入百炼后）；真服务端冒烟 [`example/decision/client_smoke`](../../example/decision/client_smoke/main.go)（`-provider jev` 或 `-provider bailian`） |
 | 演示 | [`example/decision/routing_demo`](../../example/decision/routing_demo/main.go)：REPL，每句话打印由哪一档决定、置信度与各分支概率；`-provider jev` 或 `-provider bailian`，`-shadow` 挂成影子档 |
@@ -25,8 +26,8 @@
 ## 1. 背景
 
 RoutingAgent 原来有两种决策来源：业务写的 Router 函数，和一个带 `route_to` 工具的 LLM
-classifier。classifier 每次路由都是一次完整的 LLM 调用，而且给不出可信的置信度，框架
-没法知道哪次判断该信、哪次该复核。
+classifier。链尾的 classifier 每次做一次 LLM 分类，提交合法分支就可路由。
+需要按置信度分流的 LLM 可在它前面单独挂一档，按供应商提供的词元概率校准，见 §4.8。
 
 决策模型能补上这一块。TypeSafe 的 Jev 不生成文本，对一个选择题直接返回选项、各选项的
 概率和一个置信度。在 458 条中文路由样本上的实测（细节见 §5）：
@@ -296,7 +297,7 @@ if errors.As(err, &undecided) {
 | `RouteDecisionOf(ev agent_v2.Event) (*RouteDecisionAction, bool)` | 从事件里取载荷；手上是 `compose_v2.Event` 时先转换成 `agent_v2.Event` |
 | `EmitRouteDecisionEvent(ctx, *RouteDecisionAction)` | 签名改为接收整个载荷 |
 
-**decision**（两家共用）
+**decision**
 
 | 符号 | 说明 |
 |---|---|
@@ -306,6 +307,7 @@ if errors.As(err, &undecided) {
 | 选项 `WithBaseURL` / `WithModel` / `WithHTTPClient` / `WithAttemptTimeout` / `WithMaxRetries` / `WithBackoff` / `WithRetryBudget` | 两家的客户端都接受 |
 | `Choice` / `Score` / `Noul` | 三种问题的构造函数 |
 | `NewRouteDecider(client, opts...)` | 路由决策方；选项 `WithInstructions` / `WithStateFunc` |
+| `NewLLMRouteDecider(model, calibrate)` / `LLMRouteSample` | 用非流式 Chat Completions 的词元对数概率和业务校准函数构造路由决策方 |
 | `DefaultRouteInstructions` | 默认问题描述 |
 | `NewClient(apiKey, Preset, opts...)`，`Preset{Provider, BaseURL, DefaultModel, RequestIDHeader, Protocol}` | 按服务方描述构造客户端，接别的兼容服务时用；接 Jev 与百炼用下面两个子包 |
 
@@ -430,7 +432,7 @@ Run 返回中断，调用方按 `InterruptID` 带上用户的答案 Resume，路
 [`TestRouteDecider_AskUserWhenUnsure`](../../agent_v2/route_decider_test.go) 一致，`topTwo` 的
 实现也在那里。
 
-实际使用时还要处理几件事。第一档报错或弃权时 `prev.Scores` 为空，比如 Jev 因为输入没有文本而
+实际使用时还要处理几件事。第一档报错或弃权时 `prev.Scores` 可能为空，比如 Jev 因为输入没有文本而
 弃权。用户答的不在候选里时，这一档记为 `unknown_target`；这个例子里问用户的是最后一档，它拿不出
 合法目标时那次 Resume 返回 `RouteUndecidedError`。之后再 Resume 会从头判：第一档若仍拿不准，
 这一档换了新的提问 ID，用户会被重新问到。更稳妥的做法是在决策方里当场校验答案，不合法就再调一次 `compose_v2.Ask` 换个问法
@@ -547,6 +549,41 @@ router := agent_v2.NewRoutingAgent(opts...).
 - **改档要重新装配。** 改了配置要重建 RoutingAgent 才生效，一般就是重启服务。同一个 agent 在运行中途切换不支持，原因见
   下一条与 §6。
 - **按档名保护在途答复。** 新任务使用新配置；在途任务继续原待答档。要切换待答档的角色，先处理该档已发出的提问。
+
+### 4.8 校准 LLM 路由的置信度
+
+用 `decision.NewLLMRouteDecider` 和 `WithRouteDecider` 把支持 `logprobs` 的 Chat Completions 模型挂进升级链。
+使用未绑定工具的专用模型，端点须能返回实际模型标识并支持 `temperature=0` 和 `max_tokens=16`。
+用户消息取本轮的 `Message.Content`。系统消息供给按注册顺序用 A–Z 编号的 1–26 个分支及各自说明。
+没有文本或候选超出范围时，该档直接弃权。
+
+```go
+// calibrate 由应用提供，签名为 func(decision.LLMRouteSample) (float64, bool)。
+scored := decision.NewLLMRouteDecider(
+    openai.NewClient(apiKey, modelSnapshot, openai.WithSystem("openai")),
+    calibrate,
+)
+router := agent_v2.NewRoutingAgent(
+    agent_v2.WithRoutingName("support"),
+    agent_v2.WithRouteDecider("llm-scored", scored, minConfidence),
+    agent_v2.WithRoutingClassifier(llmClassifier),
+    agent_v2.WithRoutingDescriptions(descriptions),
+).AddBranch("billing", billingAgent).AddBranch("tech", techAgent)
+```
+
+短回复以 `stop` 结束，唯一可见词元和文本匹配时，适配器才会按该标签找出候选。拒答、弃权标签 `0`、
+截断、缺失概率或占位概率均会弃权。服务报错走升级链的错误路径。
+模型返回后及校准完成后的档位交接会检查调用方取消，取消时终止路由。
+OpenAI 返回词元及浮点对数概率，`-9999` 表示没有该词元的精确数值。百炼兼容端点只为部分模型提供
+`logprobs`，极低概率也可能是 `null`。本档只要求选中词元的概率。
+[OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) ·
+[百炼兼容 API](https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-openai-chat-completions)
+
+校准函数收到实际模型名、配置的供应商、候选顺序、选中分支和原始对数概率。它按当前模型、提示词、
+候选配置和业务标注样本给出 0–1 的置信度。样本超出校准范围时返回 `false`，该档弃权。
+共享决策方时，校准函数应支持并发调用。
+`Scores` 只保留选中标签的原始生成概率 `exp(Logprob)`，供事件和影子评估使用。门槛比较的是
+`Confidence`，同样支持按分支设置。真实业务的接管门槛由 [A03](../code/todo.md#p2--业务回归与发布验收) 验收。
 
 ---
 
@@ -742,4 +779,4 @@ go run ./example/decision/routing_eval -cases requests.jsonl -scenarios routes.j
 
 ## 7. 限制与待办
 
-开放项见 [中心 backlog](../code/todo.md)，包括 LLM classifier 置信度、线上样本标注和其它决策点。
+开放项见 [中心 backlog](../code/todo.md)，包括线上样本校准、接管门槛和其它决策点。

@@ -18,7 +18,10 @@ func TestCloneCalleeInput_FieldCoverage(t *testing.T) {
 		"Message.Annotations":               "cloneAnyMap",
 		"Message.Metadata":                  "结构体拷",
 		"MessageMetadata.Usage":             "clonePtr",
-		"MessageMetadata.Logprobs":          "切片拷、元素共享（模型输出的附属，钩子没有理由改）",
+		"MessageMetadata.Logprobs":          "逐词元拷",
+		"LogProbContent.TopLogprobs":        "逐候选拷",
+		"LogProb.Bytes":                     "slices.Clone",
+		"LogProb.Logprob":                   "clonePtr",
 		"ContentBlock.Text":                 "clonePtr",
 		"ContentBlock.ImageUrl":             "结构体拷",
 		"ImageUrlContentBlock.ImageUrl":     "clonePtr",
@@ -32,8 +35,6 @@ func TestCloneCalleeInput_FieldCoverage(t *testing.T) {
 		"ContentBlock.Data":                 "结构体拷",
 		"DataContentBlock.Data":             "cloneAny",
 	}
-	// 共享的子树不往下走
-	shared := map[string]bool{"MessageMetadata.Logprobs": true}
 	seen := map[reflect.Type]bool{}
 	var walk func(t reflect.Type)
 	walk = func(typ reflect.Type) {
@@ -53,9 +54,7 @@ func TestCloneCalleeInput_FieldCoverage(t *testing.T) {
 					t.Errorf("%s（%s）在 cloneCalleeInput 里没有说法：拷还是共享？", path, f.Type)
 					continue
 				}
-				if !shared[path] {
-					walk(f.Type)
-				}
+				walk(f.Type)
 			case reflect.Struct:
 				walk(f.Type)
 			}
@@ -83,7 +82,13 @@ func TestCloneCalleeInput_EditsDoNotReachOriginal(t *testing.T) {
 		{Type: "data", Data: &schema.DataContentBlock{Type: schema.ContentBlockTypeData,
 			Data: map[string]any{"list": []any{"x"}}}},
 	}
-	orig.Metadata = &schema.MessageMetadata{Model: "m", Usage: &schema.MessageUsage{TotalTokens: 3}}
+	orig.Metadata = &schema.MessageMetadata{
+		Model: "m", Usage: &schema.MessageUsage{TotalTokens: 3},
+		Logprobs: []*schema.LogProbContent{{
+			LogProb:     schema.LogProb{TokenText: "A", Bytes: []int32{65}, Logprob: new(-0.25)},
+			TopLogprobs: []*schema.LogProb{{TokenText: "B", Bytes: []int32{66}, Logprob: new(-1.25)}},
+		}},
+	}
 	before, err := json.Marshal(orig)
 	if err != nil {
 		t.Fatal(err)
@@ -105,6 +110,10 @@ func TestCloneCalleeInput_EditsDoNotReachOriginal(t *testing.T) {
 	c.ContentBlocks = append(c.ContentBlocks, &schema.ContentBlock{Type: "text"})
 	c.Metadata.Model = "改了"
 	c.Metadata.Usage.TotalTokens = 99
+	c.Metadata.Logprobs[0].Bytes[0] = 90
+	*c.Metadata.Logprobs[0].Logprob = 0
+	c.Metadata.Logprobs[0].TopLogprobs[0].Bytes[0] = 90
+	*c.Metadata.Logprobs[0].TopLogprobs[0].Logprob = 0
 
 	after, err := json.Marshal(orig)
 	if err != nil {

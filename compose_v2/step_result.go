@@ -431,6 +431,7 @@ func SaveStepResult(ctx context.Context, key string, v any, opts ...StepOption) 
 		}
 		a.cm.putNodeState(k+nodeStreamsSuffix, stv)
 	}
+	Heartbeat(ctx)
 	return nil
 }
 

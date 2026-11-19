@@ -2122,6 +2122,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				// commitSuperstepAdvance 里保留现场，由下面单独返回。
 				var sendErr *sendPayloadApplyErr
 				if errors.As(commitErr, &sendErr) {
+					Heartbeat(ctx)
 					notifyNodeCommits(ctx, res.afterCommit)
 					return fmt.Errorf("apply send directives: %w", commitErr)
 				}
@@ -2150,6 +2151,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		//     已提交、且进 CompletedFrontier 后**永不重跑** ⟹ 它的代际再没机会推进。
 		//     后果实测：该节点被回边重访时的**新提问**算出与上一轮**完全相同**的
 		//     InterruptID，业务累积传的旧答案把它静默满足——用户根本没被问，`err == nil`。
+		if len(res.SucceededBranches) > 0 {
+			Heartbeat(ctx)
+		}
 		notifyNodeCommits(ctx, res.afterCommit)
 
 		// 失败/中断 return（已 record 完 interrupts + 更新 frontier + 记完成兄弟）
@@ -3112,6 +3116,9 @@ func runNodeWithHooks(ctx context.Context, id NodeID, fn NodeFunc, componentKind
 	// 收集器每次尝试一个，拿回来的是成功那次的。
 	var sink *sendSink
 	writes, sink, err = runNodeBody(nodeCtx, id, fn, chs, policy)
+	if err == nil {
+		err = inheritedNodeTimeout(nodeCtx)
+	}
 	settleNodeStreams(nodeCtx, cm, streamNodeKey, nodeStreamRec, prevStreams, err, GetEventSink(nodeCtx), string(id))
 	// **普通语句置旗，不能放 defer**：NodeFunc 里 Goexit 时 runNodeBody（里面的 safeNodeRun）
 	// 永不返回、这一行执行不到 ⟹ 旗保持 false ⟹ 函数头 defer 第三支接手；panic 则被

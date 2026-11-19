@@ -5,18 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
-// nodePolicy 是一个节点声明的执行策略：每次尝试的超时（[WithNodeTimeout]）与失败后的重试
-// （[WithNodeRetry]）。零值 = 都不设，节点函数只跑一次、不限时。
+// nodePolicy 保存节点每次尝试的固定时限、空闲时限及重试策略。
 type nodePolicy struct {
 	timeout time.Duration
+	idle    time.Duration
 	retry   RetryConfig
 }
 
-func (p nodePolicy) active() bool { return p.timeout > 0 || p.retry.MaxRetries > 0 }
+func (p nodePolicy) active() bool { return p.timeout > 0 || p.idle > 0 || p.retry.MaxRetries > 0 }
 
 // nodeTimeoutStragglerGrace 是节点超时之后、还没返回时再等多久出声告警。超时取消 ctx 之后，
 // 响应 ctx 的节点通常在毫秒级返回（收尾的 IO 也就一两秒）；过了这么久还没回来，基本可以断定
@@ -61,6 +61,18 @@ func WithNodeTimeout(d time.Duration) NodeOption {
 	}
 }
 
+// WithNodeIdleTimeout 限制一次节点尝试可以连续多久没有进度。d <= 0 关闭，默认关闭。
+//
+// 计时从节点体进入时开始。节点事件、成功的 [SaveStepResult]、子图超步提交和
+// [Heartbeat] 续期。进度沿当前尝试及其嵌套执行传播。固定 [WithNodeTimeout] 与
+// 调用方 deadline 继续约束整次尝试。
+//
+// 到期以 [*NodeTimeoutError] 取消节点 ctx，Idle 为 true。框架等待节点返回，
+// 并按 [WithNodeRetry] 的策略决定是否用一份新的空闲预算重试。
+func WithNodeIdleTimeout(d time.Duration) NodeOption {
+	return func(c *nodeConfig) { c.policy.idle = max(0, d) }
+}
+
 // WithNodeRetry 让节点执行失败后按 cfg 重试（cfg.MaxRetries 次，0 = 不重试）。**MaxRetries > 0 时
 // cfg.ShouldRetry 必填**，不给在这里当场 panic（理由见 [RetryConfig.ShouldRetry]：重试会把节点里的
 // 副作用再做一遍，只有配重试的人答得上「这个错重跑有没有救」）；想用框架的保守谓词就传
@@ -82,7 +94,7 @@ func WithNodeTimeout(d time.Duration) NodeOption {
 // 终局失败、坏存档（[ErrCheckpointNotResumable]）、档没写成（[ErrCheckpointNotPersisted]）；谓词否决的也不重试。
 // 节点的钩子（OnNodeStart / OnNodeEnd）在所有尝试外面各触发一次。
 //
-// 配了 [WithNodeTimeout] 时，超时的尝试以 [*NodeTimeoutError] 失败，默认谓词会重试它。
+// 固定或空闲超时的尝试以 [*NodeTimeoutError] 失败，默认谓词会重试它。
 //
 // ⚠️ 只重试节点函数本身。出边的条件函数报错不在此列——那由 [WithCondFailPolicy] 决定。
 func WithNodeRetry(cfg RetryConfig) NodeOption {
@@ -93,7 +105,7 @@ func WithNodeRetry(cfg RetryConfig) NodeOption {
 	return func(c *nodeConfig) { c.policy.retry = cfg }
 }
 
-// NodeTimeoutError 是节点的一次执行尝试超过 [WithNodeTimeout] 的时限而失败。用 `errors.As` 取；
+// NodeTimeoutError 是节点的一次执行尝试超过 [WithNodeTimeout] 或 [WithNodeIdleTimeout] 的时限而失败。用 `errors.As` 取；
 // 节点里也能从 `context.Cause(ctx)` 拿到同类型的值，分清是自己超时还是调用方喊停。
 //
 // **故意不实现 Unwrap**：节点超时时自己返回的错多半包着 `context.DeadlineExceeded`，露在链上的话
@@ -102,6 +114,8 @@ func WithNodeRetry(cfg RetryConfig) NodeOption {
 type NodeTimeoutError struct {
 	// Timeout 是这次尝试的时限。
 	Timeout time.Duration
+	// Idle 表示连续无进度超过空闲时限，零值表示固定时限。
+	Idle bool
 	// Err 是节点函数自己返回的错；超时之后才返回成功时为 nil（那次结果按超时丢弃）。从
 	// `context.Cause` 取到的那个值上也是 nil。
 	Err error
@@ -109,10 +123,14 @@ type NodeTimeoutError struct {
 
 // Error 返人类可读的错误信息。
 func (e *NodeTimeoutError) Error() string {
-	if e.Err == nil {
-		return fmt.Sprintf("节点执行超时（超过 %s）", e.Timeout)
+	kind := "执行"
+	if e.Idle {
+		kind = "空闲"
 	}
-	return fmt.Sprintf("节点执行超时（超过 %s）: %v", e.Timeout, e.Err)
+	if e.Err == nil {
+		return fmt.Sprintf("节点%s超时（超过 %s）", kind, e.Timeout)
+	}
+	return fmt.Sprintf("节点%s超时（超过 %s）: %v", kind, e.Timeout, e.Err)
 }
 
 // runNodeBody 跑节点函数：按节点声明的策略重试、每次尝试限时。没声明策略时就是一次 safeNodeRun，
@@ -123,7 +141,7 @@ func (e *NodeTimeoutError) Error() string {
 func runNodeBody(ctx context.Context, id NodeID, fn NodeFunc, chs Channels, p nodePolicy) ([]ChannelWrite, *sendSink, error) {
 	if !p.active() {
 		sink := &sendSink{}
-		ws, err := safeNodeRun(withSendSink(ctx, sink), id, fn, chs)
+		ws, err := runNodeAttempt(withSendSink(ctx, sink), id, fn, chs, p)
 		return ws, sink, err
 	}
 	type attemptResult struct {
@@ -150,7 +168,7 @@ func runNodeBody(ctx context.Context, id NodeID, fn NodeFunc, chs Channels, p no
 				streams.Abandon()
 			}
 		}()
-		ws, err := runNodeAttempt(withSendSink(c, sink), id, fn, chs, p.timeout)
+		ws, err := runNodeAttempt(withSendSink(c, sink), id, fn, chs, p)
 		streams.End(err)
 		ended = true
 		lastErr = err
@@ -162,44 +180,78 @@ func runNodeBody(ctx context.Context, id NodeID, fn NodeFunc, chs Channels, p no
 	return out.ws, out.sink, nil
 }
 
-// runNodeAttempt 跑节点函数的一次尝试，timeout > 0 时限时（语义见 [WithNodeTimeout]）。
-func runNodeAttempt(ctx context.Context, id NodeID, fn NodeFunc, chs Channels, timeout time.Duration) ([]ChannelWrite, error) {
-	if timeout <= 0 {
+// runNodeAttempt 建立一次尝试的预算并收尾，保留外层 ctx 作为取消归属的判据。
+func runNodeAttempt(ctx context.Context, id NodeID, fn NodeFunc, chs Channels, p nodePolicy) ([]ChannelWrite, error) {
+	parent := nodeProgressFrom(ctx)
+	if p.timeout <= 0 && p.idle <= 0 && parent == nil {
 		return safeNodeRun(ctx, id, fn, chs)
 	}
-	// 每次尝试一个新的 cause 值：只认这一次尝试自己的时限（按指针比）
-	cause := &NodeTimeoutError{Timeout: timeout}
-	attemptCtx, cancel := context.WithTimeoutCause(ctx, timeout, cause)
-	defer cancel()
-	var returned atomic.Bool
-	straggler := time.AfterFunc(timeout+nodeTimeoutStragglerGrace, func() {
-		if returned.Load() {
-			return
+	if err := inheritedNodeTimeout(ctx); err != nil {
+		return nil, err
+	}
+	attemptCtx := ctx
+	// 指针身份区分本次尝试自己的时限与父节点的时限。
+	var wall, idle *NodeTimeoutError
+	var wallAt time.Time
+	if p.timeout > 0 {
+		var cancel context.CancelFunc
+		deadline := time.Now().Add(p.timeout)
+		if inherited, ok := ctx.Deadline(); ok && !deadline.Before(inherited) {
+			attemptCtx, cancel = context.WithCancel(attemptCtx)
+		} else {
+			wallAt = deadline
+			wall = &NodeTimeoutError{Timeout: p.timeout}
+			attemptCtx, cancel = context.WithDeadlineCause(attemptCtx, wallAt, wall)
 		}
-		slog.WarnContext(ctx, "compose_v2: 节点超过 WithNodeTimeout 之后仍未返回——它没有响应 ctx 取消，图在等它",
-			"node", id, "ns", GetGraphNS(ctx), "timeout", timeout)
-	})
-	// 节点函数 runtime.Goexit 时下面那两行跑不到，defer 补上（不然几秒后报一条「仍未返回」的假告警）
-	defer func() {
-		returned.Store(true)
-		straggler.Stop()
-	}()
+		defer cancel()
+	}
+	var expireIdle func()
+	if p.idle > 0 {
+		var cancel context.CancelCauseFunc
+		idle = &NodeTimeoutError{Timeout: p.idle, Idle: true}
+		attemptCtx, cancel = context.WithCancelCause(attemptCtx)
+		defer cancel(nil)
+		expireIdle = func() { cancel(idle) }
+	}
+	var progress *nodeProgress
+	if idle != nil || wall != nil || parent != nil {
+		// 共享父预算的子节点也有自己的进度寿命，迟到的旧子尝试不能替父节点续期。
+		progress = newNodeProgress(attemptCtx, parent, wallAt, p.idle, expireIdle)
+		defer progress.stop(time.Time{})
+		attemptCtx = withNodeProgress(attemptCtx, progress)
+		if sink := GetEventSink(attemptCtx); progress.tracksIdle && sink != nil {
+			attemptCtx = WithEventSink(attemptCtx, progressEventSink{inner: sink, progress: progress})
+		}
+	}
+	stopWarning := watchNodeTimeout(attemptCtx, id, wall, idle)
+	defer stopWarning()
 	ws, err := safeNodeRun(attemptCtx, id, fn, chs)
-	// 返回之后立刻置位，不等 defer：下面归因的这段时间里定时器到点的话不该再报「仍未返回」
-	returned.Store(true)
-	straggler.Stop()
-	// 这次尝试自己的时限没到（节点在时限内返回，或者时限到之前调用方的 ctx 先死了）：结果原样交回
-	if context.Cause(attemptCtx) != error(cause) {
+	finishedAt := time.Now()
+	stopWarning()
+	idleDue := progress.stop(finishedAt)
+	wallDue := wall != nil && !finishedAt.Before(wallAt)
+	if wallDue && attemptCtx.Err() == nil {
+		// 固定期限已到，等原生 timer 发布取消原因再归因。
+		<-attemptCtx.Done()
+	}
+	cause := ownNodeTimeout(attemptCtx, wall, idle)
+	if (cause == wall && !wallDue) || (cause == idle && !idleDue) {
+		cause = nil
+	}
+	if cause == nil {
+		if err == nil && (idleDue || wallDue) && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return ws, err
 	}
+	timeoutErr := *cause
 	// 时限到了之后才返回成功：按超时丢弃。不看调用方此刻死没死——时限是先到的，超过时限的尝试就是
 	// 失败的尝试；看的话结果取决于调用方恰好在节点返回之前还是之后取消（审计实测：时限到了、调用方随后
 	// 取消、节点再返回成功，写入照样提交了）。
 	if err == nil {
-		slog.WarnContext(ctx, "compose_v2: 节点超过 WithNodeTimeout 之后才返回成功——它没有响应 ctx 取消，"+
-			"这次执行实际没有被超时打断（结果已按超时丢弃）",
-			"node", id, "ns", GetGraphNS(ctx), "timeout", timeout)
-		return nil, &NodeTimeoutError{Timeout: timeout}
+		slog.WarnContext(ctx, "compose_v2: 节点超时后返回成功，已丢弃该次尝试的结果",
+			"node", id, "ns", GetGraphNS(ctx), "timeout", cause.Timeout, "idle", cause.Idle)
+		return nil, &timeoutErr
 	}
 	// 时限到了、节点带着错返回：调用方随后也死了、中断这类必须上传的错（MustPropagate 两样都认）、panic，
 	// 原样交出；其余是这次尝试超时
@@ -210,5 +262,49 @@ func runNodeAttempt(ctx context.Context, id NodeID, fn NodeFunc, chs Channels, t
 	if errors.As(err, &pe) {
 		return ws, err
 	}
-	return nil, &NodeTimeoutError{Timeout: timeout, Err: err}
+	timeoutErr.Err = err
+	return nil, &timeoutErr
+}
+
+func ownNodeTimeout(ctx context.Context, wall, idle *NodeTimeoutError) *NodeTimeoutError {
+	cause, _ := context.Cause(ctx).(*NodeTimeoutError)
+	if cause != wall && cause != idle {
+		return nil
+	}
+	return cause
+}
+
+// watchNodeTimeout 仅在本次尝试超时后启动告警计时，调用方取消时没有节点超时告警。
+func watchNodeTimeout(ctx context.Context, id NodeID, wall, idle *NodeTimeoutError) func() {
+	if wall == nil && idle == nil {
+		return func() {}
+	}
+	var mu sync.Mutex
+	var finished bool
+	var warning *time.Timer
+	stop := context.AfterFunc(ctx, func() {
+		cause := ownNodeTimeout(ctx, wall, idle)
+		mu.Lock()
+		defer mu.Unlock()
+		if cause != nil && !finished {
+			warning = time.AfterFunc(nodeTimeoutStragglerGrace, func() {
+				mu.Lock()
+				done := finished
+				mu.Unlock()
+				if !done {
+					slog.WarnContext(ctx, "compose_v2: 节点超时后仍未返回，图正在等待它响应取消",
+						"node", id, "ns", GetGraphNS(ctx), "timeout", cause.Timeout, "idle", cause.Idle)
+				}
+			})
+		}
+	})
+	return func() {
+		stop()
+		mu.Lock()
+		defer mu.Unlock()
+		finished = true
+		if warning != nil {
+			warning.Stop()
+		}
+	}
 }

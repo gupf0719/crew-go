@@ -394,6 +394,12 @@ func TestSubgraphNodePolicy_RetryResumesChild(t *testing.T) {
 			opts: []compose_v2.NodeOption{compose_v2.WithNodeTimeout(50 * time.Millisecond),
 				compose_v2.WithNodeRetry(compose_v2.SimpleRetry(1))},
 		},
+		{
+			name:      "idle",
+			failFirst: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+			opts: []compose_v2.NodeOption{compose_v2.WithNodeIdleTimeout(50 * time.Millisecond),
+				compose_v2.WithNodeRetry(compose_v2.SimpleRetry(1))},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var aRuns, bRuns atomic.Int32

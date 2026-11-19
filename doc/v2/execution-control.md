@@ -9,7 +9,7 @@
 | 能力 | 入口 | 一句话 | 跑一个 |
 |---|---|---|---|
 | 声明式断点 | `GraphBuilder.WithInterruptBefore/After`、RunOption `compose_v2.WithInterruptBefore/After`、GraphAgent `WithGraphInterruptBefore/After`；`compose_v2.AllNodes` 通配 | 跑到某个节点之前 / 之后停下，不改节点代码；续跑就是放行 | `example/harness/execution_control_smoke` ① |
-| 节点超时 | `compose_v2.WithNodeTimeout(d)`（`AddNode` 的选项；子图节点用 `WithSubgraphNodeOptions`） | 每次执行尝试一个时限：到点取消节点的 ctx、照样等它返回，失败是 `*NodeTimeoutError` | 单测 `compose_v2/node_policy_test.go` |
+| 节点超时 | `compose_v2.WithNodeTimeout(d)`、`WithNodeIdleTimeout(d)`（子图节点经 `WithSubgraphNodeOptions`） | 每次尝试可同时限制总耗时和连续无进度时长，失败为 `*NodeTimeoutError` | [节点超时回归](../../compose_v2/node_idle_timeout_test.go) |
 | 节点级重试 | `compose_v2.WithNodeRetry(cfg)` | 节点失败后在同一超步里原地重试；记进节点私有态的步骤与 `RunSubAgent` 已完成的调用不重做，节点体里其余的副作用照常重放 | 同上 |
 | 审批只读放行 | `agent_v2.WithApprovalMode(agent_v2.ApprovalAskWrites)`；只读声明 `tool.WithReadOnly()` / `tool.ReadOnlyDeclarer`；MCP `mcp.WithTrustedClient` | 只读工具直接执行，其余执行前问人；审批方式自动写进系统提示 | ② |
 | 运行中插话 | `agent_v2.NewInbox()` + `agent_v2.WithInboxCtx(ctx, inbox)` | agent 执行过程中用户补充的话，在安全位置接进当前回合；这次调用续不了时放回收件箱 | ③ |
@@ -117,6 +117,7 @@ InterruptID 由任务代号、ns、边界上的成员（实例身份与访问次
 ```go
 bld.AddNode("fetch", fetchFn,
     compose_v2.WithNodeTimeout(30*time.Second),
+    compose_v2.WithNodeIdleTimeout(8*time.Second),
     compose_v2.WithNodeRetry(compose_v2.ExponentialBackoff(2, time.Second, 10*time.Second)))
 
 // 子图节点
@@ -126,26 +127,31 @@ bld.AddSubgraphNode("enrich", sub, compose_v2.WithSubgraphNodeOptions(compose_v2
 `WithNodeRetry` 的 `cfg.MaxRetries > 0` 时 `cfg.ShouldRetry` 必填，不给当场 panic（重试会把节点里的副作用再做一遍，
 只有配重试的人答得上「这个错重跑有没有救」）；想用框架的保守谓词就传 `SimpleRetry` / `ExponentialBackoff`。
 
-### 2.2 超时：取消信号，不是掐断
+### 2.2 固定时限、空闲时限与取消
 
-时限按**每一次执行尝试**计，重试时重新计时；没有「连同重试的总时限」——那个交给调用方 ctx 的 deadline。
+两种时限都按**一次节点尝试**计时。固定时限限制总耗时，空闲时限限制从开始或上次进度起连续等待的时长。
+当前节点的排队、起止钩子和重试退避在它自己的尝试预算之外。子图里的这些阶段仍受外层尝试的预算约束。
+整次请求的时限由调用方设置。
+空闲时限默认关闭，`WithNodeIdleTimeout(0)` 也可关闭。续期保留 `ctx.Deadline()` 公布的固定时限与调用方期限。
 
-到点时框架取消交给节点的 ctx（`context.Cause(ctx)` 是一个 `*NodeTimeoutError`，节点据此分得清自己超时还是调用方
-喊停），然后**照样等节点函数返回**。响应 ctx 的节点（HTTP、数据库、模型调用）当场被解开；不看 ctx 的不会——框架不丢下
-它往前走：被丢下的执行还在跑，它的副作用与对存档的写会发生在无人观测、也无人能拦的时刻。取而代之的是让失效可见：
+以下进度为当前尝试及其外层尝试续期。
 
-- 超时之后过了几秒还没返回：`slog.Warn` 点名这个节点「它没有响应 ctx，图在等它」；
-- 超时之后才返回成功：同样告警，并且这次结果**按超时丢弃**——超过时限的尝试就是失败的尝试，不看它最后交回了什么，
-  也不看调用方那时死没死（时限是先到的）。
+- 业务调用 `compose_v2.Heartbeat(ctx)`。可用于长时间计算或分段执行的 I/O。
+- 节点经框架事件出口发送事件，包括实际流式片段。`reset_stream` 与观测钩子自己的事件转发属于观测和收尾。
+- `compose_v2.SaveStepResult` 成功记入本次执行的步骤。
+- 嵌套图提交完成的成员，包括部分成功超步里已提交的成员。
 
-这次尝试以 `*NodeTimeoutError` 失败（外面包着带节点位置的 `*GraphNodeError`）。它**不在错误链上露出
-`context.DeadlineExceeded`**：错误链上的那个错在本包里被当成「调用方的 ctx 到期了」的标签——出口把存档标成等续跑的
-挂起、观测记成超时。节点自己超时是这一次执行失败了：配了重试就按谓词重试（默认谓词会重试），用完就是一个
-普通的节点失败——同超步的兄弟照常跑完、成功的照常提交，存档是失败现场，续跑只重跑这个节点。节点返回的原始错误在
-`NodeTimeoutError.Err` 里。
+同超步的其他节点各用自己的预算。重试与 Resume 建立新预算，旧尝试结束后其 ctx 和事件出口失去续期能力。
+`DetachExecution` 去掉进度归属。provider SSE 空闲超时继续管理连接读取，节点空闲超时管理整个尝试的进度。
 
-不改写成超时、原样往上传的：调用方的 ctx 已经死了——时限之前就死了，或者时限到了之后、节点带着错返回时已经死了（迟到
-的成功不看这个，一律按超时丢弃）；节点抛了中断或别的必须上传的错（`MustPropagate`）；节点 panic 了。
+到期时取消节点 ctx，然后等待函数返回。空闲到期以 `context.Canceled` 解除等待，具体原因从
+`context.Cause(ctx)` 读 `*NodeTimeoutError`，其 `Idle` 为 true。固定时限的 `Idle` 为 false。
+固定或调用方期限与空闲期限重合时，由原有 deadline 取消。超时后仍未返回会记告警，迟到的成功结果会被丢弃。
+
+节点超时由 `*GraphNodeError` 携带位置，`NodeTimeoutError.Err` 保留节点原错供排查，错误链在
+`NodeTimeoutError` 处终止。节点局部超时按普通节点失败参与配置的重试，同超步成功的兄弟仍可提交。
+调用方先取消时保留节点返回的错误；调用方 ctx 结束后停止重试。
+中断、软取消、终局错误与 panic 按原有控制流传出。软取消信号仍在超步边界接收。
 
 ### 2.3 重试：同一次节点执行再做一遍
 
@@ -172,15 +178,10 @@ ctx 错）、软取消、陈旧写回、终局失败、坏存档（`ErrCheckpoin
 
 ### 2.4 子图节点
 
-配了 checkpointer 时子图节点的重试 / 超时有一个好性质：子图失败时它的存档留着，下一次尝试从子图自己的存档续跑，子图里
-已经跑完的节点不重跑。被超时取消时：子图里响应 ctx 的节点在这一超步中途以 ctx 错失败，存档记着这一超步已经开始
-执行（`FrontierStarted` 为真，等续跑的挂起档）；不响应的跑完这一超步，子图在下一个超步边界停下、存档。没配时子图每次尝试从头跑。
-
-### 2.5 没做的
-
-- **心跳续期的空闲超时**（有进度就续期，适合长时间流式生成的模型节点）：要把「进度」沿 ctx 传进嵌套图、按执行状态
-  归类，面比墙钟时限大得多，先做墙钟时限。记在 backlog。
-- 被超时取消后不配合的节点：不提供「放弃等待」的选项（理由见 §2.2）。
+子图沿用父尝试的 ctx。子图在进入节点体、计算条件边和结算成员结果时核对继承期限。
+钩子可为子图派生更短的期限。父预算到期后，子图跳过尚未执行的节点体和条件函数，把迟到的结果按取消处理。
+配置 checkpointer 时会保留此前提交的节点结果和失败成员已记录的节点私有态，父节点重试从子图存档续跑。
+未配置 checkpointer 时，重试从头运行子图。已成功完成并清档的子图结果可按 §2.3 记入步骤记录供重试复用。
 
 ## 3. 审批：只读放行档 + 审批方式写进提示词
 

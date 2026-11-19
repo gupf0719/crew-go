@@ -227,13 +227,23 @@ type EventSink interface {
 
 type eventSinkKey struct{}
 
+type eventSinks struct {
+	send    EventSink
+	observe EventSink // 观测钩子走框架的转发出口，保留流记录。
+}
+
+func eventSinksFrom(ctx context.Context) eventSinks {
+	sinks, _ := ctx.Value(eventSinkKey{}).(eventSinks)
+	return sinks
+}
+
 // withEventSink 是 framework 内部 ctx 注入 helper, runNodeWithHooks 在节点入口
 // 调本函数挂 nodeEventSink. 业务侧用 WithEventSink (公开版本).
 func withEventSink(ctx context.Context, sink EventSink) context.Context {
 	if sink == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, eventSinkKey{}, sink)
+	return context.WithValue(ctx, eventSinkKey{}, eventSinks{send: sink, observe: sink})
 }
 
 // WithEventSink 把 sink 挂到 ctx 上，跟 GetEventSink 对称。
@@ -246,15 +256,17 @@ func withEventSink(ctx context.Context, sink EventSink) context.Context {
 //   - 节点体里自己再派生一层，对之后直接调用的组件照样生效（只截获那一段）；
 //   - 接管不了整张图的事件流——要接管就实现 OnNodeEvent。
 func WithEventSink(ctx context.Context, sink EventSink) context.Context {
-	return withEventSink(ctx, sink)
+	if sink == nil {
+		return ctx
+	}
+	sinks := eventSinksFrom(ctx)
+	sinks.send = sink
+	return context.WithValue(ctx, eventSinkKey{}, sinks)
 }
 
 // GetEventSink 从 ctx 取 EventSink——nil 安全（hook 未设时返 nil sink）。
 func GetEventSink(ctx context.Context) EventSink {
-	if sink, ok := ctx.Value(eventSinkKey{}).(EventSink); ok {
-		return sink
-	}
-	return nil
+	return eventSinksFrom(ctx).send
 }
 
 // eventHookCtx 是 OnNodeEvent 拿到的 ctx：给定的 ctx 摘掉收信号处——OnNodeEvent 只作观测，在里面做出的
@@ -264,7 +276,16 @@ func GetEventSink(ctx context.Context) EventSink {
 // 执行发出来的（一个 tool_call、一次嵌套调用、一次钩子调用……），在那里做出的决定归不到它该归的那一段：
 // 失败的调用里做出的照样交出、暂停续跑之后丢失、同一批里谁赢随调度（均实测）。曾经在各段的入口按具体
 // 类型重绑 sink 去补，业务自己包一层转发的 sink、钩子里再发一次事件就又漏了（同样实测）。
-func eventHookCtx(ctx context.Context) context.Context { return withSignalScope(ctx, nil) }
+func eventHookCtx(ctx context.Context) context.Context {
+	ctx = withSignalScope(ctx, nil)
+	// 钩子只观察事件。事件的进度已按发送它的尝试登记。
+	if p := nodeProgressFrom(ctx); p != nil && p.tracksIdle {
+		ctx = withNodeProgress(ctx, nil)
+		observer := eventSinksFrom(ctx).observe
+		ctx = context.WithValue(ctx, eventSinkKey{}, eventSinks{send: observer, observe: observer})
+	}
+	return ctx
+}
 
 // graphEventSink 建图级的 EventSink（nodeID 为空）：条件边、节点级钩子、图级钩子里发的事件经它送达
 // OnNodeEvent，带着 ctx（摘掉收信号处）。

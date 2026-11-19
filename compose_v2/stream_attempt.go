@@ -215,8 +215,12 @@ func (s recordingSink) Send(ev Event) {
 // beginStreamRecord 开一段执行的记录，并给 ctx 上的 EventSink 包一层 recordingSink。
 func beginStreamRecord(ctx context.Context) (context.Context, *streamRecord) {
 	ctx, rec := withStreamRecord(ctx)
-	if inner := GetEventSink(ctx); inner != nil {
-		ctx = WithEventSink(ctx, recordingSink{inner: inner, rec: rec})
+	if sinks := eventSinksFrom(ctx); sinks.send != nil {
+		sinks.send = recordingSink{inner: sinks.send, rec: rec}
+		if sinks.observe != nil {
+			sinks.observe = recordingSink{inner: sinks.observe, rec: rec}
+		}
+		ctx = context.WithValue(ctx, eventSinkKey{}, sinks)
 	}
 	return ctx, rec
 }

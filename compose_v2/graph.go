@@ -157,7 +157,7 @@ type Graph struct {
 	// node span operation.name 标对应 kind (GraphAgent 显式编排路径让组件调用在 trace 区分).
 	// 无声明的 node 不在 map 内 (读返 "" → 默认 workflow node kind).
 	nodeComponents map[NodeID]string
-	// nodePolicies 节点声明的超时 / 重试（WithNodeTimeout / WithNodeRetry），没声明的不在 map 内。
+	// nodePolicies 保存声明了超时或重试策略的节点。
 	nodePolicies map[NodeID]nodePolicy
 	adj          map[NodeID][]edge // node 出边
 	channels     []anyChannel      // 编译期注册的所有 channel
@@ -304,8 +304,7 @@ func NewBuilder() *GraphBuilder {
 	}
 }
 
-// NodeOption 配置 AddNode 注册的节点：组件类型（[WithNodeComponent]）、超时（[WithNodeTimeout]）、
-// 重试（[WithNodeRetry]）。
+// NodeOption 配置 AddNode 注册的节点：组件类型、固定时限、空闲时限、重试。
 type NodeOption func(*nodeConfig)
 
 type nodeConfig struct {
@@ -325,8 +324,7 @@ func WithNodeComponent(kind string) NodeOption {
 	return func(c *nodeConfig) { c.component = kind }
 }
 
-// AddNode 注册节点。可选 NodeOption 声明组件类型（WithNodeComponent）、超时（WithNodeTimeout）、
-// 重试（WithNodeRetry）。
+// AddNode 注册节点。可选 NodeOption 声明组件类型、固定或空闲时限及重试。
 //
 // **audit⁷ HIGH-2 fix (audit¹² 补漏 — audit⁷ commit 23eebe4 谎报 5 处实改 3 处)**:
 // isFrameworkNil 检 typed nil func (协议七复证). 业务 `var fn NodeFunc; AddNode(id, fn)`

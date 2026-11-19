@@ -33,11 +33,11 @@ type subgraphConfig struct {
 }
 
 // WithSubgraphNodeOptions 给子图所在的那个父图节点加节点选项——同 AddNode 的 opts：组件类型
-// （[WithNodeComponent]）、每次尝试的超时（[WithNodeTimeout]）、重试（[WithNodeRetry]）。
+// （[WithNodeComponent]）、每次尝试的时限（[WithNodeTimeout]、[WithNodeIdleTimeout]）、重试（[WithNodeRetry]）。
 //
-// 配了 checkpointer 时（[WithCheckpointer] + [WithSessionID]，或经 ctx），子图节点的重试有一个好性质：子图
-// 失败时它的存档留着（被超时取消时它在下一个超步边界停下、存档），下一次尝试从子图自己的存档续跑，子图
-// 里已经跑完的节点不重跑。没配时子图每次尝试从头跑。
+// 子图结算成员结果时核对从父节点继承的时限。配了 checkpointer 时（[WithCheckpointer] + [WithSessionID]，
+// 或经 ctx），子图失败会保留存档，下一次尝试从子图自己的存档续跑，已提交的节点无需重跑。
+// 未配置 checkpointer 时，子图每次尝试从头跑。
 func WithSubgraphNodeOptions(opts ...NodeOption) SubgraphOption {
 	return func(c *subgraphConfig) { c.nodeOpts = append(c.nodeOpts, opts...) }
 }

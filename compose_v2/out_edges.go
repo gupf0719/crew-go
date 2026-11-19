@@ -49,6 +49,9 @@ func evalOutEdges(ctx context.Context, g *Graph, from NodeID, chs Channels, ph c
 			targets = append(targets, e.to)
 			continue
 		}
+		if err := inheritedNodeTimeout(ctx); err != nil {
+			return nil, err
+		}
 		// cond fn panic 转 error——业务自定义 cond panic 时不能让 goroutine crash
 		// 直接穿出 Run，绕过 defer SaveNS / OnAgentEnd 兜底。与 safeNodeRun 同款。
 		//
@@ -129,6 +132,12 @@ func evalMemberOutEdges(ctx context.Context, g *Graph, cm *ChannelManager, m Fro
 		visit:      visit,
 		acc:        answerScopedAccessor(ctx, &nodeStateAccessor{cm: cm, key: nodeKey}),
 	})
+	if err == nil {
+		if stop := inheritedNodeTimeout(ctx); stop != nil {
+			cm.markNodeStreamsPaused(nodeKey)
+			return nil, nil, stop
+		}
+	}
 	if condRejected(ctx, err) {
 		cm.bumpRerunGen(nodeKey, "")
 	} else if err != nil && IsRetryFutile(ctx, err) {

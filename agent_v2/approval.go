@@ -472,7 +472,7 @@ type approvalResult struct {
 }
 
 // checkToolApproval 在工具执行前查审批决策链。框架自身的控制工具直接放行，业务 skill action
-// 按普通工具审批。scope 把该 action 的长期规则限定在其 skill 和 action 名上。
+// 按普通工具审批。scope 可把长期规则限定在指定的 skill action 或便签写入分区。
 //
 //	这次调用记下的结论 / ApprovalMode 默认 → 启发式覆盖（每次调用只形成一次，见 approvalDecisionOf）
 //	→（若 Ask）这次调用已准入过 → 本次 Resume 答案 → don't-ask-again 规则 fast-path → 首次抛中断
@@ -562,7 +562,9 @@ func checkToolApproval(ctx context.Context, cfg *Config, tc schema.ToolCall, arg
 	}
 	// 3) 首次 → 抛 InterruptError（Query.InterruptID 填稳定 ID 让 caller 配对答案）
 	question := fmt.Sprintf("是否允许执行工具 %q？参数：%s", name, tc.Function.Arguments)
-	if scope != "" {
+	if scope != "" && tc.Function.Name == writeNoteToolName {
+		question += " 工具级长期放行只适用于当前便签写入分区。"
+	} else if scope != "" {
 		question += " 工具级长期放行只适用于本次指定的 skill action。"
 	}
 	return approvalResult{err: &compose_v2.InterruptError{

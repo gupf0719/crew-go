@@ -123,7 +123,7 @@ func TestToolsGate_IgnoresSameBatchReveals(t *testing.T) {
 		}))
 	a := NewBasicAgent(WithName("gate"), WithModel(&lookupLoopModel{}), WithToolkit(kit),
 		WithToolSearch(&ToolSearchConfig{Enabled: true, Deferred: func(tl tool.Tool) bool { return tl.Name() == "lookup" }}))
-	toolsFn := a.makeToolsFn(a.config, memberGrants{}, a.composeDispatchToolkit(a.config, memberGrants{}, false))
+	toolsFn := a.makeToolsFn(a.config, memberGrants{}, a.composeDispatchToolkit(a.config, memberGrants{}, false, nil))
 	call := []schema.ToolCall{{ID: "l", Type: "function", Function: schema.FunctionCall{Name: "lookup", Arguments: `{}`}}}
 
 	turn := &revealTurn{}

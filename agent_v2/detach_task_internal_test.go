@@ -20,7 +20,7 @@ var taskExecutionCtxKeys = []any{
 	sessionKey{}, slotClaimKey{}, rootRunAdmissionKey{}, topLevelAgentStartKey{}, taskScopeKey{}, callApprovalKey{}, finalRoundKey{}, compactionMemoKey{}, toolsUsedKey{}, foAttemptsKey{}, revealedChKey{}, toolBindingSinkKey{}, toolBindingKey{},
 	revealTurnKey{}, repeatTurnKey{},
 	runOverridesCtxKey{}, offloadDedupKey{}, subAgentStoreScopeKey{},
-	historyCtxKey{}, historySlotCtxKey{}, historyReceiptCtxKey{},
+	historyCtxKey{}, historySlotCtxKey{}, historyReceiptCtxKey{}, conversationRequestKey{},
 	handoffHopsCtxKey{}, handoffDestKey{}, handoffHistoryModeKey{}, routeDestKey{},
 	endErrCtxKey{}, resumePhaseCtxKey{}, toolResultPosKey{}, toolBatchKey{}, nodeGrantsKey{},
 	backgroundScopeKey{},

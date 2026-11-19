@@ -161,6 +161,7 @@ func enterRunTask(ctx context.Context, session *RunSession) context.Context {
 	if _, ok := enclosingTask(ctx); ok {
 		return stampTask(ctx, session.RunID, false)
 	}
+	ctx = withConversationRequest(ctx)
 	// 同一刻丢弃这个 RunID 名下的 don't-ask-again 规则——「上一个任务结束了」这句话对存档和
 	// 对授权必须同时成立（规则按 RunID 分，换了 RunID 本来就是一套新的；这里管的是业务复用同一个
 	// RunID 开新任务的写法）。**只清规则集**——「这次调用批过没有」那份已搬进 tools 节点的私有
@@ -173,7 +174,7 @@ func enterRunTask(ctx context.Context, session *RunSession) context.Context {
 // 任务。同样排在 `OnAgentStart` 之前，钩子之后经 compose_v2.CallHook 采纳。Resume 只在顶层调
 // （在一个正在执行的任务里调会被 commonResumePrep 拒掉）。
 func enterResumeTask(ctx context.Context, session *RunSession) context.Context {
-	return stampTask(shadowNodeGrants(ctx), session.RunID, false)
+	return stampTask(shadowNodeGrants(withConversationRequest(ctx)), session.RunID, false)
 }
 
 // enterGraphRunTask / enterGraphResumeTask 是在自己的存档槽上跑图的 agent（本包 9 个编排）的入口：先占槽（[occupySlot]），

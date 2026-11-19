@@ -70,6 +70,9 @@ type Config struct {
 	// 这层存「逐字时序回放」只追加不改。见 HistoryStore godoc。
 	History *historyConfig
 
+	historySearch HistorySearchAuthorizer
+	notes         *noteToolsConfig
+
 	// StoreMemoryNS / StoreMemory 是 RFC §6 "WithStoreMemory helper" 配置——
 	// 框架在 preamble 自动 store.Search(ns, query=lastUserInput) 注入到 LLM messages
 	// 头部 + postamble 自动 Put 保存本轮新消息。是已删 Memory 接口的 Store-backed

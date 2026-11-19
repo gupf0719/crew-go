@@ -588,6 +588,8 @@ func TestMyRedisHistory(t *testing.T) {
 
 设计与决策依据见 [`doc/issue/issue-98-conversation-history.md`](../issue/issue-98-conversation-history.md)。
 
+给模型开放历史检索时，用 `WithHistorySearch` 声明会话授权函数。用 `WithNoteTools` 可以让模型保存要点并在摘要后按需读取。两个选项均为显式启用，主体、来源和结果边界见[使用方法](self-tracking.md#c12-使用方法)。
+
 ## 3. HITL 模式（人在回路）
 
 ### 节点抛 InterruptError

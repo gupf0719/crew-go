@@ -1,10 +1,10 @@
 # 项目待办
 
-2026-11-19 以 `origin/test` 的 `4417dbd` 为基线。终局扇出、持久续跑准入、跨分区清档、剩余六项缺陷及 C01–C10 已合入。2026-11-18 核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
+2026-11-19 以 `origin/test` 的 `0fee987` 为基线。终局扇出、持久续跑准入、跨分区清档、剩余六项缺陷及 C01–C11 已合入。2026-11-18 核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **49 项**。P1 **0**、P2 **4**、P3 **45**。缺陷 **0**、能力缺口 **7**、待决 **26**、验收 **16**。
+共 **48 项**。P1 **0**、P2 **4**、P3 **44**。缺陷 **0**、能力缺口 **6**、待决 **26**、验收 **16**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -26,7 +26,6 @@
 
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
-| C12 | 能力缺口 | 用户授权后的历史查询与摘要后 notes | 明确键空间、可读用户和检索结果来源，保留现有存储或消息投影的访问约束。历史 TODO 406、415。 |
 | C13 | 能力缺口 | 普通嵌套慢工具的后台执行与持久性边界 | e185749 关闭显式持久后台子 Agent 方案。独立记录普通 `WithBackgroundTasks` 在嵌套运行的支持范围和异步工具结果恢复。历史 TODO 422、423。 [慢任务](../v2/background-tasks.md) |
 | C14 | 能力缺口 | A2A human gate 的旧任务引用 | 在远端任务已终局且需要发新请求的路径带回旧任务引用，保持初次请求与重挂语义。历史 TODO 554。 [远端实现](../../a2a/remote_agent.go) |
 | C15 | 能力缺口 | 扩充自研 Agent 的续跑和低阶嵌套能力 | 当前 `EnterRun` 面向 Run，仓内远端 Agent 不靠这里 Resume。提供独立续跑入口前先锁定授权、历史和退出边界。历史 TODO 534。 |
@@ -73,6 +72,8 @@
 | Q27 | 待决 | 持久化业务状态演进与按执行 namespace 查历史 | ISSUE-70 Phase 4 的通用状态迁移需要版本化调用方。SelfHistoryByNS 希望按执行 namespace 查写入记录，先核对执行位置能否成为历史身份。 [ISSUE-70](../issue/issue-70-checkpoint-evolution.md) |
 
 ## 已关闭及归并去向
+
+- **C12 已实现。** 历史查询先检查本次请求授权，再读取当前成员的服务端会话摘录。便签按认证 Owner 和写入者分区，经业务审批写入并可在摘要后按需读取。 [用法](../v2/self-tracking.md#c12-使用方法) · [历史跨层回归](../../agui/history_search_test.go) · [便签跨层回归](../../agent_v2/note_tools_integration_test.go)
 
 - **C11 已实现。** Skill 增加可选递归发现和原子重载，启用时执行绑定目录快照并校验续跑版本。`tool_search` 可限制任务内累计解锁。工作流和分发通过现有编排及内存 SkillBox 接入。 [Skill 用法](../v2/skill.md#文件目录与热重载) · [目录跨层回归](../../agent_v2/skill_reload_test.go) · [额度跨层回归](../../agent_v2/tool_search_limit_test.go)
 

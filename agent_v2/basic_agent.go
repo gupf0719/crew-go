@@ -2308,8 +2308,13 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 			}
 		}
 	}
-	dispatchToolkit := a.composeDispatchToolkit(cfg, grants, backgroundScopeFrom(ctx) != nil)
-	modelFn := a.makeModelFn(cfg, grants)
+	conversationTools, conversationRevision, err := bindConversationTools(ctx, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	checkpointRevision += conversationRevision
+	dispatchToolkit := a.composeDispatchToolkit(cfg, grants, backgroundScopeFrom(ctx) != nil, conversationTools)
+	modelFn := a.makeModelFn(cfg, grants, conversationTools)
 	toolsFn := a.makeToolsFn(cfg, grants, dispatchToolkit)
 	preamble := func(ctx context.Context, input *BasicAgentPreambleInput) (*BasicAgentPreambleOutput, error) {
 		return a.preambleFn(ctx, input, cfg.Skill)
@@ -2611,10 +2616,10 @@ func resetRequiredToolChoice(o *model.Options) {
 // 不往 cfg.Toolkit 里注册：那是业务传进来的对象，可能被几个 agent 共用——写进去的话没配这些能力的
 // agent 也拿到了（实测：没配结构化输出的 agent 拿别的 agent 的 schema JSON 当最终答复收尾，`err == nil`）。
 // 要加时拷一份；业务的同名工具在这份里被框架那件顶掉（构造期已告警）。
-func withFrameworkTools(cfg *Config, tk *tool.Toolkit, background bool) *tool.Toolkit {
+func withFrameworkTools(cfg *Config, tk *tool.Toolkit, background bool, conversationTools []tool.Tool) *tool.Toolkit {
 	background = background && cfg.BackgroundTasks != nil
 	references := cfg.Skill != nil && cfg.Skill.SkillBox != nil && hasSkillReferences(cfg.Skill.SkillBox)
-	if !cfg.AskUserOptIn && cfg.OutputSchema == nil && cfg.ToolResultSpill == nil && !background && !references {
+	if !cfg.AskUserOptIn && cfg.OutputSchema == nil && cfg.ToolResultSpill == nil && !background && !references && len(conversationTools) == 0 {
 		return tk
 	}
 	out := tool.NewToolkit()
@@ -2638,6 +2643,7 @@ func withFrameworkTools(cfg *Config, tk *tool.Toolkit, background bool) *tool.To
 	if references {
 		out.Register(&skillReferenceTool{box: cfg.Skill.SkillBox, maxTokens: referenceMaxTokens(cfg)})
 	}
+	out.RegisterAll(conversationTools...)
 	return out
 }
 
@@ -2728,7 +2734,7 @@ func isFinalRound(ctx context.Context) bool {
 //
 // ReactiveCompact 循环最多 MaxAttempts 次，每次 compact 后重试，仍 prompt-too-long
 // 继续 compact 直到成功 / attempts 耗尽。
-func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants) BasicAgentModelFn {
+func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants, conversationTools []tool.Tool) BasicAgentModelFn {
 	// 业务自带同名工具 warn 在构造期一次而非每轮——
 	// 避免 modelFn 每轮 LLM 调用都打同样 warn → N 轮会话产生 N 条噪声
 	if cfg.Skill != nil && cfg.Skill.SkillBox != nil &&
@@ -2839,7 +2845,7 @@ func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants) BasicAgentMode
 
 		// Skill 集成：仅 toolCall 模式注入 activate_skill 工具——adaptive / pre_match
 		// 模式由 buildInitialMessages 已预激活 skill 进 sysPrompt，无需再让 LLM 调工具。
-		toolkit := withFrameworkTools(&cfg, cfg.Toolkit, backgroundScopeFrom(ctx) != nil)
+		toolkit := withFrameworkTools(&cfg, cfg.Toolkit, backgroundScopeFrom(ctx) != nil, conversationTools)
 		if cfg.Skill != nil && cfg.Skill.SkillBox != nil && skillActivationMode(cfg.Skill) == skill.SkillActivationModeToolCall {
 			// P2.B/C: 注入 fork 模式 resolver + parent model fallback
 			actTool := newSkillTool(cfg.Skill.SkillBox).
@@ -3152,7 +3158,7 @@ func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants) BasicAgentMode
 // + skill / tool_search 这些框架工具 + 按授予挂的转交 / 路由（没被授予时挂软失败桩）。绑定侧（makeModelFn）
 // 每轮另拼一份，两份注册同一组框架工具。类型标注（pushToolCategorizerCtx）也按这一份查——那是实际会被
 // 派发的实例。
-func (a *BasicAgent) composeDispatchToolkit(cfg Config, grants memberGrants, background bool) *tool.Toolkit {
+func (a *BasicAgent) composeDispatchToolkit(cfg Config, grants memberGrants, background bool, conversationTools []tool.Tool) *tool.Toolkit {
 	// 只要有用户 toolkit 或 toolCall 模式 skill 集成，就需要 toolsFn。
 	// adaptive / pre_match 不注 activate_skill 工具，纯靠用户 toolkit 决定是否需要 toolsFn。
 	skillNeedsTool := cfg.Skill != nil && cfg.Skill.SkillBox != nil && skillActivationMode(cfg.Skill) == skill.SkillActivationModeToolCall
@@ -3167,7 +3173,7 @@ func (a *BasicAgent) composeDispatchToolkit(cfg Config, grants memberGrants, bac
 	// 图拓扑不受影响：tools 节点本来就恒存在，nil 只在**运行到**它时才报错。
 	// 内置 skill 工具的 lazy 初始化——modelFn 内 toolkit 是 clone 的，toolsFn
 	// 这里独立维护一份 dispatch 用 toolkit。adaptive / pre_match 不注 activate_skill。
-	dispatchToolkit := withFrameworkTools(&cfg, cfg.Toolkit, background)
+	dispatchToolkit := withFrameworkTools(&cfg, cfg.Toolkit, background, conversationTools)
 	if skillNeedsTool {
 		// 综合 audit H3 fix: 检测业务自带同名工具，warn 提示被框架版覆盖
 		// （toolsFn 构造期一次性 warn——modelFn 已 per-Run warn 过同样信号，但这里
@@ -3430,8 +3436,12 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 			// 只读放行档要知道这次派发的那件工具有没有声明只读——按实例认（tool.IsReadOnly），不按名字
 			target := dispatchToolkit.Get(tc.Function.Name)
 			readOnly := tool.IsReadOnly(target)
+			scopedTool, conversation := target.(*conversationTool)
+			liveRead := conversation && readOnly
 			var approvalScope string
-			if _, ok := target.(*skillActionTool); ok {
+			if conversation {
+				approvalScope = scopedTool.approvalScope
+			} else if _, ok := target.(*skillActionTool); ok {
 				skillName, actionName := skillActionNames(args)
 				approvalScope = identityString(skillName, actionName)
 			}
@@ -3462,6 +3472,11 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 						if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
 							return nil, err
 						}
+						if name != tc.Function.Name {
+							if _, rewritten := dispatchToolkit.Get(name).(*conversationTool); conversation || rewritten {
+								return tool.Failure(tool.ErrCodeInvalidArguments, "会话工具须以通过审批的名称执行"), nil
+							}
+						}
 						return dispatchToolkit.Call(ctx, name, a)
 					})
 					if len(cfg.ToolMiddlewares) == 0 || minted {
@@ -3471,7 +3486,7 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 					// 交过来的是存下来的 ctx 时，工具体照样在这次调用的位置上跑。曾经原样交给工具体：中间件为了
 					// 挂 span 沿用第一次存下的 ctx，工具里的提问每次续跑都换一个 ID、永远答不完（实测）。
 					mwCtx, adopt := compose_v2.EnterHook(c)
-					if record {
+					if record && !liveRead {
 						callTool = recordedEndpoint(callTool,
 							func() bool { return toolDeadlineExceeded(guard, c, cfg.ToolTimeout, nil) },
 							func() { recalledTimeout = true })
@@ -3488,7 +3503,7 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 			ran := false
 			// **可后台的调用**（见 background_task.go）：在后台 goroutine 里跑，YieldAfter 之内返回就跟同步执行一样往下走；
 			// 到点了还没返回就转入后台，这次的 tool_result 换成任务 id。
-			if sc := backgroundScopeFrom(callCtx); backgroundEligible(sc, minted, dispatchToolkit.Get(tc.Function.Name)) {
+			if sc := backgroundScopeFrom(callCtx); !conversation && backgroundEligible(sc, minted, target) {
 				// 后台任务结束时没有 OnToolEnd 这一步，当场按大小处理（deferSize=false）
 				render := func(c context.Context, r *tool.Result) bgRendered {
 					rc := renderToolContent(c, &cfg, false, tc.Function.Name, r, false)
@@ -3547,7 +3562,8 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 				return outcome{err: err}
 			}
 			// 开了转存时按大小处理留到 OnToolEnd 之后（deferSize=true，见 renderToolContent）：转存的要是钩子改写之后的那份
-			rendered := renderToolContent(callCtx, &cfg, minted, tc.Function.Name, res, true)
+			// 授权读取已有输出边界，避免另发不复核当前权限的转存入口。
+			rendered := renderToolContent(callCtx, &cfg, minted || liveRead, tc.Function.Name, res, true)
 			content, toolErr := rendered.content, rendered.toolErr
 
 			// **P2.D inline body 协议**：仅 framework activate_skill 成功 + InlineSkillBody 启用时
@@ -3670,9 +3686,11 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 			})
 			oc.signals = sigs
 			// 参考文档的读取标记随结果重放，供续跑时的去重读取使用。
-			_, referenceRead := dispatchToolkit.Get(tc.Function.Name).(*skillReferenceTool)
+			target := dispatchToolkit.Get(tc.Function.Name)
+			_, referenceRead := target.(*skillReferenceTool)
+			_, conversation := target.(*conversationTool)
 			minted := isFrameworkMintedIn(dispatchToolkit, tc.Function.Name)
-			if oc.err == nil && oc.toolMsg != nil && !oc.replayed &&
+			if oc.err == nil && oc.toolMsg != nil && !oc.replayed && !(conversation && tool.IsReadOnly(target)) &&
 				(referenceRead || shouldMemoize(minted, oc.signals)) {
 				record.Result = &toolMemoEntry{ToolMsg: oc.toolMsg, BodyMsg: oc.bodyMsg, Signals: oc.signals}
 				if save() && !minted && len(cfg.ToolMiddlewares) > 0 {

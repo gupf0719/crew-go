@@ -463,8 +463,9 @@ const historyWriterBacklogWarn = 64
 // 取一次，之后整个 Run 不再变。逐节点重算既是白费，也给「同一个 Run 里前后写到不同
 // 租户」留了口子。
 type historyWriter struct {
-	store HistoryStore
-	key   HistoryKey
+	hosted bool
+	store  HistoryStore
+	key    HistoryKey
 	// task 是这条流写进历史的记录要盖的任务章（[HistoryTaskAnnotation]）：建写入器那一刻所在任务的
 	// RunID。嵌套位置沿用父的写入器，被调方属于调用方的任务，章也就是同一个；DetachTask 开的独立任务
 	// 剥掉了写入器、自己建新的，章是它自己的。
@@ -866,6 +867,8 @@ const (
 	TaskHistoryAgent TaskHistorySource = "agent"
 	// TaskHistoryRequest 表示从请求上下文声明的配置选择 HistoryStore。
 	TaskHistoryRequest TaskHistorySource = "request"
+	// TaskHistoryHost 表示由宿主绑定其配置的 HistoryStore。
+	TaskHistoryHost TaskHistorySource = "host"
 )
 
 // TaskHistoryDestination 是一个任务的已选历史分区。持久宿主保存 Key 和 Source，
@@ -915,6 +918,9 @@ func startHistory(ctx context.Context, hc *historyConfig, agentName string) (con
 		binding = taskHistoryBinding{}
 	}
 	destination := binding.destination
+	if destination.Source == TaskHistoryHost && isFrameworkNil(destination.Store) {
+		return ctx, noop, fmt.Errorf("agent %q: %w: hosted history store is unavailable", agentName, ErrTaskHistoryBinding)
+	}
 	if destination.Store == nil && hc != nil {
 		destination.Store = hc.store
 		destination.Source = TaskHistoryAgent
@@ -954,6 +960,7 @@ func startHistory(ctx context.Context, hc *historyConfig, agentName string) (con
 		}
 	}
 	w := newHistoryWriter(ctx, destination.Store, key)
+	w.hosted = destination.Source == TaskHistoryHost
 	// 调用方提供了前文时定下这次运行以谁为准（见 caller_history.go）。拥有者 = 建写入器时还不在任何正在执行的任务里：
 	// 各个 agent 入口都在盖自己的任务章之前建写入器，所以这里看到的任务只能是外面的（节点里、钩子里、嵌套调用里调起的）
 	if prior, declared := callerPrior(ctx); declared {
@@ -1197,6 +1204,11 @@ func claimSharedRootInput(ctx context.Context, prior []*schema.Message, input *s
 //
 // 没开历史 / 被 WithoutHistoryCtx 摘掉时是 no-op。
 func recordHistory(ctx context.Context, owner, display string, msgs []*schema.Message) {
+	recordHistoryWithToolBatch(ctx, owner, display, msgs, nil, nil)
+}
+
+// recordHistoryWithToolBatch 可在写入工具结果时保留调用实例，结果正文和原始调用 ID 按原消息存放。
+func recordHistoryWithToolBatch(ctx context.Context, owner, display string, msgs []*schema.Message, batch *toolBatch, calls []schema.ToolCall) {
 	w := historyWriterFrom(ctx)
 	if w == nil || len(msgs) == 0 {
 		return
@@ -1206,7 +1218,7 @@ func recordHistory(ctx context.Context, owner, display string, msgs []*schema.Me
 	// 拷贝一份再盖章：msgs 里的 *schema.Message 是 channel 里那批的同一批指针，
 	// 直接改它们的 Annotations 会污染正在喂给模型的消息。
 	stamped := make([]*schema.Message, 0, len(msgs))
-	for _, m := range msgs {
+	for i, m := range msgs {
 		if m == nil {
 			continue
 		}
@@ -1226,7 +1238,13 @@ func recordHistory(ctx context.Context, owner, display string, msgs []*schema.Me
 		if isDerivedInput(m) {
 			continue
 		}
-		stamped = append(stamped, w.stamp(m, owner, display))
+		record := w.stamp(m, owner, display)
+		if i < len(calls) && calls[i].ID != "" && m.Role == schema.RoleTool && schema.GetToolResultID(m) == calls[i].ID {
+			if instance := batch.callInstanceID(i); instance != "" {
+				record.Annotations[ToolCallInstanceIDExtraKey] = instance
+			}
+		}
+		stamped = append(stamped, record)
 	}
 	if len(stamped) == 0 {
 		return
@@ -1237,6 +1255,11 @@ func recordHistory(ctx context.Context, owner, display string, msgs []*schema.Me
 // stamp 给一条要写进历史的消息盖归属、任务章与来源（见 stampHistoryAgent），返回拷贝。
 func (w *historyWriter) stamp(m *schema.Message, owner, display string) *schema.Message {
 	cp := stampHistoryAgent(m, owner, display, w.task)
+	if w.hosted {
+		cp.Annotations[hostedHistoryTaskAnnotation] = true
+	} else {
+		delete(cp.Annotations, hostedHistoryTaskAnnotation)
+	}
 	if w.origin != "" {
 		cp.Annotations[historyOriginAnnotation] = w.origin
 	}

@@ -195,7 +195,8 @@ func (w digestWriter) block(b *schema.ContentBlock) {
 func (w digestWriter) annotations(ann map[string]any) {
 	filtered := make(map[string]any, len(ann))
 	for k, v := range ann {
-		if k == compose_v2.RunIDAnnotationKey || k == toolCallBatchIDAnnotation {
+		if k == compose_v2.RunIDAnnotationKey || k == toolCallBatchIDAnnotation ||
+			k == HistoryInputMessageIDAnnotation || k == ToolCallInstanceIDExtraKey {
 			continue
 		}
 		filtered[k] = v

@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"reflect"
+	"slices"
 
 	"crew-go/compose_v2"
 	"crew-go/hook"
 	"crew-go/internal/panicerr"
+	"crew-go/schema"
 )
 
 // recoverToErr 是 9 编排（BasicAgent + 8 编排）Run/Resume 顶部统一的 panic→error 兜底。
@@ -368,12 +371,47 @@ type topLevelAgentStartKey struct{}
 // CallAgentStart 调用入口钩子并采纳它派生的 ctx。顶层入口钩子里发起的同任务子调用
 // 没有父节点接收挂起，框架在该子调用内关闭存档。独立任务可以先用 DetachTask 脱离。
 func CallAgentStart(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo, input *hook.AgentInput) (context.Context, error) {
-	return compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
+	original := lastAgentInputMessage(input)
+	var wireID string
+	if original != nil && original.Role == schema.RoleUser {
+		wireID, _ = original.Annotations[HistoryInputMessageIDAnnotation].(string)
+	}
+	ctx, err := compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
 		if !compose_v2.WithinNodeScope(c) {
 			c = context.WithValue(c, topLevelAgentStartKey{}, true)
 		}
 		return hooks.OnAgentStart(c, info, input)
 	})
+	if err == nil && wireID != "" {
+		restoreHistoryInputID(input, original, wireID)
+	}
+	return ctx, err
+}
+
+// restoreHistoryInputID 保留宿主消息身份，内容仍取开始钩子采纳的输入。
+func restoreHistoryInputID(input *hook.AgentInput, original *schema.Message, wireID string) {
+	accepted := lastAgentInputMessage(input)
+	if accepted == nil {
+		accepted = original
+	}
+	if accepted.Role != schema.RoleUser {
+		return
+	}
+	if id, _ := accepted.Annotations[HistoryInputMessageIDAnnotation].(string); id == wireID {
+		return
+	}
+	stamped := *accepted
+	stamped.Annotations = maps.Clone(accepted.Annotations)
+	if stamped.Annotations == nil {
+		stamped.Annotations = make(map[string]any, 1)
+	}
+	stamped.Annotations[HistoryInputMessageIDAnnotation] = wireID
+	if len(input.Messages) == 0 {
+		input.Messages = []*schema.Message{&stamped}
+		return
+	}
+	input.Messages = slices.Clone(input.Messages)
+	input.Messages[len(input.Messages)-1] = &stamped
 }
 
 // WrapAgentStartErr 包装 OnAgentStart 返回的错误——**没人能接住的 hook 中断在这里被拒**。

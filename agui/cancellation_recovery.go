@@ -307,5 +307,5 @@ func (h *handler) recoverCancellation(ctx context.Context, key string) (err erro
 	}
 	ctx = compose_v2.WithThreadIDCtx(ctx, thread)
 	ctx = compose_v2.WithOwner(ctx, intent.Owner)
-	return cancelSharedSession(ctx, s, ag, sharedCancellationRequest{}, h.cancellationHistory, agent_v2.WithResumeAbortContext(lifecycle))
+	return cancelSharedSession(ctx, s, ag, sharedCancellationRequest{}, h.historyForCancellation(s), agent_v2.WithResumeAbortContext(lifecycle))
 }

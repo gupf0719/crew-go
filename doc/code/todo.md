@@ -1,10 +1,10 @@
 # 项目待办
 
-2026-11-19 以 `test` 的 `7d71f69` 为基线。终局扇出、持久续跑准入、跨分区清档、剩余六项缺陷及 C01–C04、C06 已合入。2026-11-18 核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
+2026-11-19 以 `origin/test` 的 `233724d` 为基线。终局扇出、持久续跑准入、跨分区清档、剩余六项缺陷及 C01–C06 已合入。2026-11-18 核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **54 项**。P1 **0**、P2 **4**、P3 **50**。缺陷 **0**、能力缺口 **12**、待决 **26**、验收 **16**。
+共 **53 项**。P1 **0**、P2 **4**、P3 **49**。缺陷 **0**、能力缺口 **11**、待决 **26**、验收 **16**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -26,7 +26,6 @@
 
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
-| C07 | 能力缺口 | 需要编辑或重生时让前端与服务端历史共用消息身份 | 服务端历史权威既定。定义编辑的分叉与保留策略，以及调用 ID、SSE 消息 ID 和 HistoryStore 记录的映射。历史 TODO 306。 |
 | C08 | 能力缺口 | 路由模型输出可用的分类置信度 | 单独验证当前 classifier 输出契约和 RouteDecider 档位置信度。只在 provider 可提供可校准的值时接入。历史 TODO 282。 |
 | C09 | 能力缺口 | SQL Store 可选 TTL | 已有清理流程和显式删除。定义到期后的读取、命名空间枚举、历史保留和跨方言时钟行为。历史 TODO 358。 |
 | C10 | 能力缺口 | Handoff 确定性退回和缺 transfer 的诊断 | 阶段 3 是可选拓扑，忘装 transfer 的软提示需能区分合法终点。两条分别验收。历史 TODO 359、518。 [Handoff](../v2/handoff.md) |
@@ -78,6 +77,8 @@
 | Q27 | 待决 | 持久化业务状态演进与按执行 namespace 查历史 | ISSUE-70 Phase 4 的通用状态迁移需要版本化调用方。SelfHistoryByNS 希望按执行 namespace 查写入记录，先核对执行位置能否成为历史身份。 [ISSUE-70](../issue/issue-70-checkpoint-evolution.md) |
 
 ## 已关闭及归并去向
+
+- **C07 已实现。** AG-UI 能按存档或线上消息身份准备编辑与重生分支。原会话保留，分支读取服务端前缀。SQLite 回归覆盖 BasicAgent 流式入口、媒体回放与工具实例映射。 [用法](../v2/agui.md#历史分叉与消息寻址) · [跨层回归](../../sql/agui_history_fork_test.go)
 
 - **C05 已实现。** GraphAgent 可为每次 Run 或 Resume 添加断点。在原边界继续后按新配置停下，经 SQLite 重连仍以当前中断 ID 寻址。 [用法](../v2/execution-control.md#11-用法) · [跨层回归](../../sql/agui_breakpoint_test.go)
 

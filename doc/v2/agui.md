@@ -86,6 +86,31 @@ BasicAgent 在工具节点写入提交后，按调用声明顺序发送结果。
 
 `context` 的描述和值以及非空 `state` 会以 JSON 补到本次送模的用户消息。BasicAgent 和 LLMPlanner 使用这份临时数据，历史和存档保留原对话。默认会话的 Resume 请求可提供新的本轮数据。共享会话续跑时沿用 Run 时的这份数据。客户端的 system / developer 消息仍按前文规则过滤。[AG-UI 输入类型](https://docs.ag-ui.com/sdk/js/core/types) · [中断原因](https://docs.ag-ui.com/concepts/interrupts#reason-taxonomy)
 
+### 历史分叉与消息寻址
+
+用 `agui.WithHistoryStore(history)` 启用 Handler 管理的历史。它以 `WithOwnerResolver` 的结果与
+`threadId` 组成 HistoryKey。普通 Run 使用已存的服务端前文及请求中的最后一条用户消息。
+查询历史、分叉及 Run/Resume 都要求非空 owner，缺失时返回 HTTP 401。
+共享部署的实例配置同一 HistoryStore，已绑定宿主历史的任务据此继续和收尾。
+
+1. `GET /agui?threadId=<源会话>&history=references` 返回存档顺序中的用户、助手和工具记录引用。
+   `id` 是 HistoryStore 消息 ID，`wireId` 给出可用的 AG-UI 地址。用户使用请求消息 ID，缺省时由服务端提供。
+   助手在有模型调用 ID 时用它作地址，发送文本流时与 SSE 的 `messageId` 一致。
+   工具引用的 `callId` 是模型协议中的原始调用 ID，
+   `instanceId` 与 SSE 的 `toolCallId` 对应。框架工具结果的 `wireId` 是线上结果的基准 ID。
+   如果请求消息列表已占用它，SSE 结果使用数字后缀，分叉入口也识别这个别名。
+2. `POST /agui?threadId=<源会话>&history=fork` 传 `{"action":"edit","messageId":"<用户消息>"}`，
+   或传 `{"action":"regenerate","messageId":"<用户、助手或工具结果消息>"}`。
+   入口先按存档 ID 查找，再按线上地址查找。多份等价输入归到同一轮，匹配到不同轮时返回 HTTP 409。
+3. HTTP 201 返回新的 `threadId`、原用户输入的 `sourceMessageId`、可用的 `sourceWireId` 和可提交的
+   AG-UI 用户消息 `input`。编辑时改写该输入的内容，重生时沿用返回的正文和媒体。
+   为新 `threadId` 发普通 Run，给本次运行分配新的 `runId`。
+
+分支只复制选中轮之前的服务器记录，保留工具往返和原消息身份。源会话的历史与挂起任务保留。
+每次准备生成独立的会话 ID，模型和工具在后续 Run 执行。
+在宿主用户输入已保存后才能按同轮助手答复重生。旧任务缺少宿主映射时按任务章查找唯一的用户输入，
+无法定位原输入时返回 HTTP 409。未保存调用实例的旧工具记录仍可按服务端 ID 寻址。
+
 ## 5. HITL 闭环（Resume）
 
 ```
@@ -232,7 +257,8 @@ Redis 第一次轮询时分页导入旧记录。导入完成后持久保存标�
 关闭期间续答返回 HTTP 409 `cleanup_pending`。同一取消批次可重试。挂起查询和同线程新 Run 可在会话租约外构造原工厂后参与补偿。
 如果准备补偿期间其他实例已替换任务，挂起查询读取当前开放的问题，新 Run 返回 HTTP 409 `busy`，由调用方决定是否再次提交。
 如果保留的原工作流工厂不可用，后台保留进度，相关请求返回 `workflow_version_unavailable`。提供原版本后恢复。
-共享任务在实际选择历史后端时记录来源。由 HTTP 中间件选出的后端或未记录来源的旧任务，
+共享任务在实际选择历史后端时记录来源。由 `WithHistoryStore` 绑定的任务沿用宿主后端。
+由 HTTP 中间件选出的后端或未记录来源的旧任务，
 使用 `agui.WithCancellationHistory` 按保存的 `HistoryKey` 解析原逻辑存储，解析成功后才接受替换。
 由 Agent 工厂选择的后端可沿用原工厂配置。回调使用服务凭据，后台补偿只处理存档和历史。
 

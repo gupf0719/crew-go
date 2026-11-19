@@ -74,13 +74,17 @@ func ownRunInput(m *schema.Message) *schema.Message {
 // 原地改碰不到钩子的对象；共享历史视图按 ID 认同一条原始输入，没有 ID 的话转交的每一跳入口各补一个、各记一份（实测）。
 // 各 agent 的 Run 入口都经它。
 func adoptHookInput(in *hook.AgentInput, input *schema.Message) *schema.Message {
-	if in == nil || len(in.Messages) == 0 || in.Messages[len(in.Messages)-1] == nil {
-		return input
-	}
-	if got := in.Messages[len(in.Messages)-1]; got != input {
+	if got := lastAgentInputMessage(in); got != nil && got != input {
 		return ownRunInput(got)
 	}
 	return input
+}
+
+func lastAgentInputMessage(in *hook.AgentInput) *schema.Message {
+	if in == nil || len(in.Messages) == 0 {
+		return nil
+	}
+	return in.Messages[len(in.Messages)-1]
 }
 
 func cloneCalleeInput(m *schema.Message) *schema.Message {

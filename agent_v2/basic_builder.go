@@ -1601,7 +1601,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			if err := compose_v2.SaveStepResult(ctx, basicToolsHistoryStep, true, compose_v2.Rerunnable(), compose_v2.WithStreams(nil)); err != nil {
 				slog.WarnContext(ctx, "agent_v2: 记「这一批已记过会话历史」失败，这次执行之后作废时续跑会再记一份", "err", err)
 			}
-			recordHistory(ctx, historyOwner(ctx, name), name, results)
+			recordHistoryWithToolBatch(ctx, historyOwner(ctx, name), name, results, batch, toolCalls)
 		}
 
 		writes := []compose_v2.ChannelWrite{compose_v2.Write(basicMessagesCh, append(results, referenceMessages...))}

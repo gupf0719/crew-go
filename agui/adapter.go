@@ -474,15 +474,24 @@ func (a *sseAdapter) emitToolResult(out *schema.ToolOutput) {
 	// （「Re-streaming a message the consumer already has appends to it」）。
 	// 这里曾无条件用 a.runID，于是一个 run 里 N 个工具结果全撞在一起。
 	//
-	// 结果消息 ID 由本次 AG-UI runId 与调用 ID 派生。自研 Agent 复用调用 ID 时用后缀区分结果消息。
-	callID, _ := wireToolCallID(out.Extra, out.CallId)
-	resultID := a.runID + "/" + callID
+	callID, hasInstance := wireToolCallID(out.Extra, out.CallId)
+	base := toolResultWireID(callID)
+	if !hasInstance {
+		// 自研 Agent 复用原始工具调用 ID 时继续按本次请求区分结果消息。
+		base = a.runID + "/" + callID
+	}
+	resultID := base
 	for n := 2; a.byID[resultID] != nil || a.inputIDs[resultID]; n++ {
-		resultID = a.runID + "/" + callID + "#" + strconv.Itoa(n)
+		if old := a.byID[resultID]; hasInstance && old != nil && !old.voided && old.role == "tool" && old.toolCallID == callID {
+			return
+		}
+		resultID = base + "#" + strconv.Itoa(n)
 	}
 	a.recordLocked(&emittedMessage{id: resultID, producer: producer, role: "tool", toolCallID: callID}).content.WriteString(content)
 	a.writeLocked(NewToolCallResult(resultID, callID, content))
 }
+
+func toolResultWireID(instance string) string { return instance + "/result" }
 
 // OnError 把中间错误（model / tool 层）映射为 Custom([CustomEventError])——供前端观测，不占
 // RunError 终态语义（终态 RunError 由 handler 在 Run 返回 error 时发）。

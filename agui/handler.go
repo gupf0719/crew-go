@@ -101,6 +101,7 @@ const DefaultMaxSessions = 10000
 // 用户消息里的 image、audio、video 和 document 部分转成消息的媒体块。activity 消息的
 // content 是对象，不是对话内容，Content 留空；别的角色的 content 是对象时解码报错。
 type AGUIMessage struct {
+	ID      string `json:"id,omitempty"`
 	Role    string `json:"role"`
 	Content string `json:"content"`
 	media   []*schema.ContentBlock
@@ -113,13 +114,14 @@ type AGUIMessage struct {
 // UnmarshalJSON 解 role 与 content：content 接受字符串、ContentPart 数组、对象与 null（见类型说明）。
 func (m *AGUIMessage) UnmarshalJSON(b []byte) error {
 	var raw struct {
+		ID      string          `json:"id"`
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	}
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return err
 	}
-	m.Role, m.Content, m.media, m.droppedParts = raw.Role, "", nil, nil
+	m.ID, m.Role, m.Content, m.media, m.droppedParts = raw.ID, raw.Role, "", nil, nil
 	m.raw = append(json.RawMessage(nil), b...)
 	c := bytes.TrimSpace(raw.Content)
 	switch {
@@ -268,7 +270,8 @@ func WithMaxSessions(n int) Option {
 //	agui.WithOwnerResolver(func(context.Context) string { return "default" })
 //
 // 多租户：从认证中间件放进 ctx 的主体取。**不要**从客户端可控的字段（header /
-// body / query）取，那等于没做。resolver 返空串的请求全落同一个匿名分区。
+// body / query）取，那等于没做。resolver 返空串时，默认使用同一个匿名分区。
+// 启用 [WithHistoryStore] 后，查询历史、分叉及 Run/Resume 均要求非空 owner，缺失时返回 HTTP 401。
 func WithOwnerResolver(fn compose_v2.OwnerResolver) Option {
 	return func(h *handler) { h.ownerResolver = fn }
 }
@@ -373,6 +376,7 @@ type handler struct {
 	build               AgentFactory
 	sessionStore        SessionStore
 	cancellationHistory func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error)
+	historyStore        agent_v2.HistoryStore
 	runStore            RunStore
 	runTimeout          time.Duration
 	workflowVersion     string
@@ -393,6 +397,11 @@ type handler struct {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch op := r.URL.Query().Get("history"); op {
+	case "references", "fork":
+		h.serveHistory(w, r, op)
+		return
+	}
 	if r.Method == http.MethodGet && h.sessionStore != nil {
 		if runID := r.URL.Query().Get("runId"); h.runStore != nil && runID != "" {
 			h.serveRunQuery(w, r, runID)
@@ -462,6 +471,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx, key := h.requestContext(r, in.ThreadID)
+	if h.historyStore != nil && key.owner == "" {
+		_ = sse.Reject(http.StatusUnauthorized, "owner_required", "conversation history requires an authenticated owner")
+		return
+	}
 	if h.runStore != nil {
 		h.serveTrackedRun(ctx, sse, r, &in, key, raw)
 		return
@@ -518,6 +531,10 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 		return
 	}
 	h.warnClientMessages(ctx, rep)
+	if h.historyStore != nil {
+		// 新分支的前缀可能为空。启用宿主历史时只使用已存入该分区的前缀。
+		prior = nil
+	}
 	ctx = agent_v2.WithCallerHistoryCtx(ctx, prior)
 
 	var previousAgent agent_v2.Agent
@@ -632,7 +649,7 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 	}
 	if shared != nil {
 		if previousAgent != nil {
-			if err := cancelSharedSession(cleanupCtx, shared, previousAgent, sharedCancellationRequest{replacement: true}, h.cancellationHistory); err != nil {
+			if err := cancelSharedSession(cleanupCtx, shared, previousAgent, sharedCancellationRequest{replacement: true}, h.historyForCancellation(shared)); err != nil {
 				if shared.record != nil && shared.record.Cancellation != nil {
 					slog.WarnContext(ctx, "agui: 替换任务的历史收尾未完成", "sid", oldTask, "err", err)
 					_ = sse.Reject(http.StatusConflict, "cleanup_pending", "the previous task still needs cleanup")
@@ -662,7 +679,7 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 			return
 		}
 		activity.FinishAbandon()
-		ctx = shared.bindHistory(ctx)
+		ctx = shared.bindHistory(ctx, h.hostedHistory(key))
 	} else {
 		if dropActivity != nil {
 			replacing = true
@@ -686,7 +703,11 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 			}
 			dropActivity.Release()
 		}
+		claimed.history = h.hostedHistory(key)
 		ctx = claimed.bindLocalHistory(ctx, sess.RunID)
+	}
+	if h.historyStore != nil {
+		ctx = agent_v2.WithHistoryCtx(ctx, h.historyStore, key.owner)
 	}
 	started = true
 	// **收尾必须挂在 defer 上，不能写成 ag.Run 之后的普通语句。**
@@ -964,7 +985,7 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 	if allCancelled {
 		var err error
 		if shared != nil {
-			err = cancelSharedSession(ctx, shared, ag, sharedCancellationRequest{entries: in.Resume, epoch: pendingEpoch}, h.cancellationHistory)
+			err = cancelSharedSession(ctx, shared, ag, sharedCancellationRequest{entries: in.Resume, epoch: pendingEpoch}, h.historyForCancellation(shared))
 		} else {
 			if entry.abortCtx == nil {
 				entry.abortCtx = context.WithoutCancel(agent_v2.WithCallerHistoryCtx(abortBase, prior))
@@ -1009,7 +1030,14 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 			settled = true
 			return
 		}
-		ctx = shared.bindHistory(ctx)
+		var hosted agent_v2.TaskHistoryDestination
+		if shared.record.HistorySource == agent_v2.TaskHistoryHost {
+			hosted = h.hostedHistory(key)
+			if hosted.Store != nil {
+				ctx = agent_v2.WithHistoryCtx(ctx, hosted.Store, shared.record.HistoryKey.Owner)
+			}
+		}
+		ctx = shared.bindHistory(ctx, hosted)
 	} else {
 		all = h.recordAnswers(key, answers)
 		ctx = entry.bindLocalHistory(ctx, sess.RunID)
@@ -1707,6 +1735,11 @@ func splitClientMessages(msgs []AGUIMessage) (prior []*schema.Message, input *sc
 		return nil, nil, rep
 	}
 	input = msgs[last].userMessage()
+	id := msgs[last].ID
+	if id == "" {
+		id = input.ID
+	}
+	input.Annotations = map[string]any{agent_v2.HistoryInputMessageIDAnnotation: id}
 	rep.inputDropped = len(msgs[last].droppedParts) > 0
 	rep.droppedParts = len(msgs[last].droppedParts)
 	prior = make([]*schema.Message, 0, last)

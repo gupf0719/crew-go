@@ -184,12 +184,16 @@ func (s *sharedSession) session() *agent_v2.RunSession {
 	return sess
 }
 
-func (s *sharedSession) bindHistory(ctx context.Context) context.Context {
+func (s *sharedSession) bindHistory(ctx context.Context, hosted agent_v2.TaskHistoryDestination) context.Context {
 	sid, key := s.record.TaskID, s.record.HistoryKey
 	if key != (agent_v2.HistoryKey{}) {
-		return agent_v2.WithTaskHistoryBinding(ctx, sid, agent_v2.TaskHistoryDestination{Key: key}, nil)
+		destination := agent_v2.TaskHistoryDestination{Key: key, Source: s.record.HistorySource}
+		if destination.Source == agent_v2.TaskHistoryHost {
+			destination.Store = hosted.Store
+		}
+		return agent_v2.WithTaskHistoryBinding(ctx, sid, destination, nil)
 	}
-	return agent_v2.WithTaskHistoryBinding(ctx, sid, agent_v2.TaskHistoryDestination{}, func(ctx context.Context, destination agent_v2.TaskHistoryDestination) error {
+	return agent_v2.WithTaskHistoryBinding(ctx, sid, hosted, func(ctx context.Context, destination agent_v2.TaskHistoryDestination) error {
 		if s.record == nil || s.record.TaskID != sid || s.record.Closing {
 			return errPendingChanged
 		}
@@ -245,7 +249,7 @@ func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agen
 	} else if key := s.record.HistoryKey; key != (agent_v2.HistoryKey{}) {
 		opts = append(opts, agent_v2.WithResumeAbortHistoryKey(&key))
 	}
-	if request.replacement || s.record.Cancellation != nil && s.record.Cancellation.Replacement {
+	if s.record.HistorySource == agent_v2.TaskHistoryHost || request.replacement || s.record.Cancellation != nil && s.record.Cancellation.Replacement {
 		// 中间件提供的存储会覆盖 Agent 配置。未知来源的旧记录也需要宿主定位原存储。
 		if resolveHistory == nil && s.record.HistorySource != agent_v2.TaskHistoryAgent {
 			return errHistoryResolverRequired
@@ -352,7 +356,7 @@ func (h *handler) openSharedSessionAfterCancellation(ctx context.Context, key se
 		if buildErr != nil {
 			return locked, nil, buildErr
 		}
-		if err := cancelSharedSession(locked, s, ag, sharedCancellationRequest{}, h.cancellationHistory); err != nil {
+		if err := cancelSharedSession(locked, s, ag, sharedCancellationRequest{}, h.historyForCancellation(s)); err != nil {
 			return locked, nil, err
 		}
 		if beforeRun && candidate.Cancellation.Replacement {

@@ -497,16 +497,18 @@ routing 分类器、reflect 评估器与反馈教练、`NewPlanAgent` 的 planne
 写的判断、Parallel 的 Merger / Aggregator 里拿 agent 当裁判）要自己在子 ctx 上调一次
 `agent_v2.WithoutHistoryCtx(ctx)`。
 
-**调用方手里的前文**（`WithCallerHistoryCtx`）：有的调用方每次请求都带着整场对话（AG-UI 前端就是这样，`agui`
-已自动接上）。把这一轮之前的轮次推进 ctx：
+**调用方手里的前文**（`WithCallerHistoryCtx`）。AG-UI 默认处理请求中的前文，应用也可以把这一轮之前的轮次放进 ctx。
 
 ```go
 ctx = agent_v2.WithCallerHistoryCtx(ctx, earlierTurns) // 这一轮之前的轮次，不含这一轮的输入
 ag.Run(ctx, sess, schema.UserMessage("这一轮的问题"))
 ```
 
-**一次运行只认一个来源**——前文与历史层描述的是同一段对话，客户端会裁、会改、会重新生成，历史层又有客户端看不到的
-工具往返，两份放在一起没有可靠的对法：
+启用 `agui.WithHistoryStore` 时，Handler 按 owner 和 threadId 使用服务端前缀，只从请求取得本轮用户输入。
+历史为空或读取失败时，本轮从当前输入继续。编辑和重生通过显式分叉准备新的会话前缀。
+[历史分叉与消息寻址](agui.md#历史分叉与消息寻址)
+
+在 `WithCallerHistoryCtx` 提供前文的模式下，每次运行选用一个来源。
 
 | 情形 | 读历史的 agent 看到什么 |
 |---|---|
@@ -517,10 +519,8 @@ ag.Run(ctx, sess, schema.UserMessage("这一轮的问题"))
 配置（嵌套的编排也算），树里只要有成员配了 `WithHistory`，写入器就由最外层的编排拥有；两处配得不一样直接报错。GraphAgent
 没有静态子列表，要以服务端为准就在运行入口用 `WithHistoryCtx` 声明。
 
-以服务端为准的三个后果，接 AG-UI 前端时要知道：
+使用该前文接入方式时，服务端历史遵循以下约定。
 
-- 前端「编辑前面的消息」「重新生成答复」不会改写服务端的记录，模型照旧看到服务端那份。要这类功能，让前端拥有历史（不配
-  历史层）。
 - 同一场对话各轮要用同一套配置：某几轮由没配历史层的 agent 接，那几轮进不了服务端的记录，以服务端为准的轮看不到它们。
 - 前文只在服务端第一次见到这场对话时写一次；那一次读或写失败，这次运行照样以客户端为准、看得到前文，但之后那几轮不在
   服务端的记录里。

@@ -171,13 +171,19 @@ func sameCheckpointPartition(ctx context.Context, cp Checkpointer, sid string) b
 	return parentToken != "" && parentToken == CheckpointTaskLeaseToken(ctx, child.CheckpointTaskLeases(), sid)
 }
 
-// CheckCheckpointIdentity 确认存档可以交给这张编译图。旧档仍能解码，续跑要求
-// 明确且相同的存档身份。cp 为 nil 时没有需要校验的身份。
+// CheckCheckpointIdentity 核对存档是否与编译图相符，包括存档身份和屏障进度。
+// 旧档仍能解码，续跑要求明确且相同的存档身份。cp 为 nil 时直接通过。
 func (g *Graph) CheckCheckpointIdentity(cp *Checkpoint) error {
-	if cp == nil || (cp.GraphID != "" && cp.GraphID == g.CheckpointIdentity()) {
+	if cp == nil {
 		return nil
 	}
-	return RejectCheckpointIdentity(cp, fmt.Sprintf("graph %q has checkpoint identity %q", g.ID(), g.CheckpointIdentity()))
+	if cp.GraphID == "" || cp.GraphID != g.CheckpointIdentity() {
+		return RejectCheckpointIdentity(cp, fmt.Sprintf("graph %q has checkpoint identity %q", g.ID(), g.CheckpointIdentity()))
+	}
+	if err := g.validateCheckpointSchedule(cp); err != nil {
+		return checkpointTargetRejection(err, cp)
+	}
+	return nil
 }
 
 // RejectCheckpointIdentity 拒绝恢复这份档。问题 ID 随错误交给祖先图，以保留该分支原有的待答项。

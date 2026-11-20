@@ -1,10 +1,10 @@
 # 项目待办
 
-2026-11-20 以 `origin/test` 的 `2cf19b5` 为基线。终局扇出、持久续跑准入、跨分区清档、剩余六项缺陷及 C01–C14 已合入。2026-11-18 核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
+2026-11-20 以 `origin/test` 的 `fd40a78` 为基线。终局扇出、持久续跑准入、跨分区清档、剩余六项缺陷及 C01–C15 已合入。2026-11-18 核验时 [GitHub](https://github.com/gupf0719/crew-go/issues) 无开放 Issue，仓内编号见 [Issue 索引](../issue/issues.md)。
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **45 项**。P1 **0**、P2 **4**、P3 **41**。缺陷 **0**、能力缺口 **3**、待决 **26**、验收 **16**。
+共 **44 项**。P1 **0**、P2 **4**、P3 **40**。缺陷 **0**、能力缺口 **2**、待决 **26**、验收 **16**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -26,7 +26,6 @@
 
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
-| C16 | 能力缺口 | 手写 Graph 的 AND-join 与收尾屏障 | 当不同深度前驱汇入同一节点时提供全到齐的策略。普通 any-of 保留现行契约。历史 TODO 571。 |
 | C17 | 能力缺口 | 给内部决策和结构化输出补可观测区分 | 明确独立的路由/评估模型统计维度，补结构化输出类型。fallback 已 emit 指标，端到端断言归 A08。历史 TODO 350、382。 [可观测性](../v2/observability.md) |
 | C18 | 能力缺口 | 按 Handoff 来源收窄候选与按次暂停转交 | 源自 ISSUE-99 的 #7 和 #8。分别验证候选权限和同一次执行中 tool/程序化转交都受控制。 [控制信号](../issue/issue-99-handoff-control-signal.md) |
 | A06 | 验收 | Anthropic 真流、错误分类与服务端上下文清理 | 核对空闲流处理、SSE 间隔、真实计费拒绝及 prompt-too-long 原文的可识别性。跑 `TestSmoke_ContextEditing` 确认两种清理的实际统计、与 compaction 组合的请求以及严格前缀回放。另核对实际触发压缩后的交互和编辑前后的缓存用量。依赖 `ANTHROPIC_API_KEY` 与实际返回条件。 [流式冒烟命令](../description/smoke-test-recipes.md) · [清理冒烟](../../example/model/anthropic_smoke/context_editing_test.go) |
@@ -69,6 +68,8 @@
 | Q27 | 待决 | 持久化业务状态演进与按执行 namespace 查历史 | ISSUE-70 Phase 4 的通用状态迁移需要版本化调用方。SelfHistoryByNS 希望按执行 namespace 查写入记录，先核对执行位置能否成为历史身份。 [ISSUE-70](../issue/issue-70-checkpoint-evolution.md) |
 
 ## 已关闭及归并去向
+
+- **C16 已实现。** 固定前驱可跨超步汇合，已触发的收尾节点等普通工作排空后执行。SQLite 回归覆盖子图两次挂起、原地址续跑、等待实例的私有输入、已完成成员只执行一次和清档。 [调度用法](../v2/channel-engine.md#46-固定前驱汇合与收尾节点) · [跨层回归](../../sql/graph_schedule_test.go)
 
 - **C15 已实现。** 自研 Agent 可用 `EnterResume` 校验独立续跑请求并保留原会话审批。低阶图嵌套时上下文绑定子会话，回归覆盖原提问续跑、完成记录重放、历史归属和清档。 [自研入口](../v2/usage-guide.md#自研-agent-的续跑) · [跨层回归](../../agent_v2/custom_nested_graph_test.go)
 

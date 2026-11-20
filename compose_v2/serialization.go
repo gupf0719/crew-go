@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
 	"sync"
 
 	"crew-go/internal/panicerr"
@@ -285,6 +286,8 @@ func UnmarshalTagged(data []byte) (any, error) {
 
 //   - v23：AutoCompact 的审批绑定摘要调用和输入视图，将视图代际保存在节点状态。旧摘要审批续跑时重新提问。
 
+//   - v24：固定前驱的汇合进度与收尾等待队列随超步存档，私有输入沿用实例身份。
+
 // CheckpointSchemaVer 是 Checkpoint 当前存档版本号。恢复时可据此识别旧版运行状态的语义。
 // Marshal 和 Unmarshal 不按版本拒绝存档。
 //
@@ -300,7 +303,7 @@ func UnmarshalTagged(data []byte) (any, error) {
 //   - 业务侧迁移逻辑负责按 cp.SchemaVer 分支决定 unmarshal 字段
 //   - framework 加 `Migrate(v Old, vNew int) (*Checkpoint, error)` 类工具
 //   - 不在 Unmarshal 路径加 fail-fast
-const CheckpointSchemaVer = 23
+const CheckpointSchemaVer = 24
 
 // checkpointSchemaVer (private alias 保 framework 内部 reference 兼容).
 const checkpointSchemaVer = CheckpointSchemaVer
@@ -429,6 +432,8 @@ func (cm *ChannelManager) Snapshot() (*Checkpoint, error) {
 		copy(cp.CurrentFrontier, cm.frontierAtExit)
 		cp.FrontierStarted = cm.frontierStarted
 	}
+	cp.DeferredFrontier = slices.Clone(cm.deferredFrontier)
+	cp.JoinProgress = cloneJoinProgress(cm.joinProgress)
 	if len(cm.pendingInterrupts) > 0 {
 		cp.PendingInterrupts = make([]*AskQuery, len(cm.pendingInterrupts))
 		copy(cp.PendingInterrupts, cm.pendingInterrupts)
@@ -705,6 +710,8 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 	prevRecipientKey := cm.recipientKey
 	prevDeferred := cm.deferredSends
 	prevFrontier := cm.frontierAtExit
+	prevDeferredFrontier := cm.deferredFrontier
+	prevJoinProgress := cm.joinProgress
 	prevFrontierInputs := cm.frontierInputs
 	prevFrontierStarted := cm.frontierStarted
 	prevPendingSends := cm.pendingSendWrites
@@ -731,6 +738,8 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 		cm.recipientKey = prevRecipientKey
 		cm.deferredSends = prevDeferred
 		cm.frontierAtExit = prevFrontier
+		cm.deferredFrontier = prevDeferredFrontier
+		cm.joinProgress = prevJoinProgress
 		cm.frontierInputs = prevFrontierInputs
 		cm.frontierStarted = prevFrontierStarted
 		cm.pendingSendWrites = prevPendingSends
@@ -903,6 +912,8 @@ func (cm *ChannelManager) Restore(cp *Checkpoint) (err error) {
 		copy(cm.frontierAtExit, cp.CurrentFrontier)
 		cm.frontierStarted = cp.FrontierStarted
 	}
+	cm.deferredFrontier = slices.Clone(cp.DeferredFrontier)
+	cm.joinProgress = cloneJoinProgress(cp.JoinProgress)
 	cm.frontierInputs, err = cm.restoreFrontierInputsLocked(cp)
 	if err != nil {
 		return err
@@ -934,21 +945,24 @@ func (cm *ChannelManager) restoreFrontierInputsLocked(cp *Checkpoint) (map[strin
 	if len(cp.FrontierInputs) == 0 {
 		return nil, nil
 	}
-	instances := make(map[string]int, len(cp.CurrentFrontier))
-	for _, member := range cp.CurrentFrontier {
-		instances[member.InstanceID]++
+	instances := make(map[string]int, len(cp.CurrentFrontier)+len(cp.DeferredFrontier))
+	for _, frame := range [][]FrontierMember{cp.CurrentFrontier, cp.DeferredFrontier} {
+		for _, member := range frame {
+			instances[member.InstanceID]++
+		}
 	}
 	inputs := make(map[string][]ChannelWrite, len(cp.FrontierInputs))
 	for id, serialized := range cp.FrontierInputs {
 		if id == "" || instances[id] != 1 {
-			return nil, fmt.Errorf("restore send input for instance %q without a unique frontier member", id)
+			return nil, fmt.Errorf("%w: restore send input for instance %q without a unique scheduled member",
+				ErrCheckpointNotResumable, id)
 		}
 		writes, err := unmarshalChannelWrites(serialized)
 		if err == nil {
 			err = validateSendInput(writes, cm.channels)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("restore send input for instance %q: %w", id, err)
+			return nil, fmt.Errorf("%w: restore send input for instance %q: %w", ErrCheckpointNotResumable, id, err)
 		}
 		inputs[id] = writes
 	}

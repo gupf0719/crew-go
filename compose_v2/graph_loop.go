@@ -1671,8 +1671,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			cm.setTaskID(newEpoch())
 		}
 		cm.setInputDigest(cfg.inputDigest)
-		// 复用 cm 跑新任务时，上一次运行已提交的上行信号不该在这次成功时再交一次
-		cm.resetSignalsForFreshRun()
+		cm.resetFreshRunProgress()
 		if restartCandidate && !partitionChanged && rootCp == nil && GetOwner(ctx) == owner {
 			ctx = withCheckpointRestartScope(ctx, ctx, cfg, restartSlots)
 		}
@@ -1728,7 +1727,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		// __plan_current__ 等）时，caller 不知道要注册啥。
 		// 幂等：caller 已 Restore 过的话，再调用同 snap 覆盖回相同值（无副作用）。
 		if err := cm.Restore(cfg.resumeFrom); err != nil {
-			return fmt.Errorf("auto-restore: %w", err)
+			// 还未接管目标槽。让父图保留子图原来已公开的待答项。
+			return checkpointTargetRejection(fmt.Errorf("auto-restore: %w", err), cfg.resumeFrom)
 		}
 		if len(cfg.resumeFrom.CurrentFrontier) != 0 && readsCheckpoint {
 			claimed, err := cfg.checkpointer.ClaimResume(ctx, cfg.sessionID, cfg.graphNS, rootCp, cfg.resumeFrom)
@@ -1784,10 +1784,13 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			bodyReached = true // 成功出口之三（共三处，见 Goexit 判据 defer）
 			return nil
 		}
+		initial := stepSchedule{frontier: frontier}
+		if err := g.planDeferred(cm, &initial); err != nil {
+			return err
+		}
+		frontier = initial.frontier
+		cm.setInitialSchedule(initial)
 	}
-
-	// 中断保护：每帧推进时记录 frontier 到 cm，让 Snapshot 能拿到中断点
-	cm.updateFrontier(frontier)
 
 	// **F-B fix**：补 apply 上次没能提交的 SendDirective payload——必须在
 	// 跑任何节点**之前**（frontier 里就有等着读这些 payload 的 target）。fresh run
@@ -2065,28 +2068,29 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		//
 		// 原先这些散落在提交之后的 150 行里，中间任何一处被掐断都会留下半应用的存档
 		// （独立审计逐点注入实测：成功兄弟的出边整批丢失、target 读到零值、写入双计）。
-		var (
-			nextFrontier []FrontierMember
-			isEnd        bool
-			dirWrites    []ChannelWrite
-			nextInputs   map[string][]ChannelWrite
-		)
+		var next stepSchedule
+		var isEnd bool
 		if res.FirstErr == nil {
-			nextFrontier, isEnd = assembleFrontier(append(append([]NodeID{}, res.Targets...), completedTargets...))
+			joinTargets, waiting := g.planJoins(cm, res.SucceededBranches, completedEarlier)
+			targets := append(append([]NodeID{}, res.Targets...), completedTargets...)
+			next.frontier, isEnd = assembleFrontier(append(targets, joinTargets...))
 			// 先前已提交的成员先投递，按已经校验的顺序折叠共享 payload。
 			for _, d := range sends {
 				if d.Target == "" || d.Target == EndNode {
 					continue
 				}
-				nextFrontier = append(nextFrontier, FrontierMember{NodeID: d.Target, InstanceID: d.instanceID})
+				next.frontier = append(next.frontier, FrontierMember{NodeID: d.Target, InstanceID: d.instanceID})
 				if len(d.Input) > 0 {
-					if nextInputs == nil {
-						nextInputs = make(map[string][]ChannelWrite)
-					}
-					nextInputs[d.instanceID] = d.Input
+					next.setInput(d.instanceID, d.Input)
 				}
-				dirWrites = append(dirWrites, d.Payload...)
+				next.sendWrites = append(next.sendWrites, d.Payload...)
+			}
+			if err := g.planDeferred(cm, &next); err != nil {
+				return err
+			}
+			if len(next.frontier) > 0 {
 				isEnd = false
+				next.joinProgress = waiting
 			}
 		}
 
@@ -2097,7 +2101,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 					res.SucceededBranches, res.ConsumedAnswers, res.Signals, res.SendDirectives, res.Targets, res.WriteOwners)
 			} else {
 				commitErr = cm.commitSuperstepAdvance(res.SuccessWrites,
-					res.SucceededBranches, res.ConsumedAnswers, res.Signals, nextFrontier, dirWrites, nextInputs)
+					res.SucceededBranches, res.ConsumedAnswers, res.Signals, next)
 			}
 			if commitErr != nil {
 				// 提交失败时，刚收到的答案和兄弟进度都还未结算。发生子档身份冲突时，
@@ -2179,7 +2183,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			bodyReached = true // 成功出口之一（共三处：本处 + 空档幂等 no-op + Start→End 极端图）
 			return nil
 		}
-		frontier = nextFrontier
+		frontier = next.frontier
 
 		// 新算出的边界先过断点：after 看刚整体提交的这个超步（含部分失败时先成功的兄弟），before 看下一
 		// 超步要执行的。**排在 durability 中途写档与下一轮循环顶的软取消 / ctx 检查之前**——那些停止先落档

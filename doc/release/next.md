@@ -9,6 +9,7 @@
 - 新建路由升级链时给每个 `WithRouteDecider` 档位使用稳定名称。 [路由决策](../v2/route-decider.md)
 - 使用 `SendDirective.Input` 的部署应统一 Checkpoint 的读写版本。Schema 19 增加 `frontier_inputs` 和 `deferred_sends[].input`，缺少这两个字段的旧存档仍可读取。旧进程读取新存档会忽略这些字段，回退前先处理挂起的私有投递。 [存档结构](../v2/checkpoint.md)
 - Schema 23 将 AutoCompact 审批绑定到本次摘要调用和实际送模视图。经过图身份校验后，未绑定的旧摘要审批会重新提问，业务提问沿用原 ID。 [摘要提问](../v2/context-compaction.md#压缩结果的复用单次-run-内的备忘与跨-run-的压缩边界)
+- Schema 24 保存固定前驱的到达记录与收尾队列。为在途图新增调度声明前，先用原图处理挂起任务。回退前，由支持 Schema 24 的版本处理使用这两项调度能力的存档。 [调度契约](../v2/channel-engine.md#46-固定前驱汇合与收尾节点)
 - 旧工具账已登记展示但未记录展示方式时，AG-UI 续跑向前端发送空正文，模型与历史沿用存档中的定稿结果。 [AG-UI 事件映射](../v2/agui.md)
 - A2A 使用 `a2a-go/v2 v2.7.0`。新版服务端要求请求携带 `A2A-Version: 1.0`。`server.Card` 默认声明 `text/plain` 和 `application/json`，按 `text` 匹配名片的客户端需更新。自装配服务端应按请求 owner 隔离任务读取、列表与重订阅。旧挂起档缺少答复投递状态时，续跑需能读取远端任务做对账。 [A2A 接入](../v2/a2a.md)
 - MCP stdio 通过 `WithStdioEnvAllowlist` 选择继承变量，服务明确需要的凭据也可用 `WithStdioEnv` 提供。 [MCP](../v2/mcp.md)

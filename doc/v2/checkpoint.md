@@ -47,7 +47,7 @@ type Checkpoint struct {
     NS        string           // 本 cp 的 ns 路径（嵌套寻址用）
     ParentNS  string           // 父 ns（O(1) 反查祖先）
     Status    CheckpointStatus // Unset / Pending / Failed / Aborted / Resuming，见 §3.1
-    SchemaVer int              // 当前 CheckpointSchemaVer = 23
+    SchemaVer int              // 当前 CheckpointSchemaVer = 24
     GraphID   string           // 防 cp 串台（§4.3）
     CreatedAt int64            // UnixNano，Cleanup 按它排序；框架只在 caller 没给时盖
     Epoch     string           // 写代：每次 SaveNS 换一枚（§2.2）
@@ -65,7 +65,9 @@ type Checkpoint struct {
     CompletedSignals  []SignalRecord         // 部分失败超步里成功成员先记在一边的上行信号（整超步完成时再合并）
     RecipientKey      []byte                 // 铸收件人的密钥（compose_v2.SignalRecipient），续跑时同一个位置算出同一个收件人
     CurrentFrontier   []FrontierMember       // 下一帧要跑谁
-    FrontierInputs    map[string][]SerializedWrite // 当前投递实例的私有输入，按 InstanceID 寻址
+    FrontierInputs    map[string][]SerializedWrite // 活动与收尾等待实例的私有输入
+    JoinProgress      map[int][]NodeID        // 按汇合声明下标记录尚未就绪的固定前驱
+    DeferredFrontier  []FrontierMember       // 等普通工作排空的收尾成员
     FrontierStarted   bool                   // 这一超步开没开始执行（成员中断 / 失败之后的档为真；停在超步边界上的——软取消、ctx 取消、断点停下——为假）——续跑时决定判不判 before 断点
     NodeVisits        map[NodeID]int         // 每节点成功跑过几次——中断 ID 的 visit 维度靠它跨 cp 递增
 
@@ -83,6 +85,10 @@ type Checkpoint struct {
 
 **cp 粒度 = channel 粒度**：`Channels` 是 per-channel 自描述序列化
 （`taggedValue{Type, Data}`），业务加新字段不用动序列化协议。
+
+Schema 24 的汇合进度和收尾队列随超步提交。两种调度声明都参与图存档身份校验，
+普通图沿用原身份。屏障进度与编译定义冲突或缺少活动帧时，恢复拒绝并保留原档。
+[配置和执行语义](channel-engine.md#46-固定前驱汇合与收尾节点)
 
 ### 2.2 三个"身份"字段别混
 
@@ -209,7 +215,7 @@ func TestMyPGCheckpointer(t *testing.T) {
 | `CPStatusAborted` | 终局失败与存档身份冲突并存时封存根档。身份冲突的子档保留。 |
 | `CPStatusResuming` | 该世代已获准续跑，后续结果尚未持久确认。保留快照和旧问题供诊断。 |
 
-恢复会检查 `Checkpoint.HasResumableWork()`、图与任务身份、目标分区和存档世代。普通的 Pending、Failed 和旧 Unset 快照都按 frontier 与待答内容判断。已封存或未结算的续跑会被入口拒绝。详见[持久续跑准入](#持久续跑准入)。
+恢复会检查 `Checkpoint.HasResumableWork()`、图与任务身份、目标分区和存档世代。普通的 Pending、Failed 和旧 Unset 快照按活动帧、待答项与屏障进度识别候选。只有屏障进度却缺少活动帧的档会被拒绝并保留排查。已封存或未结算的续跑会被入口拒绝。 [持久续跑准入](#持久续跑准入)
 
 ### 3.2 何时存
 

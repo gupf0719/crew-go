@@ -279,8 +279,14 @@ type Checkpoint struct {
 	// 与 CompletedFrontier 同时机重放（并入重跑超步的 next frontier + payload）。
 	DeferredSends []SerializedSend `json:"deferred_sends,omitempty"`
 
-	// FrontierInputs 按 CurrentFrontier 的投递实例 ID 保存该实例的私有 channel 输入。
+	// FrontierInputs 按 CurrentFrontier 或 DeferredFrontier 的投递实例 ID 保存私有 channel 输入。
 	FrontierInputs map[string][]SerializedWrite `json:"frontier_inputs,omitempty"`
+
+	// JoinProgress 记录每组尚未就绪的固定前驱。键是 AddJoinEdge 的声明下标，值按节点 ID 排序。
+	JoinProgress map[int][]NodeID `json:"join_progress,omitempty"`
+
+	// DeferredFrontier 记录已触发并在等待普通工作排空的收尾成员。
+	DeferredFrontier []FrontierMember `json:"deferred_frontier,omitempty"`
 
 	// NodeStates 节点私有中断态（见 node_state.go 的类型 godoc）——键是
 	// `nodeStateKey(NodeID, InstanceID, Visit)`，值是 tagged JSON。
@@ -397,12 +403,13 @@ func (s CheckpointStatus) Resumable() bool {
 	return s == CPStatusPending || s == CPStatusFailed
 }
 
-// HasResumableWork 报存档是否有待执行节点或待答问题。存量普通快照即使没有
+// HasResumableWork 报存档是否有待执行工作或待答问题。存量普通快照即使没有
 // Status，仍可按内容判断。恢复还要核对图、任务和目标槽的身份，并通过 [Checkpointer.ClaimResume]
 // 的持久准入。[CPStatusResuming] 保存诊断现场，本谓词仍可能为真。
-// 挂起非空且 frontier 为空的矛盾档由恢复入口拒绝。
+// 有待答项或屏障进度却没有活动帧的矛盾档由恢复入口拒绝。
 func (cp *Checkpoint) HasResumableWork() bool {
-	return cp != nil && (len(cp.CurrentFrontier) > 0 || len(cp.PendingInterrupts) > 0)
+	return cp != nil && (len(cp.CurrentFrontier) > 0 || len(cp.PendingInterrupts) > 0 ||
+		len(cp.JoinProgress) > 0 || len(cp.DeferredFrontier) > 0)
 }
 
 // BelongsToTask 判「这份存档属于代号为 taskID 的那次任务」。

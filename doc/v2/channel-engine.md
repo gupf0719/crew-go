@@ -35,18 +35,16 @@
 ### 1.1 一句话定位
 
 crew-go 的图引擎是**channel-based BSP（Bulk Synchronous Parallel）超步执行模型**：
-每个超步并发执行一组节点，所有节点写入的 channel 在 barrier 同步点统一 reduce
-合并，下一帧从合并后的 channel 状态计算新 frontier。**isEnd 与 next-tasks 计算合并
-在同一函数**，根除 v1 时代「已完成 graph 被 ctx 拦下」类 bug。
+每个超步并发执行一组节点。引擎在提交点合并成功成员的写入，推进下一帧与屏障进度。
+到达 End 且工作排空时，图在当前超步提交后返回成功。
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  超步 N:                                                         │
-│    1. computeNextTasks(g, cm) → (frontier, isEnd)               │
-│    2. if isEnd → return（终止条件优先于 ctx 检查）              │
-│    3. ctx.Err() check                                           │
-│    4. 并发 execute(frontier) → 收集所有 ChannelWrite           │
-│    5. cm.ApplyAll(writes) ← BSP barrier，reducer 统一合并       │
+│    1. 检查取消，执行活动帧                                      │
+│    2. 归并出边、投递和屏障的调度计划                            │
+│    3. 提交写入、下一帧与等待进度                                │
+│    4. 已到达 End 且工作排空时返回成功                           │
 │  超步 N+1:                                                       │
 │    ... 重复                                                       │
 └─────────────────────────────────────────────────────────────────┘
@@ -72,7 +70,8 @@ compose_v2/
 ├── channel.go              Channel[T] 泛型定义 + 4 reducer 工厂
 ├── channel_manager.go      ChannelManager + anyChannel 类型擦除
 ├── graph.go                Graph 编译产物与节点、边数据结构
-├── graph_loop.go           Run 主入口 + computeNextTasks + ApplyAll
+├── graph_loop.go           Run 主入口与超步提交
+├── schedule.go             固定前驱汇合与收尾调度
 ├── send.go                 SendFrom / SendDirective fan-out 协议
 ├── access.go               Get/Write/Has 包级泛型访问函数
 ├── interrupt.go            InterruptError + AskQuery + IsInterrupt
@@ -319,92 +318,20 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) e
 
 ### 3.2 主循环时序
 
-```
-Run(ctx, g, cm, opts...) {
-    // 0. 入口前置：Checkpointer / sessionID / graphNS push ctx；ResumeContext 早就绪
-    // 1. Resume 路径：LoadNS → cm.Restore(cp)（恢复 channels + frontier + PendingInterrupts）
-    // 2. 应用 initialWrites（首次 Run 注入 input）：cm.ApplyAll(opts.InitialWrites)
-
-    // 3. 初始 frontier 在循环【外】算一次（StartNode 出边）
-    frontier, isEnd, _ := computeNextTasks(ctx, g, []NodeID{StartNode}, cm)
-    if isEnd { return nil }             // StartNode→EndNode 极端图直接成功
-    cm.updateFrontier(frontier)
-
-    // 4. 超步循环（真实顺序——grep graph_loop.go::Run）
-    for {
-        if err := ctx.Err(); err != nil { return err }    // 帧首：只查 ctx（done 上轮末已判）
-        if len(frontier) == 0 { return errFrontierEmpty } // 空 frontier 守卫
-        for _, id := range distinctNodeIDs(frontier) {    // visits++ / maxVisit 防御（按 NodeID 去重，
-            if visits[id]++; visits[id] > maxVisit { ... } //   否则同 Target 扇出 N 次直接把计数推 N 格）
-        }
-
-        res := executeFrontier(ctx, g, frontier, cm, hooks) // 并发执行 frontier（per-branch delta）
-
-        if res.SingleWriterConflictErr != nil { return ... } // 核对本逻辑超步的所有成员，包括已部分提交者
-
-        if res.FirstErr != nil {                          // 失败/中断：先整批 record（撞 ID 当场拒）
-            cm.recordInterruptBatch(allQueriesOf(res.AllInterrupts))
-            narrowFrontierTo = res.FailedBranches
-        }
-
-        // ★ 下一帧与 payload **在提交之前纯计算**算好——出边由各成员在自己的执行里算完，
-        //   assembleFrontier 只做去重 + 判 End。这是把它们收进一个临界区的前提。
-        if res.FirstErr == nil {
-            _, deferredSends, completedTargets := cm.peekCompletedSiblings()
-            nextFrontier, isEnd = assembleFrontier(res.Targets + completedTargets)
-            res.SendDirectives = deferredSends ++ res.SendDirectives   // deferred 前置
-            for _, d := range res.SendDirectives {        // Target 并入 nextFrontier
-                nextFrontier = append(nextFrontier, member(d))          // payload 攒进 dirWrites
-                dirWrites = append(dirWrites, d.Payload...); isEnd = false
-            }
-        }
-
-        // ★ 提交：按路径拆成两个方法，各自把自己那条路的字段改动**全部**收进一个临界区
-        if res.FirstErr != nil {
-            // 写入落地 / frontier 窄化 / 代际推进 / 答案兑付 / 成功兄弟记账
-            cm.commitSuperstepPartial(res.SuccessWrites, narrowFrontierTo,
-                res.SucceededBranches, res.ConsumedAnswers, res.SendDirectives, res.Targets)
-            return res.exitErr()   // 终局失败 > 坏存档 > 档没写成 > 中断 > 第一个业务错
-        }
-        // 写入落地 / 代际推进 / 答案兑付 / 待办清空 / **frontier 前移** / **payload 第二次 apply**
-        //   （payload 那次单独 apply：并进第一次的话它失败会把成功成员的写一起回滚）
-        cm.commitSuperstepAdvance(res.SuccessWrites, res.SucceededBranches,
-            res.ConsumedAnswers, nextFrontier, dirWrites)
-
-        if isEnd { return nil }                           // ★graph 跑完直接返（不进下一轮 ctx 检查）
-        frontier = nextFrontier
-        cm.updateFrontier(frontier)
-    }
-}
-// cp save / DeleteSubtree 统一在 Run 顶层 cleanup defer 按 runErr 分流（见 checkpoint.md §3.2/§3.3）——
-//   循环体内任何 return 只把 error 冒泡，不直接 SaveNS。
-// 节点成功完成后 runNodeWithHooks 递增 visit（失败/中断不增）保 InterruptID 稳定。
-```
+1. 续跑恢复活动帧、待答项和屏障状态。新执行应用初始写入，求值起点出边并划分活动帧和收尾队列。
+2. 每个超步先检查取消和边界，再经 `executeFrontier` 执行成员。成员自己的条件边在提交前求值。
+3. 部分失败且通过提交校验时，`commitSuperstepPartial` 尝试提交成功成员的写入、完成记录及待发出边。
+   提交成功后留下失败成员与原等待队列。
+4. 整步成功时合并当前及此前已完成成员的出边，计算固定前驱到达、动态投递和收尾释放。
+   `commitSuperstepAdvance` 将成员写入、访问计数、答案兑付和调度进度一并提交。共享投递 payload 随后在同一临界区归并，失败时记入待补写入。
+5. 工作排空并到达 End 后返回成功。还有待执行工作时检查断点并进入下一轮。Sync 和 Async 过程档在超步边界写入。
 
 ### 3.3 核心不变量
 
 #### 不变量 1：isEnd 优先于 ctx
 
-真实循环结构（`graph_loop.go::Run`）：`computeNextTasks` + `isEnd` 在循环体**末尾**，
-`ctx.Err()` 在下一轮循环体**顶部**——二者跨 iteration 边界形成「isEnd 优先 ctx」：
-
-```go
-for {
-    if err := ctx.Err(); err != nil { return err } // 帧首：只查 ctx（done 上轮末已判）
-    // ... executeFrontier → recordInterrupt → ApplyAll（见 §3.2）...
-    nextFrontier, isEnd, err := computeNextTasks(...) // 帧末：算下一帧 + isEnd 合并判定
-    if isEnd { return nil }   // graph 跑完直接返，不进入下一轮帧首的 ctx 检查
-    frontier = nextFrontier
-}
-```
-
-**机制**：graph 跑完时 `isEnd` 在帧末 `return nil`，**不会**进入下一轮帧首的 ctx 检查
-——所以「已完成的 graph 即便 deadline 已过也不被 ctx 拦下」。v1 时代 `plan_chat_web`
-bug「已完成 graph 被 ctx 拦下」正是 v1 把 ctx 检查放在 isEnd 之前。
-[`why-channel-based.md`](./why-channel-based.md) §1 直接 trigger 详述。
-
-channel-based 模型下 `computeNextTasks` 同时返 (frontier, isEnd)——一处判定，永远
-不可能不一致。
+普通目标和已释放的收尾都计入下一活动帧。到达 End 且没有下一帧时，当前提交完成后直接返回成功。
+仍有工作时进入下一轮检查 ctx，收尾也遵守该边界。由此避免已完成的图在下一轮被误报为取消。
 
 #### 不变量 2：BSP barrier（统一同步点 reduce）
 
@@ -487,8 +414,7 @@ CLAUDE.md "交付纪律" 强制约束。
 - `InterruptError` + `ctx.Err()` + 业务 error + **panic（经 `safeNodeRun` 转 error）** 都经
   Run defer 走**同一 SaveNS 路径**——panic 不是特例（旧版"panic 不存 cp"已废：panic 转 error
   后与业务 error 同走 `graph_loop.go::Run` defer）
-- 但**仅当 frontier 或 PendingInterrupts 非空才 SaveNS**；都空（无中断点的快速失败）skip 不存
-  cp（避免存无意义空 cp）—— 故上表"✅ SaveNS"前提是有中断点
+- 出口仅在 `Checkpoint.HasResumableWork()` 为真时保存可恢复现场。空的失败现场不落档。
 - panic 路径虽存 cp，业务**仍应避免用 panic 表达 HITL**——Resume 拿 panic 时可能不一致的
   channel 状态（§13.5 #7）
 - ctx cancel 是**外部主动停**——fan-out 兄弟也收到 cancel 信号（共享 ctx），与业务
@@ -511,11 +437,13 @@ func WithChannel[T any](b *GraphBuilder, ch *Channel[T]) *GraphBuilder
 // 节点 / 边
 func (b *GraphBuilder) AddNode(id NodeID, fn NodeFunc, opts ...NodeOption) *GraphBuilder
 func (b *GraphBuilder) AddEdge(from, to NodeID) *GraphBuilder
-func (b *GraphBuilder) AddConditionalEdge(from NodeID, cond EdgeCondition) *GraphBuilder
+func (b *GraphBuilder) AddJoinEdge(from []NodeID, to NodeID) *GraphBuilder
+func (b *GraphBuilder) AddConditionalEdge(from NodeID, cond EdgeCondition, opts ...CondOption) *GraphBuilder
 
 // 配置
 func (b *GraphBuilder) WithName(name string) *GraphBuilder           // 调试用
 func (b *GraphBuilder) WithMaxVisit(n int) *GraphBuilder            // 单节点最大访问次数（防死循环）
+func (b *GraphBuilder) WithDeferredNodes(nodes ...NodeID) *GraphBuilder
 
 // 编译
 func (b *GraphBuilder) Compile() (*Graph, error)
@@ -646,6 +574,32 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 子图作为节点嵌入父图——子图独立 channel 命名空间，cp 物理写到父 store 的
 `(parentSID, parentNS/childID)` ns 路径。详见 §8 NS 命名空间体系。
 
+### 4.6 固定前驱汇合与收尾节点
+
+普通 `AddEdge` 按任一前驱触发，同一超步内的相同静态目标只调度一次。深度不同的两条路径
+可以在不同超步各触发一次。需要等固定前驱都提交时，使用 `AddJoinEdge`。
+
+```go
+// 先登记 fast、relay、slow、merge 和 finalize 五个节点。
+b.AddEdge(compose_v2.StartNode, "fast").
+    AddEdge(compose_v2.StartNode, "relay").
+    AddEdge("relay", "slow").
+    AddJoinEdge([]compose_v2.NodeID{"fast", "slow"}, "merge").
+    AddEdge(compose_v2.StartNode, "finalize").
+    WithDeferredNodes("finalize")
+```
+
+- **固定前驱汇合**。每组按节点 ID 记录成功提交，允许跨超步到达。重复到达合并为一次。凑齐后
+  触发目标并清空本组记录，普通目标进入下一活动帧，收尾目标按排空规则调度。条件分支绕过必需前驱时，
+  该组不会触发，图可按正常路径结束。
+  多组汇合声明、普通边及动态投递各自独立触发同一个目标。
+- **收尾屏障**。`WithDeferredNodes` 让已触发的收尾节点等本图普通工作排空再同批执行。等待中的
+  同一静态目标合并为一次，动态投递保留各自的实例 ID 和私有输入。共享 payload 仍随发出方的调度提交。
+  收尾节点可通过出边发起后续工作，队列受 `WithMaxFrontierWidth` 限制。
+- **挂起与恢复**。启用存档时，可恢复的挂起或失败会保留汇合进度、收尾队列和私有输入。部分提交已成功的
+  前驱在该超步推进时计入到达，续跑仅重跑未完成的成员。收尾节点实际进入活动帧时才检查其
+  before 断点。 [存档结构](checkpoint.md#21-checkpoint-全字段)
+
 ---
 
 ## 5. Checkpoint 协议
@@ -671,14 +625,14 @@ func (b *GraphBuilder) AddSubgraphNode(id NodeID, sub *Graph, opts ...SubgraphOp
 
 ### 7.1 Fan-out 范式
 
-v2 fan-out 由 `SendFrom` + `SendDirective` 协议实现——节点内部主动调 `SendFrom(ctx, directives...)`
-让框架在下一超步派生 N 分支：
+v2 fan-out 由 `SendFrom` 和 `SendDirective` 表达。发出方的超步推进时调度投递目标，
+普通目标进入下一活动帧，收尾目标等本图普通工作排空再运行。
 
 ```go
 // compose_v2/send.go
 type SendDirective struct {
     Target  NodeID          // 目标节点 ID（必须已在 graph 注册）
-    Payload []ChannelWrite  // 在下一超步入口归并到共享 channel
+    Payload []ChannelWrite  // 发出方的超步推进时归并到共享 channel
     Input   []ChannelWrite  // 只提供给本次投递的目标实例
 }
 
@@ -698,15 +652,14 @@ InterruptID 防 ask_user 串台，**不** push 分支 ns、**不**建 per-branch
 
 同一 target 的多个实例可以分别接收 `Input`。每个输入 channel 从零值按投递顺序归并，
 覆盖目标实例的读视图。条件边与 `AddSubgraphNode` 的显式导入读取这个视图，
-节点返回的写入仍进入共享提交。私有输入随延迟投递和当前 frontier 的实例 ID 存档。
+节点返回的写入仍进入共享提交。私有输入随部分提交的待发指令、活动帧或收尾等待队列的实例 ID 存档。
 （⚠️ `JoinFanoutNS` **不是**「与引擎 fan-out 无关」：`AddSubgraphNode` 就用
 `JoinFanoutNS(parentNS, id, fanoutIdx)` 给 SendFrom 派生的子图实例分子 ns——那是**子图**这一
 层的 cp 分离，跟上面说的「分支不分裂 ns」不矛盾：分支自己不分，分支里嵌的子图分。）
 
 ### 7.2 所有 fan-out 编译为图原生超步 frontier
 
-**统一**：v2 fan-out 不是新概念——`computeNextTasks` 算出 frontier 长度 ≥ 2 即超步并
-发；fan-out 只是"业务主动指定 frontier 内容"的一种方式。
+活动帧含多个成员时由 `executeFrontier` 并发执行。fan-out 让业务在运行中指定待调度的成员。
 
 **调度器对待 fan-out / 普通超步无区别**：
 
@@ -732,8 +685,7 @@ v2 channel-based 模型下**这是天然能力**——每个分支只写自己�
 - 成功分支的 writes 已在 cp.Channels 里（ApplyAll 已合并）→ 不需要重跑
 - 失败/中断分支的 writes 没合并 → 重跑该分支
 
-**实现位置**：`compose_v2/graph_loop.go::executeFrontier` 收集 errs 时按分支分类——
-成功分支立即 apply 进 cm、失败分支不动 cm（保持 barrier 之前的状态）。
+**实现位置**。`executeFrontier` 按成员收集结果和错误，提交阶段统一应用成功成员的写入。
 
 **发散 fan-out 的补充（PA-H1）**：当成功分支与失败分支走【不同出边】（A→X、B→Y）时，仅
 "成功分支 writes 在 cp.Channels" 不够——Resume 重跑失败成员 B 成功后，成功成员 A 的后继 X

@@ -703,12 +703,3 @@ func init() {
 	// 通过），它要随存档走。
 	RegisterValueType[Signals]("compose_v2.Signals")
 }
-
-// resetSignalsForFreshRun 清掉 cm 上的上行信号与收件人密钥——新开时调（续跑由 Restore 整体换成
-// 存档里的）。复用 cm 跑新任务时不清的话，上一次运行已提交的信号在这次成功时再交一次（实测：第二次
-// WithFreshRun 交出 "run1,run2"）。
-func (cm *ChannelManager) resetSignalsForFreshRun() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	cm.signals, cm.completedSignals, cm.recipientKey = nil, nil, nil
-}

@@ -175,8 +175,10 @@ type ChannelManager struct {
 	// 经 Snapshot/Restore 持久化到 cp.PendingSendWrites。
 	pendingSendWrites []ChannelWrite
 
-	// frontierInputs 仅持有当前 frontier 的私有输入，按投递实例身份寻址。
-	frontierInputs map[string][]ChannelWrite
+	// frontierInputs 持有活动帧和收尾等待队列的私有输入，按投递实例身份寻址。
+	frontierInputs   map[string][]ChannelWrite
+	deferredFrontier []FrontierMember
+	joinProgress     map[int][]NodeID
 
 	// visitCount 跟踪每个节点的成功完成次数（audit Round 3 Bug #1 修复）。
 	// 用于 InterruptSite 编入 visit 维度——同节点跨多次访问（BasicAgent ReAct
@@ -607,6 +609,22 @@ func channelValueTypeMatches(want, got reflect.Type) bool {
 	return got == nil || want == got || (want.Kind() == reflect.Interface && got.Implements(want))
 }
 
+// resetFreshRunProgress 清掉上次执行的信号及等待进度，续跑时由 Restore 恢复。
+func (cm *ChannelManager) resetFreshRunProgress() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.signals, cm.completedSignals, cm.recipientKey = nil, nil, nil
+	cm.frontierInputs, cm.deferredFrontier, cm.joinProgress = nil, nil, nil
+}
+
+func (cm *ChannelManager) setInitialSchedule(next stepSchedule) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.deferredFrontier = next.deferred
+	cm.updateFrontierLocked(next.frontier)
+	cm.frontierStarted = false
+}
+
 // updateFrontier 是 Run 内部 helper：更新当前帧 frontier 到 cm，便于中断时
 // Snapshot 自动持久化。不导出。
 func (cm *ChannelManager) updateFrontier(frontier []FrontierMember) {
@@ -626,9 +644,11 @@ func (cm *ChannelManager) markFrontierStarted() {
 func (cm *ChannelManager) updateFrontierLocked(frontier []FrontierMember) {
 	if len(cm.frontierInputs) > 0 {
 		inputs := make(map[string][]ChannelWrite)
-		for _, member := range frontier {
-			if writes, ok := cm.frontierInputs[member.InstanceID]; ok {
-				inputs[member.InstanceID] = writes
+		for _, frame := range [][]FrontierMember{frontier, cm.deferredFrontier} {
+			for _, member := range frame {
+				if writes, ok := cm.frontierInputs[member.InstanceID]; ok {
+					inputs[member.InstanceID] = writes
+				}
 			}
 		}
 		cm.frontierInputs = inputs
@@ -676,7 +696,7 @@ func (cm *ChannelManager) updateFrontierLocked(frontier []FrontierMember) {
 // 各成员在自己的执行里算完（算不出来的成员根本不算成功），assembleFrontier 只做去重
 // 与判 End。所以它们能提到提交之前算好再传进来。
 //
-// ⚠️ **`dirWrites` 是第二次 apply，不并进第一次**：并进去的话 payload 里一个 reducer
+// ⚠️ **共享投递 payload 在第二次 apply 归并**：并进第一次的话 payload 里一个 reducer
 // 失败会把成功成员的写入一起回滚，那些成员重跑时 fan-out 实例身份是新铸的 ⟹ 已兑付
 // 的答案绑在旧身份上，变成永远等不到的挂起。
 //
@@ -737,10 +757,10 @@ func (cm *ChannelManager) commitSuperstepPartial(
 }
 
 // commitSuperstepAdvance 是**全员成功**路径的提交：写入落地、代际推进、答案兑付、上行信号并入、
-// 待办记录清空、frontier 前移、SendFrom payload 折叠，**七样在同一个临界区里**。signals 是调用方
+// 待办记录清空、frontier 和屏障推进、SendFrom payload 折叠都在同一个临界区里。signals 是调用方
 // 已经跟部分失败时记在一边的合并过的整份。
 //
-// nextFrontier 为 nil 表示本超步之后无待执行成员（isEnd，或出边为空的异常图）——
+// next.frontier 为 nil 表示本超步之后无待执行成员（isEnd，或出边为空的异常图）——
 // 两者都是清空 frontier，区分交给调用方（前者返回成功，后者由下一轮的空 frontier 检查报错）。
 //
 // # dirWrites 为什么是**第二次** applyAllLocked 而不是并进第一次
@@ -756,9 +776,7 @@ func (cm *ChannelManager) commitSuperstepAdvance(
 	succeeded []FrontierMember,
 	consumedAnswers []string,
 	signals []SignalRecord,
-	nextFrontier []FrontierMember,
-	dirWrites []ChannelWrite,
-	nextInputs map[string][]ChannelWrite,
+	next stepSchedule,
 ) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -777,12 +795,14 @@ func (cm *ChannelManager) commitSuperstepAdvance(
 	cm.completedSignals = nil
 	cm.completedWriteOwners = nil
 	cm.frontierInputs = nil
-	cm.updateFrontierLocked(nextFrontier)
-	cm.frontierInputs = nextInputs
+	cm.updateFrontierLocked(next.frontier)
+	cm.frontierInputs = next.inputs
+	cm.deferredFrontier = next.deferred
+	cm.joinProgress = next.joinProgress
 	cm.frontierStarted = false // 新边界，还没开始执行
-	if len(dirWrites) > 0 {
-		cm.pendingSendWrites = append([]ChannelWrite(nil), dirWrites...)
-		if err := cm.applyAllLocked(dirWrites); err != nil {
+	if len(next.sendWrites) > 0 {
+		cm.pendingSendWrites = append([]ChannelWrite(nil), next.sendWrites...)
+		if err := cm.applyAllLocked(next.sendWrites); err != nil {
 			// 保留 frontier + pendingSendWrites 作 Resume 现场。**标记是哪一步失败的**
 			// ——调用方对两种失败的处置完全相反（前一次失败要整超步重跑，这一次不能，
 			// 成功成员的写入已经落地、frontier 已前移，重跑就是双计）。由知情的这一处

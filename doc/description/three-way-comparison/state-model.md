@@ -25,8 +25,8 @@
 | Reducer 抽象 | 9+ 内置 channel type（LastValue/Topic/BinaryOperatorAggregate/NamedBarrierValue/Ephemeral/Untracked/...） | 2 种内置 channel（Pregel / DAG）+ FanInMergeConfig + 业务 mergeValues | 5 个 reducer 工厂：`LastValue`/`Append`/`Sum`/`OnceFlag`/`Custom`，外加 `DynamicChannel` 运行时注册（`compose_v2/channel.go`） |
 | 跨节点字段映射 | channel name 隐式对齐 | `FieldMapping{fromNodeKey, from, to}` 显式声明 | `Channel[T]` 引用（包级 `Get`/`Write` 传引用），无字符串映射、IDE 重命名安全 |
 | 类型安全 | Python TypedDict + 运行时校验 | Go 类型擦除（`any`）+ 反射 | `Channel[T]` Go 泛型，节点读写编译期类型保护；类型擦除只在 `ChannelManager` 内部（`channelHandle[T]`） |
-| End 检测 | `apply_writes` 后 `if not self.tasks: status="done"`（统一同步点，`pregel/_loop.py:496-498`） | `if v, ok := nodeMap[END]; ok` 在 `calculateNextTasks` 出口（统一同步点，`graph_run.go:720-722`） | `computeNextTasks` 算下一帧 frontier，全为 EndNode 即 `isEnd`，与 `ApplyAll` 合并为统一同步点（`graph_loop.go`，对齐三方） |
-| 多前驱 join（fan-in 触发语义） | 默认 any-of；`add_edge([a,b], c)` 编译成 `NamedBarrierValue`（all-of、跨超步累积）；`defer=True` 编译成 `NamedBarrierValueAfterFinish`（等整图收尾）；`Send` 扇出的汇聚不经它、靠超步 | DAG channel 通过 `controlPredecessors` 静态依赖（AND-join） | **只有 any-of**：`assembleFrontier` 只对本超步目标去重、无前驱账本——同超步前驱塌成一次（ParallelAgent finalize 靠这个），深度不等则 join 跑两次、首跑只见部分数据、`err == nil`（实测，见决策 11）。动态扇出的汇聚与 LangGraph 同款靠超步（`SendFrom` → 下一超步并发 → 本帧全跑完才进下一帧）；缺的是声明式 AND-join 与 defer |
+| End 检测 | `apply_writes` 后 `if not self.tasks: status="done"`（统一同步点，`pregel/_loop.py:496-498`） | `if v, ok := nodeMap[END]; ok` 在 `calculateNextTasks` 出口（统一同步点，`graph_run.go:720-722`） | 归并出边、投递和收尾释放后，到达 End 且下一帧为空时在本次提交后返回成功。 |
+| 多前驱 join（fan-in 触发语义） | 默认 any-of；`add_edge([a,b], c)` 编译成 `NamedBarrierValue`（all-of、跨超步累积）；`defer=True` 编译成 `NamedBarrierValueAfterFinish`（等整图收尾）；`Send` 扇出的汇聚不经它、靠超步 | DAG channel 通过 `controlPredecessors` 静态依赖（AND-join） | 普通边默认 any-of。`AddJoinEdge` 汇集固定前驱的提交，`WithDeferredNodes` 等普通工作排空。动态扇出仍以超步提交汇聚。 |
 | 跨超步累积 | channel 自身持久 + 可选 reducer 累加 | channel 自身持久 + 业务 typed state | `Sum`/`Append` reducer 直接表达（channel value 随 cp 持久化、跨 Resume 安全）——channel 是**唯一** state 模型（v1 `ProcessState[S]` 已删） |
 | Send / 动态投递 | `Send(node, payload)` 转 task | `controls` map 显式控制流写入 | `SendFrom(ctx, ...SendDirective)`（`SendDirective{Target, Payload []ChannelWrite}`），Payload 走 channel reducer 注入下一超步（`compose_v2/send.go:67`） |
 
@@ -61,7 +61,7 @@
 - **reducer 由用户显式声明**，不内嵌默认 LastValue——避免 EndChannel 用 LastValue 时被覆盖为 false 的语义陷阱（`channel.go:51-53`）；终止信号用 `OnceFlag` 表达单调
 - **`Channel[T]` 泛型编译期类型保护**：`Get`/`Write` 传 channel 引用，value 类型编译期校验；类型擦除只在 `ChannelManager` 持 `[]anyChannel` 时发生（`channelHandle[T]`），节点 API 仍 typed
 - **跨超步累积**用 `Sum`/`Append` reducer（channel value 随 cp 持久化、跨 Resume 安全）——channel 是**唯一** state 模型（v1 GraphState / `ProcessState[S]` typed local state 已删：生产零 caller + fan-out 抢锁瓶颈，理由见 [`why-channel-based.md`](../../v2/why-channel-based.md) §2.1）
-- **End 检测统一同步点**：`computeNextTasks` 算下一帧 frontier 与 `ApplyAll` 合并写入，消除 v1 "done 检测散落 + ctx-vs-done 窗口" 根因（详见 `channel-engine.md`）
+- **End 检测统一同步点**。普通工作及收尾排空时在本次超步提交后返回，避免已完成的结果被下一轮取消检查拦下。 [引擎时序](../../v2/channel-engine.md#32-主循环时序)
 
 reducer 约定（`channel.go:16-47` godoc）：纯函数、内部禁止访问 `cm`（ApplyAll 归并段持锁调 reducer，重入 RLock 死锁）、满足关联 + 交换律（fan-out 多分支并发 reduce 顺序受调度影响）、无 error 返回、闭包不持久化跨 Resume（状态用 channel value 自身承载）。
 
@@ -82,7 +82,7 @@ reducer 约定（`channel.go:16-47` godoc）：纯函数、内部禁止访问 `c
 
 | v1 不足 | v2 现状 |
 |---|---|
-| End 检测无统一同步点 / ctx-vs-done 窗口 | 已修：`computeNextTasks` + `ApplyAll` 统一同步点（`graph_loop.go`，详见 `channel-engine.md`） |
+| End 检测无统一同步点 / ctx-vs-done 窗口 | 超步提交后统一完成。等待收尾释放时，图仍保留活动帧。 |
 | 跨超步累积只能走 typed state | 已修：`Sum` / `Append` reducer 直接表达，且随 cp 持久化 |
 | fan-out 合并规则不可配置（强制 append / last-writer） | 已修：每 channel 自带 reducer，`Custom` 表达任意合并规则 |
 
@@ -90,7 +90,7 @@ reducer 约定（`channel.go:16-47` godoc）：纯函数、内部禁止访问 `c
 
 | # | 不足 | 证据 | 他家对照 |
 |---|---|---|---|
-| 1 | 多前驱节点只有 any-of 触发，缺声明式 AND-join 与 defer | 深度不等的 join 节点跑两次、首跑吃半份数据、`err == nil`（探针实测 `order=up,down,side,other,down`；LangGraph 同图 down 跑一次且在 side 之后）。9 编排不撞——builder 生成的图前驱恒同超步（ParallelAgent 一次 `SendFrom` 投 N 个 worker → finalize）；GraphAgent 手搓图会撞。绕法：前驱各 `Write(Sum,1)` + join 空转 + cond→EndNode（多一次 visit）。⚠️ 旧描述「缺动态 fan-in barrier（`NamedBarrierValue` 式）」是张冠李戴：它守的是静态 AND-join；动态扇出「运行时 spawn N 分支、全到才汇总」两家都靠超步（`SendFrom` + `Append` 汇聚，`send.go` map-reduce 范例），我们已等价覆盖 | LangGraph `add_edge(list, end)`（`graph/state.py:928-935` docstring「wait for ALL」）→ `attach_edge` 编译 `NamedBarrierValue`（`:1551-1575`）；`defer=True` → `NamedBarrierValueAfterFinish` + `apply_writes` 末尾 `finish()`（`pregel/_algo.py:337-342`） |
+| 1 | 缺固定前驱汇合与收尾节点（C16 已补） | 不等深的普通边仍可各触发一次。同图中的固定汇合仅在两支提交后执行。SQLite 回归验证收尾跨挂起保留输入及已完成成员。 [引擎对照](../../../compose_v2/schedule_test.go) · [跨层回归](../../../sql/graph_schedule_test.go) | LangGraph 的 `add_edge(list, end)` 与 `defer=True` 提供相近的显式入口。 |
 | 2 | ~~无 ephemeral（channel 一律持久）~~ **非目标（2026-09-03 改判）** | LangGraph 的 `EphemeralValue` 是**引擎内部触发机制**：`START` 与每个节点的 `branch:to:<node>` 触发 channel（`graph/state.py:1354,1526-1530`），静态边 / 条件边往它写 `None`、按版本触发；用户态 `Annotated[T, EphemeralValue]` 在它自己的 StateGraph 测试与 docs 里零用例。我们的控制流不在 channel 里（frontier 是 `[]FrontierMember`、Send 走 ctx sink），那个内部需求不存在；用户态两家皆零消费者。channel value 一律随 cp 持久化这一点不变，也不再视为缺口 | LangGraph `channels/ephemeral_value.py:15-26` |
 | 3 | Send 是"投递给 Target"非"纯 pub" | `SendDirective{Target, Payload}` 需指定 Target 节点（空 / EndNode Target 被静默跳过而非报错，`graph_loop.go`）；Payload 已走 channel reducer，但仍非"写共享 channel 让若干订阅者各自按调度激活" | LangGraph `Send` / channel pub-sub 订阅模型 |
 
@@ -98,11 +98,11 @@ reducer 约定（`channel.go:16-47` godoc）：纯函数、内部禁止访问 `c
 
 | 他家方案 | 学 / 不学 / 已学 | 状态 |
 |---|---|---|
-| LangGraph `apply_writes → if not tasks: done` 统一同步点 | **已学**：v2 `computeNextTasks` 返回 `(frontier, isEnd)` 合并判定 + `ApplyAll` 统一 reduce（`graph_loop.go`） | 已落地 |
+| LangGraph `apply_writes → if not tasks: done` 统一同步点 | v2 在超步提交处完成调度，并在到达 End 且工作排空后返回。 | 已落地 |
 | LangGraph `apply_writes` 任务路径排序（fan-in reduce 顺序确定性）| **部分学**：整超步重跑路径已确定；只重跑失败分支路径顺序会变、需该场景 reducer 顺序无关；不学"每次全排序"——它靠整超步重跑实现、与我们 per-branch delta 优势冲突 | 取舍（见决策 6）|
 | LangGraph `BinaryOperatorAggregate` reducer | **已学**：`Sum` 内置 + `Custom[T](name, reducer, zero)` 表达任意二元累加（`channel.go:160,189`） | 已落地 |
 | LangGraph `Topic`（pubsub append/accumulate） | **部分已学**：`Append[T]` 覆盖累积语义；纯 pub-sub 多订阅者调度未做 | 部分 |
-| LangGraph `add_edge([a,b],c)` 静态 AND-join（编译成 `NamedBarrierValue`）+ `defer=True` 收尾节点 | **按需做**：仓内零消费者、9 编排不撞；将来候选 `AddJoinEdge([]NodeID, to)`（cp 存 seen 集合）或节点级 defer（`assembleFrontier` 算出 live 为空时再放一批），都动 cp 序列化与 Resume。教学面已补：`AddEdge` godoc 写明 any-of 与「深度不等 ⟹ 双触发」 | 待需求（见决策 11） |
+| LangGraph `add_edge([a,b],c)` 静态 AND-join 与 `defer=True` 收尾节点 | crew-go 将到达记录和收尾队列放在调度进度中，随超步提交和恢复。 | C16 已落地。 [使用方法](../../v2/channel-engine.md#46-固定前驱汇合与收尾节点) |
 | LangGraph `EphemeralValue`（step 内可见跨 step 清） | **非目标**：它是引擎内部触发机制，我们的 frontier 模型让需求不存在；用户态两家零消费者（见 §四 不足 2） | 已决策（2026-09-03） |
 | LangGraph 9+ channel 类型完整体系 | **已决策不学**：v2 选 4 内置 + Custom，保留极简学习曲线，验证够用 | 已决策 |
 | eino `FieldMapping{from, to}` 字符串字段映射 | **已决策不学**：v2 `Channel[T]` 引用 + 包级 `Get`/`Write` 编译期类型安全，优于字符串映射 | 已落地（反向案例） |
@@ -120,11 +120,11 @@ reducer 约定（`channel.go:16-47` godoc）：纯函数、内部禁止访问 `c
 
 > channel-based 重设计已落地——v2 即结果。本节保留最初决策 + 落地结论。
 
-1. **v1 today bug 根因消除**：v1 A 方案（`graphLoop` 调换 done/ctx 顺序）是临时止血；v2 channel-based 用 `computeNextTasks` 合并 isEnd + `ApplyAll` 统一同步点彻底消除根因（详见 `channel-engine.md`）
+1. **完成判定**。v2 在超步提交后判定是否还有待执行工作，已完成的图直接返回结果。 [引擎时序](../../v2/channel-engine.md#32-主循环时序)
 2. **channel-based 重设计完成**：`Channel[T]` Go 泛型做出比 eino `field_mapping` 更干净的 API（引用传递 + 编译期类型）+ 保留类型安全；9 编排全部迁移到 channel 模型
 3. **不学 eino FieldMapping**：已落地——保持 channel 引用 + 包级泛型读写，不引入字符串字段映射层
 4. **v1 优势保留**：编译期类型安全、嵌入不需 channel 协议、"零/极简 reducer 学习曲线"（v2 用 4 内置 reducer 替代 v1 的零 reducer，仍远少于 LangGraph 9+）这些优势 channel-based 后保留
-5. **剩余待补**：~~动态 fan-in barrier（`NamedBarrierValue` 式）+ channel 级 ephemeral~~ → 2026-09-03 调研改写为「多前驱只有 any-of，缺声明式 AND-join / defer」（见决策 11、第四节不足 1）；ephemeral 转非目标
+5. **多前驱调度**。C16 提供显式固定前驱汇合和收尾屏障。普通静态边和动态扇出沿用已有超步行为。ephemeral 的取舍见第四节第 2 项。
 6. **fan-in reduce 顺序确定性**：不学 LangGraph"每次 apply 按任务路径全排序"——它无 per-branch delta、整超步重跑、排序免费；我们有 per-branch delta 优势（只重跑失败分支省 LLM 调用），全排序需 cp 存各分支 delta + fan-out 前快照、成本高且收益场景罕见。接受现状：① 同 Run 内顺序确定（`executeFrontier` 按 frontier 索引收集）；② 跨 Resume 两种行为——**整超步重跑**（`ApplyAll`/reducer panic 异常路径）顺序一致、**只重跑失败分支**（业务失败 / 中断主路径）顺序变，故该场景 reducer 需顺序无关（`channel.go` reducer godoc 已注明两种行为）。eino 无防御（fan-in 走 Go map 随机顺序、`mergeValues` 无 sort）不参考。
 7. **不做图拓扑环路检测 / 全图可达性校验**：`GraphBuilder.validate()`（`compose_v2/graph.go`）只做编译期基础校验——图非空、每个 nodeID 过 ns 命名规范（`ValidateNodeIDForNS`，防 `/`、`#` 错位导致 cp 跨 ns 串台）且不是起止节点名、静态边的源/目标节点存在且不指回 START（条件边目标运行时才知、跳过）、至少一条 START 出边；**不检测环路，也不做可达性 / 孤儿节点 / dead-end 校验**。
    - **环检测——对 BSP 执行模型是反模式**：v2 是 superstep + frontier 的 BSP 引擎，循环回边是一等公民——BasicAgent 的 `model → tools → model`、LoopAgent / ReflectAgent / PlanAgent 的回边都是环。"检测到环就报错"等于让框架拒绝自己赖以运行的核心拓扑。环检测属于 DAG 范式的卫生检查、不属于 BSP 范式——我们是 BSP，不做是模型自洽。
@@ -138,10 +138,10 @@ reducer 约定（`channel.go:16-47` godoc）：纯函数、内部禁止访问 `c
    - **LangGraph 同款不变量、且是内建的**：`channels/last_value.py:56-64` 的 `LastValue.update()` 在 `len(values) != 1` 时抛 `InvalidUpdateError(ErrorCode.INVALID_CONCURRENT_GRAPH_UPDATE)`，错误正文直接给出路（"Use an Annotated key to handle multiple values"）；逃生舱是 `AnyValue`（`channels/any_value.py:15-17`，docstring "assumes that if multiple values are received, they are all equal"，取最后一个不报错）。这道守卫不是我们自创的防御，是这一类引擎的既有共识。
    - **我们不加新 channel 类型**：`Custom(name, func(_, next T) T { return next }, zero)` 已经是现成的「谁最后写谁赢、我不在乎」——显式写下同一个 reducer 的不受管。少一个 API、同一个形状。
    - **同目标实例的私有入参**：LangGraph 的 `Send(node, arg)` 直接提供目标节点的入参。crew-go 用 `SendDirective.Input` 传同一目标各实例的私有 channel 写入，输入按实例 ID 随 frontier 持久化。`SendDirective.Payload` 用于共享 channel 写入，多条投递写同一个 `LastValue` 仍会触发冲突守卫。见 [扇出范式](../../v2/channel-engine.md#71-fan-out-范式)。
-11. **多前驱 join 是 any-of，缺的是静态 AND-join / defer——不是「动态 fan-in barrier」也不是 ephemeral（2026-09-03 单视角调研 + 主会话复跑探针）**：backlog 那条「动态 fan-in barrier（`NamedBarrierValue` 式）+ channel 级 ephemeral」两半都不成立。
+11. **固定前驱汇合与收尾的演进（2026-09-03 调研，2026-11-20 落地）**。
    - **`NamedBarrierValue` 不动态、不是用户 API**：`names` 由 `add_edge(list, end)` 编译期 `set(starts)` 定死（`graph/state.py:1551-1575`），写未知名字直接 `InvalidUpdateError`（`channels/named_barrier_value.py:56-67`）；LangGraph 自己的 tests / docs 零处直接构造。`Send` 扇出的汇聚走保留 channel `TASKS`（`Topic(accumulate=False)`）+ 超步，链上没有它——「动态 fan-in」两家都是超步本身，我们已等价覆盖。
-   - **我们的多前驱是 any-of**：`assembleFrontier`（`compose_v2/out_edges.go:121-152`）只对本超步目标去重、无前驱账本。探针（`-overlay` 编译、仓库零改动）：START→A→C + START→B→B2→C ⟹ `order=B,A,B2,C,C`；逐字镜像 LangGraph `test_simple_multi_edge` ⟹ `order=up,down,side,other,down`（LangGraph 里 down 跑一次且在 side 之后）；手写 barrier（`Sum` 计数 + join 空转 + cond→EndNode）可行，`C_visits=2 C_realWork=1`。LangGraph 默认同样是 any-of（两条 `add_edge(x,c)` 深度不等也双触发——正是它要 `defer` 的原因），差别是它另给两个 opt-in。
-   - **取舍**：先不做功能——仓内零消费者（`okr.md` KR7.3 讲的是 merge 函数可插拔，reducer 早覆盖，触发语义没提）、9 编排前驱恒同超步、手写绕法能跑；**教学面当场补**（`AddEdge` godoc）。将来真需要时两个候选（`AddJoinEdge` / 节点级 defer）都动 cp 序列化与 Resume，属高风险 commit。
+   - **普通边的历史对照**。`assembleFrontier` 只对本超步目标去重。原探针的 START→A→C 与 START→B→B2→C 产生 `order=B,A,B2,C,C`，C 两次读取的数据不同。LangGraph 的普通 `add_edge(x,c)` 同样可跨超步各触发一次。手写计数方案可将实际工作减到一次，但仍访问 C 两次。
+   - **C16 决策**。保留普通边默认触发，以 `AddJoinEdge` 接受静态前驱集合，以 `WithDeferredNodes` 标记收尾。只有成功提交的前驱计入到达，已触发的收尾随活动帧同步推进和持久化。 [调度契约](../../v2/channel-engine.md#46-固定前驱汇合与收尾节点)
    - **ephemeral 转非目标**：见第四节不足 2。
    - **`ErrRunAborted` 的理由不是「重跑必然一样」**（独立审计实测证伪两次：条件写换批数据就 err=nil；冲突方之一第一次恰好失败时守卫看不到它），而是「这个矛盾会随存档反复复现，留 Pending 档只会让 auto-load 一遍遍撞」；代价（清子树连带清掉已答过的挂起档）写进 godoc。
 

@@ -12,8 +12,8 @@ import (
 //
 // 机制：节点 NodeFunc 内**imperative**调 SendFrom(ctx, ...) 写 ctx-injected
 // sink（更直观，不强制走 conditional edge 回调），节点 return 后框架 drain sink
-// 合并到下一超步 frontier；Payload 是 []ChannelWrite 走 channel reducer 流（与
-// compose_v2 channel-based 主线一致）。
+// 在提交时调度。普通目标进入下一超步，标记为 [GraphBuilder.WithDeferredNodes] 的目标进入收尾队列。
+// Payload 经 channel reducer 写入共享状态，私有 Input 随目标实例保留。
 //
 // ⚠️ **Payload 写进的是共享 channel 状态，不是「这条指令的私有入参」**。N 条指令的
 // payload 在下一超步开始前**一次性归并**进同一批 channel——下一超步的**所有**节点都看到
@@ -106,12 +106,12 @@ type sendSink struct {
 	afterCommit []func()
 }
 
-// SendFrom 在节点函数（NodeFunc）内调用——动态向下一超步投递 fan-out 指令。
+// SendFrom 在节点函数（NodeFunc）内调用，动态投递 fan-out 指令。
 //
 // **必须从 NodeFunc 内调用**——否则 ctx 没有 sendSink，调用静默 noop（不报错——
 // 业务复用 NodeFunc 在框架外测试时不应崩）。
 //
-// 节点 return 后框架按声明顺序 append 到下一超步 frontier。重复 Target 不去重
+// 成功提交时框架按声明顺序调度，收尾目标在普通工作排空后执行。重复 Target 不去重
 // （caller 想要 N 个并发 worker 时按 N 次调用）。
 //
 // **失败语义**：节点 return error 时 directives 自然被丢弃（compose_v2 BSP 协议：

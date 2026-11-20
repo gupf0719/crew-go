@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -119,6 +120,25 @@ func (g *Graph) fingerprintCheckpoint(revision string, subgraphs map[NodeID][sha
 		return strings.Compare(a.name(), b.name())
 	})
 	encoded.channels(channels)
+	if len(g.joinEdges) > 0 {
+		encoded.text("join-edges")
+		encoded.count(len(g.joinEdges))
+		for _, edge := range g.joinEdges {
+			encoded.text(string(edge.to))
+			encoded.count(len(edge.from))
+			for _, id := range edge.from {
+				encoded.text(string(id))
+			}
+		}
+	}
+	if len(g.deferredNodes) > 0 {
+		encoded.text("deferred-nodes")
+		ids := slices.Sorted(maps.Keys(g.deferredNodes))
+		encoded.count(len(ids))
+		for _, id := range ids {
+			encoded.text(string(id))
+		}
+	}
 	return sha256.Sum256(encoded)
 }
 

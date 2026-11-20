@@ -208,7 +208,10 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 			},
 			FrontierInputs: map[string][]compose_v2.SerializedWrite{
 				"i7": {{Channel: "ch2", Type: "string", Data: json.RawMessage(`"private"`)}},
+				"i8": {{Channel: "ch2", Type: "string", Data: json.RawMessage(`"waiting private"`)}},
 			},
+			JoinProgress:     map[int][]compose_v2.NodeID{0: {"left", "relay"}},
+			DeferredFrontier: []compose_v2.FrontierMember{{NodeID: "finish"}, {NodeID: "send", InstanceID: "i8"}},
 			// audit iter-3 视角 1 MED-2: 加 n3:0 zero-value 验业务 backend dropZero
 			// 序列化策略 (e.g., protobuf [default=0] / Java Map dropZero) 不破坏
 			// NodeVisits 协议 — crew-go 协议 (NodeVisits map[NodeID]int) 0 值
@@ -443,8 +446,15 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 		if got := loaded.DeferredSends[1].Input; len(got) != 1 || got[0].Channel != "ch2" || got[0].Type != "string" || string(got[0].Data) != `"deferred private"` {
 			t.Errorf("DeferredSends[1].Input round-trip lost: %+v", got)
 		}
-		if got := loaded.FrontierInputs["i7"]; len(loaded.FrontierInputs) != 1 || len(got) != 1 || got[0].Channel != "ch2" || got[0].Type != "string" || string(got[0].Data) != `"private"` {
+		if got := loaded.FrontierInputs["i7"]; len(loaded.FrontierInputs) != 2 || len(got) != 1 || got[0].Channel != "ch2" || got[0].Type != "string" || string(got[0].Data) != `"private"` {
 			t.Errorf("FrontierInputs round-trip lost: %+v", loaded.FrontierInputs)
+		}
+		if got := loaded.FrontierInputs["i8"]; len(got) != 1 || got[0].Channel != "ch2" || got[0].Type != "string" || string(got[0].Data) != `"waiting private"` {
+			t.Errorf("deferred member input round-trip lost: %+v", got)
+		}
+		if len(loaded.JoinProgress) != 1 || !slices.Equal(loaded.JoinProgress[0], original.JoinProgress[0]) ||
+			!slices.Equal(loaded.DeferredFrontier, original.DeferredFrontier) {
+			t.Errorf("scheduling state round-trip lost: joins=%+v deferred=%+v", loaded.JoinProgress, loaded.DeferredFrontier)
 		}
 		// issue-95#1: Owner 是这批里最隐蔽的字段——漏了不报错、不丢数据，只是
 		// Resume 重跑某节点时它的旧 SendFrom 清不掉 → Target 被调度两次（业务侧

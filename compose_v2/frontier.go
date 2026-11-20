@@ -15,7 +15,7 @@ import (
 // # 为什么 frontier 不能只是 []NodeID（ISSUE-96 根因）
 //
 // 同一个 NodeID 可以有 **N 个并发实例**：`SendFrom` 同 Target 投递多次时
-// `nextFrontier` 逐条 append **不去重**（by-design，`SendDirective` godoc 的头号示例
+// 下一帧逐条追加投递实例（`SendDirective` godoc 的头号示例
 // 就是 N 个并发 worker）。而静态边 / cond 边走 `evalOutEdges` / `assembleFrontier` 的去重集合
 // （`map[NodeID]struct{}`）→ 同 NodeID 恒 1 份。
 //
@@ -42,7 +42,7 @@ import (
 //
 // # 它同时是 cp 的 wire 形态
 //
-// `cp.CurrentFrontier` / `cp.CompletedFrontier` 直接是 `[]FrontierMember`，**身份内联
+// `cp.CurrentFrontier` / `cp.CompletedFrontier` / `cp.DeferredFrontier` 直接是 `[]FrontierMember`，**身份内联
 // 在记录里**，不是「NodeID 数组 + 平行的身份数组按下标对齐」。
 //
 // 引入实例身份时先做的是后者，理由是「绝大多数图没有多实例，平行数组让缺字段天然退化
@@ -164,7 +164,7 @@ func instanceTokenValue(instanceID string) (uint64, bool) {
 
 // bumpInstanceCounterFromCheckpoint 把发号器抬到不低于 cp 里出现过的最大 token。
 //
-// 扫的是**所有**存了实例身份的地方：两组 frontier 成员 + deferred send 的目标与发出者
+// 扫的是**所有**存了实例身份的地方：活动、已完成和收尾等待成员，以及 deferred send 的目标与发出者
 // 身份。漏扫一处，那一处的旧 token 就可能被重新发出去（见 Restore 调用点的注释：撞号是
 // 静默的错误结果，不是报错）。
 func bumpInstanceCounterFromCheckpoint(cp *Checkpoint) {
@@ -181,6 +181,9 @@ func bumpInstanceCounterFromCheckpoint(cp *Checkpoint) {
 		consider(m.InstanceID)
 	}
 	for _, m := range cp.CompletedFrontier {
+		consider(m.InstanceID)
+	}
+	for _, m := range cp.DeferredFrontier {
 		consider(m.InstanceID)
 	}
 	for _, sd := range cp.DeferredSends {

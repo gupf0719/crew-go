@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -158,11 +160,13 @@ type Graph struct {
 	// 无声明的 node 不在 map 内 (读返 "" → 默认 workflow node kind).
 	nodeComponents map[NodeID]string
 	// nodePolicies 保存声明了超时或重试策略的节点。
-	nodePolicies map[NodeID]nodePolicy
-	adj          map[NodeID][]edge // node 出边
-	channels     []anyChannel      // 编译期注册的所有 channel
-	maxVisit     int
-	maxWidth     int
+	nodePolicies  map[NodeID]nodePolicy
+	adj           map[NodeID][]edge // node 出边
+	channels      []anyChannel      // 编译期注册的所有 channel
+	joinEdges     []joinEdge
+	deferredNodes map[NodeID]struct{}
+	maxVisit      int
+	maxWidth      int
 
 	// breakBefore / breakAfter 是编译期声明的断点（GraphBuilder.WithInterruptBefore / After），
 	// Run 时与运行期的取并集。
@@ -239,6 +243,8 @@ func (b *GraphBuilder) Compile() (*Graph, error) {
 		nodePolicies:   make(map[NodeID]nodePolicy, len(b.nodePolicies)),
 		adj:            make(map[NodeID][]edge, len(b.nodes)+1),
 		channels:       append([]anyChannel(nil), b.channels...),
+		joinEdges:      slices.Clone(b.joinEdges),
+		deferredNodes:  maps.Clone(b.deferredNodes),
 		maxVisit:       b.maxVisit,
 		maxWidth:       b.maxWidth,
 		breakBefore:    breakpointSet{}.with(b.interruptBefore),
@@ -283,6 +289,8 @@ type GraphBuilder struct {
 	nodeComponents      map[NodeID]string     // Phase 2: node→组件类型声明 (见 Graph.nodeComponents)
 	nodePolicies        map[NodeID]nodePolicy // 节点的超时 / 重试声明（见 Graph.nodePolicies）
 	edges               []edge
+	joinEdges           []joinEdge
+	deferredNodes       map[NodeID]struct{}
 	channels            []anyChannel
 	maxVisit            int
 	maxWidth            int
@@ -373,10 +381,8 @@ func (b *GraphBuilder) applyNodeOptions(id NodeID, opts []NodeOption) {
 //     且 err == nil——实测 order=B,A,B2,C,C。join 节点若在首跑就调 LLM / 产生副作用，
 //     那一次是拿半份数据跑的。
 //
-// 要 all-of（「等两个前驱都到了再跑一次」）今天没有声明式写法，两条路：把前驱重排到同一
-// 超步；或手写 barrier——前驱各 Write(Sum, 1)，join 节点读到 < N 时不干活、用条件边路由到
-// EndNode 空转一趟，== N 才真正执行（代价一次多余 visit：hook 照 fire、ns 的 @visit 维照
-// tick）。声明式 AND-join / 收尾节点（defer）列在 doc/code/todo.md，按需做。
+// 需要等固定前驱全部提交时用 [GraphBuilder.AddJoinEdge]，需要等普通工作排空时用
+// [GraphBuilder.WithDeferredNodes]。
 func (b *GraphBuilder) AddEdge(from, to NodeID) *GraphBuilder {
 	b.edges = append(b.edges, edge{from: from, to: to})
 	return b
@@ -446,7 +452,8 @@ func (b *GraphBuilder) WithMaxVisit(n int) *GraphBuilder {
 	return b
 }
 
-// WithMaxFrontierWidth 设单个超步的最大成员数（默认 10000）。限制同时执行数用 [WithMaxConcurrentNodes]。
+// WithMaxFrontierWidth 设单个超步的最大成员数（默认 10000）。将一起执行的收尾队列也受此限制。
+// 限制同时执行数用 [WithMaxConcurrentNodes]。
 //
 // 触顶时返的是 `%w [MaxWidthError]`（`Width` = 触顶那一刻的宽度）——**不是**
 // [MaxIterationsError]，那个只装迭代深度。宽度与深度是两个正交维度，各有自己的类型。
@@ -534,5 +541,5 @@ func (b *GraphBuilder) validate() error {
 	if !hasStart {
 		return fmt.Errorf("graph has no edge from %s", StartNode)
 	}
-	return nil
+	return b.validateSchedule()
 }

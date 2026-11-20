@@ -376,7 +376,8 @@ func resolveRunSession(ctx context.Context, s **RunSession, agentName string) er
 // agent，入口不拒。两张图身份不同时（BasicAgent 显式起了不同的名字）它载入那份档撞 `compose_v2.ErrGraphIDConflict`、
 // 什么都不执行；两个都没起名字、结构又相同时会把那份档读进来接着跑。在那里调别的 agent 要经 `RunSubAgent`。
 //
-// 返回的 ctx 交给业务钩子（经 `compose_v2.CallHook` 调）与后续执行。
+// 返回的 ctx 已绑定返回的 session，交给业务钩子（经 `compose_v2.CallHook` 调）与后续执行。
+// 自行实现独立续跑时使用 [EnterResume]。
 //
 // 为什么自研实现也要守：session 的 RunID 是任务的身份，实现往往用它分自己的状态（RemoteAgent 的
 // 远端 task 句柄按它存）。嵌套位置上随手给一个新 session，父节点每次重跑都是一个新的远端 task、
@@ -388,7 +389,7 @@ func EnterRun(ctx context.Context, session *RunSession, agentName string) (conte
 	if err := resolveRunSession(ctx, &session, agentName); err != nil {
 		return ctx, nil, err
 	}
-	return enterRunTask(ctx, session), session, nil
+	return enterRunTask(WithSession(ctx, session), session), session, nil
 }
 
 // GetSession 从 ctx 取 RunSession。nil 表示业务未注入。

@@ -71,6 +71,40 @@ func resolveAbortHistoryStore(ctx context.Context, key HistoryKey, cfg resumeCon
 	return nil, errors.New("abort history store is unavailable")
 }
 
+// validateResumeScope 在读取任务状态或触发钩子前核对独立续跑的位置。
+func validateResumeScope(ctx context.Context, agentTypeName, agentName, sessionID string) error {
+	task, nested := enclosingTask(ctx)
+	if !nested {
+		task, nested = compose_v2.GraphScopeSessionID(ctx)
+	}
+	if nested {
+		where := fmt.Sprintf("在正在执行的任务 %q 里", task)
+		if task == "" {
+			where = "在一个正在执行的任务里（那次 Run 没配 session ID）"
+		}
+		return rejectCall(ctx, "%s %q (ns=%q): %s调 Resume(sid=%q)；续跑另一个任务先 DetachTask(ctx)",
+			agentTypeName, agentName, compose_v2.GetGraphNS(ctx), where, sessionID)
+	}
+	if detachedFromRunning(ctx, sessionID) {
+		return rejectCall(ctx, "%s %q: 脱离之后 Resume 的 sessionID %q 是脱离出来之前所在的任务——"+
+			"它此刻正在执行，不能再续跑一次", agentTypeName, agentName, sessionID)
+	}
+	return nil
+}
+
+// validateResumeSession 保证存档、嵌套调度和审批使用同一个任务身份。
+func validateResumeSession(ctx context.Context, agentTypeName, agentName, sessionID string, session *RunSession) error {
+	if session == nil || session.RunID == sessionID {
+		return nil
+	}
+	if session.RunID == "" {
+		return rejectCall(ctx, "%s %q: WithResumeSession 传入的 session 的 RunID 为空；续跑用的 session 的 RunID 要等于 sessionID %q",
+			agentTypeName, agentName, sessionID)
+	}
+	return rejectCall(ctx, "%s %q: Resume 的 sessionID %q 与 WithResumeSession 传入的 session.RunID %q 不一致；两者是同一个任务的身份，传同一个值",
+		agentTypeName, agentName, sessionID, session.RunID)
+}
+
 // commonResumePrep 抽取 9 编排 Resume 共享 boilerplate (audit #5 阶段 1 补审 MED-2 fix).
 //
 // **处理范围**:
@@ -120,22 +154,9 @@ func resolveAbortHistoryStore(ctx context.Context, key HistoryKey, cfg resumeCon
 // 传 nil 表示这条路不接历史。
 func commonResumePrep(ctx context.Context, agentTypeName string, ag Agent, sessionID string, opts []ResumeOption, info *hook.AgentInfo, hooks hook.Hooks, subs []Agent) (*resumePrep, context.Context, error) {
 	agentName := ag.Name()
-	// 0. Resume 只在顶层调：在一个正在执行的任务里，续跑的要么是这个任务本身（它正在跑，用不着
-	// 续），要么是另一个任务——那得先 DetachTask 拿一个跟当前执行无关的 ctx，否则当前执行留在 ctx
-	// 上的位置、答案、新开信号全被带进那个任务（见 enclosingTask）。排在一切之前：Abort 分支会删存档。
-	if task, ok := enclosingTask(ctx); ok {
-		where := fmt.Sprintf("在正在执行的任务 %q 里", task)
-		if task == "" {
-			where = "在一个正在执行的任务里（那次 Run 没配 session ID）"
-		}
-		return nil, ctx, rejectCall(ctx, "%s %q (ns=%q): %s调 Resume(sid=%q)；续跑另一个任务先 DetachTask(ctx)",
-			agentTypeName, agentName, compose_v2.GetGraphNS(ctx), where, sessionID)
-	}
-	// 脱离之后续跑的正是脱离出来之前所在的、此刻仍在执行的任务（脱离几层都算，见 compose_v2.DetachedFrom）：
-	// 它就在执行着，再续一遍会把它正在跑的节点重跑一遍（实测）。
-	if detachedFromRunning(ctx, sessionID) {
-		return nil, ctx, rejectCall(ctx, "%s %q: 脱离之后 Resume 的 sessionID %q 是脱离出来之前所在的任务——"+
-			"它此刻正在执行，不能再续跑一次", agentTypeName, agentName, sessionID)
+	// 位置校验先于任何存档查询；Abort 会直接删档。
+	if err := validateResumeScope(ctx, agentTypeName, agentName, sessionID); err != nil {
+		return nil, ctx, err
 	}
 
 	// 1. cper nil check (跟 9 编排 8330d6e 后 message 格式对齐:
@@ -146,7 +167,10 @@ func commonResumePrep(ctx context.Context, agentTypeName string, ag Agent, sessi
 	}
 
 	// 2. parse opts
-	rcfg := applyResumeOptions(opts)
+	rcfg, err := applyResumeOptions(opts)
+	if err != nil {
+		return nil, ctx, rejectCall(ctx, "%s %q: %s", agentTypeName, agentName, err)
+	}
 	if err := rcfg.breakpoints.validate(ag); err != nil {
 		return nil, ctx, err
 	}
@@ -161,13 +185,8 @@ func commonResumePrep(ctx context.Context, agentTypeName string, ag Agent, sessi
 	// 按 session.RunID 找自己的存档：一个任务被劈成两半，嵌套层找不到自己的档、从头重放副作用，
 	// 跑成功后按 session.RunID 清子树，把另一个任务挂着的存档删掉（实测 err=nil）；审批规则也跟着
 	// session.RunID 走，另一个任务里答的 approve_always 让这个任务挂着的转账静默执行。
-	if s := rcfg.session; s != nil && s.RunID != sessionID {
-		if s.RunID == "" {
-			return nil, ctx, rejectCall(ctx, "%s %q: WithResumeSession 传入的 session 的 RunID 为空；续跑用的 session 的 RunID 要等于 sessionID %q",
-				agentTypeName, agentName, sessionID)
-		}
-		return nil, ctx, rejectCall(ctx, "%s %q: Resume 的 sessionID %q 与 WithResumeSession 传入的 session.RunID %q 不一致；两者是同一个任务的身份，传同一个值",
-			agentTypeName, agentName, sessionID, s.RunID)
+	if err := validateResumeSession(ctx, agentTypeName, agentName, sessionID, rcfg.session); err != nil {
+		return nil, ctx, err
 	}
 	// 续跑在预读存档前登记，覆盖钩子和历史收尾。显式放弃与 WithAbandonedTasks 使用同一套许可。
 	runID := sessionID

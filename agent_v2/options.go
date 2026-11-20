@@ -594,12 +594,15 @@ func WithResumeModelOptions(opts ...model.Option) ResumeOption {
 }
 
 // applyResumeOptions 应用 ResumeOption 列表。
-func applyResumeOptions(opts []ResumeOption) resumeConfig {
+func applyResumeOptions(opts []ResumeOption) (resumeConfig, error) {
 	cfg := resumeConfig{action: ResumeActionContinue}
 	for _, o := range opts {
+		if o == nil {
+			return resumeConfig{}, errors.New("nil resume option")
+		}
 		o(&cfg)
 	}
-	return cfg
+	return cfg, nil
 }
 
 // WithToolTimeout 给**单个业务工具**调用一个 deadline（仅 BasicAgent；0 = 不设，默认）。

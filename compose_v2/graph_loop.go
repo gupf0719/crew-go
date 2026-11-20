@@ -487,20 +487,14 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			runErr = wrapped
 		}
 	}()
-	// 这次执行还在跑的标记（见 runAliveKey）：不在任何节点执行范围里的 Run 铸一个、出口置否，嵌套的 Run 继承。
-	// 脱离时记进来源链。解析出 sid 后登记任务执行，存档与 OnGraphEnd 收尾完成后再注销。
+	// 图确定任务身份后建立执行范围，存档与 OnGraphEnd 收尾完成后再注销。
 	rootRun := !WithinNodeScope(ctx)
 	commitRoot := rootRun && taskCommitBase(ctx) == nil
-	var alive *atomic.Bool
+	var execution *graphExecution
 	var activity, scopeActivity *TaskActivity
-	if rootRun {
-		alive = new(atomic.Bool)
-		alive.Store(true)
-		ctx = context.WithValue(ctx, runAliveKey{}, alive)
-	}
 	defer func() {
-		if alive != nil {
-			alive.Store(false)
+		if execution != nil {
+			execution.alive.Store(false)
 		}
 		if scopeActivity != nil {
 			scopeActivity.Release()
@@ -688,6 +682,12 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	}
 	if cfg.sessionID == "" {
 		cfg.sessionID = GetSessionID(ctx)
+	}
+	parentExecution := graphExecutionFrom(ctx)
+	if rootRun || parentExecution == nil || parentExecution.sessionID != cfg.sessionID {
+		execution = &graphExecution{sessionID: cfg.sessionID, parent: parentExecution}
+		execution.alive.Store(true)
+		ctx = context.WithValue(ctx, runAliveKey{}, execution)
 	}
 	if cfg.checkpointedBreakpoints && (!breakBefore.empty() || !breakAfter.empty()) &&
 		(cfg.checkpointer == nil || cfg.sessionID == "") {

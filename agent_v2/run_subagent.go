@@ -28,7 +28,7 @@ import (
 //     子 agent 时撞成一次；漏输入内容 = 另一次调用续上这次的存档、新输入没进图，用户对这一次的
 //     回答被套到另一次上），而维度还会继续增加。
 //  2. **NewSharedChildSession**: 父 ctx 含 sess 时构造半共享 child sess (events 独立,
-//     values 共享指针, RunID 沿用, parentSess 反向指针——ISSUE-79). 业务 store.Search
+//     values 共享指针, RunID 沿用, parentSess 反向指针——ISSUE-79). 被调方的参数与 [GetSession] 都能取到子 session。业务 store.Search
 //     可走 `sess.RootSession()` 沿链上追看父 history.
 //  3. **WithSubAgentStoreScope**: 标记「这次调用发生在成员位置上」。业务 Store 可据此选择后端或 TTL，
 //     MicroCompact 据此隔离写入去重（见 WithSubAgentStoreScope）。
@@ -212,7 +212,7 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 替被调方盖任务章，它的入口据此不声明新任务、续自己的存档（见 enterRunTask）。调用方是不是
 	// 九个编排之一都一样：业务自研的 agent、框架外业务自己的循环里发起的嵌套调用，续跑时同样要
 	// 续得上；开新任务的方式跟别处一样是换 RunID（`sess.NextTask()`）。
-	subCtx = withTaskScope(subCtx, childSess.RunID)
+	subCtx = withTaskScope(WithSession(subCtx, childSess), childSess.RunID)
 
 	// 3. 标记「这次调用发生在成员位置上」（见 WithSubAgentStoreScope）。
 	subCtx = WithSubAgentStoreScope(subCtx, true)

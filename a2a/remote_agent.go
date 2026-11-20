@@ -142,7 +142,6 @@ func (a *RemoteAgent) Run(ctx context.Context, session *agent_v2.RunSession, inp
 	if err != nil {
 		return nil, err
 	}
-	ctx = agent_v2.WithSession(ctx, session)
 	// 在节点执行里：这次调用连同它的 agent 级钩子放进它自己的相位（见 callPhase）。远端要人时提问不占调用它的那段代码
 	// 的序号——调用方在节点体、工具体、交接相位还是钩子里都一样，它按进度跳过这次调用时后面的提问不挪位。
 	if compose_v2.WithinNodeScope(ctx) {

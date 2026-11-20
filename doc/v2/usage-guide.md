@@ -213,6 +213,24 @@ for _, q := range cp.PendingInterrupts {
 }
 ```
 
+### 自研 Agent 的续跑
+
+自研实现可以在 `Run` 入口调用 `agent_v2.EnterRun`。返回的 ctx 绑定了同一个会话，
+供钩子和后续执行使用。`RunSubAgent` 会分配独立子会话和存档位置。父任务恢复时重新经过
+原调用点，挂起调用重入子 Agent 的 `Run`，已完成的调用重放结果。
+
+自研实现管理自己的持久化时，独立 `Resume` 从 `agent_v2.EnterResume(ctx, sid, name, opts...)`
+取得上下文和 `ResumeRequest`，返回的 ctx 用于本次调用。该入口拒绝在任务内直接续跑，
+包括低阶根图的开始和结束钩子。用 `DetachTask` 可在任务内续跑另一个任务，脱离前仍在执行的
+任务不能重入。入口校验 `WithResumeSession` 与 `sid` 一致，保留原会话的审批规则并隔离外层节点授予。
+未提供 `WithResumeSession` 时按 `sid` 创建会话对象，会话内的审批规则和事件需要原会话。
+实现用 `UserInputs` 按 `InterruptID` 匹配原挂起项，
+`UserText` 保留为独立指示。钩子可以用 `GetResumePhase` 读取本次操作。
+
+应用先按请求主体核验任务归属和挂起状态，再处理答案、历史及退出，负责重复请求的并发控制。
+框架图可用 `NewGraphAgent` 管理存档准入、历史和收尾。自研壳透传该图的 `Resume` 时直接传原 ctx
+和选项。宿主委托的 Abort 删档和历史确认、单次图断点以及模型覆盖由对应的内置 Agent 处理。
+
 ### Durability（崩溃恢复，可选）
 
 `WithDurability` 控制 cp **写入时机**（默认 `exit` = 历史行为，零额外 I/O、零行为变更）。长 / 贵 Run 需要**硬崩溃恢复**（kill -9 / OOM / 断电——出口 defer 不跑）时显式开 `sync` / `async`：框架在**每个超步边界**把全量 cp 写到持久后端，崩溃后从最近超步 Resume。

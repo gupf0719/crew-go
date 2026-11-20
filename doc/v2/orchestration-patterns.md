@@ -916,6 +916,12 @@ BasicAgent 显式起了名字时图身份是「名字:结构指纹」，裸调�
 的图身份相同）子层接着跑父图的存档、旁路工具多执行一次、成功时把父图的档删掉，`err == nil`。传新 session 时 agent 入口直接拒
 （哨兵 `agent_v2/task_scope_test.go` 的 `TestTask_BareRunWithNewSessionInNode_IsRejected`）。
 
+低阶图可以用 `compose_v2.GraphBuilder.AddSubgraphNode` 嵌入纯子图。低阶子图的节点需要调用自研或内置
+Agent 时，使用 `RunSubAgent`。被调方的 session 参数与 `GetSession(ctx)` 一致。调用方绑定了父会话时，
+业务 KV 沿父会话共享，事件在子会话隔离。父节点返回中断并持久化后，恢复会重新走到原调用点，
+挂起调用重入子 Agent 的 `Run`，已完成的调用重放结果。关于独立续跑见
+[自研 Agent 的续跑](usage-guide.md#自研-agent-的续跑)。
+
 详见 [`channel-engine.md`](./channel-engine.md) §8.1–§8.2（ns 形态与 API）+ CLAUDE.md "GraphAgent 提示"。
 
 ---

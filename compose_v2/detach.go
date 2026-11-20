@@ -37,14 +37,14 @@ import (
 // 的值照常可见。上层包的执行状态（实现了 [ExecutionStateKey] 的 key：agent_v2 的 session、收件人、
 // 节点授予……）一并剥掉。
 //
-// 剥的同时记下**这一路是从哪些任务里脱离出来的**（[DetachedFrom]）：在节点执行范围里脱离时记下那次 Run
+// 剥的同时记下**这一路是从哪些任务里脱离出来的**（[DetachedFrom]）：在图执行范围里脱离时记下那次 Run
 // 的 sid（没配 sid 时记空串——有所在的任务，只是它没有身份），接在之前几次脱离记下的后面；连同那次执行
 // 「还在不在跑」的标记一起记。上层包据此拒绝在独立运行里再开一遍**仍在执行**的那些任务（agent_v2：Run /
 // Resume 的 RunID 是其中之一就拒——曾经只有 agent_v2.DetachTask 记、只记一层，直接用本函数或脱离两层之后拿
 // 外层任务的 session 跑 agent，那个 agent 当新任务收尾时把外层任务挂着的存档删了，实测）。「仍在执行」按任务判：
 // 那个任务此刻没有执行在跑（挂起了，ctx 是当时存下来的）就不算——用存下来的 ctx 脱离之后续跑它是合法的（曾经
 // 一律拒，实测）；它又续跑起来（另一次执行）期间拿当时存下的 ctx 脱离照样算（曾经按那一次执行判、放过了，实测）。
-// 不在节点执行范围里的任务（编排的 agent 级钩子跑在图外）引擎这一层看不到，上层用 [DetachExecutionFrom] 补上。
+// 图外的任务（例如编排的 agent 级钩子）由上层用 [DetachExecutionFrom] 补上。
 //
 // 独立运行挂起时，它的根图抛出的中断带着记号：所在任务的节点把它返回时引擎拒收（那个挂起这个任务答不了，
 // 只能在顶层用它自己的 sid 续）——原样返回、取出里面的 *InterruptError 返回、再包一层、合并进别的中断都一样。
@@ -53,7 +53,7 @@ func DetachExecution(ctx context.Context) context.Context {
 }
 
 // DetachExecutionFrom 同 [DetachExecution]，另把 task 记进「这一路是从哪些任务里脱离出来的」：给有自己的任务
-// 身份、而此刻不在节点执行范围里的上层包用（`agent_v2.DetachTask`：编排的 agent 级钩子跑在图外，引擎这一层
+// 身份、而此刻不在图执行范围里的上层包用（`agent_v2.DetachTask`：编排的 agent 级钩子跑在图外，引擎这一层
 // 看不到那个任务）。task 是那个任务的 sid（没有身份时传空串）。
 func DetachExecutionFrom(ctx context.Context, task string) context.Context {
 	return detachExecution(ctx, task, true)
@@ -62,9 +62,16 @@ func DetachExecutionFrom(ctx context.Context, task string) context.Context {
 func detachExecution(ctx context.Context, task string, withTask bool) context.Context {
 	// 先读出之前几次脱离记下的那一串：它是执行状态，下面包上 detachedCtx 之后就看不见了
 	from, _ := ctx.Value(detachedFromKey{}).([]detachedOrigin)
-	alive := runAliveFrom(ctx)
+	execution := graphExecutionFrom(ctx)
+	var alive *atomic.Bool
+	if execution != nil {
+		alive = &execution.alive
+	}
 	if sid, inNode := NodeScopeSessionID(ctx); inNode {
 		from = appendDetachedFrom(from, detachedOrigin{task: sid, alive: alive})
+	}
+	for graph := execution; graph != nil; graph = graph.parent {
+		from = appendDetachedFrom(from, detachedOrigin{task: graph.sessionID, alive: &graph.alive})
 	}
 	if withTask {
 		from = appendDetachedFrom(from, detachedOrigin{task: task, alive: alive})
@@ -134,7 +141,7 @@ func withoutDetachedFrom(ctx context.Context, task string) context.Context {
 type detachedFromKey struct{}
 
 // DetachedFrom 返回 ctx 这一路是从哪些**仍在执行**的任务里脱离出来的（sid，先脱离的在前，同一个任务只出现
-// 一次；那次 Run 没配 sid 时是空串）。没有脱离过、或只在节点执行范围之外用 [DetachExecution] 脱离过时为空
+// 一次；那次 Run 没配 sid 时是空串）。没有脱离过、或只在图执行范围之外用 [DetachExecution] 脱离过时为空
 // （[DetachExecutionFrom] 另记它给的任务）。
 //
 // 「仍在执行」按任务判，满足任一条就算：
@@ -162,15 +169,30 @@ func DetachedFrom(ctx context.Context) []string {
 	return out
 }
 
-// runAliveKey 携带「这次执行还在跑」的标记：不在任何节点执行范围里的那次 Run（顶层的、脱离出来的根图）在
-// 入口铸一个、出口置否，它里面嵌套的 Run 沿 ctx 继承同一个。执行状态：脱离时剥掉，脱离出来的根图铸自己的。
-// 从一次执行里存下来的 ctx 带着它，执行结束之后读到的是否；那个任务是不是又在别的执行里跑，另看 [TaskExecuting]。
-// 没配 sid 的执行只能靠它（[TaskExecuting] 按 sid 登记）。
+// runAliveKey 携带图的任务身份和存活标记。共享任务的嵌套图沿用所在范围；
+// 有独立任务 ID 的低阶图另记一层，在退出收尾后标记结束。
 type runAliveKey struct{}
 
-func runAliveFrom(ctx context.Context) *atomic.Bool {
-	a, _ := ctx.Value(runAliveKey{}).(*atomic.Bool)
-	return a
+type graphExecution struct {
+	sessionID string
+	alive     atomic.Bool
+	parent    *graphExecution
+}
+
+func graphExecutionFrom(ctx context.Context) *graphExecution {
+	execution, _ := ctx.Value(runAliveKey{}).(*graphExecution)
+	return execution
+}
+
+// GraphScopeSessionID 返回当前图执行范围的任务 ID，包括根图的开始和结束钩子。
+// 无 session ID 的图返回 ("", true)。从图中留存的 ctx 仍属于该次执行，独立调用前须用 [DetachExecution]。
+// 节点自己所属的图及任务身份由 [NodeScopeSessionID] 提供。
+func GraphScopeSessionID(ctx context.Context) (string, bool) {
+	execution := graphExecutionFrom(ctx)
+	if execution == nil {
+		return "", false
+	}
+	return execution.sessionID, true
 }
 
 // detachedCtx 挡住执行状态的 key，其余原样委托。

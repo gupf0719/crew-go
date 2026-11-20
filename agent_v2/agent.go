@@ -22,9 +22,10 @@ type Agent interface {
 	// 这么接的）。要开一个独立的任务，调用方先 [DetachTask]。
 	Run(ctx context.Context, session *RunSession, input *schema.Message, opts ...RunOption) ([]*AgentEvent, error)
 
-	// Resume 续跑被 InterruptError 中断的 Run。从 ctx 取 Checkpointer 加载 cp。
+	// Resume 继续有待处理工作的任务。内置编排从 ctx 上的 Checkpointer 加载存档。
 	// Action 决定 Continue / Replan / Abort 三态。只在顶层调：在一个正在执行的任务里续跑别的任务
 	// 先 [DetachTask]。
+	// 自行管理续跑状态的实现可用 [EnterResume]。嵌套调用随父图重入 [Agent.Run]。
 	Resume(ctx context.Context, sessionID string, opts ...ResumeOption) ([]*AgentEvent, error)
 
 	// Name 返回 agent 名（用于 hook AgentInfo + 日志 + cp）。

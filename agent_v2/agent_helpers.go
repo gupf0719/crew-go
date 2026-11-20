@@ -83,8 +83,9 @@ func enclosingTask(ctx context.Context) (string, bool) {
 func rejectCall(ctx context.Context, format string, args ...any) error {
 	msg := fmt.Sprintf(format, args...)
 	_, nested := enclosingTask(ctx)
+	_, inGraph := compose_v2.GraphScopeSessionID(ctx)
 	detached := len(compose_v2.DetachedFrom(ctx)) > 0
-	if nested || detached {
+	if nested || inGraph || detached {
 		return fmt.Errorf("%s: %w", msg, compose_v2.ErrRunAborted)
 	}
 	return &errCallRejected{msg: msg}

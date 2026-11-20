@@ -193,7 +193,7 @@ func (g *graph) AddGraphNode(key string, node AnyGraph, opts ...GraphAddNodeOpt)
 1. **GraphAgent 业务自定义 NodeFunc 内 sub.Run 漏 push 父位置 NS** (**已闭合 #7 F4 commit `f6ede83`**)
    - LangGraph `add_node(name, pregel)` 注册时自动派生子 NS, 业务无负担
    - crew-go v2 GraphAgent 让业务自定义拓扑灵活性高但需走 `agent_v2.RunSubAgent`（手拼 `JoinNS(parentNS, nodeID)` 会漏掉实例维 / visit 维 / 调用方节点与相位 / 输入内容，也拿不到完成记录）
-   - **已加** `agent_v2.RunSubAgent(ctx, nodeID, sub Agent, input *schema.Message, opts ...RunOption)` helper — 一站式 push 3 件 ctx (graphNS + NewSharedChildSession + storeScope); GraphAgent 业务自定义 NodeFunc 内推荐用此 helper 避免漏 push silent bug. **7 编排 wrapper** (Sequential/Parallel/Loop/Routing/Reflect/Handoff/Plan) 已内置 push 协议
+   - `agent_v2.RunSubAgent` 为 GraphAgent 或低阶图的节点分配子 namespace、子会话及 Store 作用域。自研 Agent 在 ctx 和参数里取到同一个子会话。父图续跑走到原调用点时重入挂起调用，或重放已完成的子结果。 [低阶用法](../../v2/orchestration-patterns.md#104-关键责任嵌套子-agent-必须走-runsubagent)
 
 2. **子图 import / export 把「复制值」实现成「经 reducer 写」——对累加 reducer 是相加**
    （**已闭合，2026-09-02**）

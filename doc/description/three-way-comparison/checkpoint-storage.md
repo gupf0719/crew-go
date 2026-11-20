@@ -512,9 +512,10 @@ class CheckpointNotLatest(Exception):
 
 ~~**同会话并发 Resume 的库内形态怎么选**~~（2026-07-20 提出）→ **已决**，见上文「同一会话并发执行 §决策记录」：契约 + opt-in 写回世代校验，默认零开销。
 
-两条附带处置：
+执行与存档边界
 
-- **同进程互斥**。内置 Agent 新任务和根 Resume 取得任务许可，沿同一执行上下文的嵌套图借用许可。活动的根 Resume 与同 RunID 的独立续跑互斥，由此保护任务级审批规则的结算。 [Resume 契约](../../v2/hitl-resume.md#52-三模式语义)
+- **同进程互斥**。内置 Agent 新任务和根 Resume 取得任务许可，沿同一执行上下文的嵌套图借用许可。取得框架任务许可的根 Resume 与同 RunID 的其他框架续跑互斥，由此保护任务级审批规则的结算。 [Resume 契约](../../v2/hitl-resume.md#52-三模式语义)
+- **自研续跑**。`EnterResume` 复用内置入口的位置和身份校验，执行及持久化由应用负责。使用框架图存档的自研壳可把原请求交给 `GraphAgent.Resume`，由图入口承担准入、历史和收尾。 [自研入口](../../v2/usage-guide.md#自研-agent-的续跑)
 - **`CreatedAt` 框架生产代码零处赋值**（`redis` 拿它当 thread score、`Cleanup` 拿它当 GC 排序键，而框架从不写）→ **已修**：盖章点就落在 mint `Epoch` 的同一个函数（`guardedSaveNS`），只在 caller 没给时盖。修之前 `Cleanup(keepLastN)` 的排序键恒等、落到 sid 字典序，而 sid 是 UUIDv4——实测保留的是**最先创建**的那批，GC 方向整个反过来。
 
 

@@ -25,8 +25,8 @@ func TestEnterRun_SameEntryAsOrchestrations(t *testing.T) {
 		sess := NewRunSession()
 		approve(sess)
 		ctx, got, err := EnterRun(callerGrants, sess, "x")
-		if err != nil || got != sess {
-			t.Fatalf("EnterRun: %v（session 应原样返回）", err)
+		if err != nil || got != sess || GetSession(ctx) != sess {
+			t.Fatalf("EnterRun: %v（session 应返回并绑定到 ctx）", err)
 		}
 		if task, ok := enclosingTask(ctx); !ok || task != sess.RunID {
 			t.Errorf("应盖上这个任务的章：task=%q ok=%v", task, ok)

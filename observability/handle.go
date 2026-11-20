@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"crew-go/compose_v2"
+	"crew-go/internal/inference"
 )
 
 type handleKind int
@@ -32,9 +33,11 @@ type handle struct {
 	name    string // agent 名 / 节点 ID / 工具名
 	graphNS string
 	scope   *agentScope // 所在 agent 调用；agent 句柄指向自己的 scope
+	purpose inference.Purpose
 
 	// agent
 	agentKind string
+	sessionID string
 	workflow  bool // invoke_workflow（编排）而不是 invoke_agent
 
 	// model

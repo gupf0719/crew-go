@@ -16,6 +16,7 @@ const (
 	AttrRequestMaxTokens      = attribute.Key("gen_ai.request.max_tokens")
 	AttrRequestTopP           = attribute.Key("gen_ai.request.top_p")
 	AttrRequestStream         = attribute.Key("gen_ai.request.stream")
+	AttrOutputType            = attribute.Key("gen_ai.output.type")
 	AttrResponseModel         = attribute.Key("gen_ai.response.model")
 	AttrResponseFinishReasons = attribute.Key("gen_ai.response.finish_reasons")
 	AttrResponseTTFC          = attribute.Key("gen_ai.response.time_to_first_chunk")
@@ -44,7 +45,8 @@ const (
 	AttrOutcome         = attribute.Key("crew.outcome")
 	AttrAgentKind       = attribute.Key("crew.agent.kind") // AgentInfo.Type：base / sequential / parallel / loop / routing / handoff / plan / reflect / graph / a2a_remote，业务自研 agent 自己定
 	AttrAgentRound      = attribute.Key("crew.agent.round")
-	AttrRunID           = attribute.Key("crew.run.id") // RunSession.RunID：一个任务的身份
+	AttrModelPurpose    = attribute.Key("crew.model.purpose") // 内部决策用途：routing / evaluation / reflection
+	AttrRunID           = attribute.Key("crew.run.id")        // RunSession.RunID：一个任务的身份
 	AttrGraphNS         = attribute.Key("crew.graph.ns")
 	AttrNodeID          = attribute.Key("crew.node.id")
 	AttrNodeInstance    = attribute.Key("crew.node.instance")

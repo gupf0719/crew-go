@@ -109,8 +109,7 @@ ID。业务的检索 / 嵌入工具走工具路径：`execute_tool {工具名}` 
 |---|---|---|
 | `gen_ai.provider.name`（chat） | Required | 模型客户端填了 `Message.Metadata.System` 才有（openai 兼容客户端用 `WithSystem`，deepseek / qwen 默认已填）；业务自研客户端不填时缺 |
 | `gen_ai.request.model` | Cond. Required | 客户端实现 `model.ModelNamer` 或按次指定模型时已记；都没有时缺（§3.1） |
-| `gen_ai.request.seed` / `top_k` / `frequency_penalty` / `presence_penalty` / `stop_sequences` / `choice.count` | Cond. / Recommended | `ModelInput.Config` 只带模型名、温度、max_tokens、top_p（按次设了的） |
-| `gen_ai.output.type` | Cond. Required | 结构化输出（`WithOutputSchema`）时可以记 `json`，未接 |
+| `gen_ai.request.seed` / `top_k` / `frequency_penalty` / `presence_penalty` / `stop_sequences` / `choice.count` | Cond. / Recommended | `ModelInput.Config` 提供模型名、温度、max_tokens、top_p 和请求的输出类型 |
 | `gen_ai.response.id` | Recommended | `MessageMetadata` 没有这个字段 |
 | `server.address` / `server.port` | Recommended | 地址在模型客户端里，钩子看不到 |
 | `gen_ai.usage.{text,image,audio}.*` | Recommended | `MessageUsage` 不按模态拆分（缓存读写、推理 token 已记；缓存写入目前只有 `model/anthropic` 报） |

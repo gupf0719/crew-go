@@ -6,6 +6,7 @@ import (
 
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/internal/inference"
 	"crew-go/schema"
 )
 
@@ -66,6 +67,7 @@ type RoutingAgentBuilder struct {
 	branches            []routingBranchDef
 	router              RoutingAgentRouter
 	hooks               hook.Hooks
+	observeModel        inference.GenerateObserver
 }
 
 // 内部 channels (RoutingAgent 编排专用)
@@ -173,11 +175,13 @@ func (b *RoutingAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	//
 	// 8-method 协议：OnAgentStart 整个调用 1 次, 由 agent_v2.RoutingAgent.Run/Resume
 	// top-level fire——classify 节点不触发业务级 hook（只触发引擎层 OnNodeStart/End）。
-	router := b.router
+	router, observeModel := b.router, b.observeModel
 	classifyFn := func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 		input, _ := compose_v2.Get(chs, routingAgentInputCh)
 		// 路由函数是内部决策（见 decisionCtx）：它里面请教的 agent 不进会话历史、不取用户的插话
-		target, err := router(decisionCtx(ctx), input)
+		routeCtx := inference.WithPurpose(decisionCtx(ctx), inference.Routing)
+		routeCtx = inference.WithGenerateObserver(routeCtx, name, observeModel)
+		target, err := router(routeCtx, input)
 		if err != nil {
 			// 控制流（compose_v2.InterruptError / ctx.Err）与业务硬错都 propagate：
 			//   - InterruptError → runNodeWithHooks 走标准 node interrupt

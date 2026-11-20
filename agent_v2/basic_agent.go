@@ -2328,9 +2328,17 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	if a.config.Hooks != nil {
 		bld = bld.WithAgentHooks(a.config.Hooks)
 	}
+	bld.outputSchema = cfg.OutputSchema
 	// 交给 OnModelStart 的请求配置：跟 modelFn 发请求用的同一个模型（按次 WithRunModel 覆盖构造期的）与同一组按次选项。
 	bld = bld.WithModelConfig(func(ctx context.Context) *schema.ModelConfig {
-		return model.RequestConfig(resolveModel(ctx, a.config.Model), resolveModelOpts(ctx)...)
+		request := model.RequestConfig(resolveModel(ctx, cfg.Model), resolveModelOpts(ctx)...)
+		if cfg.OutputSchema != nil {
+			if request == nil {
+				request = &schema.ModelConfig{}
+			}
+			request.OutputType = "json"
+		}
+		return request
 	})
 	if a.config.BackgroundTasks != nil {
 		bld.backgroundNotes = backgroundNotes // 后台任务的结束通知（见 background_task.go）
@@ -2752,28 +2760,6 @@ func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants, conversationTo
 		var agentsMD string
 		if len(cfg.AgentsMDPaths) > 0 {
 			agentsMD = loadAgentsMD(ctx, cfg.AgentsMDPaths)
-		}
-
-		// 结构化输出预算（A4）：数**本次调用**里 final_output 的尝试次数，超 maxRetries 抛
-		// typed StructuredOutputError（绝不静默退化）。
-		//
-		// 计数由 tools 节点按派发层的章写进 `basicFinalOutputAttemptsCh`，**不再扫消息列表**
-		// ——那个列表含 prior，开了会话历史层时上几轮的尝试会被算进本轮预算，**模型压根
-		// 不被调用就抛错**（实测：Run 1 有过一次校验失败回炉，Run 2 换全新问题、模型第一次
-		// 就给合法 JSON，仍报「已尝试 2 次」）。跟「陈旧答复顶替本轮答案」是同一个根因。
-		//
-		// 原先「数历史而非独立 counter」的动机是「cp 持久、跨 Resume 累积不重置」——
-		// 那个顾虑对普通变量成立，对 channel 不成立（channel 本来就在 cp 里）。
-		// 顺带也不再受压缩影响：压缩只临时改喂给 LLM 的那份、不写回 channel，而计数
-		// 现在根本不看消息列表。
-		if cfg.OutputSchema != nil {
-			if attempts := getFinalOutputAttempts(ctx); attempts > cfg.OutputSchema.maxRetries {
-				return nil, &StructuredOutputError{
-					SchemaName: cfg.OutputSchema.name,
-					Attempts:   attempts,
-					LastError:  lastStructuredError(msgs),
-				}
-			}
 		}
 
 		// 这一轮之前的摘要结果（单次 Run 内复用，见 compaction_memo.go）：消息流的前 Upto 条换成那次的压缩

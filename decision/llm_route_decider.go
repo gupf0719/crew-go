@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"crew-go/agent_v2"
+	"crew-go/internal/inference"
 	"crew-go/model"
 	"crew-go/schema"
 )
@@ -50,7 +51,7 @@ func NewLLMRouteDecider(m model.ChatModel, calibrate func(LLMRouteSample) (float
 		if strings.TrimSpace(input) == "" || len(req.Candidates) == 0 || len(req.Candidates) > len(routeLabels) {
 			return agent_v2.RouteDecision{}, nil
 		}
-		reply, err := m.Generate(ctx, []*schema.Message{
+		reply, err := inference.Generate(ctx, m, []*schema.Message{
 			schema.SystemMessage(llmRoutePrompt(req.Candidates)),
 			schema.UserMessage(input),
 		}, model.WithTemperature(0), model.WithMaxTokens(16), model.WithToolChoice(schema.ToolChoiceNone),

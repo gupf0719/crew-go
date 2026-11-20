@@ -2,6 +2,7 @@ package model_test
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"crew-go/model"
@@ -39,17 +40,18 @@ func TestRequestConfig(t *testing.T) {
 			&schema.ModelConfig{ModelName: "m", Temperature: 0.3, MaxTokens: 512, TopP: 0.9}},
 		{"不报模型名也没参数", anonModel{}, nil, nil},
 		{"不报模型名但有覆盖", anonModel{}, []model.Option{model.WithModel("x")}, &schema.ModelConfig{ModelName: "x"}},
+		{"仅设 JSON 对象", anonModel{}, []model.Option{model.WithJSONObject()}, &schema.ModelConfig{OutputType: "json"}},
+		{"仅设 JSON schema", anonModel{}, []model.Option{model.WithJSONSchema("answer", nil, false)}, &schema.ModelConfig{OutputType: "json"}},
+		{"请求 JSON 后改文本", anonModel{}, []model.Option{model.WithJSONObject(), model.WithResponseFormat(&model.ResponseFormat{Type: "text"})},
+			&schema.ModelConfig{OutputType: "text"}},
+		{"清除请求格式", anonModel{}, []model.Option{model.WithJSONObject(), model.WithResponseFormat(nil)}, nil},
 		{"nil 模型", nil, nil, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := model.RequestConfig(c.m, c.opts...)
-			if (got == nil) != (c.want == nil) {
-				t.Fatalf("got %+v, want %+v", got, c.want)
-			}
-			if got != nil && (got.ModelName != c.want.ModelName || got.Temperature != c.want.Temperature ||
-				got.MaxTokens != c.want.MaxTokens || got.TopP != c.want.TopP) {
-				t.Errorf("got %+v, want %+v", *got, *c.want)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("got %+v, want %+v", got, c.want)
 			}
 		})
 	}

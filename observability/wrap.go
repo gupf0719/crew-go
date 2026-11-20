@@ -71,7 +71,7 @@ func (w *wrappedHooks) OnAgentEnd(ctx context.Context, info *hook.AgentInfo, out
 
 func (w *wrappedHooks) OnModelStart(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
 	o := w.obs.o
-	ctx1, mh := o.startModel(ctx, info, in)
+	ctx1, mh := o.startModel(ctx, info, in, o.scopeFrom(ctx))
 	defer abortOnPanic(func(err error) { o.abortLeaf(ctx1, mh, err, "model_start_error") })
 	ctx2, err := w.inner.OnModelStart(ctx1, info, in)
 	if err != nil {

@@ -44,14 +44,14 @@ events, err := ag.Run(ctx, sess, input)          // 必须用 Install 返回的 
 | 链 | 装在哪 | 管什么 |
 |---|---|---|
 | 业务级 `obs.AgentHooks()`（`hook.Hooks`） | agent 构造选项 | agent / 模型调用 / 工具调用 span，推理、token、工具、agent 指标，中断与续跑 |
-| 编排级 `obs.OrchHooks()`（`agent_v2.OrchestrationHooks`） | ctx（`agent_v2.WithCtxOrchHooks`） | 节点与工作流 span，框架事件（压缩、存档、扇出、规划、路由、fallback）转成 span 事件与指标 |
+| 编排级 `obs.OrchHooks()`（`agent_v2.OrchestrationHooks`） | ctx（`agent_v2.WithCtxOrchHooks`） | 节点与工作流 span，采样路由推理，框架事件（压缩、存档、扇出、规划、路由、fallback）转成 span 事件与指标 |
 
 拿不到 opts 就拿不到 ctx，没有只装一半的用法。opts 里已配的 `WithHooks`、ctx 上已有的编排钩子都被包进
 observability 里面（见下一段），不会被顶掉。
 
 **两个安装点分开的拓扑**（agent 构造一次、ctx 每个请求另外准备，典型是 `a2a/server`）收不进一次调用，
 两半各装各的：agent 构造时 `agent_v2.WithHooks(obs.AgentHooks())`，每个请求的 ctx 上
-`agent_v2.WithCtxOrchHooks(ctx, obs.OrchHooks())`。漏装编排那半不报错，只是节点 span 与框架指标静默缺失；
+`agent_v2.WithCtxOrchHooks(ctx, obs.OrchHooks())`。漏装编排那半不报错，节点 span、框架指标和采样路由推理会缺失。
 框架在第一次 `OnAgentEnd` 发现「业务级接了、编排级一次没跑过」时用 `slog` 告警一次（判据是编排钩子自己
 跑过没有，不是 ctx 里有没有——编排钩子也可以走 RunOption `agent_v2.WithOrchHooks`）。
 
@@ -112,7 +112,7 @@ instrumentation scope 名是 `crew-go/observability`（`observability.ScopeName`
 | `invoke_workflow {工作流名}` | INTERNAL | `OnGraphStart`，**外面没有同一 ns 的 agent span 时**：应用直接 `compose_v2.Run` 的图、节点里再跑的图、`AddSubgraphNode` 的子图 | `invoke_workflow` |
 | `node {节点 ID}` | INTERNAL | `OnNodeStart` | 无 |
 | `retrieval {节点 ID}` / `embeddings {节点 ID}` / `guardrail {节点 ID}` | INTERNAL | `OnNodeStart`，节点声明了 `compose_v2.WithNodeComponent` | `retrieval` / `embeddings` / 无 |
-| `chat {模型}` | CLIENT | `OnModelStart` | `chat` |
+| `chat {模型}` | CLIENT | `OnModelStart`，或 RoutingAgent 的采样路由经编排钩子记录 | `chat` |
 | `execute_tool {工具名}` | INTERNAL | `OnToolStart`；加载 skill 的 `activate_skill` 调用是 `execute_tool activate_skill {skill 名}` | `execute_tool` |
 | `invoke_agent {远端 agent 名}` | CLIENT | `a2a.RemoteAgent`（配了 `a2a.WithObservability`） | `invoke_agent` |
 | `a2a.server {操作}` | SERVER | `a2a/server` executor（配了 `server.WithExecutorObservability`） | 无 |
@@ -167,6 +167,16 @@ invoke_agent assistant
 `gen_ai.provider.name` 来自模型客户端填的 `Message.Metadata.System`（`openai.WithSystem`；deepseek /
 qwen 客户端已默认填）。
 
+Routing 的分类器与采样路由用 `crew.model.purpose=routing`，Reflect 的评估器用 `evaluation`，反馈教练用
+`reflection`。决策中的 agent、节点和 chat span 继承用途，普通业务调用在决策范围外省略该属性。
+`decision.NewLLMRouteDecider` 的实际模型请求由 RoutingAgent 当前选中的 `obs.OrchHooks` 记录，采集请求元数据、耗时和用量。
+规则或外部决策服务走路由事件，回调直接调用自有模型时由应用接入相应的模型观测。
+
+`gen_ai.output.type` 来自框架所见的请求配置。BasicAgent 的 `WithOutputSchema` 与按次选项声明的原生
+`json_object`、`json_schema` 都记 `json`。无框架 schema 时，按次格式明确设为 `text` 才记 `text`。
+解析和 schema 校验的结果独立于这个属性。
+[OTel 输出类型定义](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/registry/attributes/gen-ai.md#gen-ai-output-type)
+
 工具类别：业务工具实现 `tool.Categorizer` 返回 `tool.CategoryRetrieval` 等，框架查到后放进
 `ToolInput.Extra["category"]`，观测层据此记 `crew.tool.category`，span 名不变。GraphAgent 里直接调组件的
 节点用 `compose_v2.WithNodeComponent` 声明，节点 span 按 GenAI 操作名命名。
@@ -207,7 +217,7 @@ A2A client span 按发请求用的 ctx 判（`A2AClientSpan.End(ctx, err)`），
 错误信息写进 status 描述与 `exception` 事件前先脱敏、再截到 1024 字符；远端 A2A 的错误详情不写进 span（可能含
 对端的敏感信息）。工具失败但没给错误说明时，只有打开内容采集才拿工具输出当错误信息。
 
-**错误路径上的收尾**：模型 / 工具调用失败时框架不调 `OnModelEnd` / `OnToolEnd`，`chat` / `execute_tool` span 由
+**错误路径上的收尾**。BasicAgent 的模型 / 工具调用失败时框架不调 `OnModelEnd` / `OnToolEnd`，`chat` / `execute_tool` span 由
 `OnError` 以失败结束，同时记带 `error.type` 的时长样本。`OnError` 按错误码分层：`model_*` 只收模型 span、
 `tool_*` 只收工具 span；agent / 编排层的错误（`agent_start_error`、`branch_error`……）不碰叶子——框架报这些时
 交来的 ctx 可能是开始之前的，最内层是外层的工具调用（比如工具里跑的子 agent 开始被拒）。一批工具的开始钩子失败
@@ -217,6 +227,8 @@ A2A client span 按发请求用的 ctx 判（`A2AClientSpan.End(ctx, err)`），
 成功的话记 `error` / `_OTHER`；这些叶子不记时长样本。`OnError` 报到 agent / 节点 / 工作流上的错误不在那里记——
 错误要是被处理掉了（重试成功、分支失败被兜住），按 OTel 的 recording-errors 指引不该记；没被处理的话，那个 span
 结束时自己以失败收尾。
+
+采样路由在直接模型调用返回时收尾。升级到下一档仍保留已实际发出的推理样本，取消和挂起的时长样本省略 `error.type`。
 
 **一次调用只按它自己的结局记一次**：
 
@@ -271,7 +283,7 @@ trace。
 
 | 指标 | 类型 / 单位 | 属性 |
 |---|---|---|
-| `gen_ai.client.inference.duration` | 直方图 / s | `gen_ai.operation.name`、`gen_ai.provider.name`、`gen_ai.request.model`、`gen_ai.response.model`（有才记）；失败时（`OnError` 收尾）带 `error.type` |
+| `gen_ai.client.inference.duration` | 直方图 / s | `gen_ai.operation.name`、`gen_ai.provider.name`、`gen_ai.request.model`、`gen_ai.response.model`、`crew.model.purpose`（有才记），观测到的推理失败带 `error.type` |
 | `gen_ai.client.inference.time_to_first_chunk` | 直方图 / s | 同上，流式调用成功时才记 |
 | `gen_ai.client.inference.usage.input_tokens` | 计数 / {token} | 同上 + `gen_ai.token.modality` |
 | `gen_ai.client.inference.usage.output_tokens` | 计数 / {token} | 同上 |
@@ -279,12 +291,12 @@ trace。
 | `gen_ai.client.inference.usage.cache_write.input_tokens` | 计数 / {token} | 同上 |
 | `gen_ai.client.inference.usage.reasoning.output_tokens` | 计数 / {token} | 同上 |
 | `gen_ai.invoke_agent.duration` | 直方图 / s | `gen_ai.agent.name`、`gen_ai.request.model`（知道时）；失败时 `error.type` |
-| `gen_ai.invoke_agent.inference_calls` | 直方图 / {inference_call} | `gen_ai.agent.name` |
+| `gen_ai.invoke_agent.inference_calls` | 直方图 / {inference_call} | `gen_ai.agent.name`、`crew.model.purpose`（决策范围） |
 | `gen_ai.invoke_agent.tool_calls` | 直方图 / {tool_call} | `gen_ai.agent.name` |
 | `gen_ai.invoke_workflow.duration` | 直方图 / s | `gen_ai.workflow.name`；失败时 `error.type` |
 | `gen_ai.execute_tool.duration` | 直方图 / s | `gen_ai.tool.name`、`gen_ai.tool.type`、`gen_ai.agent.name`；失败时 `error.type`，被审批拒绝时 `crew.tool.outcome=denied`；从工具账重放的不记 |
 
-- token 计数只在模型调用成功（`OnModelEnd`）时记，数量为 0 的不记。
+- token 计数在模型调用成功且带用量时记，数量为 0 的省略。
 - 口径照约定：输入 token 含缓存读写（cache_read / cache_write 是它的子集）；输出 token 含推理 token（约定要求推理计入
   输出、输出取计费口径）。`MessageUsage.OutputTokens` 本来就是这个口径（`ThinkTokens` 是它的子集，openai 兼容客户端取 `completion_tokens_details.reasoning_tokens`、Claude 取 `output_tokens_details.thinking_tokens`），原样记。缓存写入目前只有
   `model/anthropic` 报。
@@ -304,7 +316,7 @@ trace。
 | `crew.resumes` | 计数 | `gen_ai.agent.name`、`crew.agent.kind`、`crew.resume.action` | 显式 Resume 及实际载入可执行存档的嵌套 agent |
 | `crew.skill.activations` | 计数 | `gen_ai.agent.name`、`gen_ai.skill.name` | `activate_skill` 调用成功结束 |
 | `crew.checkpoint.stale_writes` | 计数 | `crew.checkpoint.stale_op`（拿不到操作名时 `unknown`） | agent 以陈旧写回结束（开了陈旧写回检测，且结束时 ctx 没被取消） |
-| `crew.node.executions` | 计数 | `crew.node.id` | 每次节点执行（编排钩子） |
+| `crew.node.executions` | 计数 | `crew.node.id`、`crew.model.purpose`（决策范围） | 每次节点执行（编排钩子） |
 | `crew.compactions` | 计数 | `crew.compact.layer`、`crew.outcome` | 压缩完成（`compaction` 事件的 after 阶段） |
 | `crew.compaction.duration` | 直方图 / s | `crew.compact.layer` | 同上 |
 | `crew.compaction.ratio` | 直方图 / 1 | `crew.compact.layer` | 同上，压缩后 / 压缩前 token |
@@ -359,8 +371,8 @@ mp := sdkmetric.NewMeterProvider(
 
 | 属性 | 在哪 |
 |---|---|
-| `gen_ai.input.messages` | agent span（首跑取最后一条用户消息，续跑取调用方这次给的输入）、chat span（这轮交给模型的全部消息） |
-| `gen_ai.output.messages` | agent span（最终答复，挂起时不记）、chat span（模型这轮的输出） |
+| `gen_ai.input.messages` | agent span（首跑取最后一条用户消息，续跑取调用方这次给的输入）、业务级模型钩子的 chat span（这轮交给模型的全部消息） |
+| `gen_ai.output.messages` | agent span（最终答复，挂起时不记）、业务级模型钩子的 chat span（模型这轮的输出） |
 | `gen_ai.system_instructions` | chat span（agent 的前言：系统提示词、模板渲染结果） |
 | `gen_ai.tool.call.arguments` / `gen_ai.tool.call.result` | execute_tool span |
 

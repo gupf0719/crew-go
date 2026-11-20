@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"crew-go/compose_v2"
+	"crew-go/internal/inference"
 )
 
 // OrchestrationHooks 是图级观测/streaming hook (高层版本, ctx-based).
@@ -121,23 +122,30 @@ func adaptHooks(h OrchestrationHooks) compose_v2.OrchestrationHooks {
 //	ag.Run(ctx, sess, input, agent_v2.WithOrchHooks(hooks))
 func NewChainOrchHooks(hooks ...OrchestrationHooks) OrchestrationHooks {
 	composeHooks := make([]compose_v2.OrchestrationHooks, 0, len(hooks))
+	var modelObservers []inference.GenerateObserver
 	for _, h := range hooks {
 		if isFrameworkNil(h) { // typed-nil 也过滤——否则包进 adapter 后绕过 compose 侧 isFrameworkNil（它只检 adapter 本身）
 			continue
 		}
 		composeHooks = append(composeHooks, &composeHooksAdapter{inner: h})
+		if observe := inference.GenerateObserverFrom(h); observe != nil {
+			modelObservers = append(modelObservers, observe)
+		}
 	}
 	if len(composeHooks) == 0 {
 		return NoOpOrchestrationHooks{}
 	}
 	chained := compose_v2.NewChainOrchHooks(composeHooks...)
-	return &chainOrchAdapter{inner: chained}
+	return &chainOrchAdapter{inner: chained, observeGenerate: inference.ChainGenerateObservers(modelObservers)}
 }
 
 // chainOrchAdapter 反向适配 — 把 compose_v2.ChainOrchHooks 包回 agent_v2.OrchestrationHooks.
 type chainOrchAdapter struct {
-	inner compose_v2.OrchestrationHooks
+	inner           compose_v2.OrchestrationHooks
+	observeGenerate inference.GenerateObserver
 }
+
+func (a *chainOrchAdapter) GenerateObserver() inference.GenerateObserver { return a.observeGenerate }
 
 func (a *chainOrchAdapter) OnGraphStart(ctx context.Context) (context.Context, error) {
 	return a.inner.OnGraphStart(ctx, compose_v2.Channels{})

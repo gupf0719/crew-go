@@ -216,6 +216,8 @@ type BasicAgentBuilder struct {
 	hooks     hook.Hooks // 业务级 hook（OnAgentStart/End + OnModelStart/End + OnToolStart/End + OnError）
 	// modelConfig 算这次模型调用的请求配置（模型名与按次参数），交给 OnModelStart 的 ModelInput.Config；nil 时不填。
 	modelConfig func(ctx context.Context) *schema.ModelConfig
+	// outputSchema 的校验预算由模型节点读取持久的尝试次数后裁决。
+	outputSchema *outputConfig
 	// backgroundNotes 给模型节点这一轮要送进对话的后台任务结束通知（BasicAgent 开了后台任务时设，见
 	// background_task.go）；nil = 没有。
 	backgroundNotes func(ctx context.Context, msgs []*schema.Message) []*schema.Message
@@ -914,6 +916,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	tools := b.tools
 	hooks := b.hooks
 	modelConfig := b.modelConfig
+	outputSchema := b.outputSchema
 	// nil 防护: 业务自定义 hook pointer receiver + 传 nil pointer 时 hooks 是 typed nil
 	// (interface 持非 nil type tag), `hooks == nil` 返 false 漏 fail-fast → 下游
 	// hooks.OnModel* / OnTool* / OnError 调用 nil deref panic
@@ -1023,10 +1026,16 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 8-method 协议：OnAgentStart 不在此触发——它整个调用 1 次, 由
 		// agent_v2.BasicAgent.Run/Resume top-level fire（跟 OnAgentEnd 同函数 scope,
 		// 业务 OTel ctx-push pattern 真生效）。每轮喂 LLM 的完整消息流观测走 OnModelStart。
-		// 把本次调用累计的 final_output 尝试次数透给 modelFn 做预算裁决——它拿不到
-		// channels，而让它自己数消息就得扫含 prior 的列表（正是要摆脱的做法）。
-		foAttempts, _ := compose_v2.Get(chs, basicFinalOutputAttemptsCh)
-		ctx = withFinalOutputAttempts(ctx, foAttempts)
+		// 以工具节点提交的本次尝试次数为准，Resume 沿用。预算耗尽时直接报告校验失败，
+		// OnModelStart 只交付实际可能发出的请求或待重放的答复。
+		if outputSchema != nil && !hasRec {
+			attempts, _ := compose_v2.Get(chs, basicFinalOutputAttemptsCh)
+			if attempts > outputSchema.maxRetries {
+				err := &StructuredOutputError{SchemaName: outputSchema.name, Attempts: attempts, LastError: lastStructuredError(msgs)}
+				hooks.OnError(modelHookCtx(ctx, "OnError"), info, &schema.CommError{Code: modelCallErrCode(ctx, err), Message: err.Error()})
+				return nil, fmt.Errorf("model: %w", err)
+			}
+		}
 		// 「agent 是什么」那一段：channel 是权威副本（随 cp 走），作为 ModelInput 的
 		// **独立字段**交给 hook——不跟 Messages 合并。
 		//

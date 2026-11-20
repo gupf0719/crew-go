@@ -9,6 +9,7 @@ import (
 
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/internal/inference"
 	"crew-go/schema"
 )
 
@@ -438,7 +439,8 @@ func (r *RoutingAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	// Resume 拿不到授予（授予走 RunOption）——顶层直接 Resume 本编排时它的成员没有
 	// 转交 / 路由能力。嵌在 HandoffAgent / RoutingAgent 底下的续跑不走这条：外层节点重跑时
 	// 仍以 Run 形态带着授予调下来。
-	g, err := r.buildComposeGraph(ctx, session, hooks, memberGrants{})
+	orchHooks := extractOrchHooksOrCtx(ctx, rcfg.orchHooks)
+	g, err := r.buildComposeGraph(session, hooks, memberGrants{}, routeModelObserver(orchHooks))
 	if err != nil {
 		return nil, fmt.Errorf("routing agent resume: build graph: %w", err)
 	}
@@ -461,8 +463,8 @@ func (r *RoutingAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	if rcfg.userText != "" {
 		runOpts = append(runOpts, compose_v2.WithResumeUserText(rcfg.userText))
 	}
-	if hooks := extractOrchHooksOrCtx(ctx, rcfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
+	if orchHooks != nil {
+		runOpts = append(runOpts, compose_v2.WithHooks(orchHooks))
 	}
 	runErr := compose_v2.Run(ctx, g, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := RoutingAgentFinalMessage(cm.Channels())
@@ -484,7 +486,8 @@ func (r *RoutingAgent) runGraph(
 	hooks hook.Hooks,
 ) (*schema.Message, error) {
 	cm := compose_v2.NewChannelManager()
-	g, err := r.buildComposeGraph(ctx, session, hooks, runCfg.grantsFor(r))
+	orchHooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks)
+	g, err := r.buildComposeGraph(session, hooks, runCfg.grantsFor(r), routeModelObserver(orchHooks))
 	if err != nil {
 		return nil, fmt.Errorf("routing agent %q: build graph: %w", r.Name(), err)
 	}
@@ -510,23 +513,31 @@ func (r *RoutingAgent) runGraph(
 			runOpts = append(runOpts, compose_v2.WithRunNS(ns))
 		}
 	}
-	if hooks := extractOrchHooksOrCtx(ctx, runCfg.orchHooks); hooks != nil {
-		runOpts = append(runOpts, compose_v2.WithHooks(hooks))
+	if orchHooks != nil {
+		runOpts = append(runOpts, compose_v2.WithHooks(orchHooks))
 	}
 	runErr := compose_v2.Run(ctx, g, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := RoutingAgentFinalMessage(cm.Channels())
 	return final, runErr
 }
 
+func routeModelObserver(hooks compose_v2.OrchestrationHooks) inference.GenerateObserver {
+	if adapter, ok := hooks.(*composeHooksAdapter); ok {
+		return inference.GenerateObserverFrom(adapter.inner)
+	}
+	return inference.GenerateObserverFrom(hooks)
+}
+
 // grants 是**已自查过**发给本编排的转交 / 路由授予（空 = 没有）。每个成员显式转授——
 // 「这一步是我的组成部分」这个意图只能由编排自己表达，不能靠环境让谁都捡得到。
 func (r *RoutingAgent) buildComposeGraph(
-	parentCtx context.Context,
 	parentSession *RunSession,
 	hooks hook.Hooks,
 	grants memberGrants,
+	observeModel inference.GenerateObserver,
 ) (*compose_v2.Graph, error) {
 	bld := NewRoutingAgentBuilder().WithName(r.Name())
+	bld.observeModel = observeModel
 	if hooks != nil {
 		bld = bld.WithAgentHooks(hooks)
 	}

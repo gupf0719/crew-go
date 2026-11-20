@@ -174,8 +174,8 @@ func (o *Observability) AgentHooks(inner ...hook.Hooks) hook.Hooks {
 }
 
 // OrchHooks 返回编排级钩子（agent_v2.OrchestrationHooks），用 agent_v2.WithCtxOrchHooks(ctx, …) 或
-// RunOption agent_v2.WithOrchHooks 装上。不装就没有节点 / 工作流 span，压缩、存档、扇出、路由、
-// 规划、fallback 这些框架事件的指标也不记。inner 的含义同 AgentHooks：业务的编排钩子交给它，别自己串。
+// RunOption agent_v2.WithOrchHooks 装上。记录节点 / 工作流 span、采样路由推理，以及压缩、存档、扇出、
+// 路由、规划和 fallback 等事件的指标。inner 的含义同 AgentHooks：业务的编排钩子交给它。
 func (o *Observability) OrchHooks(inner ...agent_v2.OrchestrationHooks) agent_v2.OrchestrationHooks {
 	if o == nil {
 		return agent_v2.NoOpOrchestrationHooks{}

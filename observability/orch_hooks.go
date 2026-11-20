@@ -12,6 +12,7 @@ import (
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
 	"crew-go/fallback"
+	"crew-go/internal/inference"
 )
 
 // eventSeenKey 标记「这次事件投递本实例已经处理过」（见 OnNodeEvent）。
@@ -95,7 +96,8 @@ func (o *Observability) startNode(ctx context.Context, nodeID string) (context.C
 		cur.name == nodeID && cur.graphNS == graphNS && cur.instance == inst {
 		return ctx, nil
 	}
-	attrs := []attribute.KeyValue{AttrNodeID.String(nodeID)}
+	labels := withModelPurpose([]attribute.KeyValue{AttrNodeID.String(nodeID)}, inference.PurposeFrom(ctx))
+	attrs := labels
 	if graphNS != "" {
 		attrs = append(attrs, AttrGraphNS.String(graphNS))
 	}
@@ -119,7 +121,7 @@ func (o *Observability) startNode(ctx context.Context, nodeID string) (context.C
 	if o.recordContent {
 		nh.partialBuf = &boundedBuffer{max: o.maxContent}
 	}
-	o.inst.nodeExecutions.Add(ctx, 1, metric.WithAttributes(AttrNodeID.String(nodeID)))
+	o.inst.nodeExecutions.Add(ctx, 1, metric.WithAttributes(labels...))
 	return o.withHandle(ctx, nh), nh
 }
 

@@ -14,6 +14,7 @@ import (
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/internal/inference"
 	specModel "crew-go/modules/model"
 	"crew-go/schema"
 )
@@ -67,6 +68,8 @@ func (o *Observability) startAgent(ctx context.Context, info *hook.AgentInfo) (c
 		spanName += " " + info.Name
 	}
 	attrs := []attribute.KeyValue{AttrOperationName.String(op), nameKey.String(info.Name)}
+	purpose := inference.PurposeFrom(ctx)
+	attrs = withModelPurpose(attrs, purpose)
 	if info.Type != "" {
 		attrs = append(attrs, AttrAgentKind.String(info.Type))
 	}
@@ -75,8 +78,9 @@ func (o *Observability) startAgent(ctx context.Context, info *hook.AgentInfo) (c
 		attrs = append(attrs, AttrGraphNS.String(graphNS))
 	}
 	ctx, span := o.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrs...))
+	sid := compose_v2.GetSessionID(ctx)
 	ah := &handle{kind: kindAgent, span: span, start: time.Now(), name: info.Name, graphNS: graphNS,
-		agentKind: info.Type, workflow: workflow}
+		agentKind: info.Type, workflow: workflow, purpose: purpose, sessionID: sid}
 	ah.scope = &agentScope{}
 	o.inst.agentActive.Add(ctx, 1, metric.WithAttributes(AttrAgentName.String(info.Name)))
 
@@ -85,7 +89,6 @@ func (o *Observability) startAgent(ctx context.Context, info *hook.AgentInfo) (c
 		o.recordAgentResume(ctx, ah, action)
 		return ctx, ah
 	}
-	sid := compose_v2.GetSessionID(ctx)
 	ctx = compose_v2.WithCheckpointRestoreObserver(ctx, func(restored context.Context) {
 		if compose_v2.GetGraphNS(restored) == ah.graphNS && compose_v2.GetSessionID(restored) == sid &&
 			o.agentHandleFrom(restored) == ah && !ah.ended.Load() {
@@ -208,7 +211,8 @@ func (o *Observability) endAgent(ctx context.Context, info *hook.AgentInfo, out 
 			a = append(a, AttrRequestModel.String(m))
 		}
 		o.inst.agentDuration.Record(ctx, dur, metric.WithAttributes(a...))
-		o.inst.agentInferences.Record(ctx, ah.scope.inference.Load(), metric.WithAttributes(AttrAgentName.String(info.Name)))
+		o.inst.agentInferences.Record(ctx, ah.scope.inference.Load(),
+			metric.WithAttributes(withModelPurpose([]attribute.KeyValue{AttrAgentName.String(info.Name)}, ah.purpose)...))
 		o.inst.agentToolCalls.Record(ctx, ah.scope.toolCalls.Load(), metric.WithAttributes(AttrAgentName.String(info.Name)))
 	}
 	o.inst.agentInvocations.Add(ctx, 1, metric.WithAttributes(AttrAgentName.String(info.Name),
@@ -217,7 +221,7 @@ func (o *Observability) endAgent(ctx context.Context, info *hook.AgentInfo, out 
 }
 
 func (h *agentHooks) OnModelStart(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
-	ctx, mh := h.o.startModel(ctx, info, in)
+	ctx, mh := h.o.startModel(ctx, info, in, h.o.scopeFrom(ctx))
 	h.o.modelStartContent(mh, in)
 	return ctx, nil
 }
@@ -226,7 +230,7 @@ func (h *agentHooks) OnModelStart(ctx context.Context, info *hook.AgentInfo, in 
 //
 // 沿用原答复续跑的那一遍（见 hook.ModelResponseReusedKey）没有模型调用，不开 span：那次调用在停下的那一遍已经按自己的
 // 结局收过尾（里面的钩子停下时包装层照样收，见 wrappedHooks.OnModelEnd），再开一个就是一次调用记两次。
-func (o *Observability) startModel(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, *handle) {
+func (o *Observability) startModel(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput, scope *agentScope) (context.Context, *handle) {
 	if in != nil && hook.IsModelResponseReused(in.Extra) {
 		return ctx, nil
 	}
@@ -235,6 +239,8 @@ func (o *Observability) startModel(ctx context.Context, info *hook.AgentInfo, in
 	}
 	attrs := []attribute.KeyValue{AttrOperationName.String(OpChat), AttrAgentName.String(info.Name),
 		AttrAgentRound.Int(int(info.Round))}
+	purpose := inference.PurposeFrom(ctx)
+	attrs = withModelPurpose(attrs, purpose)
 	var reqModel string
 	if in != nil && in.Config != nil {
 		reqModel = in.Config.ModelName
@@ -250,6 +256,10 @@ func (o *Observability) startModel(ctx context.Context, info *hook.AgentInfo, in
 		if in.Config.TopP > 0 {
 			attrs = append(attrs, AttrRequestTopP.Float64(float64(in.Config.TopP)))
 		}
+		switch in.Config.OutputType {
+		case "json", "text":
+			attrs = append(attrs, AttrOutputType.String(in.Config.OutputType))
+		}
 	}
 	if conv := compose_v2.GetThreadID(ctx); conv != "" {
 		attrs = append(attrs, AttrConversationID.String(conv))
@@ -260,7 +270,8 @@ func (o *Observability) startModel(ctx context.Context, info *hook.AgentInfo, in
 	}
 	ctx, span := o.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 	mh := &handle{kind: kindModel, span: span, start: time.Now(), name: info.Name,
-		graphNS: compose_v2.GetGraphNS(ctx), requestModel: reqModel, scope: o.scopeFrom(ctx), inputModality: "text"}
+		graphNS: compose_v2.GetGraphNS(ctx), requestModel: reqModel, scope: scope,
+		purpose: purpose, inputModality: "text"}
 	mh.scope.add(mh)
 	if mh.scope != nil {
 		mh.scope.inference.Add(1)
@@ -325,6 +336,11 @@ func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *
 	if mh == nil || mh.kind != kindModel {
 		return ctx, nil
 	}
+	o.finishModel(ctx, mh, out, o.recordContent)
+	return ctx, nil
+}
+
+func (o *Observability) finishModel(ctx context.Context, mh *handle, out *schema.ModelOutput, recordContent bool) {
 	var provider, respModel, finish string
 	if out != nil && out.Message != nil && out.Message.Metadata != nil {
 		md := out.Message.Metadata
@@ -365,18 +381,18 @@ func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *
 		ttfc = time.Unix(0, first).Sub(mh.start).Seconds()
 		extra = append(extra, AttrResponseTTFC.Float64(ttfc))
 	}
-	if o.recordContent && out != nil && out.Message != nil {
+	if recordContent && out != nil && out.Message != nil {
 		extra = append(extra, AttrOutputMessages.String(o.messagesJSON([]*schema.Message{out.Message}, finish)))
 	}
 	mh.scope.remove(mh)
 	if !o.finish(mh, result{outcome: OutcomeSuccess}, extra...) {
-		return ctx, nil
+		return
 	}
 	// gen_ai.request.model 只填调用方请求的模型；不知道时不拿响应里的模型名去顶（两者可以不同，比如别名解析到具体版本）。
 	if mh.scope != nil && mh.requestModel != "" {
 		mh.scope.lastModel.Store(mh.requestModel)
 	}
-	labels := inferenceLabels(provider, mh.requestModel, respModel)
+	labels := mh.inferenceLabels(provider, respModel)
 	o.inst.inferenceDuration.Record(ctx, seconds(mh.start), metric.WithAttributes(labels...))
 	if ttfc > 0 {
 		o.inst.inferenceTTFC.Record(ctx, ttfc, metric.WithAttributes(labels...))
@@ -395,21 +411,38 @@ func (h *agentHooks) OnModelEnd(ctx context.Context, info *hook.AgentInfo, out *
 		addTokens(ctx, o.inst.usageOutput, outputTokens(usage), outTok)
 		addTokens(ctx, o.inst.usageReasoning, usage.ThinkTokens, outTok)
 	}
-	return ctx, nil
 }
 
-func inferenceLabels(provider, requestModel, responseModel string) []attribute.KeyValue {
+func withModelPurpose(attrs []attribute.KeyValue, purpose inference.Purpose) []attribute.KeyValue {
+	if purpose != "" {
+		return append(attrs, AttrModelPurpose.String(string(purpose)))
+	}
+	return attrs
+}
+
+func (mh *handle) inferenceLabels(provider, responseModel string) []attribute.KeyValue {
 	a := []attribute.KeyValue{AttrOperationName.String(OpChat)}
 	if provider != "" {
 		a = append(a, AttrProviderName.String(provider))
 	}
-	if requestModel != "" {
-		a = append(a, AttrRequestModel.String(requestModel))
+	if mh.requestModel != "" {
+		a = append(a, AttrRequestModel.String(mh.requestModel))
 	}
 	if responseModel != "" {
 		a = append(a, AttrResponseModel.String(responseModel))
 	}
-	return a
+	return withModelPurpose(a, mh.purpose)
+}
+
+func (o *Observability) finishModelError(ctx context.Context, mh *handle, r result) {
+	mh.scope.remove(mh)
+	if o.finish(mh, r) {
+		labels := mh.inferenceLabels("", "")
+		if r.failed() {
+			labels = append(labels, AttrErrorType.String(r.errType))
+		}
+		o.inst.inferenceDuration.Record(ctx, seconds(mh.start), metric.WithAttributes(labels...))
+	}
 }
 
 // outputTokens 是 GenAI 约定口径的输出 token：包含推理 token（约定要求 reasoning.output_tokens 计入
@@ -609,11 +642,7 @@ func (h *agentHooks) OnError(ctx context.Context, info *hook.AgentInfo, err *sch
 	cur := o.handleFrom(ctx)
 	switch {
 	case cur != nil && cur.kind == kindModel && strings.HasPrefix(err.Code, "model_"):
-		cur.scope.remove(cur)
-		if o.finish(cur, r) {
-			o.inst.inferenceDuration.Record(ctx, seconds(cur.start), metric.WithAttributes(
-				append(inferenceLabels("", cur.requestModel, ""), AttrErrorType.String(r.errType))...))
-		}
+		o.finishModelError(ctx, cur, r)
 	case cur != nil && cur.kind == kindTool && strings.HasPrefix(err.Code, "tool_"):
 		cur.scope.remove(cur)
 		if o.finish(cur, r) {

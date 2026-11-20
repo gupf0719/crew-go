@@ -6,6 +6,7 @@ import (
 
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/internal/inference"
 	"crew-go/schema"
 )
 
@@ -288,6 +289,7 @@ func (b *ReflectAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// Reflector / EvalFunc 是内部决策（同评审 agent 那一档，见 decisionCtx）：它们里面请教的 agent 不进
 		// 会话历史、不取用户的插话。
 		evalCtx := decisionCtx(compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), fmt.Sprintf("round_%d", round))))
+		evalCtx = inference.WithPurpose(evalCtx, inference.Evaluation)
 
 		if reflector != nil {
 			op, err := reflector(evalCtx, orig, out)
@@ -386,6 +388,7 @@ func (b *ReflectAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		fbCtx := compose_v2.WithGraphNS(ctx, compose_v2.JoinNS(compose_v2.GetGraphNS(ctx), fmt.Sprintf("round_%d", fbRound)))
 
 		if feedbackFn != nil {
+			fbCtx = inference.WithPurpose(fbCtx, inference.Reflection)
 			op, err := feedbackFn(fbCtx, orig, out, critique)
 			if err != nil {
 				if _, isInt := compose_v2.IsInterrupt(err); !isInt && ctx.Err() == nil {

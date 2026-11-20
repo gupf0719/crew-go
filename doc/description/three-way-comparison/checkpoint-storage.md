@@ -284,7 +284,7 @@ func forwardCheckPoint(ctx context.Context, nodeKey string) context.Context {
 
 两个进程副本同时对同一 sessionID 调 `Resume`，各自从 cp 载入同一状态、各自执行、各自写回。
 
-**我们的实测**（`compose_v2.Run` 直接调用，屏障强制并发）：
+**早期实测**（当时用 `compose_v2.Run` 的重叠调用模拟两个副本，启动屏障同时放行两个 goroutine）：
 
 ```
 副本A err=<nil>
@@ -295,7 +295,8 @@ func forwardCheckPoint(ctx context.Context, nodeKey string) context.Context {
 
 `-race` 干净——这是**逻辑双重执行**，不是数据竞争，race detector 永远抓不到。
 
-复现：`go test -tags concurrentprobe ./compose_v2/ -run TestProbe_ConcurrentResume -v`（探针在 `compose_v2/concurrent_resume_test.go`，build tag 隔离故默认 `go test ./...` 不编译）。
+当前版本以存档实例及任务登记协调本机执行，并提供 [共享存档租约和持久准入](../../v2/checkpoint.md#61-共享存档的任务租约)。
+默认 [回归套件](../../../compose_v2/local_task_lease_test.go) 验证同实例拒绝独立重叠执行、并行子图共用备选分区和最后一支释放。
 
 ### 五方现状（2026-07-21 全部读本地源码核实）
 

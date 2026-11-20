@@ -93,7 +93,9 @@
 //
 //	# Store
 //	{prefix}:store:item:{ns_joined}:{key}    → JSON value
-//	{prefix}:store:nsidx                     → SET (所有 ns_joined, ListNamespaces 主路径)
+//	{prefix}:store:nsidx                     → SET (待核对的 ns_joined)
+//	{prefix}:store:nsitems:{ns_hex}            → ZSET (item key 与过期时间)
+//	{prefix}:store:nsidx:expiry-v1             → 旧名称索引已回填
 //
 //	# Checkpointer
 //	{prefix}:cp:item-v2:{sid_base64url}:{ns}              → JSON cp payload
@@ -115,8 +117,13 @@
 //   - **DeleteSubtree**: `deleteSubtreeScript` — 内部 SMEMBERS + Lua filter prefix +
 //     对每 matched: DEL item + DEL meta + SREM nsidx/pending;
 //     最后 SCARD nsidx 验空条件 SREM sids
-//   - **Store.Put**: `putScript` — 内部 GET old + cjson.decode 拿 created_at + SET
-//     new (拼新 JSON 保 CreatedAt 语义) + SADD nsidx
+//   - **Store.Put**: `putScript` 保留原 CreatedAt，在同一个 Lua 调用中写入条目和索引。
+//     按 Redis 时钟记录到期点，写入时清理一批已过期成员。只含有限期条目的索引会在最晚成员到期时一起过期。
+//   - **Store.ListNamespaces**: 在截断和分页前检查条目，原子回收空名称。首次枚举扫描旧条目，
+//     旧键的冒号有歧义时保留索引中已有的候选。新写入带归属，重写后仅显示实际 namespace。
+//     升级时先停同前缀的旧写者，再由新版本完成回填。
+//     限制 Store ACL 时，开放上述索引键及脚本使用的有序集合、TIME、PEXPIREAT、PERSIST、
+//     GETRANGE、PTTL、EXISTS、SCAN 和 UNLINK 命令。
 //
 // **iter-5-K 解决 cjson decode silent fallback**: 用 Redis Hash 存 cp metadata
 // (graph_id/status/created_at), Lua HGET 单字段查不依赖 cjson 解析整

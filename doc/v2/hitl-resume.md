@@ -713,7 +713,7 @@ toolsNode := func(ctx context.Context, chs Channels) ([]ChannelWrite, error) {
 |---|---|---|
 | 进程在 tools 节点执行中途崩溃 | memo 只随节点「没成」的那次出口存档落盘；sync / async durability 只在超步边界写档，那一刻这个节点还没开始或已经结束，带不上 memo——配了也一样丢 | 写操作带 idempotency_key（durability 只保超步边界的进度，保不了节点中途的） |
 | `SaveNodeState` 失败（序列化失败等；日志 `agent_v2: 存 tool_call 进度失败，该工具 Resume 时会重跑`）| 那一条没记上 | 看到这条 warn 就知道该工具会重跑；同上 |
-| 没做出上行信号的框架元工具（`tool_search` 等）| 它们的那半副作用在工具体里发生（`tool_search` 写解锁 channel），跳过函数体就没人做，刻意不进 memo | 它们本身幂等（解锁是集合并），业务不用管；`activate_skill` 的 fork 模式里已跑完的 sub-agent 由嵌套调用的完成记录挡住重跑（见 [skill.md](./skill.md) §8） |
+| 缺少可重放产出的框架元工具 | 工具体需要重跑才能重建对应状态 | `activate_skill` 的 fork 模式里已跑完的 sub-agent 由嵌套调用的完成记录挡住重跑（见 [skill.md](./skill.md) §8）。已记录的 `tool_search` 候选随工具账恢复，再由批次决定解锁（见 [工具检索](toolsearch.md#22-揭示集存在图状态里按任务按调用流隔离)）。 |
 | 中断的那个 tool_call 自身 | 它没成功，重跑是应有之义 | ask_user 二阶段语义天然幂等（§6.4）；自定义提问工具走 `compose_v2.Ask` 同款 |
 | 业务工具在 tool_result 之外、要在续跑时**再生效一次**的产出（写进不随存档走的 session KV……）| 会被记账、命中时那半不再发生（工具里经框架入口做出的转交 / 路由决定除外——它们随账记下、命中时交出） | 那半进 cp（channel / 节点私有态），命中时从那里读回 |
 

@@ -339,6 +339,8 @@ backend opt-in. 业务跨 backend 切换前**必查**此矩阵:
   PG 上 ListNamespaces 的次序与分页窗口跟着库的排序规则变, 都 err == nil.
 - **TTL**。通过 `store.TTLAware` 检查后端能力。普通 SQL Store 和 InMemoryStore 对正时长返回
   `ErrTTLNotSupported`。SQL 到期模式的读写和清扫见下一节。
+- **Redis 枚举和升级**。正 TTL 按 Redis 时钟计时，最短 1 毫秒。枚举在深度截断、去重和分页前核对 namespace
+  是否含活条目。同前缀的写入端统一升级后，首次枚举回填既有名称和条目的对应关系。 [Redis Store 索引](../../redis/doc.go)
 - **持久化**: Redis 默认 `appendonly no` 业务 crash 丢 1h cp. 必读 `redis/doc.go`
   "Redis 持久化配置" 章节.
 

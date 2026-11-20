@@ -9,6 +9,7 @@ import (
 
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/internal/agentcall"
 )
 
 // resumePrep 是 commonResumePrep 的返回, 各编排 Resume 共享 boilerplate 的输出.
@@ -325,7 +326,7 @@ func commonResumePrep(ctx context.Context, agentTypeName string, ag Agent, sessi
 		// 零开销.
 		if info != nil && !isFrameworkNil(hooks) {
 			// 钩子报错不拦放弃（放弃是幂等清理），只是不采纳它的 ctx。
-			endCtx, _ := compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
+			endCtx, _ := compose_v2.CallHook(agentcall.Begin(ctx), func(c context.Context) (context.Context, error) {
 				return hooks.OnAgentStart(c, info, &hook.AgentInput{})
 			})
 			// Abort 是用户主动操作非 error 路径 — 不 push WithEndError, GetEndError 返 nil.

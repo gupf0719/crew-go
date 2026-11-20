@@ -111,7 +111,8 @@ func TestBackgroundTask_SnapshotPublishesOnlySettledResult(t *testing.T) {
 	}
 	task.status, task.endedAt = BackgroundTaskCompleted, time.Now()
 	after, ok := m.Get(task.id)
-	if !ok || after.Status != BackgroundTaskCompleted || after.Result != task.res || after.EndedAt.IsZero() {
+	if !ok || after.Status != BackgroundTaskCompleted || after.Result == nil || after.Result == task.res ||
+		!after.Result.Success || after.Result.Output != "正被整理的返回值" || after.EndedAt.IsZero() {
 		t.Fatalf("终态提交后快照应有结局，得到 %+v", after)
 	}
 }

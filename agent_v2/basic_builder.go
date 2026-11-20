@@ -1298,8 +1298,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		binding, _ := compose_v2.Get(chs, basicToolBindingCh)
 		ctx = withToolBinding(ctx, binding)
 		// 这一批里检索解锁的名字记在这次执行上（工具体拿不到 channel 写入口），节点成功后写进 basicRevealedCh；
-		// 节点失败或中断时随这次执行一起丢掉，续跑重跑这一批时检索重新记（tool_search 不进工具账）。每次执行一份新的，
-		// 也盖掉从调用方继承来的那份——父 agent 工具里调起的子 agent 不该记进父的这一批。
+		// 节点失败或中断时，已完成检索的候选从逐调用工具账恢复。每次执行一份新的，盖掉从调用方继承的批次。
 		turn := &revealTurn{}
 		ctx = withRevealTurn(ctx, turn)
 		// 重复调用的计数链同理：从 channel 拷一份给这一批，节点成功后写回（见 repeatToolState）。
@@ -1485,11 +1484,8 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			if revealBudget != nil && isToolSearchCall(r) {
 				admitted, dropped := turn.limit(i, revealBudget, limitedToolSearch.maxRevealed)
 				reveal = admitted
-				if dropped > 0 && !isFailedToolResult(r) {
-					r.Content = limitedToolSearch.revealReceipt(admitted, dropped)
-					if len(r.ContentBlocks) > 0 && r.ContentBlocks[0].Toolresult != nil {
-						r.ContentBlocks[0].Toolresult.Content = r.Content
-					}
+				if dropped > 0 && !isFixed(i) && !isFailedToolResult(r) {
+					setSearchReceipt(r, limitedToolSearch.revealReceipt(admitted, dropped))
 				}
 			}
 			// 还原成交给 OnToolEnd 的 ToolOutput（失败的结构化信息、审批拒绝、从工具账重放的，见 toolOutputFor）
@@ -1506,6 +1502,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				failedAfterHook[i], codeAfterHook[i] = !before.Success, before.ErrorCode
 				if deliveries != nil {
 					deliveries[i] = batch.memo[i].Result.Delivery
+				}
+				if before.Success {
+					for _, name := range reveal {
+						revealBudget[name] = true
+					}
 				}
 				continue
 			}
@@ -1615,7 +1616,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 这一批处理完了：结果定进工具账（见 agent_v2 的 finalizeToolMemo）。被裁决换掉的那几条定下的是替换后的失败结果——
 		// 不定的话账里留着它转存前、钩子脱敏前的原文，节点之后作废时随出口存档落盘（审计实测）。
 		if useToolMemo {
-			finalizeToolMemo(ctx, toolCalls, batch.memo, results, hookSignals, deliveries)
+			finalizeToolMemo(ctx, toolCalls, batch.memo, results, hookSignals, deliveries, turn)
 		}
 		// 钩子做出的决定排在这批调用的决定之后交，按钩子的先后（理由见循环里收的那一处）。
 		for _, s := range hookSignals {

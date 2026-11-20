@@ -24,13 +24,16 @@ type TaskActivity struct {
 	mode           taskActivityMode
 	fresh          *freshTaskCheckpoints
 	abandoned      []string
+	localOwner     *TaskActivity
+	releaseLocal   func()
 	sharedRun      *checkpointTaskLease
 	sharedAbandons []*checkpointTaskLease
 	cancel         context.CancelCauseFunc
 }
 
 // BeginTaskActivity 在进程内原子登记 sid 的执行和 abandoned 中任务的放弃许可。执行可嵌套，放弃与执行或另一次放弃互斥。
-// sid 为空时只申请放弃许可。支持 [TaskLeaseProvider] 的 Checkpointer 还逐个任务申请跨进程独占租约。
+// sid 为空时只申请放弃许可。支持 [TaskLeaseProvider] 的 Checkpointer 逐个任务申请跨进程独占租约。
+// 其他可比较的 Checkpointer 按实际实例和 sid 排除本进程重叠的独立执行。
 // 登记或申请冲突时返回 [ErrTaskBusy]，释放本次已取得的登记与租约。
 //
 // 给图引擎和 Agent 入口使用：在读写存档或历史之前调用，结束时 Release。放弃操作完成后可先调用 FinishAbandon。
@@ -85,7 +88,7 @@ func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandon
 	activity := &TaskActivity{sid: sid, mode: mode, abandoned: abandoned}
 	taskActivities.Lock()
 	state := taskActivities.byID[sid]
-	inherited, freshOwner, ownsExclusive := inheritedActivity(state, parent, sid)
+	inherited, freshOwner, localOwner, ownsExclusive := inheritedActivity(state, parent, sid)
 	claimsStorage := mode == taskActivityRootResume ||
 		(cp != nil && (mode == taskActivityFresh || (freshOwner != nil && state.exclusive == nil)))
 	conflicts := !ownsExclusive && (cp != nil || state.exclusive.mode == taskActivityRootResume)
@@ -104,6 +107,10 @@ func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandon
 		}
 	}
 	if sid != "" {
+		activity.localOwner = localOwner
+		if activity.localOwner == nil {
+			activity.localOwner = activity
+		}
 		if mode == taskActivityFresh {
 			activity.fresh = &freshTaskCheckpoints{checked: make(map[freshCheckpointPartition]string)}
 			freshOwner = activity
@@ -142,7 +149,7 @@ func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandon
 }
 
 // inheritedActivity 只认可当前 ctx 链上仍有效的同任务登记。调用方持有 taskActivities 的锁。
-func inheritedActivity(state taskActivityState, parent *taskActivityBinding, sid string) (count int, freshOwner *TaskActivity, ownsExclusive bool) {
+func inheritedActivity(state taskActivityState, parent *taskActivityBinding, sid string) (count int, freshOwner, localOwner *TaskActivity, ownsExclusive bool) {
 	ownsExclusive = state.exclusive == nil
 	if sid == "" || state.running == 0 {
 		return
@@ -153,6 +160,9 @@ func inheritedActivity(state taskActivityState, parent *taskActivityBinding, sid
 			continue
 		}
 		count++
+		if localOwner == nil {
+			localOwner = activity.localOwner
+		}
 		if freshOwner == nil && activity.fresh != nil {
 			freshOwner = activity
 		}
@@ -181,6 +191,10 @@ func (a *TaskActivity) FinishAbandon() {
 // Release 释放本次调用持有的许可和执行登记。
 func (a *TaskActivity) Release() {
 	a.FinishAbandon()
+	if a.releaseLocal != nil {
+		a.releaseLocal()
+		a.releaseLocal = nil
+	}
 	if a.sharedRun != nil {
 		a.sharedRun.release()
 		a.sharedRun = nil

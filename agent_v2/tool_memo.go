@@ -32,6 +32,8 @@ type toolMemoEntry struct {
 	ToolMsg *schema.Message `json:"tool_msg,omitempty"`
 	// BodyMsg 是 P2.D inline skill body 那条附加 UserMessage（多数工具为 nil）。
 	BodyMsg *schema.Message `json:"body_msg,omitempty"`
+	// Search 供同批续跑恢复检索候选，解锁仍由节点在提交批次时决定。
+	Search *toolSearchReplay `json:"search,omitempty"`
 	// Signals 是这次调用做出的上行信号（转交 / 路由决定，多数工具为空）——工具自己做出的
 	// （transfer_to_agent / route_to），以及它里面经 RunSubAgent 等嵌套调用交上来的。
 	//
@@ -64,11 +66,7 @@ type toolMemoEntry struct {
 //     函数体重跑补回来。命中跳过的后果是**静默**的：err=nil、tool_result 齐全，
 //     只是事没发生。
 //
-//     ⚠️ `tool_search` **仍必须排除，但理由已经变了**：它的已解锁集现在进 channel
-//     state（随 cp 走），不再是当初那条「副作用不进 cp」。现在的理由是**写 channel
-//     这一步发生在工具体里**——命中记账跳过函数体，就没人往 channel 写。写错理由
-//     下一个人很可能顺手把它从名单里"优化"掉，那会让同批中断场景静默退化。
-//     判据动之前先看 tool_search_resume_test.go 那四条哨兵。
+//     框架检索单独保存实际检索过的候选，在重放时交回本批。
 //
 //   - 业务工具：默认进记账；它里面经嵌套调用交上来的决定同样随记账走。
 //
@@ -156,13 +154,16 @@ func loadToolMemo(ctx context.Context, calls []schema.ToolCall) ([]*toolCallReco
 // finalizeToolMemo 逐项保存钩子改写、批内裁决和转存后的结果。此后节点提交若失败，恢复时直接
 // 重放定稿及 OnToolEnd 产生的信号。批次提前中断时，账里仍是工具刚返回的内容，供下一次钩子处理。
 func finalizeToolMemo(ctx context.Context, calls []schema.ToolCall, records []*toolCallRecord, results []*schema.Message,
-	hookSignals []compose_v2.Signals, deliveries []*toolresult.Delivery) {
+	hookSignals []compose_v2.Signals, deliveries []*toolresult.Delivery, reveals *revealTurn) {
 	for i, record := range records {
 		if record == nil || record.Result == nil || record.Result.Final || i >= len(results) || results[i] == nil {
 			continue
 		}
 		final := *record.Result
 		final.ToolMsg, final.Final, final.HookSignals = results[i], true, hookSignals[i]
+		if final.Search != nil {
+			final.Search = reveals.recorded(i)
+		}
 		if i < len(deliveries) {
 			final.Delivery = deliveries[i]
 		}

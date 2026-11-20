@@ -4,7 +4,7 @@
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **43 项**。P1 **0**、P2 **4**、P3 **39**。缺陷 **0**、能力缺口 **1**、待决 **26**、验收 **16**。
+共 **42 项**。P1 **0**、P2 **4**、P3 **38**。缺陷 **0**、能力缺口 **1**、待决 **25**、验收 **16**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -54,7 +54,7 @@
 | Q14 | 待决 | Sandbox/Code Mode 与框架信任边界 | 在 Q01 确定一致性接口后再决定可执行能力和隔离模型。授权化检索、审批工具提示另有行。历史 TODO 408、414、439。 |
 | Q15 | 待决 | 文档与测试门禁是否扩展 | 候选含 godoc 位置、守护测试的符号覆盖、全称 AST 断言、golden、并行审计隔离和 finding 判据。先以可复现错误验证收益。历史 TODO 363、400、401、418、492 及 ISSUE-73。 |
 | Q16 | 待决 | 复用各编排的 Run 序幕与钩子相位 | 核对构建/载入/失败存档与 start/end 内嵌子调用身份。保留现有入口独立覆盖，按真实漂移决定是否抽取。历史 TODO 402、561、585。 |
-| Q17 | 待决 | Store、历史及压缩数据的保留和成本 | 独立核对 HistoryStore 留存/导出、Redis 空 namespace 回收、PG 表达式索引与 CASE 类型守卫成本、AutoCompact 体量及摘要边界格式。以实际负载建立基线。历史 TODO 392、425、493、500 及 ISSUE-99。 |
+| Q17 | 待决 | Store、历史及压缩数据的保留和成本 | 核对 HistoryStore 留存和导出、PG 表达式索引与 CASE 类型守卫成本、AutoCompact 体量及摘要边界格式。以实际负载建立基线。历史 TODO 425、493、500 及 ISSUE-99。 |
 | Q18 | 待决 | 决策模型推广至其他决策点 | RoutingAgent 已有；Reflect 评估/Plan 规划等先明确各自结果、错误和人审策略，避免套用路由阈值。历史 TODO 293。 |
 | Q19 | 待决 | Plan 步骤同批依赖与动态并行 | 明确何时启用 DAG，同批 InputRefs 的解析时机和并行失败语义。当前 Plan 逐轮只执行首步。 [ISSUE-47](../issue/issue-47-planstep-explicit-input-refs.md) |
 | Q20 | 待决 | Plan 级主动审批 | 现有 ExecInputBuilder 的 Ask 可在单步审批。若要内置 plan gate，先定义首次计划、重规划和版本变化时审批复用。 [ISSUE-58](../issue/issue-58-interrupt-timing-semantics.md) |
@@ -63,10 +63,11 @@
 | Q23 | 待决 | 是否允许 AG-UI 客户端为单轮提供指令 | context/state 已按用户数据进入送模视图。若需显式客户端指令，先定义授权、优先级和持久化边界。历史 TODO 302。 [数据入口](../../agui/client_data.go) |
 | Q24 | 待决 | StoreMemory 的自定义键和过滤后配额 | 键函数影响身份和覆盖策略。非合规 Store 返回越界项时，现行过滤避免泄漏，配额可能被占用。按实际 backend 决定是否需要透明补采。历史 TODO 367、395、403。 |
 | Q25 | 待决 | 软降落遭遇不守 tool_choice 的模型时如何收尾 | 目前越权工具不执行。决定是否提供额外只读收尾机会，以及已确定不能执行时是否进入可产生 HITL 的 OnToolStart。历史 TODO 194、202。 |
-| Q26 | 待决 | 是否持久记录 tool_search 同批解锁动作 | 依赖同批重放的当前路径有保护。按不同工具快照和脱离调用层的对照决定是否需要动作记录。历史 TODO 599。 |
 | Q27 | 待决 | 持久化业务状态演进与按执行 namespace 查历史 | ISSUE-70 Phase 4 的通用状态迁移需要版本化调用方。SelfHistoryByNS 希望按执行 namespace 查写入记录，先核对执行位置能否成为历史身份。 [ISSUE-70](../issue/issue-70-checkpoint-evolution.md) |
 
 ## 已关闭及归并去向
+
+- **AgentDock 对照发现的七项缺陷已修。** 涵盖同存档实例互斥、Plan Web 断线、同批检索（Q26）、A2A 补答、后台结果、同名调用统计和 Redis 空 namespace（Q17 的子项）。 [逐项回归](backlog-audit.md#2026-11-20-agentdock-对照修复)
 
 - **C17 已实现。** 分类、采样路由、评估和反馈可按模型用途分组，结构化请求在 chat span 记录输出类型。回归覆盖同名模型、推理失败、原生格式、框架 schema 及业务同名工具。 [可观测性](../v2/observability.md#23-属性) · [跨层回归](../../observability/inference_test.go)
 

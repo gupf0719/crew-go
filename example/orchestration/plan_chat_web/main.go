@@ -61,6 +61,7 @@ type runSlot struct {
 	resumeAction    agent_v2.ResumeAction
 	resumeText      string
 	lastInterruptID string
+	verifyResume    bool
 	mode            string
 	historySize     int
 }
@@ -206,8 +207,6 @@ func runOrResume(
 	hooks hook.Hooks,
 	settle func(status, pendingID string, historySize int) error,
 ) {
-	ag := buildChatEntryAgent(m, hooks, sink, slot.mode)
-
 	if isResume {
 		sink.send("resume", map[string]any{"session_id": slot.sess.RunID, "mode": slot.mode})
 	} else {
@@ -218,6 +217,63 @@ func runOrResume(
 		})
 	}
 
+	finish := func(status, pendingID string) bool {
+		if err := settle(status, pendingID, slot.historySize+len(slot.sess.History())); err != nil {
+			log.Printf("[plan_chat_web] 更新会话终态: %v", err)
+			sink.send("error", map[string]any{"message": "session state unavailable", "status": statusError})
+			sink.send("done", map[string]any{"status": statusError})
+			return false
+		}
+		return true
+	}
+	sendInterrupted := func(reason string, data any, checkpoint map[string]any, query *compose_v2.AskQuery) {
+		pendingID := ""
+		if query != nil {
+			pendingID = query.InterruptID
+		}
+		if !finish(statusInterrupted, pendingID) {
+			return
+		}
+		payload := map[string]any{
+			"session_id": slot.sess.RunID,
+			"status":     statusInterrupted,
+			"reason":     reason,
+			"data":       data,
+			"checkpoint": checkpoint,
+		}
+		if query != nil {
+			payload["query"] = query
+		}
+		sink.send("interrupted", payload)
+		sink.send("done", map[string]any{"interrupted": true, "session_id": slot.sess.RunID, "status": statusInterrupted})
+	}
+	sendUnconfirmed := func() {
+		if finish(statusResumeUnconfirmed, "") {
+			sink.send("resume_unconfirmed", map[string]any{"session_id": slot.sess.RunID, "status": statusResumeUnconfirmed})
+			sink.send("done", map[string]any{"session_id": slot.sess.RunID, "status": statusResumeUnconfirmed})
+		}
+	}
+	if isResume && slot.verifyResume && slot.resumeAction != agent_v2.ResumeActionAbort {
+		// 上次请求无法确认结果。先发布核实过的存档，等待调用者针对这次的问题重新决定。
+		saved, err := slot.cp.LoadNS(ctx, slot.sess.RunID, "")
+		switch {
+		case err != nil:
+			log.Printf("[plan_chat_web] 核对续跑存档: %v", err)
+			sendUnconfirmed()
+		case resumableCheckpoint(saved):
+			sendInterrupted("resume checkpoint verified", nil, checkpointSummary(saved), resumeQuestion(saved, ""))
+		case saved != nil && saved.Status == compose_v2.CPStatusResuming:
+			sendUnconfirmed()
+		default:
+			if finish(statusError, "") {
+				sink.send("error", map[string]any{"message": "no resumable checkpoint", "status": statusError})
+				sink.send("done", map[string]any{"status": statusError})
+			}
+		}
+		return
+	}
+
+	ag := buildChatEntryAgent(m, hooks, sink, slot.mode)
 	var (
 		err    error
 		events []*agent_v2.AgentEvent
@@ -251,40 +307,35 @@ func runOrResume(
 		events, err = ag.Run(ctx, slot.sess, schema.UserMessage(userInput), agent_v2.WithOrchHooks(orch))
 	}
 
-	historySize := slot.historySize + len(slot.sess.History())
-	finish := func(status, pendingID string) bool {
-		if err := settle(status, pendingID, historySize); err != nil {
-			log.Printf("[plan_chat_web] 更新会话终态: %v", err)
-			sink.send("error", map[string]any{"message": "session state unavailable", "status": statusError})
-			sink.send("done", map[string]any{"status": statusError})
-			return false
-		}
-		return true
-	}
 	if err != nil {
-		var ie *compose_v2.InterruptError
-		if errors.As(err, &ie) {
-			pendingID := ""
-			if ie.Query != nil {
-				pendingID = ie.Query.InterruptID
-			}
-			checkpoint := summarizeCheckpoint(ctx, slot.cp, slot.sess.RunID)
-			if !finish(statusInterrupted, pendingID) {
+		if ie, ok := compose_v2.IsInterrupt(err); ok {
+			sendInterrupted(ie.Reason, ie.Data, summarizeCheckpoint(ctx, slot.cp, slot.sess.RunID), ie.Query)
+			return
+		}
+		if isResume && errors.Is(err, compose_v2.ErrCheckpointResumeUnconfirmed) {
+			sendUnconfirmed()
+			return
+		}
+		if isResume && ctx.Err() != nil && errors.Is(err, ctx.Err()) &&
+			!errors.Is(err, compose_v2.ErrRunAborted) && !errors.Is(err, compose_v2.ErrTaskLeaseLost) &&
+			!errors.Is(err, compose_v2.ErrCheckpointStale) && !errors.Is(err, compose_v2.ErrCheckpointNotPersisted) {
+			// HTTP 请求退出后用仍持有的会话许可核对实际存档。
+			recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			saved, readErr := slot.cp.LoadNS(recoveryCtx, slot.sess.RunID, "")
+			cancel()
+			if readErr != nil {
+				log.Printf("[plan_chat_web] 续跑断线后读取存档: %v", readErr)
+				sendUnconfirmed()
 				return
 			}
-			payload := map[string]any{
-				"session_id": slot.sess.RunID,
-				"status":     statusInterrupted,
-				"reason":     ie.Reason,
-				"data":       ie.Data,
-				"checkpoint": checkpoint,
+			if saved != nil && saved.Status == compose_v2.CPStatusResuming {
+				sendUnconfirmed()
+				return
 			}
-			if ie.Query != nil {
-				payload["query"] = ie.Query
+			if resumableCheckpoint(saved) {
+				sendInterrupted("resume request stopped", nil, checkpointSummary(saved), resumeQuestion(saved, slot.lastInterruptID))
+				return
 			}
-			sink.send("interrupted", payload)
-			sink.send("done", map[string]any{"interrupted": true, "session_id": slot.sess.RunID, "status": statusInterrupted})
-			return
 		}
 		// 非 Interrupt 错 → 终态 error (sweeper TTL 到清 slot)
 		if !finish(statusError, "") {
@@ -318,7 +369,7 @@ func runOrResume(
 		sink.send("final", data)
 	}
 	sink.send("done", map[string]any{
-		"history_size": historySize,
+		"history_size": slot.historySize + len(slot.sess.History()),
 		"status":       statusSuccess,
 		"session_id":   slot.sess.RunID,
 	})
@@ -947,6 +998,10 @@ func summarizeCheckpoint(ctx context.Context, cp compose_v2.Checkpointer, sessio
 	if err != nil || saved == nil {
 		return nil
 	}
+	return checkpointSummary(saved)
+}
+
+func checkpointSummary(saved *compose_v2.Checkpoint) map[string]any {
 	out := map[string]any{
 		"id":         saved.ID,
 		"created_at": saved.CreatedAt,
@@ -977,4 +1032,24 @@ func summarizeCheckpoint(ctx context.Context, cp compose_v2.Checkpointer, sessio
 		out["pending_interrupts"] = queries
 	}
 	return out
+}
+
+func resumableCheckpoint(saved *compose_v2.Checkpoint) bool {
+	return saved.HasResumableWork() && (saved.Status.Resumable() || saved.Status == compose_v2.CPStatusUnset)
+}
+
+func resumeQuestion(saved *compose_v2.Checkpoint, previous string) *compose_v2.AskQuery {
+	var first *compose_v2.AskQuery
+	for _, q := range saved.PendingInterrupts {
+		if q == nil {
+			continue
+		}
+		if q.InterruptID == previous {
+			return q
+		}
+		if first == nil {
+			first = q
+		}
+	}
+	return first
 }

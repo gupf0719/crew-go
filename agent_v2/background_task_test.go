@@ -164,6 +164,79 @@ func closeMgr(t *testing.T, mgr *agent_v2.BackgroundTaskManager) {
 	})
 }
 
+func TestBackgroundTaskSnapshotsOwnResults(t *testing.T) {
+	type output struct {
+		Rows []map[string]any
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	completed := make(chan agent_v2.BackgroundTask, 1)
+	mgr := agent_v2.NewBackgroundTaskManager(&agent_v2.BackgroundTaskManagerConfig{
+		OnDone: func(task agent_v2.BackgroundTask) { completed <- task },
+	})
+	closeMgr(t, mgr)
+	release := make(chan struct{})
+	guard := &sync.Mutex{}
+	guard.Lock()
+	defer guard.Unlock()
+	tk := tool.NewToolkit()
+	tk.Register(tool.NewFuncTool("build", "构建", map[string]any{"type": "object"},
+		func(ctx context.Context, _ map[string]any) (*tool.Result, error) {
+			select {
+			case <-release:
+				return &tool.Result{Success: true,
+					Output:   &output{Rows: []map[string]any{{"count": int64(42)}}},
+					Parts:    []schema.ToolResultPart{{MediaType: "image/png", Data: "aW1hZ2U="}},
+					Metadata: map[string]any{"flags": []byte{1, 2}, "guard": guard},
+				}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}))
+	m := &bgScriptModel{steps: []func([]*schema.Message) (*schema.Message, error){callStep("build", "{}"), sayStep("构建中")}}
+	if _, err := bgAgent("coder", m, tk, bgConfig(mgr)).Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("构建")); err != nil {
+		t.Fatal(err)
+	}
+	id := lastTaskID(m.input(1))
+	if id == "" {
+		t.Fatal("模型未收到后台任务句柄")
+	}
+	close(release)
+	var callback agent_v2.BackgroundTask
+	select {
+	case callback = <-completed:
+	case <-ctx.Done():
+		t.Fatal("后台任务未完成")
+	}
+	mutate := func(r *tool.Result) {
+		r.Output.(*output).Rows[0]["count"] = int64(0)
+		r.Parts[0].Data = "Y2hhbmdlZA=="
+		r.Metadata["flags"].([]byte)[0] = 9
+	}
+	if callback.ID != id || callback.Status != agent_v2.BackgroundTaskCompleted || callback.Result == nil {
+		t.Fatalf("完成回调缺少结果: %+v", callback)
+	}
+	if callback.Result.Metadata["guard"] != guard {
+		t.Fatal("完成回调复制了业务锁句柄")
+	}
+	mutate(callback.Result)
+	fetch := func() *tool.Result {
+		t.Helper()
+		task, ok := mgr.Get(id)
+		if !ok || task.Result == nil {
+			t.Fatal("查询缺少已完成结果")
+		}
+		r := task.Result
+		if r.Output.(*output).Rows[0]["count"] != int64(42) || r.Parts[0].Data != "aW1hZ2U=" ||
+			r.Metadata["flags"].([]byte)[0] != 1 || r.Metadata["guard"] != guard {
+			t.Fatalf("查询串用了另一份快照的修改: %+v", r)
+		}
+		return r
+	}
+	mutate(fetch())
+	fetch()
+}
+
 // TestBackgroundTask_SlowToolYieldsThenNotifiesOnce：慢工具跑过 YieldAfter 就转入后台——这一轮拿到任务 id、
 // Run 照常结束（工具还没返回）；工具跑完之后，下一次 Run 的第一次模型调用里有它的结果；再下一次不再重发。
 //

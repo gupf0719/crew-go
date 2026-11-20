@@ -3,6 +3,7 @@ package agent_v2
 import (
 	"reflect"
 	"slices"
+	"sync"
 
 	"crew-go/hook"
 	"crew-go/schema"
@@ -205,7 +206,8 @@ type cloneKey struct {
 
 // cloneMemo 记下已经拷过的容器与它的拷贝（环与共享在拷贝里保持同样的形状）。
 type cloneMemo struct {
-	seen map[cloneKey]reflect.Value
+	seen         map[cloneKey]reflect.Value
+	copyPointers bool
 }
 
 func (m *cloneMemo) get(k cloneKey) (reflect.Value, bool) {
@@ -229,13 +231,29 @@ func cloneValue(v reflect.Value, memo *cloneMemo) reflect.Value {
 		}
 		// 动态值拷完还是它自己（标量不可变、指针 / 函数 / channel 共享）时原样返回，免得每个
 		// 标量都重新装箱一次（JSON 形的载荷里绝大多数叶子是它们）
-		if k := v.Elem().Kind(); isScalarKind(k) || k == reflect.Pointer || k == reflect.Func ||
+		if k := v.Elem().Kind(); isScalarKind(k) || k == reflect.Pointer && !memo.copyPointers || k == reflect.Func ||
 			k == reflect.Chan || k == reflect.UnsafePointer {
 			return v
 		}
 		out := reflect.New(v.Type()).Elem()
 		out.Set(cloneValue(v.Elem(), memo))
 		return out
+	case reflect.Pointer:
+		if !memo.copyPointers || v.IsNil() || v.Type().Implements(reflect.TypeFor[sync.Locker]()) ||
+			!plainPointerTarget(v.Type().Elem()) {
+			return v
+		}
+		key := cloneKey{typ: v.Type(), ptr: v.Pointer()}
+		if c, ok := memo.get(key); ok {
+			return c
+		}
+		c := reflect.New(v.Type().Elem())
+		if c.Type() != v.Type() {
+			c = c.Convert(v.Type())
+		}
+		memo.put(key, c)
+		c.Elem().Set(cloneValue(v.Elem(), memo))
+		return c
 	case reflect.Slice:
 		if v.IsNil() {
 			return v
@@ -285,8 +303,25 @@ func cloneValue(v reflect.Value, memo *cloneMemo) reflect.Value {
 		cloneExportedFields(c, v, memo)
 		return c
 	}
-	// 标量原样；指针、函数、channel、unsafe 指针共享
+	// 标量原样；函数、channel、unsafe 指针共享。
 	return v
+}
+
+// plainPointerTarget 排除含私有值状态的数据载体，避免复制锁、连接和其他不透明句柄。
+// 字段里的引用由 cloneValue 逐个判定。数组和结构体字段会随值拷贝，需要在拷贝前核对。
+func plainPointerTarget(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Array:
+		return plainPointerTarget(t.Elem())
+	case reflect.Struct:
+		for i := range t.NumField() {
+			f := t.Field(i)
+			if !f.IsExported() || !plainPointerTarget(f.Type) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // cloneExportedFields 把 src 的导出字段逐个深拷进 dst（dst 已是 src 的整体复制、可寻址）。嵌入的

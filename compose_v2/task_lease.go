@@ -110,16 +110,18 @@ func (a *TaskActivity) WithCheckpointLeases(ctx context.Context, cp Checkpointer
 }
 
 func (a *TaskActivity) acquireCheckpointLeases(ctx context.Context, cp Checkpointer) (context.Context, error) {
-	if a.cancel != nil {
+	if a.cancel != nil || a.releaseLocal != nil {
 		return ctx, errors.New("compose_v2: task activity already has checkpoint leases")
 	}
-	provider, ok := cp.(TaskLeaseProvider)
-	if !ok || (a.sid == "" && len(a.abandoned) == 0) {
+	if isFrameworkNil(cp) || (a.sid == "" && len(a.abandoned) == 0) {
 		return ctx, nil
 	}
-	store := provider.CheckpointTaskLeases()
+	var store TaskLeaseStore
+	if provider, ok := cp.(TaskLeaseProvider); ok {
+		store = provider.CheckpointTaskLeases()
+	}
 	if isFrameworkNil(store) {
-		return ctx, nil
+		return ctx, a.acquireLocalCheckpointLease(ctx, cp)
 	}
 	if !reflect.ValueOf(store).Comparable() {
 		return ctx, errors.New("compose_v2: checkpoint task lease store must be comparable")

@@ -14,6 +14,7 @@ import (
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/internal/agentcall"
 	"crew-go/internal/inference"
 	specModel "crew-go/modules/model"
 	"crew-go/schema"
@@ -55,7 +56,7 @@ func (h *agentHooks) OnAgentEnd(ctx context.Context, info *hook.AgentInfo, out *
 func (o *Observability) startAgent(ctx context.Context, info *hook.AgentInfo) (context.Context, *handle) {
 	graphNS := compose_v2.GetGraphNS(ctx)
 	if cur := o.handleFrom(ctx); cur != nil && cur.kind == kindAgent && !cur.ended.Load() &&
-		cur.name == info.Name && cur.graphNS == graphNS {
+		sameAgentInvocation(ctx, cur, info) {
 		return ctx, nil
 	}
 	workflow := workflowKinds[info.Type]
@@ -80,7 +81,7 @@ func (o *Observability) startAgent(ctx context.Context, info *hook.AgentInfo) (c
 	ctx, span := o.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrs...))
 	sid := compose_v2.GetSessionID(ctx)
 	ah := &handle{kind: kindAgent, span: span, start: time.Now(), name: info.Name, graphNS: graphNS,
-		agentKind: info.Type, workflow: workflow, purpose: purpose, sessionID: sid}
+		agentKind: info.Type, workflow: workflow, purpose: purpose, sessionID: sid, invocation: agentcall.From(ctx)}
 	ah.scope = &agentScope{}
 	o.inst.agentActive.Add(ctx, 1, metric.WithAttributes(AttrAgentName.String(info.Name)))
 
@@ -96,6 +97,13 @@ func (o *Observability) startAgent(ctx context.Context, info *hook.AgentInfo) (c
 		}
 	})
 	return ctx, ah
+}
+
+func sameAgentInvocation(ctx context.Context, h *handle, info *hook.AgentInfo) bool {
+	id := agentcall.From(ctx)
+	// 宿主直接分发嵌套钩子时，可能继承外层的调用印记。
+	return id == h.invocation && h.name == info.Name && h.agentKind == info.Type &&
+		h.graphNS == compose_v2.GetGraphNS(ctx) && h.sessionID == compose_v2.GetSessionID(ctx)
 }
 
 func (o *Observability) recordAgentResume(ctx context.Context, ah *handle, action agent_v2.ResumeAction) {
@@ -143,7 +151,7 @@ func (o *Observability) endAgent(ctx context.Context, info *hook.AgentInfo, out 
 	ah := o.agentHandleFrom(ctx)
 	// 只收本次调用自己的句柄：框架在某些路径上拿开始之前的 ctx 调结束钩子（如放弃续跑时开始钩子报错），那个
 	// ctx 里最内层的 agent 句柄可能是外层 agent 的，收了就把外层的 span 提前结束了。
-	if ah == nil || ah.ended.Load() || ah.name != info.Name || ah.graphNS != compose_v2.GetGraphNS(ctx) {
+	if ah == nil || ah.ended.Load() || !sameAgentInvocation(ctx, ah, info) {
 		return
 	}
 	r := classify(ctx, agent_v2.GetEndError(ctx))

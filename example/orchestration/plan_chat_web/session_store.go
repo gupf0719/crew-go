@@ -14,11 +14,12 @@ import (
 )
 
 const (
-	statusRunning     = "running"
-	statusInterrupted = "interrupted"
-	statusSuccess     = "success"
-	statusError       = "error"
-	statusCancelled   = "cancelled"
+	statusRunning           = "running"
+	statusInterrupted       = "interrupted"
+	statusResumeUnconfirmed = "resume_unconfirmed"
+	statusSuccess           = "success"
+	statusError             = "error"
+	statusCancelled         = "cancelled"
 )
 
 type sessionRecord struct {

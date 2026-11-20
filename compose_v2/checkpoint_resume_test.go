@@ -74,7 +74,7 @@ func TestResumeAdmissionPersistsAcrossDurableSteps(t *testing.T) {
 				<-result
 				t.Fatal("未观察到续跑过程档")
 			}
-			retry := run()
+			retry := run(compose_v2.WithCheckpointer(&separateCheckpointClient{store.InMemoryCheckpointer}))
 			close(release)
 			if err := <-result; err != nil || !errors.Is(retry, compose_v2.ErrCheckpointResumeUnconfirmed) || writes.Load() != 1 {
 				t.Fatalf("过程档不能重新开放，同一写入只执行一次，实际首个=%v 重试=%v 写入=%d", err, retry, writes.Load())
@@ -139,7 +139,8 @@ func TestResumeAdmissionBlocksDirectChildResumeDuringDurableStep(t *testing.T) {
 					t.Fatal("前提：过程档已提交，子图写入已经发生")
 				}
 			}
-			retry := compose_v2.Run(ctx, child, compose_v2.NewChannelManager(), append(opts, compose_v2.WithRunNS(childNS))...)
+			retry := compose_v2.Run(ctx, child, compose_v2.NewChannelManager(),
+				append(opts, compose_v2.WithRunNS(childNS), compose_v2.WithCheckpointer(&separateCheckpointClient{store.InMemoryCheckpointer}))...)
 			close(release)
 			if err := <-result; err != nil || !errors.Is(retry, compose_v2.ErrCheckpointResumeUnconfirmed) || writes.Load() != 1 {
 				t.Fatalf("独立子图续跑须拒绝重复写入，父图=%v 子图=%v 写入=%d", err, retry, writes.Load())

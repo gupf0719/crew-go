@@ -5,8 +5,7 @@ package agent_v2_test
 //   - **框架元工具的产出不止 tool_result**：`transfer_to_agent` 的真决定是一条交给上层
 //     HandoffAgent 的上行信号，`tool_search` 写的是揭示集。memo 命中跳过工具体时，这些
 //     得由框架补上——否则**静默失效**（err=nil、tool_result 齐全，只是转交没发生 / 工具没
-//     解锁）。转交那半现在随 memo 记下、命中时原样交出（toolMemoEntry.Signals）；
-//     tool_search 仍排除在 memo 外、靠函数体重跑。
+//     解锁）。工具账分别记录上行信号和检索候选，候选在批次提交时才成为已解锁工具。
 //   - **memo 键必须带 tool_call 下标**：同一批里两个 tool_call 用同一个 `tc.ID`（框架别处
 //     不假设它唯一——`WithCurrentToolCallContext` 就同时带 idx 维）时，后跑的那个会命中前
 //     一个的条目、静默不执行。
@@ -117,7 +116,7 @@ func (s *countingStub) WithTools(_ []*schema.ToolInfo) (model.ChatModel, error) 
 // TestToolMemoFw_ToolSearchRevealStillEffectiveAfterResume F1b：tool_search 解锁的工具
 // Resume 后仍可调。
 func TestToolMemoFw_ToolSearchRevealStillEffectiveAfterResume(t *testing.T) {
-	var payCalls atomic.Int32
+	var payCalls, searchCalls atomic.Int32
 	payTool := tool.NewFuncTool("deferred_pay", "延迟披露的工具", map[string]any{"type": "object"},
 		func(ctx context.Context, _ map[string]any) (*tool.Result, error) {
 			payCalls.Add(1)
@@ -153,8 +152,15 @@ func TestToolMemoFw_ToolSearchRevealStillEffectiveAfterResume(t *testing.T) {
 		})),
 		agent_v2.WithToolkit(tk),
 		agent_v2.WithToolSearch(&agent_v2.ToolSearchConfig{
-			Enabled:  true,
-			Deferred: func(tl tool.Tool) bool { return tl.Name() == "deferred_pay" },
+			Enabled:     true,
+			MaxRevealed: 1,
+			Deferred:    func(tl tool.Tool) bool { return tl.Name() == "deferred_pay" },
+			Retriever: func(context.Context, string, []tool.Tool) []string {
+				if searchCalls.Add(1) == 1 {
+					return []string{"deferred_pay"}
+				}
+				return nil
+			},
 		}),
 		agent_v2.WithMaxRounds(6))
 
@@ -170,10 +176,8 @@ func TestToolMemoFw_ToolSearchRevealStillEffectiveAfterResume(t *testing.T) {
 		map[string]*schema.Message{ie.Query.InterruptID: schema.UserMessage("y")})); err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
-	if payCalls.Load() != 1 {
-		t.Errorf("被解锁的工具应恰调 1 次，实际 %d 次\n"+
-			"  0 次 = memo 命中跳过 tool_search 的工具体 ⟹ 这一批的解锁记录是空的（解锁记在这次执行上、"+
-			"不进 cp）⟹ 下一轮拿到 [tool_not_revealed]", payCalls.Load())
+	if searchCalls.Load() != 1 || payCalls.Load() != 1 {
+		t.Errorf("检索与被解锁的工具应各执行一次，实际检索 %d 次、工具 %d 次", searchCalls.Load(), payCalls.Load())
 	}
 }
 

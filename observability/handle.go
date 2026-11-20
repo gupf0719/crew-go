@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"crew-go/compose_v2"
+	"crew-go/internal/agentcall"
 	"crew-go/internal/inference"
 )
 
@@ -36,9 +37,10 @@ type handle struct {
 	purpose inference.Purpose
 
 	// agent
-	agentKind string
-	sessionID string
-	workflow  bool // invoke_workflow（编排）而不是 invoke_agent
+	agentKind  string
+	sessionID  string
+	invocation *agentcall.Invocation
+	workflow   bool // invoke_workflow（编排）而不是 invoke_agent
 
 	// model
 	requestModel  string

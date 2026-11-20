@@ -12,6 +12,7 @@ import (
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
 	"crew-go/fallback"
+	"crew-go/internal/agentcall"
 	"crew-go/internal/inference"
 )
 
@@ -31,12 +32,12 @@ func (h *orchHooks) OnGraphStart(ctx context.Context) (context.Context, error) {
 	return ctx, nil
 }
 
-// startGraph 建工作流 span；没建（外面是同一 ns 的 agent，或同一个 Observability 装了两层、外层已为这张图建过）
+// startGraph 建工作流 span；没建（外面已有本次调用和分域的 span）
 // 时返回 nil 句柄。
 func (o *Observability) startGraph(ctx context.Context) (context.Context, *handle) {
 	o.orchFired.Store(true)
 	graphNS := compose_v2.GetGraphNS(ctx)
-	if cur := o.handleFrom(ctx); cur != nil && cur.graphNS == graphNS && !cur.ended.Load() &&
+	if cur := o.handleFrom(ctx); cur != nil && sameGraphScope(ctx, cur) && !cur.ended.Load() &&
 		(cur.kind == kindAgent || cur.kind == kindGraph) {
 		return ctx, nil
 	}
@@ -46,8 +47,13 @@ func (o *Observability) startGraph(ctx context.Context) (context.Context, *handl
 		attrs = append(attrs, AttrGraphNS.String(graphNS))
 	}
 	ctx, span := o.tracer.Start(ctx, OpInvokeWorkflow+" "+name, trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrs...))
-	gh := &handle{kind: kindGraph, span: span, start: time.Now(), name: name, graphNS: graphNS, scope: o.scopeFrom(ctx)}
+	gh := &handle{kind: kindGraph, span: span, start: time.Now(), name: name, graphNS: graphNS, scope: o.scopeFrom(ctx),
+		sessionID: compose_v2.GetSessionID(ctx), invocation: agentcall.From(ctx)}
 	return o.withHandle(ctx, gh), gh
+}
+
+func sameGraphScope(ctx context.Context, h *handle) bool {
+	return h.graphNS == compose_v2.GetGraphNS(ctx) && h.sessionID == compose_v2.GetSessionID(ctx) && h.invocation == agentcall.From(ctx)
 }
 
 // workflowName 是嵌套图的工作流名：ns 最后一段的节点 ID，不带扇出实例号（#N）与重访序号（@N）——实例号
@@ -67,7 +73,7 @@ func workflowName(graphNS string) string {
 func (h *orchHooks) OnGraphEnd(ctx context.Context, err error) context.Context {
 	o := h.o
 	gh := o.handleFrom(ctx)
-	if gh == nil || gh.kind != kindGraph || gh.graphNS != compose_v2.GetGraphNS(ctx) {
+	if gh == nil || gh.kind != kindGraph || !sameGraphScope(ctx, gh) {
 		return ctx
 	}
 	r := classify(ctx, err)

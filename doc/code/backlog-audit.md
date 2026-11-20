@@ -34,6 +34,18 @@
 | D05 | AG-UI 每页读取有独立时限。回归让两个页面各用六秒，验证其他副本在五秒租约到期后能取锁，后台完整清档并沿原游标推进。 [跨层回归](../../agui/cancellation_recovery_internal_test.go) |
 | D07 | Redis 按旧写入器的 JSON 编码确认 GraphID，在移动前按原字节复核。回归核对非法 UTF-8、字面 U+FFFD 和普通 Unicode 的迁移、原字节、读档和挂起项枚举，也验证不同 JSON 编码的冲突保留源键。 [迁移回归](../../redis/checkpointer_migration_test.go) |
 
+## 2026-11-20 AgentDock 对照修复
+
+| 优先级 | 事项 | 验证 |
+| --- | --- | --- |
+| P1 | 低阶图执行本地互斥 | 同存档实例的独立执行在副作用前拒绝。并行子图共享同一备选分区，最后一支退出后归还该分区。 [执行回归](../../compose_v2/local_task_lease_test.go) |
+| P1 | Plan Web 续跑断线 | 从实际存档核对挂起，保留未确认的准入。回归覆盖 Redis、内存、准入前后断开和结算暂时失败。 [HTTP/SSE 回归](../../example/orchestration/plan_chat_web/resume_disconnect_test.go) |
+| P2 | Q26 同批检索 | 记录实际检索候选，同批续跑时恢复并按钩子裁决和额度发布。换目录时复核可用性。 [检索次数](../../agent_v2/tool_memo_framework_test.go) · [候选变更](../../agent_v2/tool_search_resume_test.go) |
+| P2 | A2A 补答对账 | GetTask 的历史确认已送达答复且状态时间推进时可识别复用消息的下一问。 [远端执行次数](../../a2a/reconcile_followup_test.go) |
+| P2 | 后台结果 | 完成回调与查询领取各自的结果数据副本。回归修改嵌套结果与媒体，核对再次读取的内容。 [快照回归](../../agent_v2/background_task_test.go) |
+| P2 | 同名 Agent 观测 | 在途 span 按调用区分，同一调用的重复安装只记一次。 [真实 Agent 回归](../../observability/agent_invocation_test.go) |
+| P2 | Redis Store 枚举及 TTL | 在分页前回收空 namespace，回填旧索引。正 TTL 的毫秒下限为一。 [分页、回填与并发写入](../../redis/store_namespace_lifecycle_test.go) |
+
 ## 最近复审、发布与设计入口
 
 在 2026-11-16 的核验基线，`552685b` 到 `e185749` 的改动集中在后台子 Agent、路由评测及配套文档和测试。这里保留该轮的真实 Redis、SQLite、BasicAgent 和旧存档验证。
@@ -483,7 +495,7 @@ D06 已关闭。基线 `e185749` 连续以同一指针写入 `alpha/left` 和 `b
 | L389 | 🟡 skill frontmatter 解析器静默丢弃未知键 已决（2026-08-27/28）：不是「还没做」是有判据的决策——三方对照的分叉是「schema 归谁所有」（第… | ✅ 已决 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [skill/discover.go](../../skill/discover.go) · 原文溯源 877aea13（仅文档溯源） |
 | L390 | 🟡 fork_with_context 被接受但静默降级 已删（2026-08-26）：调研查实 context 键不在 agentskills.io 标准里、Claude C… | ✅ 已删（2026-08-26） | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/skill_tool.go](../../agent_v2/skill_tool.go) · 原文溯源 877aea13（仅文档溯源） |
 | L391 | 🔍 两处设计文档的开放项从没进过中心表（2026-08-26 盘点）：① skill-system.md 有一整节「待办（potential V2 work，按 ROI 排）」… | ✅ 已归置 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [doc/description/three-way-comparison/skill-system.md](../../doc/description/three-way-comparison/skill-system.md)、[doc/v2/fault-analysis-system.md](../../doc/v2/fault-analysis-system.md) · 原文溯源 877aea13（仅文档溯源） |
-| L392 | 🟢 redis ListNamespaces 会列出已删空的历史 ns（2026-09-07 归置，原是 redis/store_list.go 里的 TODO）：nsidx … | 🟢 已知限制（框架不回收） | 已知限制/P3 | Q17 | redis/store_list.go 索引允许已空 namespace。若有真实扇出成本再设回收。 · 现存入口 [redis/store_list.go](../../redis/store_list.go)、[redis/store.go](../../redis/store.go)、[agent_v2/basic_agent.go](../../agent_v2/basic_agent.go) · 基线缺旧引用 5b8d7ba7 · 原文溯源 877aea13（仅文档溯源） |
+| L392 | 🟢 redis ListNamespaces 会列出已删空的历史 ns（2026-09-07 归置，原是 redis/store_list.go 里的 TODO）：nsidx … | 🟢 已知限制（框架不回收） | 完成 | Q17 子项 | 按存活成员核对并分页，空名称原子回收。写入回收一批到期记录。 [回归](../../redis/store_namespace_lifecycle_test.go) |
 | L393 | 🔵 skill 系统 P3 慎做 6 项 + 战略选择 2 项（2026-09-07 归置）：文件热重载 / paths 条件激活 / safe properties 权限模型… | 已完成所选能力 | 其余按场景立项 | C11 关闭 | 可选递归发现、显式重载和快照续跑已交付。编排和分发沿用图编排与内存来源。 · [现行契约](../v2/skill.md#文件目录与热重载) · [备选项](../description/three-way-comparison/skill-system.md) · 原文溯源 877aea13（仅文档溯源） |
 | L394 | 🔵 故障分析（RCA）系统——设计完、未实施（2026-09-07 归置）：一篇完整蓝图（业内调研 + 编排签名逐一 grep 过），按其 §12 分阶段。第二身份是 SDK … | 🔵 OPEN（等业务立项） | 按需 | Q06 | RCA 是可立项的系统设计，无核心 bug。 · 现存入口 [doc/v2/fault-analysis-system.md](../../doc/v2/fault-analysis-system.md) · 原文溯源 877aea13（仅文档溯源） |
 | L395 | 🔍 记忆注入的三条 LOW（审计 2026-08-26，判过、未修）：① 归属过滤跑在截断之后 ⟹ 越界项占掉注入名额（实测 SearchLimit=5 + 3 条越界排前面 … | 🔍 ①有代价 ②nit ③默认路径会 panic | 部分开放 | Q24 | ①非合规 backend 返回跨 owner 数据可消耗 WithLimit 后过滤的配额。② scope 小瑕。③ nil item 有 TestStoreMemory_NilSearchItemsSkipped。关联 L403。 · 原文溯源 c194ade2（仅文档溯源） |
@@ -690,7 +702,7 @@ D06 已关闭。基线 `e185749` 连续以同一指针写入 `alpha/left` 和 `b
 | L596 | 🟢 IsRetryable 这个「保守默认」偏宽 两半已分别结案（2026-08-27）。 框架自抛的那半：已修——改成 compose_v2.NonRetryable 接口，… | ✅ 已结案（NonRetryable 接口 43ef4489 + TestBusinessErrors_StillRetried） | 完成（当前回归） | — | 原行已关闭，当前树仍有对应回归入口。 · 现存回归 [TestBusinessErrors_StillRetried](../../compose_v2/max_iterations_retry_test.go#L62) · 定义 877aea13 · 现存入口 [compose_v2/retry.go](../../compose_v2/retry.go)、[fallback/fallback.go](../../fallback/fallback.go) · 基线缺旧引用 43ef4489 · 原文溯源 877aea13（仅文档溯源） |
 | L597 | 🟢 5 处存量注释 drift（失效符号引用）（2026-08-21 commentaudit 扫出，非本次引入）。agent_v2/session.go:44 引用 List… | ✅ 已处置 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/session.go](../../agent_v2/session.go)、[compose_v2/errors.go](../../compose_v2/errors.go)、[compose_v2/node_state.go](../../compose_v2/node_state.go) · 原文溯源 877aea13（仅文档溯源） |
 | L598 | 🟡 工具解锁记录靠消息 annotation 承载，会被「只留末尾 N 条」切掉 已解决（2026-08-21 当天）：外部调研指出这个形态只有「历史重扫」这半，而同类机制真正… | ✅ DONE（2026-08-21） | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/tool_search.go](../../agent_v2/tool_search.go)、[agent_v2/basic_builder.go](../../agent_v2/basic_builder.go) · 原文溯源 877aea13（仅文档溯源） |
-| L599 | 🟢 tool_search 的「同批」那半仍依赖函数体重跑（2026-08-21 实测，位 6 的收尾）。已解锁集现在有两条路：channel state（权威，随 cp 走）… | OPEN（2026-08-21 立） | 设计债 | Q26 | tool_memo.go 的 framework 例外与 revealTurn 重跑安全保同批解锁。先量测真实发生率，再考虑持久动作账。 · 现存回归 [TestToolSearch_RevealedSurvivesResume](../../agent_v2/tool_search_resume_test.go#L22) · 定义 877aea13 · 现存入口 [agent_v2/tool_search.go](../../agent_v2/tool_search.go)、[agent_v2/basic_builder.go](../../agent_v2/basic_builder.go) · 基线缺旧引用 60cecdc7、fcb08464 · 原文溯源 877aea13（仅文档溯源） |
+| L599 | 🟢 tool_search 的「同批」那半仍依赖函数体重跑（2026-08-21 实测，位 6 的收尾）。已解锁集现在有两条路：channel state（权威，随 cp 走）… | OPEN（2026-08-21 立） | 完成 | Q26 | 按调用位置持久化检索回执和候选。同批 Resume 重放检索，并按当前目录、额度和钩子裁决提交。 [跨层回归](../../agent_v2/tool_memo_framework_test.go) |
 | L600 | 🟢 抄机制没抄前提：同一段「扫历史重建状态」在别处安全、在我们这儿是两条漏洞（2026-08-21 实证，方法级教训）。 外部调研给的方向是「权威副本进存档 + 历史重扫做幂等… | ✅ DONE（2026-08-21，教训已记） | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 原文溯源 877aea13（仅文档溯源） |
 
 ### 文档、测试、审计历程和附录 · 90 条

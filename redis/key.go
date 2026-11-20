@@ -2,6 +2,7 @@ package redis
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"strings"
 
 	"crew-go/store"
@@ -83,6 +84,18 @@ func escapeGlobPattern(s string) string {
 //	{prefix}:store:nsidx → SET (所有 ns_joined)
 func storeNSIndexKey(prefix string) string {
 	return prefix + ":store:nsidx"
+}
+
+func storeNSIndexReadyKey(prefix string) string {
+	return prefix + ":store:nsidx:expiry-v1"
+}
+
+func storeNSItemsPrefix(prefix string) string {
+	return prefix + ":store:nsitems:"
+}
+
+func storeNSIndexOwner(ns string) string {
+	return hex.EncodeToString([]byte(ns))
 }
 
 // parseStoreItemKey 从 Redis item key 反向解析 (ns, key). 失败返 ("", "", false).

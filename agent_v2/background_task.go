@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -132,7 +133,8 @@ type BackgroundTask struct {
 
 	Status    BackgroundTaskStatus
 	StartedAt time.Time
-	// EndedAt / Result / Err 在任务结束之后才有：Result / Err 是工具的原始返回。
+	// EndedAt / Result / Err 在任务结束之后才有。每次查询和完成回调各持有一份 Result，
+	// 递归复制数据容器与普通数据指针。Err、map 键和含私有状态的指针句柄保留身份。
 	EndedAt time.Time
 	Result  *tool.Result
 	Err     error
@@ -325,6 +327,14 @@ func (t *bgTask) snapshotLocked() BackgroundTask {
 	return snapshot
 }
 
+// withCopiedResult 在锁外复制已结算的结果供业务查询或回调。
+func (s BackgroundTask) withCopiedResult() BackgroundTask {
+	if s.Result != nil {
+		s.Result = cloneValue(reflect.ValueOf(s.Result), &cloneMemo{copyPointers: true}).Interface().(*tool.Result)
+	}
+	return s
+}
+
 func (t *bgTask) terminal() bool {
 	return t.status == BackgroundTaskCompleted || t.status == BackgroundTaskFailed || t.status == BackgroundTaskCancelled
 }
@@ -332,16 +342,19 @@ func (t *bgTask) terminal() bool {
 // Get 返回任务 id 的快照（业务侧用，不看作用域）。没有或已过期时 ok 为 false。
 func (m *BackgroundTaskManager) Get(id string) (BackgroundTask, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	t := m.tasks[id]
 	if t == nil {
+		m.mu.Unlock()
 		return BackgroundTask{}, false
 	}
 	if now := time.Now(); t.terminal() && now.Sub(t.endedAt) > m.cfg.Retention {
 		m.sweepConvLocked(t.conv, now)
+		m.mu.Unlock()
 		return BackgroundTask{}, false
 	}
-	return t.snapshotLocked(), true
+	snap := t.snapshotLocked()
+	m.mu.Unlock()
+	return snap.withCopiedResult(), true
 }
 
 // Cancel 取消任务 id（业务侧用，不看作用域，比如用户在界面上点了取消）。任务在跑时返回 true。
@@ -740,7 +753,7 @@ func (m *BackgroundTaskManager) afterDone(ctx context.Context, id string, snap B
 	slog.InfoContext(ctx, "agent_v2: 后台任务结束", "task_id", id, "tool", snap.ToolName,
 		"status", string(snap.Status), "elapsed", snap.EndedAt.Sub(snap.StartedAt))
 	if m.cfg.OnDone != nil {
-		m.cfg.OnDone(snap)
+		m.cfg.OnDone(snap.withCopiedResult())
 	}
 }
 

@@ -3313,6 +3313,7 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 		// 每个调用独占自己的账项。工具返回时立即保存产出，兄弟调用中断时仍可重放。
 		var records []*toolCallRecord
 		batch := toolBatchFrom(ctx)
+		turn := revealTurnFrom(ctx)
 		if batch != nil {
 			records = batch.memo
 			if references {
@@ -3329,8 +3330,22 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 
 		runOne := func(callCtx context.Context, tc schema.ToolCall, idx int, record *toolCallRecord, save func() bool) (oc outcome) {
 			if hit := record.Result; hit != nil && hit.ToolMsg != nil {
+				msg := hit.ToolMsg
+				if hit.Search != nil {
+					// 额度裁剪和钩子可能原地改写回执，原账项留给下一次恢复。
+					msg = cloneCalleeInput(msg)
+					var names []string
+					if search, ok := dispatchToolkit.Get(tc.Function.Name).(*toolSearchTool); ok && turn != nil {
+						names, _ = splitCandidates(hit.Search.Names, search.deferred)
+						turn.add(idx, names...)
+					}
+					if len(names) != len(hit.Search.Names) && !isFailedToolResult(msg) {
+						// 固定提示不重建钩子已处理的正文，也不交出目录里已撤下的候选。
+						setSearchReceipt(msg, "部分工具已从检索候选中撤下。请按当前工具列表选择，或重新检索。")
+					}
+				}
 				compose_v2.EmitSignals(callCtx, hit.Signals)
-				return outcome{toolMsg: hit.ToolMsg, bodyMsg: hit.BodyMsg, replayed: true}
+				return outcome{toolMsg: msg, bodyMsg: hit.BodyMsg, replayed: true}
 			}
 			// review-v6 H-02 fix: 业务 Tool.Call panic 转 outcome.err 不冒泡——
 			// ISSUE-81 N>=2 fanout 路径下 goroutine 内未 recover 的 panic 让 Go runtime
@@ -3700,11 +3715,15 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 			// 参考文档的读取标记随结果重放，供续跑时的去重读取使用。
 			target := dispatchToolkit.Get(tc.Function.Name)
 			_, referenceRead := target.(*skillReferenceTool)
+			var search *toolSearchReplay
+			if _, ok := target.(*toolSearchTool); ok {
+				search = turn.recorded(idx)
+			}
 			_, conversation := target.(*conversationTool)
 			minted := isFrameworkMintedIn(dispatchToolkit, tc.Function.Name)
 			if oc.err == nil && oc.toolMsg != nil && !oc.replayed && !(conversation && tool.IsReadOnly(target)) &&
-				(referenceRead || shouldMemoize(minted, oc.signals)) {
-				record.Result = &toolMemoEntry{ToolMsg: oc.toolMsg, BodyMsg: oc.bodyMsg, Signals: oc.signals}
+				(referenceRead || search != nil || shouldMemoize(minted, oc.signals)) {
+				record.Result = &toolMemoEntry{ToolMsg: oc.toolMsg, BodyMsg: oc.bodyMsg, Signals: oc.signals, Search: search}
 				if save() && !minted && len(cfg.ToolMiddlewares) > 0 {
 					// 工具账已接管重放。清除中间件端点的原值，免得被裁剪的附件随存档保留第二份。
 					if err := compose_v2.SaveStepResult(toolExecutionState(callCtx, tc.Function.Name), endpointRecordStep, nil); err != nil {
@@ -3787,7 +3806,7 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 					}
 					oc.toolMsg.Annotations[finalOutputAttemptAnnotation] = true
 				}
-				// 框架那件 tool_search 的调用同样在这一层认、盖章（见 toolSearchCallAnnotation）。它也不进工具账。
+				// 框架检索按实际派发实例盖章，批末只用成功且盖章的结果提交候选。
 				if i < len(toolCalls) {
 					if _, ok := dispatchToolkit.Get(toolCalls[i].Function.Name).(*toolSearchTool); ok {
 						if oc.toolMsg.Annotations == nil {

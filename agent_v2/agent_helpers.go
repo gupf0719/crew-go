@@ -10,6 +10,7 @@ import (
 
 	"crew-go/compose_v2"
 	"crew-go/hook"
+	"crew-go/internal/agentcall"
 	"crew-go/internal/panicerr"
 	"crew-go/schema"
 )
@@ -378,7 +379,7 @@ func CallAgentStart(ctx context.Context, hooks hook.Hooks, info *hook.AgentInfo,
 	if original != nil && original.Role == schema.RoleUser {
 		wireID, _ = original.Annotations[HistoryInputMessageIDAnnotation].(string)
 	}
-	ctx, err := compose_v2.CallHook(ctx, func(c context.Context) (context.Context, error) {
+	ctx, err := compose_v2.CallHook(agentcall.Begin(ctx), func(c context.Context) (context.Context, error) {
 		if !compose_v2.WithinNodeScope(c) {
 			c = context.WithValue(c, topLevelAgentStartKey{}, true)
 		}

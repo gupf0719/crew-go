@@ -145,6 +145,7 @@ func (s *chatServer) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	var record sessionRecord
+	var verifyResume bool
 	err = s.sessions.update(ctx, key, func(current *sessionRecord) (*sessionRecord, error) {
 		now := time.Now().UTC()
 		if resuming {
@@ -153,6 +154,12 @@ func (s *chatServer) chat(w http.ResponseWriter, r *http.Request) {
 			}
 			if current.terminal() {
 				return nil, finishedSession{current.Status}
+			}
+			// 已取得独占许可，遗留 running 表示前一次未提交终态。核对期间先保留旧记录。
+			verifyResume = current.Status == statusResumeUnconfirmed || current.Status == statusRunning
+			if verifyResume {
+				record = *current
+				return current, nil
 			}
 		} else {
 			if current != nil {
@@ -173,7 +180,8 @@ func (s *chatServer) chat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slot := &runSlot{sess: sess, cp: s.cp, mode: record.Mode, resumeAction: action,
-		resumeText: strings.TrimSpace(q.Get("text")), lastInterruptID: record.InterruptID, historySize: record.HistorySize}
+		resumeText: strings.TrimSpace(q.Get("text")), lastInterruptID: record.InterruptID,
+		verifyResume: verifyResume, historySize: record.HistorySize}
 	sink := newEventSink()
 	intHook := &interruptHook{requested: func(ctx context.Context) (bool, error) {
 		current, err := s.sessions.get(ctx, key)
@@ -206,7 +214,7 @@ func (s *chatServer) finish(ctx context.Context, key sessionKey, status, pending
 	if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
 		return err
 	}
-	if status != statusInterrupted {
+	if (sessionRecord{Status: status}).terminal() {
 		if err := s.cleanupCheckpoint(ctx, key.id); err != nil {
 			return err
 		}

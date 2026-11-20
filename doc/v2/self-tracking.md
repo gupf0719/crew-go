@@ -330,8 +330,8 @@ opt-in**」——同时**不出任何公开文档**。⟹ 与本文「必须 opt
 
 > ⚠️ **HIGH：带标记有一个方向相反的副作用，写类便签工具必须先解决它。**
 > 那几个调用点里，`shouldMemoize` 是 `signals.Len() > 0 || !minted`（`agent_v2/tool_memo.go`）——
-> **带标记又没做出上行信号 = 不进 tool_call memo = Resume 时工具体重跑**（这是刻意的，`tool_search` 靠重跑
-> 补回它写 RunSession 的那半）。对「列出 / 读 / 检索」无害，对**「写 / 追加」有害**：便签落
+> **带标记、无上行信号且无专用账项的调用会在同批 Resume 时重跑**。`tool_search` 的已完成候选已有专用账项。
+> 这条边界对**「写 / 追加」**有影响：便签落
 > `store.Store`，追加是 read-modify-write，重跑一次就多追加一份，而 **`err == nil`**。
 >
 > ⚠️ **「写类工具不并行」挡不住它**——tools 是**整节点原子**的（`basic_builder.go:663-665`：

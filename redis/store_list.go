@@ -10,10 +10,7 @@ import (
 
 // ListNamespaces 实现 store.Store.ListNamespaces.
 //
-// **数据源**: SMEMBERS `nsidx` (Put 时 SADD 维护) — O(N) 而 SCAN O(M) (M=item 总数).
-// **stale 容忍**: Delete 不删 nsidx 中的 ns (验证该 ns 下还有无 key 开销大),
-// ListNamespaces 拿到含历史 ns——框架不做 nsidx 回收，业务按需定期清理
-// （开放项在中心表 doc/code/todo.md「redis nsidx 历史 ns 残留」）.
+// 按存活条目核对 namespace。已删除或到期的条目不占分页，空 namespace 在核对时原子回收。
 //
 // **支持**:
 //   - prefix / suffix 段级过滤 (跟 InMemoryStore.matchesPrefix/Suffix 同款)
@@ -41,13 +38,12 @@ func (s *Store) ListNamespaces(ctx context.Context, opts ...store.ListOption) ([
 		}
 	}
 
-	// SMEMBERS nsidx 拿所有 ns_joined
-	nsJoineds, err := s.rdb.SMembers(ctx, storeNSIndexKey(s.prefix)).Result()
+	nsJoineds, err := s.namespaceNames(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("redis store list_namespaces: %w", err)
 	}
 
-	all := make([]store.Namespace, 0, len(nsJoineds))
+	candidates := make([]store.Namespace, 0, len(nsJoineds))
 	for _, nsJoined := range nsJoineds {
 		ns := splitNS(nsJoined)
 		if ns == nil {
@@ -59,18 +55,20 @@ func (s *Store) ListNamespaces(ctx context.Context, opts ...store.ListOption) ([
 		if !matchesSuffix(ns, cfg.Suffix) {
 			continue
 		}
-		// maxDepth 截断
-		if cfg.MaxDepth > 0 && len(ns) > cfg.MaxDepth {
-			truncated := make(store.Namespace, cfg.MaxDepth)
-			copy(truncated, ns[:cfg.MaxDepth])
-			all = append(all, truncated)
-			continue
-		}
-		all = append(all, ns)
+		candidates = append(candidates, ns)
 	}
 
-	// dedup (截断后 ns 可能重复)
+	all, err := s.liveNamespaces(ctx, candidates)
+	if err != nil {
+		return nil, fmt.Errorf("redis store list_namespaces liveness: %w", err)
+	}
+
 	if cfg.MaxDepth > 0 {
+		for i, ns := range all {
+			if len(ns) > cfg.MaxDepth {
+				all[i] = ns[:cfg.MaxDepth:cfg.MaxDepth]
+			}
+		}
 		all = dedupNamespaces(all)
 	}
 

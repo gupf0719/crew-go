@@ -95,13 +95,18 @@ func loseFirstContinuation(lost *atomic.Bool) func(http.ResponseWriter, *http.Re
 // 普通错停下时不带新答案续跑一次。
 func driveGate(t *testing.T, url string) (asked []string, final string, err error) {
 	t.Helper()
-	ra, err := a2a.NewRemoteAgent(context.Background(), url, a2a.WithHumanGate())
+	return driveGateContext(t, t.Context(), url)
+}
+
+func driveGateContext(t *testing.T, ctx context.Context, url string) (asked []string, final string, err error) {
+	t.Helper()
+	ra, err := a2a.NewRemoteAgent(ctx, url, a2a.WithHumanGate())
 	if err != nil {
 		t.Fatal(err)
 	}
 	seq := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName("gate_seq"),
 		agent_v2.WithSequentialRetryConfig(compose_v2.SimpleRetry(2))).AddStep("remote", ra)
-	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
+	ctx = compose_v2.WithCheckpointerCtx(ctx, compose_v2.NewInMemoryCheckpointer())
 	sess := agent_v2.NewRunSession()
 	answers := map[string]*schema.Message{}
 	evs, err := seq.Run(ctx, sess, schema.UserMessage("原始请求"))
@@ -253,6 +258,129 @@ func TestHumanGate_LostResponse_ReusedStatusMessageAskedAgain(t *testing.T) {
 	if o.err != nil || o.final != "done:答#2" || len(o.asked) != 2 {
 		t.Fatalf("应再问一次人、答复续上任务：err=%v final=%q 问过 %q（远端收到 %q）", o.err, o.final, o.asked, r.snapshot())
 	}
+}
+
+func TestHumanGate_LostResponse_DeduplicatedQuestionWithNewStatusTime(t *testing.T) {
+	t.Run("new-question", func(t *testing.T) { testDeduplicatedQuestion(t, false, false) })
+	t.Run("answer-still-processing", func(t *testing.T) { testDeduplicatedQuestion(t, true, false) })
+	t.Run("answer-missing-from-history", func(t *testing.T) { testDeduplicatedQuestion(t, false, true) })
+}
+
+func testDeduplicatedQuestion(t *testing.T, refreshBeforeSend, trimAnswer bool) {
+	t.Helper()
+	askedAt := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
+	askedAgainAt := askedAt.Add(time.Second)
+	r := &recRemote{}
+	exec := fnExec(func(c *a2asrv.ExecutorContext, yield func(a2atypes.Event, error) bool) {
+		txt := inputText(c)
+		if c.StoredTask == nil {
+			r.record("new:" + txt)
+			if !yield(a2atypes.NewSubmittedTask(c, c.Message), nil) {
+				return
+			}
+			next := a2atypes.NewStatusUpdateEvent(c, a2atypes.TaskStateInputRequired,
+				a2atypes.NewMessage(a2atypes.MessageRoleAgent, a2atypes.NewTextPart("批准吗")))
+			next.Status.Timestamp = &askedAt
+			yield(next, nil)
+			return
+		}
+		r.record("cont:" + txt)
+		if r.conts.Add(1) == 1 {
+			next := a2atypes.NewStatusUpdateEvent(c, a2atypes.TaskStateInputRequired, c.StoredTask.Status.Message)
+			next.Status.Timestamp = &askedAgainAt
+			yield(next, nil)
+			return
+		}
+		yield(a2atypes.NewStatusUpdateEvent(c, a2atypes.TaskStateCompleted,
+			a2atypes.NewMessage(a2atypes.MessageRoleAgent, a2atypes.NewTextPart("done:"+txt))), nil)
+	})
+	var lost atomic.Bool
+	var observed atomic.Int32
+	drop := loseFirstContinuation(&lost)
+	url := interceptServer(t, exec, func(w http.ResponseWriter, req *http.Request, body []byte, mux http.Handler) bool {
+		if !bytes.Contains(body, []byte(`"GetTask"`)) {
+			return drop(w, req, body, mux)
+		}
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		var reply map[string]json.RawMessage
+		var task a2atypes.Task
+		changed := false
+		if json.Unmarshal(rr.Body.Bytes(), &reply) == nil && json.Unmarshal(reply["result"], &task) == nil &&
+			task.Status.Timestamp != nil && task.Status.Message != nil {
+			// 模拟按消息 ID 去重的历史。复用的提问保留在答复之前，答复 ID 仍供对账。
+			at := slices.IndexFunc(task.History, func(m *a2atypes.Message) bool {
+				return m != nil && m.Role == a2atypes.MessageRoleUser && a2aPartsContain(m, "答#1")
+			})
+			switch {
+			case refreshBeforeSend && task.Status.Timestamp.Equal(askedAt):
+				// 发答前已经看到了原问题的更新时刻。
+				task.Status.Timestamp = &askedAgainAt
+				changed = true
+			case at >= 0 && task.Status.Timestamp.Equal(askedAgainAt):
+				answer := task.History[at]
+				task.History = []*a2atypes.Message{task.Status.Message}
+				if !trimAnswer {
+					task.History = append(task.History, answer)
+				}
+				if n := observed.Add(1); refreshBeforeSend && n > 1 {
+					// 已在途的原答复处理完毕，未发出下一问。
+					task.Status.State = a2atypes.TaskStateCompleted
+					task.Status.Message = a2atypes.NewMessage(a2atypes.MessageRoleAgent, a2atypes.NewTextPart("done:答#1"))
+				}
+				changed = true
+			}
+		}
+		if changed {
+			data, err := json.Marshal(task)
+			if err != nil {
+				t.Errorf("编码去重快照: %v", err)
+			} else {
+				reply["result"] = data
+				w.Header().Set("Content-Type", "application/json")
+				if err := json.NewEncoder(w).Encode(reply); err != nil {
+					t.Errorf("发送去重快照: %v", err)
+				}
+				return true
+			}
+		}
+		for key, values := range rr.Header() {
+			w.Header()[key] = values
+		}
+		w.WriteHeader(rr.Code)
+		if _, err := w.Write(rr.Body.Bytes()); err != nil {
+			t.Errorf("转发 GetTask: %v", err)
+		}
+		return true
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	asked, final, err := driveGateContext(t, ctx, url)
+	if !lost.Load() || observed.Load() == 0 {
+		t.Fatalf("未经过丢响应和去重快照，远端收到 %q", r.snapshot())
+	}
+	if refreshBeforeSend {
+		if err != nil || len(asked) != 1 || final != "done:答#1" ||
+			!slices.Equal(r.snapshot(), []string{"new:原始请求", "cont:答#1"}) {
+			t.Fatalf("原答复仍在处理时不应再问，问过 %q，最终 %q，err=%v，远端收到 %q", asked, final, err, r.snapshot())
+		}
+		return
+	}
+	if trimAnswer {
+		if err == nil || !strings.Contains(err.Error(), "did not confirm delivery") || len(asked) != 1 ||
+			!slices.Equal(r.snapshot(), []string{"new:原始请求", "cont:答#1"}) {
+			t.Fatalf("历史缺少答复时应保留未确认状态，问过 %q，最终 %q，err=%v，远端收到 %q", asked, final, err, r.snapshot())
+		}
+		return
+	}
+	if err != nil || len(asked) != 2 || final != "done:答#2" ||
+		!slices.Equal(r.snapshot(), []string{"new:原始请求", "cont:答#1", "cont:答#2"}) {
+		t.Fatalf("应核实第一答并绑定新问题，问过 %q，最终 %q，err=%v，远端收到 %q", asked, final, err, r.snapshot())
+	}
+}
+
+func a2aPartsContain(msg *a2atypes.Message, want string) bool {
+	return slices.ContainsFunc(msg.Parts, func(p *a2atypes.Part) bool { return p != nil && p.Text() == want })
 }
 
 // 远端问人之前先流出一段 artifact；答复之后流出这一轮的 artifact 收尾，响应丢了：取回的答复只含这一轮的，跟正常收尾一样。

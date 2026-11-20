@@ -497,8 +497,8 @@ memo 落地后审计抓出两个缺陷，我自己推了修法**没对照**就�
 
 > **2026-10-08 起已换代**：转交 / 路由决定改成跟着写入者提交走的上行信号（`compose_v2/signal.go`），
 > 工具账连同那次调用做出的信号一起记、命中时交出；收件槽与 `ControlEffectMetaKey` 已删。2026-10-13 起
-> `tool_search` 的解锁也不再写 RunSession：记在 tools 节点这次执行上、节点成功后写进图的 channel；它仍不进
-> 工具账（解锁记录不进 cp，命中跳过函数体就丢了这一批的解锁）。下文是当时的记录。
+> `tool_search` 的已解锁集改由图的 channel 持有。2026-11-20 起，同批还未提交的候选随逐调用工具账恢复，
+> 再经额度和钩子裁决发布。下文保留当时的记录。 [现行契约](../../v2/toolsearch.md)
 
 我们的 `transfer_to_agent` 真信号写进上层 HandoffAgent 那个**只活一次 sub-agent 调用**的收件槽
 （`handoffTransferSlot`，挂 ctx 上；早先是 `sess.SetValue(handoffPendingKey…)`，换载体的理由见

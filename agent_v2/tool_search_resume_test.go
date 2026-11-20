@@ -2,6 +2,8 @@ package agent_v2_test
 
 import (
 	"context"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"crew-go/agent_v2"
@@ -9,6 +11,55 @@ import (
 	"crew-go/schema"
 	"crew-go/tool"
 )
+
+func TestToolSearch_RevokedCandidatesNotAdvertisedOnResume(t *testing.T) {
+	var searches atomic.Int32
+	makeAgent := func(m *captureToolsModel, deferred string) *agent_v2.BasicAgent {
+		tk := tool.NewToolkit()
+		tk.Register(tsTestTool(deferred, deferred+" specification"))
+		tk.Register(tool.NewFuncTool("approve", "确认", map[string]any{"type": "object"},
+			func(ctx context.Context, _ map[string]any) (*tool.Result, error) {
+				if _, err := compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "继续？"}); err != nil {
+					return nil, err
+				}
+				return tool.Success("approved"), nil
+			}))
+		return agent_v2.NewBasicAgent(agent_v2.WithName("change_search_catalog"), agent_v2.WithModel(m),
+			agent_v2.WithToolkit(tk), agent_v2.WithToolSearch(&agent_v2.ToolSearchConfig{
+				Enabled: true, MaxRevealed: 1, Deferred: func(t tool.Tool) bool { return t.Name() == deferred },
+				Retriever: func(context.Context, string, []tool.Tool) []string {
+					searches.Add(1)
+					return []string{deferred}
+				},
+			}))
+	}
+	initial := &captureToolsModel{responses: []*schema.Message{schema.AssistantToolCallMessage([]schema.ToolCall{
+		{ID: "find", Function: schema.FunctionCall{Name: "tool_search", Arguments: `{"query":"lookup"}`}},
+		{ID: "approve", Function: schema.FunctionCall{Name: "approve", Arguments: "{}"}},
+	})}}
+	ctx := compose_v2.WithCheckpointerCtx(t.Context(), compose_v2.NewInMemoryCheckpointer())
+	session := agent_v2.NewRunSession()
+	_, err := makeAgent(initial, "old_lookup").Run(ctx, session, schema.UserMessage("查询"))
+	interrupted, ok := compose_v2.IsInterrupt(err)
+	if !ok || searches.Load() != 1 {
+		t.Fatalf("同批检索没有在挂起前完成: %v，检索 %d 次", err, searches.Load())
+	}
+	resumed := &captureToolsModel{responses: []*schema.Message{schema.AssistantMessage("已核对")}}
+	events, err := makeAgent(resumed, "new_lookup").Resume(ctx, session.RunID,
+		agent_v2.WithResumeUserInputs(map[string]*schema.Message{interrupted.Query.InterruptID: schema.UserMessage("是")}))
+	if err != nil || agent_v2.FinalMessage(events).GetContent() != "已核对" || len(resumed.inputs) != 1 {
+		t.Fatalf("续跑未交回模型: %v，%v", agent_v2.FinalMessage(events), err)
+	}
+	receipt := toolResultTexts(resumed.inputs[0])["find"]
+	if !strings.Contains(receipt, "撤下") || strings.Contains(receipt, "old_lookup") || searches.Load() != 1 {
+		t.Errorf("目录变更后回执 %q，检索 %d 次", receipt, searches.Load())
+	}
+	for _, bound := range resumed.bound {
+		if sliceHas(bound, "old_lookup") || sliceHas(bound, "new_lookup") {
+			t.Errorf("旧授权不能授予撤下或换入的工具: %v", bound)
+		}
+	}
+}
 
 // TestToolSearch_RevealedSurvivesResume：**解锁过的工具，中断续跑之后还得能调。**
 //

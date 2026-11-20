@@ -668,23 +668,23 @@ func TestStaleWriteGuard_FirstRoundOfSessionProtected(t *testing.T) {
 		}
 		return g
 	}
-	run := func(g *compose_v2.Graph) error {
+	run := func(g *compose_v2.Graph, cp compose_v2.Checkpointer) error {
 		return compose_v2.Run(ctx, g, compose_v2.NewChannelManager(),
-			compose_v2.WithCheckpointer(cper), compose_v2.WithSessionID("first_sid"),
+			compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID("first_sid"),
 			compose_v2.WithStaleWriteGuard())
 	}
 
 	errBCh := make(chan error, 1)
-	go func() { errBCh <- run(mk("B", true)) }()
+	go func() { errBCh <- run(mk("B", true), &separateCheckpointClient{cper}) }()
 	<-bLoaded // B 已 auto-load 到空槽，基线 = 空槽态
 
-	errA := run(mk("A", false)) // A 完整跑完并写入
-	if errors.Is(errA, compose_v2.ErrCheckpointStale) {
-		t.Fatalf("A 是这个槽的第一个写入者，不该被拒: %v", errA)
-	}
-	close(aDone) // 放 B 走到写回
+	errA := run(mk("A", false), cper) // A 完整跑完并写入
+	close(aDone)                      // 放 B 走到写回
 
 	errB := <-errBCh
+	if _, ok := compose_v2.IsInterrupt(errA); !ok {
+		t.Fatalf("前提：A 先写成挂起档，实际 %v", errA)
+	}
 	if !errors.Is(errB, compose_v2.ErrCheckpointStale) {
 		t.Errorf("B 载入时槽为空、写回时已被 A 创建 → 应检出 stale, got %v\n"+
 			"  没有 = 会话第一轮完全裸奔，B 的存档静默覆盖 A 的", errB)

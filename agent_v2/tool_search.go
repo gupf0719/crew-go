@@ -133,6 +133,23 @@ func (t *revealTurn) add(index int, names ...string) {
 	t.byCall[index] = append(t.byCall[index], names...)
 }
 
+// toolSearchReplay 保存框架检索命中的候选。空列表也代表检索已完成。
+type toolSearchReplay struct {
+	Names []string `json:"names,omitempty"`
+}
+
+func (t *revealTurn) recorded(index int) *toolSearchReplay {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if names, ok := t.byCall[index]; ok {
+		return &toolSearchReplay{Names: slices.Clone(names)}
+	}
+	return nil
+}
+
 func (t *revealTurn) accepted(results []*schema.Message) []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -383,6 +400,8 @@ func (t *toolSearchTool) Call(ctx context.Context, args map[string]any) (*tool.R
 		names = t.retriever(ctx, query, t.deferred)
 	}
 	matched, others := splitCandidates(names, t.deferred)
+	// 批次成功后由节点提交。批内执行仍只认此前提交的解锁集。
+	turn.add(compose_v2.GetCurrentToolCallIndex(ctx), matched...)
 	if len(matched) == 0 {
 		if len(others) > 0 {
 			// 检索器返回的都不是要解锁的工具（共享索引、在全量工具上检索时常见）：多半本来就能直接调。说「可能不存在」
@@ -392,10 +411,15 @@ func (t *toolSearchTool) Call(ctx context.Context, args map[string]any) (*tool.R
 		}
 		return tool.Success(fmt.Sprintf("没有匹配「%s」的工具。换个 query 再试，或所需能力可能不存在。", query)), nil
 	}
-	// 记进这一批的解锁记录，tools 节点成功后写进 basicRevealedCh（工具体拿不到 channel 写入口）。这一批里的
-	// 执行闸不认它：闸只认这一批开始前已提交的解锁集（见 revealedNames）。
-	turn.add(compose_v2.GetCurrentToolCallIndex(ctx), matched...)
 	return tool.Success(t.revealReceipt(matched, 0)), nil
+}
+
+func setSearchReceipt(msg *schema.Message, text string) {
+	msg.Content = text
+	if len(msg.ContentBlocks) > 0 && msg.ContentBlocks[0] != nil && msg.ContentBlocks[0].Toolresult != nil {
+		msg.ContentBlocks[0].Toolresult.Content = text
+		msg.ContentBlocks[0].Toolresult.Parts = nil
+	}
 }
 
 // revealReceipt 同时用于检索结果和按批次额度裁剪后的实际回执。

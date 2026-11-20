@@ -126,8 +126,9 @@ instrumentation scope 名是 `crew-go/observability`（`observability.ScopeName`
   `crew.graph.ns`；顶层图叫 `root`。
 - 远端 agent 同时配 `a2a.WithHooks(obs.AgentHooks())` 与 `a2a.WithObservability(obs)` 时，一次远端调用是
   `invoke_agent`（INTERNAL）下挂 `invoke_agent`（CLIENT）两层；只要 CLIENT 那层时配后者就够。
-- 结束钩子只收本次调用自己的句柄（agent 按名字与 ns、节点按节点 ID 与 ns 核对）：框架在开始失败等路径上拿
-  开始之前的 ctx 调结束钩子时，那里最内层的句柄可能是外层的，不会被误收。
+- Agent 的开始与结束按实际调用、名字、类型、会话和 namespace 配对。独立的同名调用有各自的 span，
+  同一调用的重复安装合并。工作流按调用及分域核对是否已有 Agent span。节点完成时核对节点 ID 和 namespace，
+  开始去重时也核对扇出实例。
 
 ### 2.2 父子关系
 

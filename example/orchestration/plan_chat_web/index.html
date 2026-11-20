@@ -603,13 +603,20 @@ function handle(ev) {
       }
       setUIState('paused');
       break;
+    case 'resume_unconfirmed':
+      if (current) {
+        current.body.insertAdjacentHTML('beforeend',
+          '<div class="plan-step" style="color:#fab387">续跑结果暂无法确认。点继续核对存档，或取消这次任务。</div>');
+      }
+      setUIState('verify');
+      break;
     case 'aborted':
       if (current) finishAssistantTurn('(已取消)', false);
       setUIState('finished');
       break;
     case 'done':
       // 服务端关流。interrupted/aborted 路径已切状态；其他路径走 finished。
-      if (d && (d.interrupted || d.aborted)) break;
+      if (d && (d.interrupted || d.aborted || d.status === 'resume_unconfirmed')) break;
       if (current) finishAssistantTurn('(未收到最终答复)', false);
       setUIState('finished');
       break;
@@ -645,18 +652,20 @@ function setUIState(s) {
       qEl.disabled = true;
       break;
     case 'paused':
+    case 'verify':
       sendBtn.style.display = 'none';
       stopBtn.style.display = 'none';
       resumeBtn.style.display = '';
       resumeBtn.disabled = false;
-      replanBtn.style.display = '';
+      resumeBtn.textContent = s === 'verify' ? '核对存档' : '▶ 继续';
+      replanBtn.style.display = s === 'verify' ? 'none' : '';
       replanBtn.disabled = false;
       abortBtn.style.display = '';
       abortBtn.disabled = false;
       eventsHead.classList.remove('live');
       // ISSUE-58 HITL：paused 时启用 textarea，让用户可选填"答案 / 新指令"。
       // 三按钮（继续/改方向/取消）共用 textarea 文本，按钮决定 action。
-      qEl.disabled = false;
+      qEl.disabled = s === 'verify';
       qEl.placeholder = '可选：填答案/新指令（继续=ask_user 答复 · 改方向=replan 输入）';
       break;
   }
@@ -681,8 +690,8 @@ function send() {
 //         abort（删除 checkpoint 直接结束）
 function resumeWithAction(action) {
   if (!currentSessionID || es) return;
-  const text = qEl.value.trim();
-  qEl.value = '';
+  const text = currentState === 'verify' ? '' : qEl.value.trim();
+  if (currentState !== 'verify') qEl.value = '';
   autoResize();
   // 如果有文本，先在聊天栏 echo 一下，让 user 看到自己输入了什么
   if (text) appendUserMessage(text);
